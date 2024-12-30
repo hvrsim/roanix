@@ -1,0 +1,12 @@
+[binaries]
+c = 'x86_64-roanix-mlibc-gcc'
+cpp = 'x86_64-roanix-mlibc-g++'
+ar = 'x86_64-roanix-mlibc-ar'
+strip = 'x86_64-roanix-mlibc-strip'
+pkg-config = 'x86_64-roanix-mlibc-pkg-config'
+
+[host_machine]
+system = 'roanix'
+cpu_family = 'x86_64'
+endian = 'little'
+cpu = 'x86_64'

@@ -17,7 +17,7 @@ configure() {
         CXXFLAGS_FOR_TARGET="$TARGET_CXXFLAGS" \
     ../configure \
         --prefix="${prefix}" \
-        --target=${OS_TRIPLET} \
+        --target=${common_target} \
         --with-sysroot="${sysroot_dir}" \
         --disable-nls \
         --with-linker-hash-style=gnu \

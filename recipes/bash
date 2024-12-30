@@ -51,7 +51,6 @@ package() {
 
     mkdir -p "${dest_dir}"/etc
     cp -v "${base_dir}"/distro-files/bash/bash.bashrc "${dest_dir}"/etc/
-    cp -v "${base_dir}"/distro-files/bash/bash.bash_logout "${dest_dir}"/etc/
 
     post_package_strip
 }

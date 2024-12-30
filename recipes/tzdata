@@ -18,8 +18,8 @@ build() {
     cp -rp ${source_dir}/. ./
 
     make \
-        CC="$OS_TRIPLET-gcc" \
-        AR="$OS_TRIPLET-ar" \
+        CC="$common_target-gcc" \
+        AR="$common_target-ar" \
         CFLAGS="$TARGET_CFLAGS -std=c99 $TARGET_CPPFLAGS" \
         LDFLAGS="$TARGET_LDFLAGS" \
         LDLIBS="-lintl"

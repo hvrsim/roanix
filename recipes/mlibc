@@ -11,7 +11,7 @@ deps="mlibc-headers"
 configure() {
         CFLAGS="$TARGET_CFLAGS" \
         CXXFLAGS="$TARGET_CXXFLAGS" \
-        LDFLAGS="$TARGET_LDFLAGS -Wl,/usr/local/libgcc-binaries/libgcc-$ARCHITECTURE.a" \
+        LDFLAGS="$TARGET_LDFLAGS -Wl,/usr/local/libgcc-binaries/libgcc-$common_arch.a" \
     meson_configure_noflags \
         --buildtype=debugoptimized \
         -Dno_headers=true \

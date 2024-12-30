@@ -13,7 +13,7 @@ prepare() {
 }
 
 configure() {
-    if [ "$ARCHITECTURE" = "x86_64" ]; then
+    if [ "$common_arch" = "x86_64" ]; then
         X86_FLAGS="--enable-bios \
                    --enable-bios-cd \
                    --enable-bios-pxe \
@@ -25,7 +25,7 @@ configure() {
         $X86_FLAGS \
         --enable-uefi-$ARCHITECTURE \
         --enable-uefi-cd \
-        TOOLCHAIN_FOR_TARGET=${OS_TRIPLET}
+        TOOLCHAIN_FOR_TARGET=${common_target}
 }
 
 build() {

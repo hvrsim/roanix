@@ -10,7 +10,7 @@ configure() {
         LDFLAGS="$HOST_LDFLAGS" \
     "${source_dir}"/configure \
         --prefix="${prefix}" \
-        --target=${OS_TRIPLET} \
+        --target="${common_target}" \
         --with-sysroot="${sysroot_dir}" \
         --enable-separate-code \
         --enable-cet \
