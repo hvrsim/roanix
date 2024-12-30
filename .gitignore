@@ -1,0 +1,17 @@
+# jinx artifacts
+jinx
+jinx-config
+.jinx-cache
+sources
+builds
+pkgs
+host-builds
+host-pkgs
+
+# build artifacts
+iso_root
+*.hdd
+
+# editor artifacts
+*.swp
+.vscode/
