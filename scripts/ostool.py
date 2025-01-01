@@ -104,6 +104,14 @@ def do_build(args):
         printv("build: building world...")
         return scall("./jinx build world")
 
+def do_genimg(args):
+    image_name = "roanix"
+
+    if args.filename:
+        image_name = Path(args.filename).stem
+
+    printv("genimg: creating hard drive image...")
+    return scall("./scripts/mkimage.sh hdd " + image_name)
 
 def do_clean(args):
     scall(
@@ -159,6 +167,10 @@ def build_parser(parser):
         "--pkg", type=str, dest="package", help="package to build"
     )
 
+    parser_genimg = subparsers.add_parser("genimg", help="generate disk images")
+    parser_genimg.add_argument("-f", "--filename", type=str, help="disk image filename")
+    parser_genimg.add_argument("--iso", type=str, help="build iso instead of hdd image")
+
     parser_clean = subparsers.add_parser(
         "clean", help="clean repository of build artifacts"
     )
@@ -193,6 +205,8 @@ def main():
         return do_setup(args)
     elif args.command == "build":
         return do_build(args)
+    elif args.command == "genimg":
+        return do_genimg(args)
     elif args.command == "clean":
         return do_clean(args)
     else:

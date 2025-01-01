@@ -23,7 +23,7 @@ configure() {
 
     autotools_configure \
         $X86_FLAGS \
-        --enable-uefi-$ARCHITECTURE \
+        --enable-uefi-$common_arch \
         --enable-uefi-cd \
         TOOLCHAIN_FOR_TARGET=${common_target}
 }
