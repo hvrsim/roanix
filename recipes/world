@@ -1,3 +1,0 @@
-name=world
-revision=1
-deps="kernel bash"

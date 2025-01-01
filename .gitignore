@@ -1,16 +1,19 @@
 # jinx artifacts
-jinx
-jinx-config
-.jinx-cache
-sources
-builds
-pkgs
-host-builds
-host-pkgs
+userland/jinx
+userland/jinx-config
+userland/.jinx-cache
+userland/sources
+userland/builds
+userland/pkgs
+userland/host-builds
+userland/host-pkgs
 
 # build artifacts
 iso_root
 *.hdd
+*.iso
+target/
+store/
 
 # editor artifacts
 *.swp
