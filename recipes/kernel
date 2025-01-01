@@ -1,0 +1,28 @@
+name=kernel
+version=0.0
+revision=1
+source_dir="kernel"
+imagedeps="cmake ninja-build"
+hostdeps="gcc libgcc-binaries pkg-config"
+deps="sys-libs frigg freestnd-c-hdrs freestnd-cxx-hdrs limine"
+revision=1
+
+configure() {
+    # libgcc is required on riscv...
+    if [[ "${common_arch}" == "riscv64" ]]; then
+        TARGET_LDFLAGS="$TARGET_LDFLAGS -Wl,/usr/local/libgcc-binaries/libgcc-${common_arch}-softfloat.a"
+        export TARGET_LDFLAGS
+    fi
+
+    cmake_configure
+}
+
+build() {
+    ninja -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+
+    post_package_strip
+}

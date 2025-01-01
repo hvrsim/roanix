@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ===----------------------------------------------------------------------===##
 #
-# Part of the Roanix Project, under the Mozilla Public License 2.0
+# Part of the Roanix Project, under the Mozilla Public License 2.0.
 # See LICENSE in the project root for license information.
 # SPDX-License-Identifier: MPL-2.0
 #

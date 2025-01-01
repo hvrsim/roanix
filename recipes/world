@@ -1,3 +1,3 @@
 name=world
 revision=1
-deps="bash"
+deps="kernel bash"
