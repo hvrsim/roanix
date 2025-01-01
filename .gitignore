@@ -1,19 +1,10 @@
-# jinx artifacts
-userland/jinx
-userland/jinx-config
-userland/.jinx-cache
-userland/sources
-userland/builds
-userland/pkgs
-userland/host-builds
-userland/host-pkgs
-
 # build artifacts
 iso_root
 *.hdd
 *.iso
-target/
 store/
+kernel/roanix
+kernel/target/
 
 # editor artifacts
 *.swp
