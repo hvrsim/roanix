@@ -25,4 +25,4 @@ For information about contributing to Roanix, check out our  [Contributing Guide
 
 ## License
 
-Roanix is released under the [Mozilla Public License v2.0](https://www.mozilla.org/MPL/2.0/).
+Roanix is released under the [BSD+Patent License](https://opensource.org/license/BSDplusPatent).
