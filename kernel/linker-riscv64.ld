@@ -17,9 +17,9 @@ SECTIONS
 
     /* create a section for limine reqs, and a phdr to go with it */
     .limine_requests : {
-        KEEP(*(.limine_requests_start_marker))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end_marker))
+        KEEP(*(.requests_start_marker))
+        KEEP(*(.requests))
+        KEEP(*(.requests_end_marker))
     } :limine_requests
 
     /* move to the next memory page for .text */
