@@ -9,3 +9,6 @@ kernel/target/
 # editor artifacts
 *.swp
 .vscode/
+
+# mdbook
+book/book/
