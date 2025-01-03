@@ -15,7 +15,7 @@
 //! - `arch` - CPU architecture specific code.
 //!
 
-use limine::request::{FramebufferRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use log::info;
 
@@ -48,7 +48,7 @@ unsafe extern "C" fn rmain() -> ! {
 
     arch::early();
 
-    info!("Hello, World!\n");
+    info!("main: welcome to roanix!");
 
     arch::hcf();
 }

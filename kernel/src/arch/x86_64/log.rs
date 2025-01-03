@@ -13,9 +13,9 @@
 //! ```
 //!
 
-use core::arch::asm;
 use core::fmt::{Result, Write};
-use log::{LevelFilter, Metadata, Record};
+use log::{debug, Level, LevelFilter, Metadata, Record};
+use x86_64::instructions::port::PortWriteOnly;
 
 /// Logger implementation for port 0xE9.
 struct E9Logger;
@@ -26,9 +26,8 @@ static LOGGER: E9Logger = E9Logger;
 impl Write for E9Logger {
     fn write_str(&mut self, s: &str) -> Result {
         for byte in s.bytes() {
-            unsafe {
-                asm!("out dx, al", in("dx") 0xE9, in("al") byte, options(nomem, nostack, preserves_flags));
-            }
+            let mut port = PortWriteOnly::new(0xE9);
+            unsafe { port.write(byte) }
         }
 
         Ok(())
@@ -42,8 +41,28 @@ impl log::Log for E9Logger {
     }
 
     fn log(&self, record: &Record) {
+        match record.level() {
+            Level::Error => write!(&mut E9Logger, "[\x1b[1;31mE\x1b[0m]").unwrap(),
+            Level::Warn => write!(&mut E9Logger, "[\x1b[1;33m!\x1b[0m]").unwrap(),
+            Level::Info => write!(&mut E9Logger, "[\x1b[1;32m*\x1b[0m]").unwrap(),
+            Level::Debug => write!(&mut E9Logger, "[\x1b[1;34mD\x1b[0m]").unwrap(),
+            Level::Trace => write!(&mut E9Logger, "[\x1b[1;35mT\x1b[0m]").unwrap(),
+        }
+
+        let path = if let Some(path) = record.file() {
+            path
+        } else {
+            "???"
+        };
+
+        let line = if let Some(line) = record.line() {
+            line
+        } else {
+            0
+        };
+
         // A write to the debug port can never fail.
-        write!(&mut E9Logger, "{}", record.args()).unwrap();
+        write!(&mut E9Logger, " ({}:{}) {}\n", path, line, record.args()).unwrap();
     }
 
     /// Flush calls are done on a per-character basis, therefore global flush not required.
