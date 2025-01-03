@@ -1,27 +1,47 @@
 #![no_std]
 #![no_main]
 
+//!
+//! # Roanix Kernel Documentation
+//!
+//! This is the top level of the rustdoc generated kernel documentation. For
+//! a more general guide to Roanix, check out [Roanix Internals](https://example.com).
+//!
+//! # Project Orginization
+//!
+//! Roanix code is split into modules, each representing a logical kernel subsystem.
+//! Currently implemented top level modules are as follows:
+//!
+//! - `arch` - CPU architecture specific code.
+//!
+
 use limine::request::{FramebufferRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use log::info;
 
 mod arch;
 
-/// Sets the base revision to the latest revision supported by the crate.
-/// See specification for further info.
-/// Be sure to mark all limine requests with #[used], otherwise they may be removed by the compiler.
 #[used]
+#[doc(hidden)]
 #[link_section = ".requests"]
 static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
 
-/// Define the stand and end markers for Limine requests.
 #[used]
+#[doc(hidden)]
 #[link_section = ".requests_start_marker"]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+
 #[used]
+#[doc(hidden)]
 #[link_section = ".requests_end_marker"]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
+/// Kernel Entrypoint.
+///
+/// Ensures that the limine protocol matches the requested version (3), then
+/// calls initializers for the various kernel subsystems. Finishes with a
+/// polling loop, waiting for the scheduler to active and switch to the
+/// init thread.
 #[no_mangle]
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
@@ -33,6 +53,7 @@ unsafe extern "C" fn rmain() -> ! {
     arch::hcf();
 }
 
+#[doc(hidden)]
 #[panic_handler]
 fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
     arch::hcf();
