@@ -13,13 +13,15 @@
 //! Currently implemented top level modules are as follows:
 //!
 //! - `arch` - CPU architecture specific code.
+//! - `sys` - core kernel components, basis for the rest of the kernel.
 //!
 
 use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 use log::info;
 
-mod arch;
+pub mod arch;
+pub mod sys;
 
 #[used]
 #[doc(hidden)]
@@ -46,10 +48,10 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
 
-    arch::early();
-
+    sys::console::register();
     info!("main: welcome to roanix!");
 
+    arch::early();
     arch::hcf();
 }
 
