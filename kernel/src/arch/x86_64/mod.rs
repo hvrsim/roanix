@@ -7,11 +7,6 @@
 
 use x86_64::instructions::{hlt, port::PortWriteOnly};
 
-/// Perform early CPU initialization.
-///
-/// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
-pub fn early() {}
-
 ///
 /// Writes a single character to the emulator debug port.
 ///

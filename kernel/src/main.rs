@@ -48,15 +48,8 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
 
-    sys::console::register();
+    sys::debug::register();
     info!("main: welcome to roanix!");
 
-    arch::early();
-    arch::hcf();
-}
-
-#[doc(hidden)]
-#[panic_handler]
-fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
     arch::hcf();
 }

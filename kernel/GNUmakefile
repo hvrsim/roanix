@@ -8,6 +8,7 @@ override USER_VARIABLE = $(if $(filter $(origin $(1)),default undefined),$(eval 
 # Target architecture to build for. Default to x86_64.
 $(call USER_VARIABLE,KARCH,x86_64)
 
+override RFLAGS := -Crelocation-model=static -Cforce-frame-pointers=yes
 ifeq ($(RUST_TARGET),)
     override RUST_TARGET := $(KARCH)-unknown-none
 	ifeq ($(KARCH),riscv64)
@@ -27,7 +28,7 @@ endif
 # Default target.
 .PHONY: all
 all:
-	RUSTFLAGS="-C relocation-model=static" cargo build --target $(RUST_TARGET) --profile $(RUST_PROFILE)
+	RUSTFLAGS="$(RFLAGS)" cargo build --target $(RUST_TARGET) --profile $(RUST_PROFILE)
 	cp target/$(RUST_TARGET)/$(RUST_PROFILE_SUBDIR)/$$(cd target/$(RUST_TARGET)/$(RUST_PROFILE_SUBDIR) && find -maxdepth 1 -perm -111 -type f) roanix
 
 # Remove object files and the final executable.
