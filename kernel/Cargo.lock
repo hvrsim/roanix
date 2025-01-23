@@ -23,8 +23,7 @@ checksum = "b048fb63fd8b5923fc5aa7b340d8e156aec7ec02f0c78fa8a6ddc2613f6f71de"
 [[package]]
 name = "limine"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ca87cab008b8efeebdbe037cd4d1438037d48c5cb6fed939ffa5aa06315a321"
+source = "git+https://github.com/jasondyoungberg/limine-rs.git#7a642da9f7b97843ecd7d7349feb510ed08686fe"
 dependencies = [
  "bitflags",
 ]
@@ -46,11 +45,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 
 [[package]]
+name = "raw-cpuid"
+version = "11.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ab240315c661615f2ee9f0f2cd32d5a7343a84d5ebcccb99d46e6637565e7b0"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "roanix"
 version = "0.1.0"
 dependencies = [
  "limine",
  "log",
+ "raw-cpuid",
  "rustc-demangle",
  "spin",
  "x86_64",

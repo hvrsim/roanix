@@ -7,6 +7,15 @@
 
 use x86_64::instructions::{hlt, port::PortWriteOnly};
 
+mod cpu;
+
+/// Performs early CPU initialization.
+///
+/// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
+pub fn early() {
+    cpu::enable_features();
+}
+
 ///
 /// Writes a single character to the emulator debug port.
 ///
@@ -27,9 +36,9 @@ pub fn debug_putc(byte: u8) {
     unsafe { port.write(byte) }
 }
 
-/// Pause CPU execution and wait for interrupts.
+/// Pauses CPU execution and waits for interrupts.
 ///
-/// **WARN: If interrupts are disabled, this will result in an infinite loop.**
+/// **If interrupts are disabled, this will result in an infinite loop.**
 pub fn hcf() -> ! {
     loop {
         hlt();

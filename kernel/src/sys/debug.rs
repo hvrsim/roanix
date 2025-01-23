@@ -1,12 +1,12 @@
 //!
 //! # Kernel Debugging Interface.
 //!
-//! Responsible for gathering log output from `info!`, `warn!`, `trace!` and the likes.
+//! Responsible for gathering log output from [`log::info!`], [`log::warn!`], [`log::trace!`] and the likes.
 //!
 //! Stores each line of logging output into an internal buffer, then dispatches
-//! each character out to the arch-specific debug console (`arch::debug_putc`).
+//! each character out to the arch-specific debug console ([`arch::debug_putc`][crate::arch::debug_putc]).
 //!
-//! Panic handler is also implemented within.
+//! The kernel panic handler is also implemented in this module.
 //!
 
 // static mut buffer is protected with mutex.
@@ -16,7 +16,7 @@ use core::fmt::{Result, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use limine::request::KernelFileRequest;
+use limine::request::ExecutableFileRequest;
 use log::{Level, LevelFilter, Metadata, Record};
 use spin::{Mutex, Once};
 use xmas_elf::{
@@ -26,7 +26,7 @@ use xmas_elf::{
 /// Connector between `log` crate and various outputs.
 struct KLog;
 
-/// Special wrapper that lets us use `write!` with `debug_putc`.
+/// Interface that lets us use [`write!`] with [`arch::debug_putc`][crate::arch::debug_putc].
 struct PanicWriter;
 
 /// Internal buffer of raw log output, circles back once filled.
@@ -36,7 +36,7 @@ struct RingBuffer<const N: usize> {
     write: usize,
 }
 
-/// Wrapper struct for `ElfBytes`, used for parsing the kernel symbol table.
+/// Wrapper struct for [`ElfFile`], used for parsing the kernel symbol table.
 struct KernelElf {
     pub file: ElfFile<'static>,
 }
@@ -68,7 +68,7 @@ static mut BUFFER: Mutex<RingBuffer<RING_ENTRIES>> = Mutex::new(RingBuffer {
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
-static KERNEL_FILE: KernelFileRequest = KernelFileRequest::new();
+static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
 
 impl KernelElf {
     fn new(elf: ElfFile<'static>) -> Self {
@@ -77,7 +77,7 @@ impl KernelElf {
 }
 
 impl Write for PanicWriter {
-    /// Simply calls `debug_putc` for each byte.
+    /// Calls [`arch::debug_putc`][crate::arch::debug_putc] for each character of `s`.
     fn write_str(&mut self, s: &str) -> Result {
         for byte in s.bytes() {
             crate::arch::debug_putc(byte);
@@ -88,7 +88,7 @@ impl Write for PanicWriter {
 }
 
 impl<const T: usize> Write for RingBuffer<T> {
-    /// Copies the string into the ringbuffer, and calls `debug_putc` for each byte.
+    /// Copies the string into the ringbuffer and passes it to [`PanicWriter`].
     fn write_str(&mut self, s: &str) -> Result {
         for byte in s.bytes() {
             self.data[self.write] = byte;
@@ -115,7 +115,7 @@ impl log::Log for KLog {
         true
     }
 
-    /// Pretty-prints log record and sends it through the backend.
+    /// Pretty-prints `record` and sends it through the backend.
     fn log(&self, record: &Record) {
         unsafe {
             let mut buffer = BUFFER.lock();
@@ -141,7 +141,7 @@ impl log::Log for KLog {
             };
 
             // A write to the debug port can never fail.
-            write!(&mut buffer, " ({}:{}) {}\n", path, line, record.args()).unwrap();
+            write!(&mut buffer, " \x1b[2m({}:{})\x1b[0m {}\n", path, line, record.args()).unwrap();
         }
     }
 
@@ -149,7 +149,7 @@ impl log::Log for KLog {
     fn flush(&self) {}
 }
 
-/// Connects kernel logging infra to the log crate. Also parses kernel ELF for panic unwinding.
+/// Connects kernel logging infra to the log crate. Also parses the kernel ELF for panic unwinding.
 pub fn register() {
     let kfile_resp = KERNEL_FILE
         .get_response()
@@ -166,14 +166,14 @@ pub fn register() {
 
     // Kernel logging depends on a valid logger, therefore panic if we are unable to install this logger.
     log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(LevelFilter::Info))
+        .map(|()| log::set_max_level(LevelFilter::Trace))
         .unwrap();
 }
 
 /// Target-specific unwind function.
 ///
 /// Iterates backwards through the stack, printing the symbol at each level.
-/// *NOTE: max backtrace depth is currently set to 32 function calls.*
+/// *Max backtrace depth is currently set to 32 function calls.*
 #[cfg(target_arch = "x86_64")]
 fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
     let mut rbp: usize;
@@ -216,7 +216,7 @@ fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
         }
 
         if let Some(name) = name {
-            eprint!("{:>2}: 0x{:016x} - {}\n", depth, rip, name);
+            eprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
         } else {
             eprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
         }
