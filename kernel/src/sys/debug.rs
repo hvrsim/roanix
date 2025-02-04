@@ -1,5 +1,5 @@
 //!
-//! # Kernel Debugging Interface.
+//! # Kernel Debugging Interface
 //!
 //! Responsible for gathering log output from [`log::info!`], [`log::warn!`], [`log::trace!`] and the likes.
 //!
@@ -36,7 +36,7 @@ struct RingBuffer<const N: usize> {
     write: usize,
 }
 
-/// Wrapper struct for [`ElfFile`], used for parsing the kernel symbol table.
+/// Wrapper struct for [`ElfFile`]('ElfFile'), used for parsing the kernel symbol table.
 struct KernelElf {
     pub file: ElfFile<'static>,
 }

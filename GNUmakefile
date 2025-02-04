@@ -29,6 +29,7 @@ run-iso: run-iso-$(KARCH)
 run-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M q35 \
+		-cpu qemu64,+smep \
 		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
 		-hda $(IMAGE_NAME).hdd \
@@ -38,6 +39,7 @@ run-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(
 run-iso-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
+		-cpu qemu64,+smep \
 		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
 		-cdrom $(IMAGE_NAME).iso \
@@ -75,6 +77,7 @@ run-iso-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).
 run-bios: $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M q35 \
+		-cpu qemu64,+smep \
 		-hda $(IMAGE_NAME).hdd \
 		$(QEMUFLAGS)
 
@@ -82,6 +85,7 @@ run-bios: $(IMAGE_NAME).hdd
 run-iso-bios: $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
+		-cpu qemu64,+smep \
 		-cdrom $(IMAGE_NAME).iso \
 		-boot d \
 		$(QEMUFLAGS)
@@ -109,6 +113,10 @@ store/limine:
 .PHONY: kernel
 kernel:
 	$(MAKE) -C kernel
+
+.PHONY: rustdoc
+rustdoc:
+	$(MAKE) -C kernel rustdoc
 
 $(IMAGE_NAME).iso: store/limine kernel
 	rm -rf iso_root
@@ -160,6 +168,10 @@ ifeq ($(KARCH),riscv64)
 	mcopy -i $(IMAGE_NAME).hdd@@1M store/limine/BOOTRISCV64.EFI ::/EFI/BOOT
 endif
 
+.PHONY: book
+book:
+	cd book && mdbook serve
+
 .PHONY: clean
 clean:
 	$(MAKE) -C kernel clean
@@ -168,4 +180,4 @@ clean:
 .PHONY: distclean
 distclean: clean
 	$(MAKE) -C kernel distclean
-	rm -rf store
+	rm -rf store book/book

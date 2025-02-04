@@ -1,3 +1,7 @@
+//!
+//! Abstractions to various CPU architectures
+//!
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 

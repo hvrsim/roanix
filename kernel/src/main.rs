@@ -1,20 +1,6 @@
 #![no_std]
 #![no_main]
-
-//!
-//! # Roanix Kernel Documentation
-//!
-//! This is the top level of the rustdoc generated kernel documentation. For
-//! a more general guide to Roanix, check out [Roanix Internals](https://example.com).
-//!
-//! # Project Orginization
-//!
-//! Roanix code is split into modules, each representing a logical kernel subsystem.
-//! Currently implemented top level modules are as follows:
-//!
-//! - `arch` - CPU architecture specific code.
-//! - `sys` - core kernel components, basis for the rest of the kernel.
-//!
+#![doc = include_str!("../../README.md")]
 
 use limine::request::{RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;

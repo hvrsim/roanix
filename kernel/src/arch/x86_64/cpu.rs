@@ -1,3 +1,55 @@
+//!
+//! # CPU Feature enumeration
+//!
+//! Code in this module enables and enumerates core CPU features. Documentation
+//! for specific features are documented below, along with a reference to the SDM.
+//!
+//! Note that certain features like syscalls and SSE2 aren't documented because
+//! these features are a core part of the x86_64 ISA.
+//!
+//! ## Global Pages (Required)
+//! Global Pages are used for mapping the kernel memmory and HHDM, since both
+//! regions of virtual memory are shared between every process. Global pages are
+//! not flushed from the translation-lookaside buffer (TLB) on a task switch or 
+//! a write to register CR3.
+//!
+//! Reference: *Intel SDM Volume 3A, Section 5.10*
+//!
+//! ## SMEP (Required)
+//! SMEP prevents kernel threads from executing code which is user accessible.
+//! As you can imagine, this is a pretty helpful security feature and is enabled
+//! whenever supported.
+//!
+//! Reference: *Intel SDM Volume 3A, Section 5.6*
+//!
+//! ## SMAP
+//! When SMAP is enabled, any attempt to access user-space memory while running in
+//! a privileged mode will lead to a page fault. If you are wondering how user IO
+//! is done with SMAP active, it isn't. SMAP is disabled while user IO is in progress,
+//! then enabled once again. State changes here happen through the AC bit in RFLAGS.
+//!
+//! Reference: *Intel SDM Volume 3A, Section 5.6*
+//!
+//! ## PCID
+//! Basically x86_64's version of a ASID, limited to the lower 12-bits of CR3. ALways
+//! useful to have ASIDs on a memory platform, so we enable them here.
+//!
+//! Reference: *Intel SDM Volume 3A, Section 5.10.1*
+//!
+//! ## UMIP
+//! UMIP prevents userspace code from executing supervisor instructions, such as `sgdt`
+//! and `sidt`. 
+//!
+//! Reference: *Intel SDM Volume 3A, Section 2.5*
+//!
+//! ## Intel CET
+//!
+//! CET is a new Intel processor feature that blocks return/jump-oriented programming
+//! attacks. Roanix enables both the *Shadow Stacks* and *IBRS* features when present.
+//!
+//! Reference: *Intel SDM Volume 1, Section 18*
+//!
+
 use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::registers::control::*;
 use log::{info, warn};
@@ -37,7 +89,7 @@ pub fn enable_features() {
         if ext_feats.has_smep() {
             bits |= Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION;
         } else {
-            warn!("cpu: SMEP not supported!");
+            panic!("cpu: SMEP not supported!");
         }
         if ext_feats.has_smap() {
             bits |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;

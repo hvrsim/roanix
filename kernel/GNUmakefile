@@ -37,5 +37,9 @@ clean:
 	cargo clean
 	rm -rf roanix
 
+.PHONY: rustdoc
+rustdoc:
+	cargo doc --no-deps
+
 .PHONY: distclean
 distclean: clean

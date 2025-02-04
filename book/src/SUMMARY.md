@@ -4,9 +4,5 @@
 
 # User Guide
 
-- [Building Roanix](guide/BUILDING.md)
-
-- [Virtualization with QEMU](guide/QEMU.md)
-    - [Running on Real Hardware](guide/REAL_HW.md)
-
+- [Building & Running Roanix](guide/BUILDING.md)
 - [Contributing Guide](guide/CONTRIB.md)
