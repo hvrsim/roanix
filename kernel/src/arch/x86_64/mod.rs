@@ -2,10 +2,10 @@
 //! # x86_64 Subsystem
 //!
 //! Implements a support interface for the kernel to interact with the x86_64
-//! platform. Drivers for on-chip devices, such as the TSC and APIC are 
+//! platform. Drivers for on-chip devices, such as the TSC and APIC are
 //! provided by this module aswell.
 //!
-//! Code in this module often references the *Intel SDM* for register references 
+//! Code in this module often references the *Intel SDM* for register references
 //! and ISA semantics.
 //!
 //! *You may download the SDM [here.](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)*

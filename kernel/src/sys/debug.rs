@@ -59,7 +59,7 @@ static IN_PANIC: AtomicBool = AtomicBool::new(false);
 static KERNEL_ELF: Once<KernelElf> = Once::new();
 
 /// Global buffer instance, protected with mutex for SMP contexts.
-static mut BUFFER: Mutex<RingBuffer<RING_ENTRIES>> = Mutex::new(RingBuffer {
+static BUFFER: Mutex<RingBuffer<RING_ENTRIES>> = Mutex::new(RingBuffer {
     data: [0; RING_ENTRIES],
     read: 0,
     write: 0,
@@ -117,32 +117,37 @@ impl log::Log for KLog {
 
     /// Pretty-prints `record` and sends it through the backend.
     fn log(&self, record: &Record) {
-        unsafe {
-            let mut buffer = BUFFER.lock();
+        let mut buffer = BUFFER.lock();
 
-            match record.level() {
-                Level::Error => write!(&mut buffer, "[\x1b[1;31mE\x1b[0m]").unwrap(),
-                Level::Warn => write!(&mut buffer, "[\x1b[1;33m!\x1b[0m]").unwrap(),
-                Level::Info => write!(&mut buffer, "[\x1b[1;32m*\x1b[0m]").unwrap(),
-                Level::Debug => write!(&mut buffer, "[\x1b[1;34mD\x1b[0m]").unwrap(),
-                Level::Trace => write!(&mut buffer, "[\x1b[1;35mT\x1b[0m]").unwrap(),
-            }
-
-            let path = if let Some(path) = record.file() {
-                path
-            } else {
-                "???"
-            };
-
-            let line = if let Some(line) = record.line() {
-                line
-            } else {
-                0
-            };
-
-            // A write to the debug port can never fail.
-            write!(&mut buffer, " \x1b[2m({}:{})\x1b[0m {}\n", path, line, record.args()).unwrap();
+        match record.level() {
+            Level::Error => write!(&mut buffer, "[\x1b[1;31mE\x1b[0m]").unwrap(),
+            Level::Warn => write!(&mut buffer, "[\x1b[1;33m!\x1b[0m]").unwrap(),
+            Level::Info => write!(&mut buffer, "[\x1b[1;32m*\x1b[0m]").unwrap(),
+            Level::Debug => write!(&mut buffer, "[\x1b[1;34mD\x1b[0m]").unwrap(),
+            Level::Trace => write!(&mut buffer, "[\x1b[1;35mT\x1b[0m]").unwrap(),
         }
+
+        let path = if let Some(path) = record.file() {
+            path
+        } else {
+            "???"
+        };
+
+        let line = if let Some(line) = record.line() {
+            line
+        } else {
+            0
+        };
+
+        // A write to the debug port can never fail.
+        write!(
+            &mut buffer,
+            " \x1b[2m({}:{})\x1b[0m {}\n",
+            path,
+            line,
+            record.args()
+        )
+        .unwrap();
     }
 
     /// Flush calls are done on a per-character basis, therefore global flush not required.

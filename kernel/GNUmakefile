@@ -39,7 +39,7 @@ clean:
 
 .PHONY: rustdoc
 rustdoc:
-	cargo doc --no-deps
+	cargo doc --no-deps && cd target/doc && python3 -m http.server 8080
 
 .PHONY: distclean
 distclean: clean
