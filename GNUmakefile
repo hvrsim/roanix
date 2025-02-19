@@ -29,7 +29,7 @@ run-iso: run-iso-$(KARCH)
 run-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M q35 \
-		-cpu qemu64,+smep \
+		-cpu qemu64,+fsgsbase \
 		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
 		-hda $(IMAGE_NAME).hdd \
@@ -39,7 +39,7 @@ run-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(
 run-iso-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
-		-cpu qemu64,+smep \
+		-cpu qemu64,+fsgsbase \
 		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
 		-cdrom $(IMAGE_NAME).iso \
@@ -77,7 +77,7 @@ run-iso-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).
 run-bios: $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M q35 \
-		-cpu qemu64,+smep \
+		-cpu qemu64,+fsgsbase \
 		-hda $(IMAGE_NAME).hdd \
 		$(QEMUFLAGS)
 
@@ -85,7 +85,7 @@ run-bios: $(IMAGE_NAME).hdd
 run-iso-bios: $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
-		-cpu qemu64,+smep \
+		-cpu qemu64,+fsgsbase \
 		-cdrom $(IMAGE_NAME).iso \
 		-boot d \
 		$(QEMUFLAGS)

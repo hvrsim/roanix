@@ -13,7 +13,7 @@
 * Clean, extensible driver stack with support for modern hardware including [NVMe] devices.
 * High-performance thread scheduler, based on [FreeBSD ULE].
 * Built from the ground up using [Rust], ensuring memory safety and thread safety without sacrificing performance.
-* First class support for both the [x86_64] and [riscv64] CPU architectures. Support also extends to modern CPU features (Intel MPK, RVV 1.0, and more).
+* First class support for both the [x86_64] and [riscv64] CPU architectures. Support also extends to modern CPU features (Intel CET, RVV 1.0, and more).
 
 [Rust]: https://www.rust-lang.org/
 [x86_64]: https://en.wikipedia.org/wiki/X86-64

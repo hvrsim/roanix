@@ -1,8 +1,8 @@
 //!
-//! # CPU Feature enumeration
+//! # CPU Features/Instructions
 //!
 //! Code in this module enables and enumerates core CPU features. Documentation
-//! for specific features are documented below, along with a reference to the SDM.
+//! for specific features are listed below, along with a reference to the SDM.
 //!
 //! Note that certain features like syscalls and SSE2 aren't documented because
 //! these features are a core part of the x86_64 ISA.
@@ -15,7 +15,7 @@
 //!
 //! Reference: *Intel SDM Volume 3A, Section 5.10*
 //!
-//! ## SMEP (Required)
+//! ## SMEP
 //! SMEP prevents kernel threads from executing code which is user accessible.
 //! As you can imagine, this is a pretty helpful security feature and is enabled
 //! whenever supported.
@@ -50,14 +50,26 @@
 //! Reference: *Intel SDM Volume 1, Section 18*
 //!
 
+use bitflags::bitflags;
 use log::{info, warn};
 use raw_cpuid::CpuId;
 use x86_64::registers::control::*;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 
+bitflags! {
+    /// Bitmap of supported x86 extensions.
+    pub struct CpuFeatures: u32 {
+        const SMEP = 0b0001;
+        const SMAP = 0b0010;
+        const PCID = 0b0100;
+        const CET_SS = 0b1000;
+    }
+}
+
 /// Checks for (and enables) CPU feature flags.
-pub fn enable_features() {
+pub fn enable_features() -> CpuFeatures {
     let cpuid = CpuId::new();
+    let mut cpufeats = CpuFeatures::empty();
 
     if let Some(brand_string) = cpuid.get_processor_brand_string() {
         info!("cpu: model name \"{}\"", brand_string.as_str());
@@ -70,7 +82,8 @@ pub fn enable_features() {
         );
 
         // Set the groundwork for SIMD/FP instructions by disabling
-        // emulation and activating CR0.MP
+        // emulation and activating CR0.MP. Also enable Write Protect
+        // becuase Intel CET requires it.
         Cr0::write(
             Cr0::read()
                 | !Cr0Flags::EMULATE_COPROCESSOR
@@ -84,25 +97,31 @@ pub fn enable_features() {
         .get_feature_info()
         .expect("cpu: unable to query for features with CPUID!");
 
-    if !feats.has_pge() {
-        panic!("cpu: global pages not supported!");
-    }
-
     let ext_feats = cpuid
         .get_extended_feature_info()
         .expect("cpu: unable to query for extended features with CPUID!");
 
+    if !feats.has_pge() {
+        panic!("cpu: global pages are not supported!");
+    }
+    if !ext_feats.has_fsgsbase() {
+        panic!("cpu: {{FS/GS}}BASE instructions are not supported!");
+    }
+
     // Enable Global Pages and *GSBASE/SSE instructions.
-    let mut bits = Cr4Flags::PAGE_GLOBAL | Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE;
+    let mut bits =
+        Cr4Flags::PAGE_GLOBAL | Cr4Flags::FSGSBASE | Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE;
 
     // Enable SMEP/SMAP (if supported)
     if ext_feats.has_smep() {
         bits |= Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION;
+        cpufeats |= CpuFeatures::SMEP;
     } else {
-        panic!("cpu: SMEP not supported!");
+        warn!("cpu: SMEP not supported!");
     }
     if ext_feats.has_smap() {
         bits |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;
+        cpufeats |= CpuFeatures::SMAP;
     } else {
         warn!("cpu: SMAP not supported!");
     }
@@ -110,6 +129,7 @@ pub fn enable_features() {
     // Only activate PCIDs if the `invpcid` instruction is supported.
     if feats.has_pcid() && ext_feats.has_invpcid() {
         bits |= Cr4Flags::PCID;
+        cpufeats |= CpuFeatures::PCID;
     }
 
     // Enable UMIP (if supported)
@@ -120,7 +140,12 @@ pub fn enable_features() {
     // Enable Intel CET (if supportd)
     if ext_feats.has_cet_ss() {
         bits |= Cr4Flags::CONTROL_FLOW_ENFORCEMENT;
+        cpufeats |= CpuFeatures::CET_SS;
     }
 
-    unsafe { Cr4::write(Cr4::read() | bits) }
+    unsafe {
+        Cr4::write(Cr4::read() | bits);
+    }
+
+    return cpufeats;
 }

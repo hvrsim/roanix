@@ -1,8 +1,8 @@
 //!
-//! # Memory subsystem
+//! # Memory Subsystem
 //!
-//! This module implements the kernel memory manager, responsible
-//! for managing memory resources, swapping to disk and virtual 
+//! This module implements the kernel memory interface, responsible
+//! for managing memory resources, swapping to disk and virtual
 //! page mapping.
 //!
 

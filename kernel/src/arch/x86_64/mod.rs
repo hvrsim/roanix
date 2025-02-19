@@ -11,15 +11,25 @@
 //! *You may download the SDM [here.](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)*
 //!
 
+use x86_64::addr::VirtAddr;
 use x86_64::instructions::{hlt, port::PortWriteOnly};
+use x86_64::registers::segmentation::{Segment64, GS};
 
-mod cpu;
+use crate::sys::smp::CoreLocal;
+
+pub mod cpu;
+
+/// BSP's core local context.
+static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 /// Performs early CPU initialization.
 ///
 /// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
 pub fn early() {
-    cpu::enable_features();
+    let feats = cpu::enable_features();
+
+    set_core_local(VirtAddr::from_ptr(&raw const BSP_CORE_LOCAL));
+    thiscpu().supported_feats = feats;
 }
 
 ///
@@ -36,7 +46,7 @@ pub fn early() {
 /// $ QEMUFLAGS="... -debugcon stdio" make run-bios
 /// ```
 ///
-#[inline]
+#[inline(always)]
 pub fn debug_putc(byte: u8) {
     let mut port = PortWriteOnly::new(0xE9);
     unsafe { port.write(byte) }
@@ -48,5 +58,40 @@ pub fn debug_putc(byte: u8) {
 pub fn hcf() -> ! {
     loop {
         hlt();
+    }
+}
+
+/// Returns core local context.
+///
+/// On the x86_64 platform, kernel core local data is
+/// stored in the GS segment register.
+///
+/// ## Safety
+///
+/// The kernel thread-local context isn't valid until
+/// [`set_core_local`]('set_core_local') is called, which
+/// happens very early in boot. If you find yourself requiring
+/// thread local context super early in boot, consider moving
+/// your init stage into a later part of the boot pipeline.
+#[inline(always)]
+pub fn thiscpu() -> &'static mut CoreLocal {
+    let base = GS::read_base();
+    assert!(!base.is_null());
+
+    unsafe { &mut *base.as_mut_ptr::<CoreLocal>() }
+}
+
+/// Sets the core local pointer.
+///
+/// Writes the provided core local pointer into the GS
+/// segment register.
+///
+/// **This function can only be called once per core. Further
+/// calls may result in a panic!**
+pub fn set_core_local(ptr: VirtAddr) {
+    assert!(GS::read_base().is_null());
+
+    unsafe {
+        GS::write_base(ptr);
     }
 }

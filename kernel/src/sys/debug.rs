@@ -9,9 +9,6 @@
 //! The kernel panic handler is also implemented in this module.
 //!
 
-// static mut buffer is protected with mutex.
-#![allow(static_mut_refs)]
-
 use core::fmt::{Result, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};

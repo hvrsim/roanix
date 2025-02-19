@@ -1,5 +1,5 @@
 //!
-//! Abstractions to various CPU architectures
+//! ISA Abstractions
 //!
 
 #[cfg(target_arch = "x86_64")]

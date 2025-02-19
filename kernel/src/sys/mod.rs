@@ -1,5 +1,5 @@
 //!
-//! # Core kernel components
+//! # Core Kernel Components
 //!
 //! This module encases components required by the rest of
 //! the kernel. Modules present here should not depend on
@@ -7,3 +7,4 @@
 //!
 
 pub mod debug;
+pub mod smp;
