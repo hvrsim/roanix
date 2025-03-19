@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-limine = { git = "https://github.com/jasondyoungberg/limine-rs.git" }
+limine = "0.4.0"
 log = "0.4.22"
 spin = "0.9.8"
 xmas-elf = "0.9.1"

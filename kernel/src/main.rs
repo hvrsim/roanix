@@ -7,13 +7,12 @@ use limine::BaseRevision;
 use log::info;
 
 pub mod arch;
-pub mod mem;
 pub mod sys;
 
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(2);
 
 #[used]
 #[doc(hidden)]
@@ -27,7 +26,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Kernel entrypoint.
 ///
-/// Ensures that the limine protocol matches the requested version (3), then
+/// Ensures that the limine protocol matches the requested version (2), then
 /// calls initializers for the various kernel subsystems. Finishes with a
 /// polling loop, waiting for the scheduler to active and switch to the
 /// init thread.
@@ -39,7 +38,5 @@ unsafe extern "C" fn rmain() -> ! {
     info!("main: welcome to roanix!");
 
     arch::early();
-    mem::early();
-
     arch::hcf();
 }

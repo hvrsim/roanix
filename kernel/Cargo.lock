@@ -22,8 +22,9 @@ checksum = "8f68f53c83ab957f72c32642f3868eec03eb974d1fb82e453128456482613d36"
 
 [[package]]
 name = "limine"
-version = "0.3.1"
-source = "git+https://github.com/jasondyoungberg/limine-rs.git#7a642da9f7b97843ecd7d7349feb510ed08686fe"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e6cb7fd182815ec1ea9e26061418ac37c3eebea47a14e773c563533f277bcef"
 dependencies = [
  "bitflags",
 ]
