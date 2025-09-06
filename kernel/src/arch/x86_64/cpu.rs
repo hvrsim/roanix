@@ -56,6 +56,8 @@ use raw_cpuid::CpuId;
 use x86_64::registers::control::*;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 
+//core::arch::global_asm!(include_str!("trap.S"));
+
 bitflags! {
     /// Bitmap of supported x86 extensions.
     pub struct CpuFeatures: u32 {
