@@ -1,50 +1,52 @@
 //!
 //! # Kernel Debugging Interface
 //!
-//! Responsible for gathering log output from [`log::info!`], [`log::warn!`], [`log::trace!`] and the likes.
+//! Responsible for gathering log output from [`log`] crate.
 //!
-//! Stores each line of logging output into an internal buffer, then dispatches
-//! each character out to the arch-specific debug console ([`arch::debug_putc`][crate::arch::debug_putc]).
+//! Stores each line of logging output into an internal ring-buffer, then
+//! dispatches each character out to the arch-specific debug
+//! console ([`arch::debug_putc`][crate::arch::debug_putc]).
 //!
 //! The kernel panic handler is also implemented in this module.
 //!
 
-use core::fmt::{Result, Write};
+use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::arch;
+
 use limine::request::ExecutableFileRequest;
-use log::{Level, LevelFilter, Metadata, Record};
-use spin::{Mutex, Once};
-use xmas_elf::{
-    sections::SectionData, sections::ShType, symbol_table::Entry, symbol_table::Entry64, ElfFile,
-};
+use log::Level;
+use xmas_elf::{sections::*, symbol_table::*, ElfFile};
 
 /// Connector between `log` crate and various outputs.
 struct KLog;
 
 /// Interface that lets us use [`write!`] with [`arch::debug_putc`][crate::arch::debug_putc].
-struct PanicWriter;
+struct DebugWriter;
 
-/// Internal buffer of raw log output, circles back once filled.
-struct RingBuffer<const N: usize> {
-    data: [u8; N],
-    read: usize,
-    write: usize,
+/// Contains data to reconstruct a single kernel log message.
+struct Record {
+    /// Buffer to store the formatted log message.
+    buf: [u8; 256],
+
+    /// Length of formatted log message in bytes.
+    buflen: usize,
+
+    /// Time when log message was sent (represented as UNIX epoch).
+    timestamp: u64,
 }
 
-/// Wrapper struct for [`ElfFile`]('ElfFile'), used for parsing the kernel symbol table.
-struct KernelElf {
-    pub file: ElfFile<'static>,
+/// Helper macro for printing to the debug console.
+macro_rules! dprint {
+    ($($arg:tt)*) => (write!(&mut DebugWriter, "{}", format_args!($($arg)*)).unwrap());
 }
 
-/// Helper macro for printing with the panic handler.
-macro_rules! eprint {
-    ($($arg:tt)*) => (write!(&mut PanicWriter, "{}", format_args!($($arg)*)).unwrap());
-}
-
-/// Number of characters in the ringbuffer.
-const RING_ENTRIES: usize = 4096;
+#[used]
+#[doc(hidden)]
+#[link_section = ".requests"]
+static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
 
 /// Global logger instance, `log` crate invokes this.
 static LOGGER: KLog = KLog;
@@ -52,76 +54,32 @@ static LOGGER: KLog = KLog;
 /// Atomic flag to indicate a kernel panic is active.
 static IN_PANIC: AtomicBool = AtomicBool::new(false);
 
-/// Instance of kernel file parser for panic unwinding.
-static KERNEL_ELF: Once<KernelElf> = Once::new();
-
-/// Global buffer instance, protected with mutex for SMP contexts.
-static BUFFER: Mutex<RingBuffer<RING_ENTRIES>> = Mutex::new(RingBuffer {
-    data: [0; RING_ENTRIES],
-    read: 0,
-    write: 0,
-});
-
-#[used]
-#[doc(hidden)]
-#[link_section = ".requests"]
-static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
-
-impl KernelElf {
-    fn new(elf: ElfFile<'static>) -> Self {
-        Self { file: elf }
-    }
-}
-
-impl Write for PanicWriter {
+impl Write for DebugWriter {
     /// Calls [`arch::debug_putc`][crate::arch::debug_putc] for each character of `s`.
-    fn write_str(&mut self, s: &str) -> Result {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
-            crate::arch::debug_putc(byte);
+            arch::debug_putc(byte);
         }
 
         Ok(())
     }
 }
 
-impl<const T: usize> Write for RingBuffer<T> {
-    /// Copies the string into the ringbuffer and passes it to [`PanicWriter`].
-    fn write_str(&mut self, s: &str) -> Result {
-        for byte in s.bytes() {
-            self.data[self.write] = byte;
-
-            let next = (self.write + 1) % RING_ENTRIES;
-
-            // If we have filled up the write allocation, bump the read pointer.
-            if next == self.read {
-                self.read = (self.read + 1) % RING_ENTRIES;
-            }
-
-            crate::arch::debug_putc(byte);
-
-            self.write = next;
-        }
-
-        Ok(())
-    }
-}
-
-impl log::Log for KLog {
-    /// Unused, since we accept all messages regardless of level.
-    fn enabled(&self, _metadata: &Metadata) -> bool {
-        true
-    }
-
-    /// Pretty-prints `record` and sends it through the backend.
-    fn log(&self, record: &Record) {
-        let mut buffer = BUFFER.lock();
+impl Record {
+    /// Creates a log Record using metadata from the [`log`] crate.
+    pub fn new(record: &log::Record) -> Self {
+        let mut rec = Self {
+            buf: [0; 256],
+            buflen: 0,
+            timestamp: 0,
+        };
 
         match record.level() {
-            Level::Error => write!(&mut buffer, "[\x1b[1;31mE\x1b[0m]").unwrap(),
-            Level::Warn => write!(&mut buffer, "[\x1b[1;33m!\x1b[0m]").unwrap(),
-            Level::Info => write!(&mut buffer, "[\x1b[1;32m*\x1b[0m]").unwrap(),
-            Level::Debug => write!(&mut buffer, "[\x1b[1;34mD\x1b[0m]").unwrap(),
-            Level::Trace => write!(&mut buffer, "[\x1b[1;35mT\x1b[0m]").unwrap(),
+            Level::Error => write!(&mut rec, "[\x1b[1;31mE\x1b[0m]").unwrap(),
+            Level::Warn => write!(&mut rec, "[\x1b[1;33m!\x1b[0m]").unwrap(),
+            Level::Info => write!(&mut rec, "[\x1b[1;32m*\x1b[0m]").unwrap(),
+            Level::Debug => write!(&mut rec, "[\x1b[1;34mD\x1b[0m]").unwrap(),
+            Level::Trace => write!(&mut rec, "[\x1b[1;35mT\x1b[0m]").unwrap(),
         }
 
         let path = if let Some(path) = record.file() {
@@ -138,46 +96,62 @@ impl log::Log for KLog {
 
         // A write to the debug port can never fail.
         write!(
-            &mut buffer,
+            &mut rec,
             " \x1b[2m({}:{})\x1b[0m {}\n",
             path,
             line,
             record.args()
         )
         .unwrap();
+
+        return rec;
+    }
+
+    /// Prints the record to the debug console.
+    pub fn debug_print(&self) {
+        for i in 0..self.buflen {
+            arch::debug_putc(self.buf[i]);
+        }
+    }
+}
+
+impl Write for Record {
+    /// Copy the string `s` into the record's buffer, silently
+    /// dropping bytes on overflow.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        if self.buflen + bytes.len() > self.buf.len() {
+            return Ok(());
+        }
+
+        self.buf[self.buflen..self.buflen + bytes.len()].copy_from_slice(bytes);
+        self.buflen += bytes.len();
+        Ok(())
+    }
+}
+
+impl log::Log for KLog {
+    /// Unused, since we accept all messages regardless of level.
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    /// Pretty-prints `record` and sends it through the logging backend.
+    fn log(&self, record: &log::Record) {
+        let rec = Record::new(record);
+        rec.debug_print();
     }
 
     /// Flush calls are done on a per-character basis, therefore global flush not required.
     fn flush(&self) {}
 }
 
-/// Connects kernel logging infra to the log crate. Also parses the kernel ELF for panic unwinding.
-pub fn register() {
-    let kfile_resp = KERNEL_FILE
-        .get_response()
-        .expect("debug: limine kernel file response missing!");
-
-    KERNEL_ELF.call_once(|| {
-        let file = kfile_resp.file();
-
-        let slice = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
-        let elf = ElfFile::new(slice).expect("debug: unable to parse kernel file!");
-
-        KernelElf::new(elf)
-    });
-
-    // Kernel logging depends on a valid logger, therefore panic if we are unable to install this logger.
-    log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(LevelFilter::Trace))
-        .unwrap();
-}
-
-/// Target-specific unwind function.
+/// x86_64-specific unwind function.
 ///
 /// Iterates backwards through the stack, printing the symbol at each level.
 /// *Max backtrace depth is currently set to 32 function calls.*
 #[cfg(target_arch = "x86_64")]
-fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
+fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
     let mut rbp: usize;
 
     unsafe {
@@ -188,7 +162,7 @@ fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
         return;
     }
 
-    eprint!("\n<{:-^40}>\n\n", " BACKTRACE ");
+    dprint!("\n<{:-^40}>\n\n", " BACKTRACE ");
 
     for depth in 0..32 {
         let rip = if let Some(r) = rbp.checked_add(core::mem::size_of::<usize>()) {
@@ -207,20 +181,22 @@ fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
 
         let mut name = None;
 
-        for data in symtab {
-            let value = data.value() as usize;
-            let size = data.size() as usize;
+        if symtab.is_some() && kfile.is_some() {
+            for data in symtab.unwrap() {
+                let value = data.value() as usize;
+                let size = data.size() as usize;
 
-            if rip >= value && rip < (value + size) {
-                let raw = data.get_name(kfile).unwrap_or("<unknown>");
-                name = Some(rustc_demangle::demangle(raw));
+                if rip >= value && rip < (value + size) {
+                    let raw = data.get_name(kfile.unwrap()).unwrap_or("<unknown>");
+                    name = Some(rustc_demangle::demangle(raw));
+                }
             }
         }
 
         if let Some(name) = name {
-            eprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
+            dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
         } else {
-            eprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
+            dprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
         }
     }
 }
@@ -229,44 +205,68 @@ fn perform_bt(symtab: &[Entry64], kfile: &ElfFile) {
 #[panic_handler]
 fn rust_panic(info: &PanicInfo) -> ! {
     if IN_PANIC.load(Ordering::Acquire) == true {
-        crate::arch::hcf();
+        arch::hcf();
     }
 
     IN_PANIC.store(true, Ordering::Release);
 
-    eprint!("\n  _________________________  \n");
-    eprint!("< uh oh, kernel panicked... >\n");
-    eprint!("  -------------------------  \n");
-    eprint!("          \\   ^__^          \n");
-    eprint!("           \\  (oo)\\_______  \n");
-    eprint!("              (__)\\       )\\/\\\\\n");
-    eprint!("                  ||----w |  \n");
-    eprint!("                  ||     ||  \n\n\n");
-    eprint!("\x1b[31m{}\x1b[0m\n", info.message());
+    dprint!("\n  _________________________  \n");
+    dprint!("< uh oh, kernel panicked... >\n");
+    dprint!("  -------------------------  \n");
+    dprint!("          \\   ^__^          \n");
+    dprint!("           \\  (oo)\\_______  \n");
+    dprint!("              (__)\\       )\\/\\\\\n");
+    dprint!("                  ||----w |  \n");
+    dprint!("                  ||     ||  \n\n\n");
+    dprint!("\x1b[31m{}\x1b[0m\n", info.message());
 
     if let Some(loc) = info.location() {
-        eprint!(
+        dprint!(
             "panic occurred in file '{}' at line {}.\n",
             loc.file(),
             loc.line()
         );
     }
 
-    let elf_file = &KERNEL_ELF.get().unwrap().file;
+    let efile = if let Some(resp) = KERNEL_FILE.get_response() {
+        let file = resp.file();
+        let slice = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
+        let efile = ElfFile::new(slice);
+
+        if efile.is_err() {
+            None
+        } else {
+            Some(&efile.unwrap())
+        }
+    } else {
+        None
+    };
+
     let mut symtab = None;
 
-    for section in elf_file.section_iter() {
-        if section.get_type() == Ok(ShType::SymTab) {
-            let section_data = section.get_data(elf_file).unwrap();
+    if let Some(elf) = efile {
+        for section in elf.section_iter() {
+            if section.get_type() == Ok(ShType::SymTab) {
+                let section_data = section.get_data(&elf).unwrap();
 
-            if let SectionData::SymbolTable64(st) = section_data {
-                symtab = Some(st);
+                if let SectionData::SymbolTable64(st) = section_data {
+                    symtab = Some(st);
+                }
             }
         }
     }
 
-    let symtab = symtab.unwrap();
-    perform_bt(symtab, elf_file);
+    perform_bt(symtab, efile);
 
-    crate::arch::hcf();
+    arch::hcf();
+}
+
+/// Connects kernel logging infra to the log crate.
+///
+/// This function will panic if the kernel logger is unable to be installed,
+/// since the log functions depend on a valid kernel logger.
+pub fn register() {
+    log::set_logger(&LOGGER)
+        .map(|()| log::set_max_level(log::LevelFilter::Trace))
+        .unwrap();
 }

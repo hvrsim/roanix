@@ -2,8 +2,10 @@
 #![no_main]
 #![doc = include_str!("../../README.md")]
 
-use limine::request::{RequestsEndMarker, RequestsStartMarker};
-use limine::BaseRevision;
+use limine::{
+    request::{RequestsEndMarker, RequestsStartMarker},
+    BaseRevision,
+};
 use log::info;
 
 pub mod arch;
@@ -12,7 +14,7 @@ pub mod sys;
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(2);
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
 
 #[used]
 #[doc(hidden)]
@@ -26,16 +28,16 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Kernel entrypoint.
 ///
-/// Ensures that the limine protocol matches the requested version (2), then
+/// Ensures that the limine protocol matches the requested version (3), then
 /// calls initializers for the various kernel subsystems. Finishes with a
-/// polling loop, waiting for the scheduler to active and switch to the
+/// polling loop, waiting for the scheduler to activate and switch to the
 /// init thread.
 #[no_mangle]
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
 
     sys::debug::register();
-    info!("main: welcome to roanix!");
+    info!("welcome to roanix!");
 
     arch::early();
     arch::hcf();
