@@ -1,10 +1,9 @@
 //!
-//! # Core Kernel Components
+//! # Core kernel modules.
 //!
-//! This module encases components required by the rest of
-//! the kernel. Modules present here should not depend on
-//! anything else besides [`arch`](`crate::arch`)!
+//! Kernel components required by the rest of the kernel.
+//! Modules present here should not depend on anything
+//! else besides [`arch`](`crate::arch`)!
 //!
 
 pub mod debug;
-pub mod smp;

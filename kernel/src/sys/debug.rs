@@ -5,7 +5,7 @@
 //!
 //! Stores each line of logging output into an internal ring-buffer, then
 //! dispatches each character out to the arch-specific debug
-//! console ([`arch::debug_putc`][crate::arch::debug_putc]).
+//! console ([`arch::DebugConsole`][crate::arch::DebugConsole]).
 //!
 //! The kernel panic handler is also implemented in this module.
 //!
@@ -18,12 +18,13 @@ use crate::arch;
 
 use limine::request::ExecutableFileRequest;
 use log::Level;
+use spin::Once;
 use xmas_elf::{sections::*, symbol_table::*, ElfFile};
 
-/// Connector between `log` crate and various outputs.
+/// Connector between [`log`] crate and various outputs.
 struct KLog;
 
-/// Interface that lets us use [`write!`] with [`arch::debug_putc`][crate::arch::debug_putc].
+/// Interface that lets us use [`write!`] with [`arch::DebugConsole`].
 struct DebugWriter;
 
 /// Contains data to reconstruct a single kernel log message.
@@ -48,22 +49,14 @@ macro_rules! dprint {
 #[link_section = ".requests"]
 static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
 
-/// Global logger instance, `log` crate invokes this.
+/// Global logger instance, [`log`] crate invokes this.
 static LOGGER: KLog = KLog;
 
 /// Atomic flag to indicate a kernel panic is active.
 static IN_PANIC: AtomicBool = AtomicBool::new(false);
 
-impl Write for DebugWriter {
-    /// Calls [`arch::debug_putc`][crate::arch::debug_putc] for each character of `s`.
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            arch::debug_putc(byte);
-        }
-
-        Ok(())
-    }
-}
+/// Instance of architecture specific debug console
+static DBGCON: Once<arch::DebugConsole> = Once::new();
 
 impl Record {
     /// Creates a log Record using metadata from the [`log`] crate.
@@ -110,11 +103,21 @@ impl Record {
     /// Prints the record to the debug console.
     pub fn debug_print(&self) {
         for i in 0..self.buflen {
-            arch::debug_putc(self.buf[i]);
+            DBGCON.get().unwrap().write(self.buf[i]);
         }
     }
 }
 
+impl Write for DebugWriter {
+    /// Calls [`arch::DebugConsole::write`] for each character of `s`.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            DBGCON.get().unwrap().write(byte);
+        }
+
+        Ok(())
+    }
+}
 impl Write for Record {
     /// Copy the string `s` into the record's buffer, silently
     /// dropping bytes on overflow.
@@ -210,6 +213,9 @@ fn rust_panic(info: &PanicInfo) -> ! {
 
     IN_PANIC.store(true, Ordering::Release);
 
+    // setup the dbgcon here incase it wasn't prepared before
+    DBGCON.call_once(|| arch::DebugConsole::new());
+
     dprint!("\n  _________________________  \n");
     dprint!("< uh oh, kernel panicked... >\n");
     dprint!("  -------------------------  \n");
@@ -266,6 +272,8 @@ fn rust_panic(info: &PanicInfo) -> ! {
 /// This function will panic if the kernel logger is unable to be installed,
 /// since the log functions depend on a valid kernel logger.
 pub fn register() {
+    DBGCON.call_once(|| arch::DebugConsole::new());
+
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(log::LevelFilter::Trace))
         .unwrap();

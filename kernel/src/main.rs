@@ -39,6 +39,5 @@ unsafe extern "C" fn rmain() -> ! {
     sys::debug::register();
     info!("welcome to roanix!");
 
-    arch::early();
     arch::hcf();
 }
