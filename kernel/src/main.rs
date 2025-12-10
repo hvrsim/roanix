@@ -26,6 +26,11 @@ static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 #[link_section = ".requests_end_marker"]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
+#[inline(never)]
+fn test() -> ! {
+    panic!("we are cooked!");
+}
+
 /// Kernel entrypoint.
 ///
 /// Ensures that the limine protocol matches the requested version (3), then
@@ -38,6 +43,7 @@ unsafe extern "C" fn rmain() -> ! {
 
     sys::debug::register();
     info!("welcome to roanix!");
+    test();
 
-    arch::hcf();
+    arch::wfi();
 }

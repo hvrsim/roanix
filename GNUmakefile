@@ -26,27 +26,25 @@ run: run-$(KARCH)
 run-iso: run-iso-$(KARCH)
 
 .PHONY: run-x86_64
-run-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).hdd
+run-x86_64: store/edk2-ovmf $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M q35 \
 		-cpu qemu64,+fsgsbase \
-		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
+		-drive if=pflash,unit=0,format=raw,file=store/edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-hda $(IMAGE_NAME).hdd \
 		$(QEMUFLAGS)
 
 .PHONY: run-iso-x86_64
-run-iso-x86_64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).iso
+run-iso-x86_64: store/edk2-ovmf $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M q35 \
 		-cpu qemu64,+fsgsbase \
-		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
+		-drive if=pflash,unit=0,format=raw,file=store/edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		$(QEMUFLAGS)
 
 .PHONY: run-riscv64
-run-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).hdd
+run-riscv64: store/edk2-ovmf $(IMAGE_NAME).hdd
 	qemu-system-$(KARCH) \
 		-M virt \
 		-cpu rv64 \
@@ -54,13 +52,12 @@ run-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $
 		-device qemu-xhci \
 		-device usb-kbd \
 		-device usb-mouse \
-		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
+		-drive if=pflash,unit=0,format=raw,file=store/edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-hda $(IMAGE_NAME).hdd \
 		$(QEMUFLAGS)
 
 .PHONY: run-iso-riscv64
-run-iso-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).fd $(IMAGE_NAME).iso
+run-iso-riscv64: store/edk2-ovmf $(IMAGE_NAME).iso
 	qemu-system-$(KARCH) \
 		-M virt \
 		-cpu rv64 \
@@ -68,8 +65,7 @@ run-iso-riscv64: store/ovmf/ovmf-code-$(KARCH).fd store/ovmf/ovmf-vars-$(KARCH).
 		-device qemu-xhci \
 		-device usb-kbd \
 		-device usb-mouse \
-		-drive if=pflash,unit=0,format=raw,file=store/ovmf/ovmf-code-$(KARCH).fd,readonly=on \
-		-drive if=pflash,unit=1,format=raw,file=store/ovmf/ovmf-vars-$(KARCH).fd \
+		-drive if=pflash,unit=0,format=raw,file=store/edk2-ovmf/ovmf-code-$(KARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		$(QEMUFLAGS)
 
@@ -90,19 +86,10 @@ run-iso-bios: $(IMAGE_NAME).iso
 		-boot d \
 		$(QEMUFLAGS)
 
-store/ovmf/ovmf-code-$(KARCH).fd:
-	mkdir -p store/ovmf
-	curl -Lo $@ https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/ovmf-code-$(KARCH).fd
-	case "$(KARCH)" in \
-		riscv64) dd if=/dev/zero of=$@ bs=1 count=0 seek=33554432 2>/dev/null;; \
-	esac
-
-store/ovmf/ovmf-vars-$(KARCH).fd:
-	mkdir -p store/ovmf
-	curl -Lo $@ https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/ovmf-vars-$(KARCH).fd
-	case "$(KARCH)" in \
-		riscv64) dd if=/dev/zero of=$@ bs=1 count=0 seek=33554432 2>/dev/null;; \
-	esac
+store/edk2-ovmf:
+	rm -rf store/edk2-ovmf
+	mkdir -p store/edk2-ovmf
+	cd store && curl -L https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/edk2-ovmf.tar.gz | gunzip | tar -xf -
 
 store/limine:
 	rm -rf store/limine
@@ -180,4 +167,4 @@ clean:
 .PHONY: distclean
 distclean: clean
 	$(MAKE) -C kernel distclean
-	rm -rf store book/book
+	rm -rf store book/book target

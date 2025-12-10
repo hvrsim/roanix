@@ -204,11 +204,72 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
     }
 }
 
+/// riscv64-specific unwind function.
+///
+/// Iterates backwards through the stack, printing the symbol at each level.
+/// *Max backtrace depth is currently set to 32 function calls.*
+#[cfg(target_arch = "riscv64")]
+fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
+    let mut fp: usize;
+
+    unsafe {
+        core::arch::asm!("mv {}, fp", out(reg) fp);
+    }
+
+    if fp == 0 {
+        return;
+    }
+
+    dprint!("\n<{:-^40}>\n\n", " BACKTRACE ");
+
+    for depth in 0..32 {
+        let rip = if let Some(r) = fp.checked_sub(core::mem::size_of::<usize>()) {
+            unsafe { *(r as *const usize) }
+        } else {
+            0
+        };
+
+        if rip == 0 {
+            break;
+        }
+
+        unsafe {
+            let prev_fp_addr = if let Some(addr) = fp.checked_sub(2 * core::mem::size_of::<usize>())
+            {
+                addr
+            } else {
+                break;
+            };
+            fp = *(prev_fp_addr as *const usize);
+        }
+
+        let mut name = None;
+
+        if symtab.is_some() && kfile.is_some() {
+            for data in symtab.unwrap() {
+                let value = data.value() as usize;
+                let size = data.size() as usize;
+
+                if rip >= value && rip < (value + size) {
+                    let raw = data.get_name(kfile.unwrap()).unwrap_or("<unknown>");
+                    name = Some(rustc_demangle::demangle(raw));
+                }
+            }
+        }
+
+        if let Some(name) = name {
+            dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
+        } else {
+            dprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
+        }
+    }
+}
+
 #[doc(hidden)]
 #[panic_handler]
 fn rust_panic(info: &PanicInfo) -> ! {
     if IN_PANIC.load(Ordering::Acquire) == true {
-        arch::hcf();
+        arch::wfi();
     }
 
     IN_PANIC.store(true, Ordering::Release);
@@ -264,7 +325,7 @@ fn rust_panic(info: &PanicInfo) -> ! {
 
     perform_bt(symtab, efile);
 
-    arch::hcf();
+    arch::wfi();
 }
 
 /// Connects kernel logging infra to the log crate.
