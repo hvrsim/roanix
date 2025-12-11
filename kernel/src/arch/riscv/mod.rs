@@ -8,8 +8,8 @@
 //! manuals. You can grab the latest copies [here](https://github.com/riscv/riscv-isa-manual/releases/tag/latest).
 //!
 
-use core::arch::asm;
 use crate::sys::smp::CoreLocal;
+use core::arch::asm;
 
 pub mod cpu;
 
@@ -72,7 +72,7 @@ unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> usize {
 #[inline(always)]
 pub fn thiscpu() -> &'static mut CoreLocal {
     let value: usize;
-    
+
     unsafe {
         asm!(
             "mv {}, tp",

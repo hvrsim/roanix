@@ -1,10 +1,10 @@
 //!
 //! # CPU Features/Trap Routines
-//! 
+//!
 //! This module contains code for setting up the CPU, and handling
 //! both hardware/software generated interrupts.
 //!
-//! 
+//!
 
 use core::arch::asm;
 
@@ -19,7 +19,7 @@ pub const SIE: u16 = 0x0104;
 pub const STVEC: u16 = 0x0105;
 
 /// Represents the trap frame saved onto the kernel stack during a trap.
-/// 
+///
 /// **NOTE:** The layout and offsets MUST exactly match the assembly
 /// routine `rtrap_entry`.
 #[repr(C)]
@@ -41,7 +41,7 @@ pub struct TrapFrame {
     pub t4: u64,
     pub t5: u64,
     pub t6: u64,
-    
+
     pub s0: u64,
     pub s1: u64,
     pub s2: u64,
@@ -54,7 +54,7 @@ pub struct TrapFrame {
     pub s9: u64,
     pub s10: u64,
     pub s11: u64,
-    
+
     pub ra: u64,
     pub gp: u64,
     pub prev_sp: u64,
@@ -77,7 +77,7 @@ pub unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
         csr_addr = const CSR_ADDR,
         options(nomem, nostack, preserves_flags)
     );
-    
+
     v
 }
 
@@ -92,7 +92,7 @@ pub unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
     );
 }
 
-/// Configures CPU features and control registers. 
+/// Configures CPU features and control registers.
 pub fn enable_features() {
     //
     // Setup the CPU to a working (and secure) state
@@ -112,9 +112,12 @@ pub fn enable_features() {
 }
 
 /// Kernel trap handler.
-/// 
+///
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) {
-    panic!("CPU trap triggered at IP=0x{:X}, cause=0x{:X}", frame.ip, frame.scause);
+    panic!(
+        "CPU trap triggered at IP=0x{:X}, cause=0x{:X}",
+        frame.ip, frame.scause
+    );
 }
