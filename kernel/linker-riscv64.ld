@@ -1,6 +1,6 @@
 OUTPUT_FORMAT(elf64-littleriscv)
 
-ENTRY(rmain)
+ENTRY(rv64_start)
 
 PHDRS
 {

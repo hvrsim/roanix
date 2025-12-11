@@ -72,9 +72,11 @@ impl DebugConsole {
     }
 }
 
+///
 /// Pauses CPU execution and waits for interrupts.
 ///
 /// **If interrupts are disabled, this will result in an infinite loop.**
+///
 pub fn wfi() -> ! {
     loop {
         hlt();

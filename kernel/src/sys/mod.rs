@@ -7,3 +7,4 @@
 //!
 
 pub mod debug;
+pub mod smp;
