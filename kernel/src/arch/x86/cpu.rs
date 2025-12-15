@@ -293,6 +293,7 @@ pub unsafe fn enable_features() -> CpuFeatures {
     if !feats.has_pge() {
         panic!("cpu: global pages are not supported!");
     }
+
     if !ext_feats.has_fsgsbase() {
         panic!("cpu: {{FS/GS}}BASE instructions are not supported!");
     }
@@ -308,6 +309,7 @@ pub unsafe fn enable_features() -> CpuFeatures {
     } else {
         warn!("cpu: SMEP not supported!");
     }
+
     if ext_feats.has_smap() {
         bits |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;
         cpufeats |= CpuFeatures::SMAP;
@@ -336,20 +338,19 @@ pub unsafe fn enable_features() -> CpuFeatures {
     KERNEL_GDT.load();
 
     for i in 0..256 {
-        let addr = unsafe { (vstub0 as *const u8).offset((i * 0x10) as isize) };
-
+        let addr = (vstub0 as *const u8).offset((i * 0x10) as isize);
         KERNEL_IDT[i] = IDT::from_address(addr as u64, 0);
     }
 
     let idtr = Descriptor {
-        limit: ((size_of::<IDT>() * 256) - 1) as u16,
+        limit: (core::mem::size_of::<[IDT; 256]>() - 1) as u16,
         base: (&raw const KERNEL_IDT as *const IDT) as u64,
     };
 
     let idtr_ptr: u64 = &idtr as *const Descriptor as u64;
     core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr);
 
-    return cpufeats;
+    cpufeats
 }
 
 /// Kernel trap handler.

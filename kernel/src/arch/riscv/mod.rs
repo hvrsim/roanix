@@ -54,7 +54,7 @@ unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> usize {
         lateout("a1") value,
     );
 
-    return value;
+    value
 }
 
 /// Returns core local context.
@@ -102,7 +102,7 @@ pub fn set_core_local(ptr: *const CoreLocal) {
             options(nomem, nostack, preserves_flags)
         );
 
-        assert!(value == 0);
+        assert_eq!(value, 0);
 
         asm!(
             "mv tp, {addr}",

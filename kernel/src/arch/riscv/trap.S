@@ -38,7 +38,7 @@ rtrap_entry:
     sd sp, 8(tp)
 
 .save_context:
-    addi sp, sp, -280 /* size_of::<TrapFrame>() */
+    addi sp, sp, -288 /* size_of::<TrapFrame>() aligned to 16-bytes */
 
     /* store the general purpose registers */
     sd a0, 0(sp)

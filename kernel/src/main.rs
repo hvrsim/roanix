@@ -14,7 +14,7 @@ pub mod sys;
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(4);
 
 #[used]
 #[doc(hidden)]

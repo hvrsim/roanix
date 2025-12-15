@@ -3,7 +3,7 @@ iso_root
 *.hdd
 *.iso
 store/
-kernel/roanix
+kernel/roanix-*
 kernel/target/
 
 # editor artifacts
@@ -12,3 +12,10 @@ kernel/target/
 
 # mdbook
 book/book/
+
+# device tree artifacts
+*.dtb
+*.dts
+
+# custom scripts
+*.sh

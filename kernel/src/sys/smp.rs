@@ -8,15 +8,12 @@
 #[cfg(target_arch = "x86_64")]
 use crate::arch::cpu::CpuFeatures;
 
-/// Fields available only on x86_64.
-#[cfg(target_arch = "x86_64")]
+/// Platform specific core-local fields.
 pub struct PlatformFields {
+    /// Bitmap of supported x86 extensions.
+    #[cfg(target_arch = "x86_64")]
     pub feats: CpuFeatures,
 }
-
-/// Empty struct for fields without a platform-specific context.
-#[cfg(not(target_arch = "x86_64"))]
-pub struct PlatformFields {}
 
 /// Kernel context unique to each CPU core.
 pub struct CoreLocal {
@@ -35,16 +32,12 @@ pub struct CoreLocal {
 }
 
 impl PlatformFields {
-    #[cfg(target_arch = "x86_64")]
+    /// Creates a new `PlatformFields` instance.
     pub const fn new() -> Self {
-        return PlatformFields {
+        PlatformFields {
+            #[cfg(target_arch = "x86_64")]
             feats: CpuFeatures::empty(),
-        };
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    pub const fn new() -> Self {
-        return PlatformFields {};
+        }
     }
 }
 

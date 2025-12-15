@@ -75,17 +75,8 @@ impl Record {
             Level::Trace => write!(&mut rec, "[\x1b[1;35mT\x1b[0m]").unwrap(),
         }
 
-        let path = if let Some(path) = record.file() {
-            path
-        } else {
-            "???"
-        };
-
-        let line = if let Some(line) = record.line() {
-            line
-        } else {
-            0
-        };
+        let path = record.file().map_or("???", |f| f);
+        let line = record.line().map_or(0, |l| l);
 
         // A write to the debug port can never fail.
         write!(
@@ -97,7 +88,7 @@ impl Record {
         )
         .unwrap();
 
-        return rec;
+        rec
     }
 
     /// Prints the record to the debug console.
@@ -182,19 +173,19 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
             rbp = *(rbp as *const usize);
         }
 
-        let mut name = None;
-
-        if symtab.is_some() && kfile.is_some() {
-            for data in symtab.unwrap() {
-                let value = data.value() as usize;
-                let size = data.size() as usize;
-
-                if rip >= value && rip < (value + size) {
-                    let raw = data.get_name(kfile.unwrap()).unwrap_or("<unknown>");
-                    name = Some(rustc_demangle::demangle(raw));
-                }
-            }
-        }
+        let name = if let (Some(symtab), Some(kfile)) = (symtab, kfile) {
+            symtab
+                .iter()
+                .find(|data| {
+                    let value = data.value() as usize;
+                    let size = data.size() as usize;
+                    rip >= value && rip < value.saturating_add(size)
+                })
+                .and_then(|data| data.get_name(kfile).ok())
+                .map(|raw| rustc_demangle::demangle(raw))
+        } else {
+            None
+        };
 
         if let Some(name) = name {
             dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
@@ -243,19 +234,19 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
             fp = *(prev_fp_addr as *const usize);
         }
 
-        let mut name = None;
-
-        if symtab.is_some() && kfile.is_some() {
-            for data in symtab.unwrap() {
-                let value = data.value() as usize;
-                let size = data.size() as usize;
-
-                if rip >= value && rip < (value + size) {
-                    let raw = data.get_name(kfile.unwrap()).unwrap_or("<unknown>");
-                    name = Some(rustc_demangle::demangle(raw));
-                }
-            }
-        }
+        let name = if let (Some(symtab), Some(kfile)) = (symtab, kfile) {
+            symtab
+                .iter()
+                .find(|data| {
+                    let value = data.value() as usize;
+                    let size = data.size() as usize;
+                    rip >= value && rip < value.saturating_add(size)
+                })
+                .and_then(|data| data.get_name(kfile).ok())
+                .map(|raw| rustc_demangle::demangle(raw))
+        } else {
+            None
+        };
 
         if let Some(name) = name {
             dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
@@ -268,11 +259,9 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
 #[doc(hidden)]
 #[panic_handler]
 fn rust_panic(info: &PanicInfo) -> ! {
-    if IN_PANIC.load(Ordering::Acquire) == true {
+    if IN_PANIC.swap(true, Ordering::Acquire) {
         arch::wfi();
     }
-
-    IN_PANIC.store(true, Ordering::Release);
 
     // setup the dbgcon here incase it wasn't prepared before
     DBGCON.call_once(|| arch::DebugConsole::new());
@@ -295,35 +284,26 @@ fn rust_panic(info: &PanicInfo) -> ! {
         );
     }
 
-    let efile = if let Some(resp) = KERNEL_FILE.get_response() {
+    if let Some(resp) = KERNEL_FILE.get_response() {
         let file = resp.file();
         let slice = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
-        let efile = ElfFile::new(slice);
+        if let Ok(efile) = ElfFile::new(slice) {
+            let symtab = efile
+                .section_iter()
+                .find(|s| s.get_type() == Ok(ShType::SymTab))
+                .and_then(|s| s.get_data(&efile).ok())
+                .and_then(|d| match d {
+                    SectionData::SymbolTable64(st) => Some(st),
+                    _ => None,
+                });
 
-        if efile.is_err() {
-            None
+            perform_bt(symtab, Some(&efile));
         } else {
-            Some(&efile.unwrap())
+            perform_bt(None, None);
         }
     } else {
-        None
-    };
-
-    let mut symtab = None;
-
-    if let Some(elf) = efile {
-        for section in elf.section_iter() {
-            if section.get_type() == Ok(ShType::SymTab) {
-                let section_data = section.get_data(&elf).unwrap();
-
-                if let SectionData::SymbolTable64(st) = section_data {
-                    symtab = Some(st);
-                }
-            }
-        }
+        perform_bt(None, None);
     }
-
-    perform_bt(symtab, efile);
 
     arch::wfi();
 }

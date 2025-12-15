@@ -4,7 +4,6 @@
 //! This module contains code for setting up the CPU, and handling
 //! both hardware/software generated interrupts.
 //!
-//!
 
 use core::arch::asm;
 
@@ -14,16 +13,15 @@ extern "C" {
     static rtrap_entry: u8;
 }
 
-pub const SSTATUS: u16 = 0x0100;
-pub const SIE: u16 = 0x0104;
-pub const STVEC: u16 = 0x0105;
+pub const CSR_SSTATUS: u16 = 0x0100;
+pub const CSR_SIE: u16 = 0x0104;
+pub const CSR_STVEC: u16 = 0x0105;
 
 /// Represents the trap frame saved onto the kernel stack during a trap.
 ///
 /// **NOTE:** The layout and offsets MUST exactly match the assembly
 /// routine `rtrap_entry`.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
 pub struct TrapFrame {
     pub a0: u64,
     pub a1: u64,
@@ -64,6 +62,7 @@ pub struct TrapFrame {
     pub stval: u64,
     pub ip: u64,
     pub sstatus: u64,
+    pub reserved: u64,
 }
 
 /// Returns the contents of the riscv CSR specified in `CSR_ADDR`.
@@ -98,16 +97,15 @@ pub fn enable_features() {
     // Setup the CPU to a working (and secure) state
     //
     // We accomplish this by doing the following:
-    //   - Set the trap vector, and the interrupt mode to
-    //     direct delivery.
-    //   - Enable software interrupts only in the 'sie' CSR.
-    //   - Disable MXR (Make eXecutable Readable)
-    //   - Finally, set the SIE bit in the 'sstatus' CSR.
+    //   - Set the trap vector address, and the interrupt mode to direct.
+    //   - Enable supervisor software and external interrupts in the 'sie' CSR.
+    //   - Disable MXR (Make eXecutable Readable).
+    //   - Finally, set the SIE bit in the 'sstatus' CSR to enable interrupts.
     //
     unsafe {
-        wrcsr::<STVEC>((&rtrap_entry as *const u8 as u64) & !0b11u64);
-        wrcsr::<SSTATUS>((rdcsr::<SSTATUS>() | 0x2) & !(1 << 19));
-        wrcsr::<SIE>(0x202);
+        wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
+        wrcsr::<CSR_SSTATUS>((rdcsr::<CSR_SSTATUS>() | 0x2) & !(1 << 19));
+        wrcsr::<CSR_SIE>(0x202);
     }
 }
 
@@ -117,7 +115,7 @@ pub fn enable_features() {
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) {
     panic!(
-        "CPU trap triggered at IP=0x{:X}, cause=0x{:X}",
-        frame.ip, frame.scause
+        "CPU trap triggered at IP=0x{:X}, stval=0x{:X}, cause=0x{:X}",
+        frame.ip, frame.stval, frame.scause
     );
 }
