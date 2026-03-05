@@ -1,29 +1,31 @@
 # Building & Running Roanix
 
-This chapter explains how to build Roanix from source and run it in a emulator (or on real hardware). The only supported host platform for compiling Roanix is Linux. Other platforms will either not work (Windows/non UNIX-like) or are untested (*BSD, MacOS).
+This chapter serves as a quick guide on how to Roanix from source and run it in an emulator. A quick note before starting, currently only the Linux platform is supported as a build host for Roanix. Other platforms will either not work (Windows/non UNIX-like) or are untested (*BSD, MacOS).
+
+**NOTE: Roanix currently uses a custom build system called xtool, which is a single file python script in the project root (`x.py`)**
 
 ## Dependencies
 
 Due to the use of `rust-toolchain.toml` for selecting rust toolchains, an installation of `rustup` is required. For instructions on how to install rustup, see [here](https://rustup.rs/).
 
-Packages such as `xorriso`, `mtools` and `sgdisk` are also required for image generation. For testing Roanix, the recommended emulator is QEMU (more on it in a later section). Commands to install these packages have been provided below for multiple linux distros...
+Packages such as `xorriso`, `mtools` and `sgdisk` are also required for disk image creation. Additionally, `python3` is required to run xtool, and QEMU is preferred for testing Roanix. Commands to install these packages have been provided below for multiple linux distros.
 
 **Ubuntu:**
 
 ```bash
-$ sudo apt-get install xorriso mtools gdisk make qemu-system-x86_64
+$ sudo apt-get install make python3 xorriso mtools gdisk qemu-system-x86_64
 ```
 
 **Alpine:**
 
 ```bash
-$ sudo apk add make xorriso mtools sgdisk qemu qemu-system-x86_64
+$ sudo apk add make python3 xorriso mtools sgdisk qemu qemu-system-x86_64
 ```
 
 **Arch:**
 
 ```bash
-$ sudo pacman -S make xorriso mtools sgdisk qemu-system-x86_64
+$ sudo pacman -S make python xorriso mtools gptfdisk qemu-system-x86_64
 ```
 
 ### NixOS
@@ -32,62 +34,62 @@ A NixOS flake is present in the project root, which contains all the dependencie
 
 ## Configuring the build
 
-The Makefile build system also accepts various enviorment variables for configuring the build. These variables all have sane defaults, and I have described them below: which I have described below:
+The xtool build system uses command line flags for configuration:
 
-- `KARCH`: CPU architecture to build Roanix for.
-- `RUST_PROFILE`: Build profile for cargo (release, dev, etc)
-- `IMAGE_NAME`: Basename of ISO/HDD image.
-- `QEMU_FLAGS`: Extra flags to pass to the QEMU emulator.
+- `--arch`: CPU architecture to build Roanix for.
+- `--rust-profile`: Cargo profile (`release`, `dev`, etc).
+- `--rust-target`: Override Rust target triple.
+- `--qemu-flags`: Extra flags to pass to QEMU.
 
 *For example, to build a riscv64 ISO image with release kernel:*
 ```bash
-$ KARCH=riscv64 RUST_PROFILE=release make all-iso
+$ python3 x.py --arch riscv64 --rust-profile release gen-iso
 ```
 
 ## Build Targets
 
-The root Makefile provides the build-interface for this project. I have described all targets below, except for the run targets which are covered in a later chapter.
-
-*NOTE: I recommend you read `GNUmakefile` in the project root for all the possible targets.*
-
-Build hard drive image with kernel and bootloader (for virtualization).
+Commands to build the kernel and disk images are provided below:
 
 ```bash
 # Build HDD image with kernel and bootloader
-$ make
+$ python3 x.py
 
 # Build ISO image with kernel and bootloader
-$ make all-iso
+$ python3 x.py gen-iso
+
+# Build kernel only
+$ python3 x.py build
 
 # Clean up build directories
-$ make clean
+$ python3 x.py clean
 
 # Clean up build directories and cached files.
-$ make distclean
+$ python3 x.py distclean
 ```
 
 ## Running Roanix
 
-From emulators to real hardware, there are tons of platforms on which Ronaix can operate. I have decided to cover the 2 most common platforms in sections below.
+Currently, xtool only supports running Roanix in the QEMU emulator. Using other emulators such as [VMWare](https://vmware.com) or [Simics](https://www.intel.com/content/www/us/en/developer/articles/tool/simics-simulator.html) is possible, but are not supported within xtool.
 
 ### QEMU
 
-[QEMU](https://qemu.org) (Quick Emulator) is an open-source program that emulates hardware and CPUs. It can be used to run operating systems and applications on a different machine than the one they were originally designed for.
+[QEMU](https://qemu.org) (Quick Emulator) is an open-source program that emulates hardware platforms and CPUs. It also supports native virtualization through the Linux KVM and Apple HVF frameworks.
 
-QEMU is used as a the default hypervisor for testing Roanix. Other hyperviors such as [VMWare](https://vmware.com) or [Simics](https://www.intel.com/content/www/us/en/developer/articles/tool/simics-simulator.html) are capable of running Roanix, but are not first-class citizens.
-
-Run Roanix in QEMU with the `run-*` family of make targets:
+Run Roanix in QEMU with the `run-*` family of xtool commands:
 
 ```bash
 # Run on QEMU with x86_64 BIOS enviorment
-$ make run-bios
+$ python3 x.py run-bios
 
 # Like above but enable KVM acceleration
-$ QEMU_FLAGS="--enable-kvm" make run-bios
+$ python3 x.py --qemu-flags "--enable-kvm" run-bios
 
-# Run with QEMU with <arch> UEFI enviorment
-$ make run-<arch>
+# Run with QEMU with riscv64 UEFI enviorment
+$ python3 x.py run-riscv64
 
-# Run with QEMU with <arch> UEFI enviorment (ISO image)
-$ make run-iso-<arch>
+# Run with QEMU with riscv64 UEFI enviorment (ISO image)
+$ python3 x.py run-iso-riscv64
+
+# Pass extra raw QEMU args after `--`
+$ python3 x.py run -- --enable-kvm
 ```
