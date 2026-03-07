@@ -226,7 +226,7 @@ impl GDT {
 
             // clobber rax since we use it for setting the segement regs.
             out("rax") _,
-            options(att_syntax, nostack, nomem, preserves_flags)
+            options(att_syntax, preserves_flags)
         );
     }
 }
@@ -294,13 +294,16 @@ pub unsafe fn enable_features() -> CpuFeatures {
         panic!("cpu: global pages are not supported!");
     }
 
-    if !ext_feats.has_fsgsbase() {
-        panic!("cpu: {{FS/GS}}BASE instructions are not supported!");
-    }
+    // Enable Global Pages and SSE instructions.
+    let mut bits = Cr4Flags::PAGE_GLOBAL | Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE;
 
-    // Enable Global Pages and *GSBASE/SSE instructions.
-    let mut bits =
-        Cr4Flags::PAGE_GLOBAL | Cr4Flags::FSGSBASE | Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE;
+    // FSGSBASE is optional in kernel mode, but we enable it when available
+    // so userspace can use {RD,WR}{FS,GS}BASE instructions.
+    if ext_feats.has_fsgsbase() {
+        bits |= Cr4Flags::FSGSBASE;
+    } else {
+        warn!("cpu: {{FS/GS}}BASE instructions are not supported!");
+    }
 
     // Enable SMEP/SMAP (if supported)
     if ext_feats.has_smep() {

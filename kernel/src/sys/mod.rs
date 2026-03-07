@@ -7,4 +7,5 @@
 //!
 
 pub mod debug;
+pub mod panic;
 pub mod smp;

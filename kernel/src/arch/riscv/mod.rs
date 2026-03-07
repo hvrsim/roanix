@@ -8,7 +8,7 @@
 //! manuals. You can grab the latest copies [here](https://github.com/riscv/riscv-isa-manual/releases/tag/latest).
 //!
 
-use crate::sys::smp::CoreLocal;
+use crate::sys::{debug, smp::CoreLocal};
 use core::arch::asm;
 
 pub mod cpu;
@@ -16,45 +16,49 @@ pub mod cpu;
 /// BSP's core local context.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
+/// SBI extension ID for the debug console.
+const DEBUG_EXT_ID: usize = 0x4442434E;
+
 /// Writes debug messages to the current debug sink.
 ///
 /// On all riscv64 platforms, we use the SBI debug console API.
-pub struct DebugConsole;
+fn dbgcon_write(buf: *const u8, buflen: usize) {
+    let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
 
-impl DebugConsole {
-    /// SBI extension ID for the debug console.
-    const DEBUG_EXT_ID: usize = 0x4442434E;
+    let putc = |byte: u8| {
+        let (error, _) = unsafe { sbicall(byte as usize, DEBUG_EXT_ID, 2) };
 
-    /// Creates a new instance of [`DebugConsole`].
-    pub fn new() -> Self {
-        DebugConsole {}
-    }
-
-    /// Writes a single character to the SBI debug console.
-    #[inline(always)]
-    pub fn write(&self, byte: u8) {
-        unsafe {
-            sbicall(byte.into(), Self::DEBUG_EXT_ID, 2);
+        // Invoke the legacy SBI v0.1 `console_putchar` extension as a
+        // fallback for platforms/firmware that do not implement DBCN.
+        if error != 0 {
+            let _ = unsafe { sbicall(byte as usize, 0x01, 0) };
         }
+    };
+
+    for &byte in line {
+        putc(byte);
     }
+
+    putc(b'\n');
 }
 
 /// Invokes SBI firmware API using the `ecall` instruction.
 ///
 /// **SAFETY:** This function intentionally discards errors returned by the API.
 #[inline]
-unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> usize {
+unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> (isize, usize) {
+    let error: isize;
     let value: usize;
 
     asm!(
         "ecall",
-        in("a0") arg,
+        inlateout("a0") arg as isize => error,
         in("a6") func_id,
         in("a7") ext_id,
         lateout("a1") value,
     );
 
-    value
+    (error, value)
 }
 
 /// Returns core local context.
@@ -71,6 +75,15 @@ unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> usize {
 /// your init stage into a later part of the boot pipeline.
 #[inline(always)]
 pub fn thiscpu() -> &'static mut CoreLocal {
+    thiscpu_opt().expect("riscv: thiscpu called before TP was initialized")
+}
+
+/// Returns core local context if it is initialized.
+///
+/// **NOTE: This function should only be used by the kernel logger,
+/// since it's the only module that runs before corelocal setup.**
+#[inline(always)]
+pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
     let value: usize;
 
     unsafe {
@@ -79,19 +92,21 @@ pub fn thiscpu() -> &'static mut CoreLocal {
             out(reg) value,
             options(nomem, nostack, preserves_flags)
         );
-
-        assert!(value != 0);
-
-        &mut *(value as *mut CoreLocal)
     }
+
+    if value == 0 {
+        return None;
+    }
+
+    Some(unsafe { &mut *(value as *mut CoreLocal) })
 }
 
 /// Sets the core local pointer.
 ///
 /// Writes the provided core local pointer into the TP register.
 ///
-/// **This function can only be called once per core. Further
-/// calls may result in a panic!**
+/// **NOTE: This function can only be called once per core.
+/// Further calls may result in a panic!**
 pub fn set_core_local(ptr: *const CoreLocal) {
     let value: usize;
 
@@ -112,13 +127,48 @@ pub fn set_core_local(ptr: *const CoreLocal) {
     }
 }
 
+/// Returns whether CPU interrupts are currently enabled.
+#[inline(always)]
+pub fn irqstate() -> bool {
+    let sstatus: usize;
+
+    unsafe {
+        asm!(
+            "csrr {}, sstatus",
+            out(reg) sstatus,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    sstatus & 0x2 != 0
+}
+
+/// Enables or disables CPU interrupts.
+#[inline(always)]
+pub fn irqset(enable: bool) {
+    unsafe {
+        if enable {
+            asm!(
+                "csrsi sstatus, 0x2",
+                options(nomem, nostack, preserves_flags)
+            );
+        } else {
+            asm!(
+                "csrci sstatus, 0x2",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+}
+
 /// Performs early CPU initialization.
 ///
 /// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
 pub fn early() {
     set_core_local(&raw const BSP_CORE_LOCAL);
-
     cpu::enable_features();
+
+    debug::register_sink(dbgcon_write);
 }
 
 /// Pauses CPU execution and waits for interrupts.

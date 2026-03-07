@@ -5,14 +5,16 @@
 //! include AP bringup and core local data definitions.
 //!
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::cpu::CpuFeatures;
+use core::ops::{Deref, DerefMut};
+use spin::{Mutex, MutexGuard};
+
+use crate::arch;
 
 /// Platform specific core-local fields.
 pub struct PlatformFields {
     /// Bitmap of supported x86 extensions.
     #[cfg(target_arch = "x86_64")]
-    pub feats: CpuFeatures,
+    pub feats: arch::cpu::CpuFeatures,
 }
 
 /// Kernel context unique to each CPU core.
@@ -36,7 +38,7 @@ impl PlatformFields {
     pub const fn new() -> Self {
         PlatformFields {
             #[cfg(target_arch = "x86_64")]
-            feats: CpuFeatures::empty(),
+            feats: arch::cpu::CpuFeatures::empty(),
         }
     }
 }
@@ -49,6 +51,77 @@ impl CoreLocal {
             kernel_stack: 0,
             user_stack: 0,
             platform: PlatformFields::new(),
+        }
+    }
+}
+
+/// `spin::Mutex` wrapper that masks interrupts while holding the lock.
+pub struct IrqSpinLock<T> {
+    inner: Mutex<T>,
+}
+
+/// Guard for [`IrqSpinLock`].
+pub struct IrqSpinLockGuard<'a, T> {
+    guard: Option<MutexGuard<'a, T>>,
+    irq_enabled: bool,
+}
+
+impl<T> IrqSpinLock<T> {
+    /// Creates an IRQ-safe mutex with initial payload `value`.
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+
+    /// Locks the mutex while interrupts are masked.
+    pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
+        let irq_enabled = arch::irqstate();
+        arch::irqset(false);
+
+        IrqSpinLockGuard {
+            guard: Some(self.inner.lock()),
+            irq_enabled,
+        }
+    }
+
+    /// Attempts to lock the mutex while interrupts are masked.
+    pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let irq_enabled = arch::irqstate();
+        arch::irqset(false);
+
+        let guard = self.inner.try_lock();
+        if guard.is_none() && irq_enabled {
+            arch::irqset(true);
+        }
+
+        guard.map(|guard| IrqSpinLockGuard {
+            guard: Some(guard),
+            irq_enabled,
+        })
+    }
+}
+
+impl<T> Deref for IrqSpinLockGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_mut().unwrap()
+    }
+}
+
+impl<T> Drop for IrqSpinLockGuard<'_, T> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+
+        if self.irq_enabled {
+            arch::irqset(true);
         }
     }
 }

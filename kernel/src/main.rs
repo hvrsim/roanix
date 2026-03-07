@@ -28,7 +28,7 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Kernel entrypoint.
 ///
-/// Ensures that the limine protocol matches the requested version (3), then
+/// Ensures that the limine protocol matches the requested version (4), then
 /// calls initializers for the various kernel subsystems. Finishes with a
 /// polling loop, waiting for the scheduler to activate and switch to the
 /// init thread.

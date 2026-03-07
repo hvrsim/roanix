@@ -12,10 +12,10 @@
 //!
 
 use x86_64::addr::VirtAddr;
-use x86_64::instructions::{hlt, port::*};
-use x86_64::registers::segmentation::{Segment64, GS};
+use x86_64::instructions::{hlt, interrupts as x86_interrupts, port::*};
+use x86_64::registers::model_specific::GsBase;
 
-use crate::sys::smp::CoreLocal;
+use crate::sys::{debug, smp::CoreLocal};
 
 pub mod cpu;
 
@@ -29,9 +29,7 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 ///
 /// On real hardware, the debug sink is the PC serial port (COM1).
 ///
-/// By reading from port `0xE9`, you can test for the presence of the
-/// QEMU/bochs debug port. If the debug port is deemed unusable/missing, then
-/// the debug sink is set to COM1.
+/// For ease of debugging, the debug console writes to both sinks at once.
 ///
 /// *NOTE: to make output from this console visible, pass `-debugcon stdio` to
 /// QEMU flags, like so:*
@@ -40,44 +38,56 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 /// $ QEMUFLAGS="... -debugcon stdio" make run-bios
 /// ```
 ///
-pub struct DebugConsole {
-    /// x86 port to write characters to.
-    port: u16,
+fn dbgcon_write(buf: *const u8, buflen: usize) {
+    let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
 
-    /// x86 port for checking buffer status.
-    status: u16,
-}
+    let mut dbgcon_e9: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0xE9);
+    let mut status: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(0x3FD);
+    let mut com1: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
 
-impl DebugConsole {
-    /// Creates a new instance of [`DebugConsole`]. Also selects debug port.
-    pub fn new() -> Self {
-        let mut e9: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(0xE9);
+    for &byte in line {
+        unsafe {
+            dbgcon_e9.write(byte);
 
-        if unsafe { e9.read() as u8 } == 0xE9 {
-            DebugConsole {
-                port: 0xE9,
-                status: 0xE9,
-            }
-        } else {
-            DebugConsole {
-                port: 0x3F8,
-                status: 0x3FD,
-            }
+            while status.read() & 0x20 == 0 {}
+            com1.write(byte);
         }
     }
 
-    /// Writes a single character to the chosen x86 port.
-    #[inline(always)]
-    pub fn write(&self, byte: u8) {
-        let mut port: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(self.port);
-        let mut status: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(self.status);
+    unsafe {
+        dbgcon_e9.write(b'\n');
 
-        unsafe {
-            // HACK: port 0xE9 returns a non-zero value, so it passes this check.
-            while status.read() & 0x20 == 0 {}
+        while status.read() & 0x20 == 0 {}
+        com1.write(b'\n');
+    }
+}
 
-            port.write(byte);
-        }
+/// Initializes the debug console for printing.
+///
+/// On x86_64, QEMU's debugcon is pre-configured, so we simply
+/// set COM1 (16550 UART) to 9600 9600 8N1.
+fn dbgcon_init() {
+    let mut ier: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F9);
+    let mut lcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FB);
+    let mut dll: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
+    let mut dlm: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F9);
+    let mut fcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FA);
+    let mut mcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FC);
+
+    unsafe {
+        // Disable interrupts.
+        ier.write(0x00);
+        // Enable DLAB.
+        lcr.write(0x80);
+        // Divisor = 12 (9600 baud with 1.8432 MHz clock).
+        dll.write(0x0C);
+        dlm.write(0x00);
+        // 8 bits, no parity, one stop bit.
+        lcr.write(0x03);
+        // Enable FIFO, clear TX/RX queues.
+        fcr.write(0x07);
+        // DTR | RTS | OUT2.
+        mcr.write(0x0B);
     }
 }
 
@@ -85,6 +95,9 @@ impl DebugConsole {
 ///
 /// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
 pub fn early() {
+    dbgcon_init();
+    debug::register_sink(dbgcon_write);
+
     let feats = unsafe { cpu::enable_features() };
 
     set_core_local(&raw const BSP_CORE_LOCAL);
@@ -105,10 +118,18 @@ pub fn early() {
 /// your init stage into a later part of the boot pipeline.
 #[inline(always)]
 pub fn thiscpu() -> &'static mut CoreLocal {
-    let base = GS::read_base();
-    assert!(!base.is_null());
+    thiscpu_opt().expect("x86: thiscpu called before GS base was initialized")
+}
 
-    unsafe { &mut *base.as_mut_ptr::<CoreLocal>() }
+/// Returns core local context if it is initialized.
+#[inline(always)]
+pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
+    let base = GsBase::read();
+    if base.is_null() {
+        return None;
+    }
+
+    Some(unsafe { &mut *base.as_mut_ptr::<CoreLocal>() })
 }
 
 /// Sets the core local pointer.
@@ -119,10 +140,25 @@ pub fn thiscpu() -> &'static mut CoreLocal {
 /// **This function can only be called once per core. Further
 /// calls may result in a panic!**
 pub fn set_core_local(ptr: *const CoreLocal) {
-    assert!(GS::read_base().is_null());
+    let base = GsBase::read();
+    assert!(base.is_null(), "x86: core-local already initialized");
 
-    unsafe {
-        GS::write_base(VirtAddr::from_ptr(ptr));
+    GsBase::write(VirtAddr::from_ptr(ptr));
+}
+
+/// Returns whether CPU interrupts are currently enabled.
+#[inline(always)]
+pub fn irqstate() -> bool {
+    x86_interrupts::are_enabled()
+}
+
+/// Enables or disables CPU interrupts.
+#[inline(always)]
+pub fn irqset(enable: bool) {
+    if enable {
+        x86_interrupts::enable();
+    } else {
+        x86_interrupts::disable();
     }
 }
 

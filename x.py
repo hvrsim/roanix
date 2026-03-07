@@ -519,86 +519,78 @@ def run_qemu(
         )
     )
 
+    if bios and arch != "x86_64":
+        raise BuildError("BIOS runs are only supported for x86_64.")
+
     if bios:
-        if arch != "x86_64":
-            raise BuildError("BIOS runs are only supported for x86_64.")
         build_iso(script_cfg) if use_iso else build_hdd(script_cfg)
-        argv = [
-            f"qemu-system-{arch}",
-            "-M",
-            "q35",
-            "-cpu",
-            "qemu64,+fsgsbase",
-        ]
+    else:
+        ensure_ovmf(script_cfg)
+        build_iso(script_cfg) if use_iso else build_hdd(script_cfg)
+
+    argv = [f"qemu-system-{arch}"]
+
+    if bios:
+        argv += ["-M", "q35,smm=off", "-cpu", "qemu64,+fsgsbase"]
         if use_iso:
             argv += ["-cdrom", str(script_cfg.image_iso), "-boot", "d"]
         else:
             argv += ["-hda", str(script_cfg.image_hdd)]
-        argv += ["-debugcon", "stdio"]
-        argv += list(script_cfg.qemu_flags)
-        argv += list(script_cfg.qemu_passthrough)
-        run(script_cfg, argv, step="launch qemu (x86_64 BIOS)", capture=False)
-        return
-
-    ensure_ovmf(script_cfg)
-    build_iso(script_cfg) if use_iso else build_hdd(script_cfg)
-    if arch == "x86_64":
-        argv = [
-            f"qemu-system-{arch}",
-            "-M",
-            "q35",
-            "-m",
-            "2G",
-        ]
-        if use_iso:
-            argv += ["-cpu", "qemu64,+fsgsbase"]
+        argv += ["-serial", "stdio"]
+    else:
         argv += [
             "-drive",
             f"if=pflash,unit=0,format=raw,file={OVMF_DIR / f'ovmf-code-{arch}.fd'},readonly=on",
         ]
-        if use_iso:
-            argv += ["-cdrom", str(script_cfg.image_iso)]
-        else:
+
+        if arch == "x86_64":
+            argv += ["-M", "q35", "-m", "2G"]
+            if use_iso:
+                argv += ["-cpu", "qemu64,+fsgsbase", "-cdrom", str(script_cfg.image_iso)]
+            else:
+                argv += [
+                    "-drive",
+                    f"if=pflash,unit=1,format=raw,file={OVMF_DIR / f'ovmf-vars-{arch}.fd'}",
+                    "-hda",
+                    str(script_cfg.image_hdd),
+                ]
+            argv += ["-debugcon", "stdio"]
+        elif arch == "riscv64":
             argv += [
-                "-drive",
-                f"if=pflash,unit=1,format=raw,file={OVMF_DIR / f'ovmf-vars-{arch}.fd'}",
-                "-hda",
-                str(script_cfg.image_hdd),
+                "-M",
+                "virt,acpi=off",
+                "-m",
+                "2G",
+                "-cpu",
+                "rv64",
+                "-device",
+                "ramfb",
+                "-device",
+                "qemu-xhci",
+                "-device",
+                "usb-kbd",
+                "-device",
+                "usb-mouse",
             ]
-        argv += ["-debugcon", "stdio"]
-    elif arch == "riscv64":
-        argv = [
-            f"qemu-system-{arch}",
-            "-M",
-            "virt,acpi=off",
-            "-cpu",
-            "rv64",
-            "-device",
-            "ramfb",
-            "-device",
-            "qemu-xhci",
-            "-device",
-            "usb-kbd",
-            "-device",
-            "usb-mouse",
-            "-drive",
-            f"if=pflash,unit=0,format=raw,file={OVMF_DIR / f'ovmf-code-{arch}.fd'},readonly=on",
-        ]
-        argv += (
-            ["-cdrom", str(script_cfg.image_iso)]
-            if use_iso
-            else ["-hda", str(script_cfg.image_hdd)]
-        )
-        argv += ["-serial", "stdio"]
-    else:
-        raise BuildError(f"Unsupported architecture: {arch}")
+            if use_iso:
+                argv += ["-cdrom", str(script_cfg.image_iso)]
+            else:
+                argv += ["-hda", str(script_cfg.image_hdd)]
+            argv += ["-serial", "stdio"]
+        else:
+            raise BuildError(f"Unsupported architecture: {arch}")
 
     argv += list(script_cfg.qemu_flags)
     argv += list(script_cfg.qemu_passthrough)
+    step = (
+        "launch qemu (x86_64 BIOS)"
+        if bios
+        else f"launch qemu ({arch}, {'iso' if use_iso else 'hdd'})"
+    )
     run(
         script_cfg,
         argv,
-        step=f"launch qemu ({arch}, {'iso' if use_iso else 'hdd'})",
+        step=step,
         capture=False,
     )
 
@@ -853,8 +845,16 @@ def dispatch(cfg: Config, command: Optional[str]) -> None:
     elif cmd == "run-iso-riscv64":
         run_qemu(cfg, use_iso=True, forced_arch="riscv64")
     elif cmd == "run-bios":
+        if cfg.arch != "x86_64":
+            raise BuildError(
+                "run-bios only supports --arch x86_64; use run-riscv64 for riscv64."
+            )
         run_qemu(cfg, use_iso=False, bios=True, forced_arch="x86_64")
     elif cmd == "run-iso-bios":
+        if cfg.arch != "x86_64":
+            raise BuildError(
+                "run-iso-bios only supports --arch x86_64; use run-iso-riscv64 for riscv64."
+            )
         run_qemu(cfg, use_iso=True, bios=True, forced_arch="x86_64")
     else:
         raise BuildError(f"Unknown command: {cmd}")

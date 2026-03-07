@@ -1,33 +1,34 @@
 //!
 //! # Kernel Debugging Interface
 //!
-//! Responsible for gathering log output from [`log`] crate.
+//! Logging backend used by the [`log`] crate.
 //!
-//! Stores each line of logging output into an internal ring-buffer, then
-//! dispatches each character out to the arch-specific debug
-//! console ([`arch::DebugConsole`][crate::arch::DebugConsole]).
-//!
-//! The kernel panic handler is also implemented in this module.
+//! Every log line is captured as a fixed-size [`Record`] and appended to a
+//! global ring buffer.
 //!
 
 use core::fmt::{self, Write};
-use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch;
-
-use limine::request::ExecutableFileRequest;
 use log::Level;
-use spin::Once;
-use xmas_elf::{sections::*, symbol_table::*, ElfFile};
 
-/// Connector between [`log`] crate and various outputs.
+use crate::sys::smp::IrqSpinLock;
+
+/// Connector between [`log`] crate and the kernel logging backend.
 struct KLog;
 
-/// Interface that lets us use [`write!`] with [`arch::DebugConsole`].
-struct DebugWriter;
+/// Number of entries stored in the global log ring.
+pub const RING_CAPACITY: usize = 512;
+
+/// Maximum number of registered sinks.
+pub const MAX_SINKS: usize = 8;
+
+/// Callback invoked for every formatted log message.
+pub type LogSink = fn(*const u8, usize);
 
 /// Contains data to reconstruct a single kernel log message.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct Record {
     /// Buffer to store the formatted log message.
     buf: [u8; 256],
@@ -35,92 +36,131 @@ struct Record {
     /// Length of formatted log message in bytes.
     buflen: usize,
 
+    /// Log level represented as an integer.
+    level: usize,
+
+    /// CPU responsible for the message.
+    cpu: usize,
+
     /// Time when log message was sent (represented as UNIX epoch).
     timestamp: u64,
 }
 
-/// Helper macro for printing to the debug console.
-macro_rules! dprint {
-    ($($arg:tt)*) => (write!(&mut DebugWriter, "{}", format_args!($($arg)*)).unwrap());
+/// Fixed-size ring buffer containing the latest kernel logs.
+struct LogRing {
+    records: [Record; RING_CAPACITY],
+    read: usize,
+    write: usize,
+    len: usize,
 }
 
-#[used]
-#[doc(hidden)]
-#[link_section = ".requests"]
-static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
+/// Shared debug subsystem state.
+struct DebugState {
+    ring: LogRing,
+    sinks: [Option<LogSink>; MAX_SINKS],
+}
 
 /// Global logger instance, [`log`] crate invokes this.
 static LOGGER: KLog = KLog;
 
-/// Atomic flag to indicate a kernel panic is active.
-static IN_PANIC: AtomicBool = AtomicBool::new(false);
+/// Global debug state protected by an IRQ-safe spinlock.
+static DEBUG_STATE: IrqSpinLock<DebugState> = IrqSpinLock::new(DebugState::new());
 
-/// Instance of architecture specific debug console
-static DBGCON: Once<arch::DebugConsole> = Once::new();
+/// Prevents recursive sink dispatch if a sink causes nested logging.
+static IN_SINK_DISPATCH: AtomicBool = AtomicBool::new(false);
 
 impl Record {
-    /// Creates a log Record using metadata from the [`log`] crate.
-    pub fn new(record: &log::Record) -> Self {
-        let mut rec = Self {
+    /// Creates an empty log record.
+    const fn empty() -> Self {
+        Self {
             buf: [0; 256],
             buflen: 0,
+            level: 0,
+            cpu: 0,
             timestamp: 0,
+        }
+    }
+
+    /// Creates a log record from [`log`] metadata and message payload.
+    fn from_log_record(record: &log::Record) -> Self {
+        let (prefix, level) = match record.level() {
+            Level::Error => ("[\x1b[1;31mE\x1b[0m]", 1),
+            Level::Warn => ("[\x1b[1;33m!\x1b[0m]", 2),
+            Level::Info => ("[\x1b[1;32m*\x1b[0m]", 3),
+            Level::Debug => ("[\x1b[1;34mD\x1b[0m]", 4),
+            Level::Trace => ("[\x1b[1;35mT\x1b[0m]", 5),
         };
 
-        match record.level() {
-            Level::Error => write!(&mut rec, "[\x1b[1;31mE\x1b[0m]").unwrap(),
-            Level::Warn => write!(&mut rec, "[\x1b[1;33m!\x1b[0m]").unwrap(),
-            Level::Info => write!(&mut rec, "[\x1b[1;32m*\x1b[0m]").unwrap(),
-            Level::Debug => write!(&mut rec, "[\x1b[1;34mD\x1b[0m]").unwrap(),
-            Level::Trace => write!(&mut rec, "[\x1b[1;35mT\x1b[0m]").unwrap(),
-        }
+        let mut rec = Self {
+            level: level,
+            cpu: crate::arch::thiscpu_opt().map_or(0, |cpu| cpu.id),
+            timestamp: 0,
+            ..Self::empty()
+        };
 
         let path = record.file().map_or("???", |f| f);
         let line = record.line().map_or(0, |l| l);
 
-        // A write to the debug port can never fail.
         write!(
             &mut rec,
-            " \x1b[2m({}:{})\x1b[0m {}\n",
+            "{} \x1b[2m({}:{})\x1b[0m {}",
+            prefix,
             path,
             line,
             record.args()
         )
-        .unwrap();
+        .ok();
 
         rec
     }
-
-    /// Prints the record to the debug console.
-    pub fn debug_print(&self) {
-        for i in 0..self.buflen {
-            DBGCON.get().unwrap().write(self.buf[i]);
-        }
-    }
 }
 
-impl Write for DebugWriter {
-    /// Calls [`arch::DebugConsole::write`] for each character of `s`.
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            DBGCON.get().unwrap().write(byte);
-        }
-
-        Ok(())
-    }
-}
 impl Write for Record {
-    /// Copy the string `s` into the record's buffer, silently
-    /// dropping bytes on overflow.
+    /// Copy `s` into the record buffer, truncating on overflow.
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let bytes = s.as_bytes();
-        if self.buflen + bytes.len() > self.buf.len() {
-            return Ok(());
+        let space = self.buf.len().saturating_sub(self.buflen);
+        let count = bytes.len().min(space);
+
+        self.buf[self.buflen..self.buflen + count].copy_from_slice(&bytes[..count]);
+        self.buflen += count;
+
+        Ok(())
+    }
+}
+
+impl LogRing {
+    /// Creates an empty log ring.
+    const fn new() -> Self {
+        Self {
+            records: [Record::empty(); RING_CAPACITY],
+            read: 0,
+            write: 0,
+            len: 0,
+        }
+    }
+
+    /// Pushes a record into the ring, overwriting oldest entries when full.
+    fn push(&mut self, rec: Record) {
+        self.records[self.write] = rec;
+
+        if self.len == RING_CAPACITY {
+            self.read = (self.read + 1) % RING_CAPACITY;
+        } else {
+            self.len += 1;
         }
 
-        self.buf[self.buflen..self.buflen + bytes.len()].copy_from_slice(bytes);
-        self.buflen += bytes.len();
-        Ok(())
+        self.write = (self.write + 1) % RING_CAPACITY;
+    }
+}
+
+impl DebugState {
+    /// Creates empty debug state.
+    const fn new() -> Self {
+        Self {
+            ring: LogRing::new(),
+            sinks: [const { None }; MAX_SINKS],
+        }
     }
 }
 
@@ -130,182 +170,110 @@ impl log::Log for KLog {
         true
     }
 
-    /// Pretty-prints `record` and sends it through the logging backend.
+    /// Captures a log record into the global ring and dispatches sinks.
     fn log(&self, record: &log::Record) {
-        let rec = Record::new(record);
-        rec.debug_print();
+        if IN_SINK_DISPATCH.load(Ordering::Acquire) {
+            return;
+        }
+
+        let rec = Record::from_log_record(record);
+        let mut state = DEBUG_STATE.lock();
+        state.ring.push(rec);
+
+        dispatch_sinks_locked(rec.buf.as_ptr(), rec.buflen, &state.sinks);
     }
 
-    /// Flush calls are done on a per-character basis, therefore global flush not required.
     fn flush(&self) {}
 }
 
-/// x86_64-specific unwind function.
+/// Dispatches a preformatted message buffer to all currently registered sinks.
 ///
-/// Iterates backwards through the stack, printing the symbol at each level.
-/// *Max backtrace depth is currently set to 32 function calls.*
-#[cfg(target_arch = "x86_64")]
-fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
-    let mut rbp: usize;
-
-    unsafe {
-        core::arch::asm!("mov {}, rbp", out(reg) rbp);
-    }
-
-    if rbp == 0 {
+/// Expects the caller to hold the debug state lock. A re-entrancy guard is
+/// used to prevent nested sink dispatch loops.
+#[inline]
+fn dispatch_sinks_locked(buf: *const u8, buflen: usize, sinks: &[Option<LogSink>; MAX_SINKS]) {
+    if sinks.iter().all(|slot| slot.is_none()) {
         return;
     }
 
-    dprint!("\n<{:-^40}>\n\n", " BACKTRACE ");
-
-    for depth in 0..32 {
-        let rip = if let Some(r) = rbp.checked_add(core::mem::size_of::<usize>()) {
-            unsafe { *(r as *const usize) }
-        } else {
-            0
-        };
-
-        if rip == 0 {
-            break;
-        }
-
-        unsafe {
-            rbp = *(rbp as *const usize);
-        }
-
-        let name = if let (Some(symtab), Some(kfile)) = (symtab, kfile) {
-            symtab
-                .iter()
-                .find(|data| {
-                    let value = data.value() as usize;
-                    let size = data.size() as usize;
-                    rip >= value && rip < value.saturating_add(size)
-                })
-                .and_then(|data| data.get_name(kfile).ok())
-                .map(|raw| rustc_demangle::demangle(raw))
-        } else {
-            None
-        };
-
-        if let Some(name) = name {
-            dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
-        } else {
-            dprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
-        }
+    if IN_SINK_DISPATCH
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
     }
+
+    for sink in sinks.iter().flatten() {
+        sink(buf, buflen);
+    }
+
+    IN_SINK_DISPATCH.store(false, Ordering::Release);
 }
 
-/// riscv64-specific unwind function.
+/// Registers a log sink callback.
 ///
-/// Iterates backwards through the stack, printing the symbol at each level.
-/// *Max backtrace depth is currently set to 32 function calls.*
-#[cfg(target_arch = "riscv64")]
-fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
-    let mut fp: usize;
+/// Fails silently if a sink is unable to be registered.
+pub fn register_sink(sink: LogSink) {
+    let mut state = DEBUG_STATE.lock();
 
-    unsafe {
-        core::arch::asm!("mv {}, fp", out(reg) fp);
-    }
+    for slot in &mut state.sinks {
+        if slot.is_none() {
+            *slot = Some(sink);
 
-    if fp == 0 {
-        return;
-    }
-
-    dprint!("\n<{:-^40}>\n\n", " BACKTRACE ");
-
-    for depth in 0..32 {
-        let rip = if let Some(r) = fp.checked_sub(core::mem::size_of::<usize>()) {
-            unsafe { *(r as *const usize) }
-        } else {
-            0
-        };
-
-        if rip == 0 {
-            break;
-        }
-
-        unsafe {
-            let prev_fp_addr = if let Some(addr) = fp.checked_sub(2 * core::mem::size_of::<usize>())
+            if IN_SINK_DISPATCH
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
             {
-                addr
-            } else {
-                break;
-            };
-            fp = *(prev_fp_addr as *const usize);
-        }
+                let mut idx = state.ring.read;
+                for _ in 0..state.ring.len {
+                    let rec = state.ring.records[idx];
+                    sink(rec.buf.as_ptr(), rec.buflen);
+                    idx = (idx + 1) % RING_CAPACITY;
+                }
+                IN_SINK_DISPATCH.store(false, Ordering::Release);
+            }
 
-        let name = if let (Some(symtab), Some(kfile)) = (symtab, kfile) {
-            symtab
-                .iter()
-                .find(|data| {
-                    let value = data.value() as usize;
-                    let size = data.size() as usize;
-                    rip >= value && rip < value.saturating_add(size)
-                })
-                .and_then(|data| data.get_name(kfile).ok())
-                .map(|raw| rustc_demangle::demangle(raw))
-        } else {
-            None
-        };
-
-        if let Some(name) = name {
-            dprint!("{:>2}: 0x{:016x} - {:#}\n", depth, rip, name);
-        } else {
-            dprint!("{depth:>2}: 0x{rip:016x} - <unknown>\n");
+            return;
         }
     }
 }
 
-#[doc(hidden)]
-#[panic_handler]
-fn rust_panic(info: &PanicInfo) -> ! {
-    if IN_PANIC.swap(true, Ordering::Acquire) {
-        arch::wfi();
-    }
+/// Unregisters the first matching sink callback.
+pub fn unregister_sink(sink: LogSink) -> bool {
+    let mut state = DEBUG_STATE.lock();
 
-    // setup the dbgcon here incase it wasn't prepared before
-    DBGCON.call_once(|| arch::DebugConsole::new());
-
-    dprint!("\n  _________________________  \n");
-    dprint!("< uh oh, kernel panicked... >\n");
-    dprint!("  -------------------------  \n");
-    dprint!("          \\   ^__^          \n");
-    dprint!("           \\  (oo)\\_______  \n");
-    dprint!("              (__)\\       )\\/\\\\\n");
-    dprint!("                  ||----w |  \n");
-    dprint!("                  ||     ||  \n\n\n");
-    dprint!("\x1b[31m{}\x1b[0m\n", info.message());
-
-    if let Some(loc) = info.location() {
-        dprint!(
-            "panic occurred in file '{}' at line {}.\n",
-            loc.file(),
-            loc.line()
-        );
-    }
-
-    if let Some(resp) = KERNEL_FILE.get_response() {
-        let file = resp.file();
-        let slice = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
-        if let Ok(efile) = ElfFile::new(slice) {
-            let symtab = efile
-                .section_iter()
-                .find(|s| s.get_type() == Ok(ShType::SymTab))
-                .and_then(|s| s.get_data(&efile).ok())
-                .and_then(|d| match d {
-                    SectionData::SymbolTable64(st) => Some(st),
-                    _ => None,
-                });
-
-            perform_bt(symtab, Some(&efile));
-        } else {
-            perform_bt(None, None);
+    for slot in &mut state.sinks {
+        if slot
+            .as_ref()
+            .map(|registered| core::ptr::fn_addr_eq(*registered, sink))
+            .unwrap_or(false)
+        {
+            *slot = None;
+            return true;
         }
-    } else {
-        perform_bt(None, None);
     }
 
-    arch::wfi();
+    false
+}
+
+/// Removes all currently registered sinks.
+pub fn clear_sinks() {
+    let mut state = DEBUG_STATE.lock();
+    for slot in &mut state.sinks {
+        *slot = None;
+    }
+}
+
+/// Writes a preformatted string buffer directly to all registered sinks
+/// without appending a new record to the ring buffer.
+pub(crate) fn write_to_sinks(buf: *const u8, buflen: usize) {
+    if IN_SINK_DISPATCH.load(Ordering::Acquire) {
+        return;
+    }
+
+    if let Some(state) = DEBUG_STATE.try_lock() {
+        dispatch_sinks_locked(buf, buflen, &state.sinks);
+    }
 }
 
 /// Connects kernel logging infra to the log crate.
@@ -313,8 +281,6 @@ fn rust_panic(info: &PanicInfo) -> ! {
 /// This function will panic if the kernel logger is unable to be installed,
 /// since the log functions depend on a valid kernel logger.
 pub fn register() {
-    DBGCON.call_once(|| arch::DebugConsole::new());
-
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(log::LevelFilter::Trace))
         .unwrap();
