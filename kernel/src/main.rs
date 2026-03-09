@@ -9,6 +9,7 @@ use limine::{
 use log::info;
 
 pub mod arch;
+pub mod mem;
 pub mod sys;
 
 #[used]
@@ -40,5 +41,6 @@ unsafe extern "C" fn rmain() -> ! {
     info!("welcome to roanix!");
 
     arch::early();
+    mem::init();
     arch::wfi();
 }

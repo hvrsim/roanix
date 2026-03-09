@@ -12,6 +12,7 @@ use crate::sys::{debug, smp::CoreLocal};
 use core::arch::asm;
 
 pub mod cpu;
+pub mod paging;
 
 /// BSP's core local context.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);

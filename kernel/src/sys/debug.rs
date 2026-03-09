@@ -88,7 +88,7 @@ impl Record {
             Level::Warn => ("[\x1b[1;33m!\x1b[0m]", 2),
             Level::Info => ("[\x1b[1;32m*\x1b[0m]", 3),
             Level::Debug => ("[\x1b[1;34mD\x1b[0m]", 4),
-            Level::Trace => ("[\x1b[1;35mT\x1b[0m]", 5),
+            Level::Trace => ("[\x1b[0;35mT\x1b[0m]", 5),
         };
 
         let mut rec = Self {

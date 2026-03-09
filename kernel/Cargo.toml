@@ -10,6 +10,7 @@ spin = "0.9.8"
 xmas-elf = "0.9.1"
 rustc-demangle = "0.1"
 bitflags = "2.8.0"
+intrusive-collections = { version = "0.9", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.2"

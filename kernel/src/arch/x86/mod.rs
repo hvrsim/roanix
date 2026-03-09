@@ -18,6 +18,7 @@ use x86_64::registers::model_specific::GsBase;
 use crate::sys::{debug, smp::CoreLocal};
 
 pub mod cpu;
+pub mod paging;
 
 /// BSP's core local context.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
