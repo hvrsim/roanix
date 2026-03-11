@@ -4,31 +4,21 @@
 //! Early FreeBSD ULE-inspired kernel scheduler for Roanix.
 //!
 
-use core::{
-    array,
-    cell::UnsafeCell,
-    mem::{size_of, MaybeUninit},
-    ptr,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{array, ptr};
 
-use bitflags::bitflags;
-use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
+use intrusive_collections::LinkedList;
 use log::info;
-use spin::Lazy;
 
 use crate::{
     arch,
-    mem::{self, VirtAddr, PAGE_SIZE},
-    sys::{clock, smp::IrqSpinLock},
+    sys::{
+        clock,
+        smp::IrqSpinLock,
+        thread::{allocate_thread, idle_task, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState},
+    },
 };
 
 type TrapFrame = crate::arch::cpu::TrapFrame;
-
-pub type ThreadEntry = extern "C" fn(usize) -> !;
-
-const MAX_THREADS: usize = 32;
-const KSTACK_PAGES: usize = 4;
 
 const PRIO_MIN: i32 = -20;
 const PRIO_MAX: i32 = 20;
@@ -39,13 +29,13 @@ const MIN_TIMESHARE: u8 = 88;
 const MIN_INTERACT: u8 = MIN_TIMESHARE;
 const MIN_BATCH: u8 = MIN_TIMESHARE + 48;
 
+const MAX_ITHD: u8 = 15;
 const MAX_TIMESHARE: u8 = MIN_IDLE - 1;
 const MAX_BATCH: u8 = MAX_TIMESHARE;
 const MAX_INTERACT: u8 = MIN_INTERACT + 48 - 1;
 const MAX_IDLE: u8 = 255;
 
-const SCHED_INTERACT_MAX: u32 = 100;
-const SCHED_INTERACT_HALF: u32 = SCHED_INTERACT_MAX / 2;
+const SCHED_INTERACT_HALF: u32 = 50;
 const SCHED_INTERACT_THRESH: u32 = 30;
 
 const SCHED_TICK_SHIFT: u32 = 10;
@@ -64,92 +54,7 @@ const SCHED_PRI_CPU_RANGE: u32 = PRI_BATCH_RANGE as u32 - SCHED_PRI_NRESV;
 const SRQ_BORROWING: u32 = 1 << 0;
 const SRQ_PREEMPTED: u32 = 1 << 1;
 
-intrusive_adapter!(ThreadAdapter = &'static Thread: Thread { runq_link: LinkedListLink });
-
-static THREAD_SLOTS: Lazy<[ThreadSlot; MAX_THREADS]> =
-    Lazy::new(|| array::from_fn(|_| ThreadSlot::new()));
-
 static SCHEDULER: IrqSpinLock<Option<Scheduler>> = IrqSpinLock::new(None);
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum ThreadClass {
-    Timeshare,
-    Idle,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum ThreadState {
-    Ready,
-    Running,
-    Idle,
-}
-
-bitflags! {
-    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-    struct ThreadFlags: u32 {
-        const IDLE = 1 << 0;
-        const NOLOAD = 1 << 1;
-        const SLICEEND = 1 << 2;
-    }
-}
-
-pub struct Thread {
-    runq_link: LinkedListLink,
-    _id: usize,
-    state: ThreadState,
-    class: ThreadClass,
-    flags: ThreadFlags,
-    priority: u8,
-    base_priority: u8,
-    user_priority: u8,
-    nice: i8,
-    cpu: usize,
-    rqindex: u8,
-    slice: u32,
-    ftick: u64,
-    ltick: u64,
-    rltick: u64,
-    slptime: u32,
-    runtime: u32,
-    ticks: u32,
-    _stack_base: VirtAddr,
-    stack_top: VirtAddr,
-    frame: *mut TrapFrame,
-}
-
-unsafe impl Send for Thread {}
-unsafe impl Sync for Thread {}
-
-struct ThreadSlot {
-    used: AtomicBool,
-    thread: UnsafeCell<MaybeUninit<Thread>>,
-}
-
-unsafe impl Sync for ThreadSlot {}
-
-impl ThreadSlot {
-    const fn new() -> Self {
-        Self {
-            used: AtomicBool::new(false),
-            thread: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    fn try_init(&self, thread: Thread) -> Option<&'static mut Thread> {
-        if self
-            .used
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
-        }
-
-        unsafe {
-            (*self.thread.get()).write(thread);
-            Some(&mut *(*self.thread.get()).as_mut_ptr())
-        }
-    }
-}
 
 struct RunQueue {
     bits: [u64; 4],
@@ -202,11 +107,8 @@ impl RunQueue {
 
     fn first_timeshare(&self, off: u8) -> Option<&'static Thread> {
         let start = MIN_BATCH.saturating_add(off);
-        self.first_in_range(start, MAX_BATCH).or_else(|| {
-            (off != 0)
-                .then(|| self.first_in_range(MIN_BATCH, start - 1))
-                .flatten()
-        })
+        self.first_in_range(start, MAX_BATCH)
+            .or_else(|| (off != 0).then(|| self.first_in_range(MIN_BATCH, start - 1)).flatten())
     }
 
     fn has_runnable(&self) -> bool {
@@ -326,7 +228,10 @@ impl CpuQueue {
                 current_empty = false;
             } else if self
                 .runq
-                .first_in_range(MIN_BATCH + self.ts_deq_off, MIN_BATCH + self.ts_deq_off)
+                .first_in_range(
+                    MIN_BATCH + self.ts_deq_off,
+                    MIN_BATCH + self.ts_deq_off,
+                )
                 .is_some()
             {
                 break;
@@ -353,10 +258,7 @@ impl CpuQueue {
 
     fn refresh_lowpri(&mut self) {
         let current = unsafe { self.current.as_ref() };
-        let candidate = self
-            .choose()
-            .map(|thread| thread.priority)
-            .unwrap_or(MAX_IDLE);
+        let candidate = self.choose().map(|thread| thread.priority).unwrap_or(MAX_IDLE);
         self.lowpri = current
             .map(|thread| thread.priority.min(candidate))
             .unwrap_or(candidate);
@@ -395,18 +297,21 @@ impl Scheduler {
 
     fn bootstrap(&mut self) {
         let idle = self.alloc_thread(
-            idle_thread,
-            0,
             ThreadClass::Idle,
             MAX_IDLE,
             ThreadFlags::IDLE | ThreadFlags::NOLOAD,
+            || idle_task(),
         );
         let init = self.alloc_thread(
-            init_thread,
-            0,
             ThreadClass::Timeshare,
             MIN_INTERACT,
             ThreadFlags::empty(),
+            || {
+                info!("sched: init thread online");
+                loop {
+                    core::hint::spin_loop();
+                }
+            },
         );
 
         self.cpu.set_idle(idle);
@@ -414,66 +319,74 @@ impl Scheduler {
         self.cpu.refresh_lowpri();
     }
 
-    fn alloc_thread(
+    fn alloc_thread<F, R>(
         &mut self,
-        entry: ThreadEntry,
-        arg: usize,
         class: ThreadClass,
         priority: u8,
         flags: ThreadFlags,
-    ) -> &'static mut Thread {
-        let (stack_base, stack_top) = allocate_stack();
-        let frame_addr = stack_top.as_u64() - size_of::<TrapFrame>() as u64;
-        let frame = frame_addr as *mut TrapFrame;
-
-        unsafe {
-            crate::arch::cpu::init_kernel_thread_frame(
-                frame,
-                stack_top.as_u64(),
-                thread_trampoline as *const () as usize,
-                entry as usize,
-                arg,
-            );
-        }
-
+        task: F,
+    ) -> &'static mut Thread
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
         let tid = self.next_tid;
         self.next_tid += 1;
 
-        let mut thread = None;
-        for slot in THREAD_SLOTS.iter() {
-            if let Some(created) = slot.try_init(Thread {
-                runq_link: LinkedListLink::new(),
-                _id: tid,
-                state: if flags.contains(ThreadFlags::IDLE) {
-                    ThreadState::Idle
-                } else {
-                    ThreadState::Ready
-                },
-                class,
-                flags,
-                priority,
-                base_priority: priority,
-                user_priority: priority,
-                nice: 0,
-                cpu: self.cpu.id,
-                rqindex: priority,
-                slice: 0,
-                ftick: self.global_ticks,
-                ltick: self.global_ticks,
-                rltick: self.global_ticks,
-                slptime: 0,
-                runtime: 0,
-                ticks: 0,
-                _stack_base: stack_base,
-                stack_top,
-                frame,
-            }) {
-                thread = Some(created);
-                break;
+        allocate_thread(
+            tid,
+            self.cpu.id,
+            self.global_ticks,
+            class,
+            priority,
+            flags,
+            task,
+        )
+    }
+
+    fn spawn<F, R>(&mut self, task: F) -> usize
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let thread = self.alloc_thread(
+            ThreadClass::Timeshare,
+            MIN_INTERACT,
+            ThreadFlags::empty(),
+            task,
+        );
+        let tid = thread.id;
+        let priority = thread.priority;
+        self.cpu.enqueue_new(thread, 0);
+
+        if let Some(current) = unsafe { self.cpu.current.as_ref() } {
+            if should_preempt(priority, current.priority) {
+                self.cpu.need_resched = true;
             }
         }
+        self.cpu.refresh_lowpri();
+        tid
+    }
 
-        thread.expect("sched: out of thread slots")
+    fn spawn_ithread<F, R>(&mut self, task: F, arg: u64) -> usize
+    where
+        F: FnOnce(u64) -> R + Send + 'static,
+    {
+        let thread = self.alloc_thread(
+            ThreadClass::Ithread,
+            MAX_ITHD,
+            ThreadFlags::empty(),
+            move || task(arg),
+        );
+        let tid = thread.id;
+        let priority = thread.priority;
+        self.cpu.enqueue_new(thread, 0);
+
+        if let Some(current) = unsafe { self.cpu.current.as_ref() } {
+            if should_preempt(priority, current.priority) {
+                self.cpu.need_resched = true;
+            }
+        }
+        self.cpu.refresh_lowpri();
+        tid
     }
 
     fn on_tick(&mut self, global: u64) {
@@ -490,7 +403,8 @@ impl Scheduler {
         if self.cpu.ts_off == self.cpu.ts_deq_off {
             self.cpu.ts_ticks = self.cpu.ts_ticks.wrapping_add(1);
             let advance = 2u16 - (self.cpu.ts_ticks / 4) as u16;
-            self.cpu.ts_off = ((self.cpu.ts_off as u16 + advance) % PRI_BATCH_RANGE as u16) as u8;
+            self.cpu.ts_off =
+                ((self.cpu.ts_off as u16 + advance) % PRI_BATCH_RANGE as u16) as u8;
             self.cpu.ts_ticks %= 4;
             self.cpu.advance_ts_deq_off(false);
         }
@@ -498,10 +412,13 @@ impl Scheduler {
         current.rltick = global;
         self.pctcpu_update(current, true);
 
-        if current.class == ThreadClass::Timeshare {
-            current.runtime = current.runtime.saturating_add(self.tickincr);
-            self.interact_update(current);
-            self.priority_update(current);
+        match current.class {
+            ThreadClass::Timeshare => {
+                current.runtime = current.runtime.saturating_add(self.tickincr);
+                self.interact_update(current);
+                self.priority_update(current);
+            }
+            ThreadClass::Ithread | ThreadClass::Idle => {}
         }
 
         if current.flags.contains(ThreadFlags::IDLE) {
@@ -513,11 +430,7 @@ impl Scheduler {
         }
 
         current.slice = current.slice.saturating_add(1);
-        if current.slice
-            >= self
-                .cpu
-                .slice_for(current, self.sched_slice, self.sched_slice_min)
-        {
+        if current.slice >= self.cpu.slice_for(current, self.sched_slice, self.sched_slice_min) {
             current.slice = 0;
             current.flags.insert(ThreadFlags::SLICEEND);
             self.cpu.need_resched = true;
@@ -629,13 +542,15 @@ impl Scheduler {
             .saturating_add((thread.nice as i32).max(0) as u32);
         let priority = if score < SCHED_INTERACT_THRESH {
             MIN_INTERACT
-                + (((MAX_INTERACT - MIN_INTERACT + 1) as u32 * score) / SCHED_INTERACT_THRESH) as u8
+                + (((MAX_INTERACT - MIN_INTERACT + 1) as u32 * score) / SCHED_INTERACT_THRESH)
+                    as u8
         } else {
             let len = tick_length(thread).max(1);
-            let cpu_pri_off =
-                ((((SCHED_PRI_CPU_RANGE - 1) as u64 * thread.ticks as u64) + len / 2) / len
-                    + (1u64 << SCHED_TICK_SHIFT) / 2)
-                    >> SCHED_TICK_SHIFT;
+            let cpu_pri_off = ((((SCHED_PRI_CPU_RANGE - 1) as u64 * thread.ticks as u64)
+                + len / 2)
+                / len
+                + (1u64 << SCHED_TICK_SHIFT) / 2)
+                >> SCHED_TICK_SHIFT;
             let nice_off = (((thread.nice as i32 - PRIO_MIN) as u32) * 5) / 4;
             (MIN_BATCH as u32 + cpu_pri_off.min((SCHED_PRI_CPU_RANGE - 1) as u64) as u32 + nice_off)
                 .min(MAX_BATCH as u32) as u8
@@ -676,8 +591,9 @@ impl Scheduler {
     fn pctcpu_update(&self, thread: &mut Thread, run: bool) {
         let t = self.global_ticks;
         let t_max = self.realstathz as u64 * SCHED_TICK_SECS;
-        let t_tgt = (((t_max << SCHED_TICK_SHIFT) * SCHED_CPU_DECAY_NUMER) / SCHED_CPU_DECAY_DENOM)
-            >> SCHED_TICK_SHIFT;
+        let t_tgt =
+            (((t_max << SCHED_TICK_SHIFT) * SCHED_CPU_DECAY_NUMER) / SCHED_CPU_DECAY_DENOM)
+                >> SCHED_TICK_SHIFT;
         let lu_span = t.saturating_sub(thread.ltick);
 
         if lu_span >= t_tgt {
@@ -693,8 +609,9 @@ impl Scheduler {
 
         if t.saturating_sub(thread.ftick) >= t_max {
             let len = tick_length(thread).max(1);
-            thread.ticks = ((thread.ticks as u64 / len) * t_tgt.saturating_sub(lu_span))
-                .min(u32::MAX as u64) as u32;
+            thread.ticks =
+                ((thread.ticks as u64 / len) * t_tgt.saturating_sub(lu_span)).min(u32::MAX as u64)
+                    as u32;
             thread.ftick = t.saturating_sub(t_tgt);
         }
 
@@ -727,49 +644,6 @@ fn should_preempt(pri: u8, current: u8) -> bool {
     pri <= MAX_INTERACT && current > MAX_INTERACT
 }
 
-fn allocate_stack() -> (VirtAddr, VirtAddr) {
-    let mut base = VirtAddr::zero();
-
-    for page_idx in 0..KSTACK_PAGES {
-        let page = mem::phys::alloc_zeroed_page().expect("sched: out of physical memory for stack");
-        let virt = mem::phys_to_virt(page.paddr());
-        if page_idx == 0 {
-            base = virt;
-        } else {
-            let expected = base
-                .checked_add(page_idx as u64 * PAGE_SIZE)
-                .expect("sched: stack address overflow");
-            assert_eq!(
-                virt, expected,
-                "sched: expected contiguous stack pages during bootstrap"
-            );
-        }
-    }
-
-    let top = base
-        .checked_add(KSTACK_PAGES as u64 * PAGE_SIZE)
-        .expect("sched: stack top overflow");
-    (base, top)
-}
-
-extern "C" fn thread_trampoline(entry: usize, arg: usize) -> ! {
-    let entry: ThreadEntry = unsafe { core::mem::transmute(entry) };
-    entry(arg)
-}
-
-extern "C" fn idle_thread(_: usize) -> ! {
-    loop {
-        arch::wfi();
-    }
-}
-
-extern "C" fn init_thread(_: usize) -> ! {
-    info!("sched: init thread online");
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
 pub fn init() {
     let mut guard = SCHEDULER.lock();
     if guard.is_some() {
@@ -789,6 +663,28 @@ pub fn init() {
 pub fn start() -> ! {
     let mut guard = SCHEDULER.lock();
     guard.as_mut().expect("sched: init before start").start()
+}
+
+pub fn run<F, R>(task: F) -> usize
+where
+    F: FnOnce() -> R + Send + 'static,
+{
+    let mut guard = SCHEDULER.lock();
+    guard
+        .as_mut()
+        .expect("sched: init before run")
+        .spawn(task)
+}
+
+pub fn create_ithread<F, R>(task: F, arg: u64) -> usize
+where
+    F: FnOnce(u64) -> R + Send + 'static,
+{
+    let mut guard = SCHEDULER.lock();
+    guard
+        .as_mut()
+        .expect("sched: init before create_ithread")
+        .spawn_ithread(task, arg)
 }
 
 pub fn stat_tick(global: u64, _percpu: u64) {

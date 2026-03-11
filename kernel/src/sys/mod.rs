@@ -11,3 +11,4 @@ pub mod debug;
 pub mod panic;
 pub mod sched;
 pub mod smp;
+pub mod thread;
