@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 #![doc = include_str!("../../README.md")]
 
 use limine::{

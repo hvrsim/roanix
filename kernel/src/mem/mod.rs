@@ -13,6 +13,7 @@ use limine::{
 use log::info;
 
 pub mod addr;
+pub mod alloc;
 pub mod phys;
 
 pub use addr::{align_down, align_up, pages_for_len, PhysAddr, VirtAddr, PAGE_SIZE};
@@ -50,6 +51,7 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 pub fn early() {
     info!("mem: hhdm=0x{:x}", hhdm_offset());
     phys::init();
+    alloc::init();
 }
 
 /// Returns HHDM offset provided by Limine.
