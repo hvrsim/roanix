@@ -45,7 +45,7 @@ unsafe extern "C" fn rmain() -> ! {
     mem::early();
     arch::init();
 
+    sys::sched::init();
     sys::clock::start();
-    arch::irqset(true);
-    arch::wfi();
+    sys::sched::start();
 }

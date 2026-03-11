@@ -9,4 +9,5 @@
 pub mod clock;
 pub mod debug;
 pub mod panic;
+pub mod sched;
 pub mod smp;

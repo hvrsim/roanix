@@ -4,6 +4,7 @@
 .extern rtrap
 .globl rsyscall_entry
 .globl rtrap_entry
+.globl rthread_resume
 .globl vstub0
 
 rsyscall_entry:
@@ -44,7 +45,9 @@ rsyscall_entry:
     mov %rsp, %rdi
     xor %rbp, %rbp
     call rsyscall
+    mov %rax, %rsp
 
+.Lrestore_syscall:
     /* Pop the trapframe back into place. */
     pop %rax
     pop %rbx
@@ -98,7 +101,9 @@ rtrap_entry:
     mov %rsp, %rdi
     xor %rbp, %rbp
     call rtrap
+    mov %rax, %rsp
 
+.Lrestore_trap:
     /* Pop the trapframe back into place. */
     pop %rax
     pop %rbx
@@ -125,6 +130,10 @@ rtrap_entry:
     /* And away we go :-) */
 1:
     iretq
+
+rthread_resume:
+    mov %rdi, %rsp
+    jmp .Lrestore_trap
 
 .altmacro
 .macro make_stubs start_vec, end_vec, has_ec=1

@@ -4,6 +4,7 @@
 .extern rmain
 
 .globl rv64_start
+.globl rthread_resume
 rv64_start:
 .option push
 .option norelax
@@ -100,6 +101,7 @@ rtrap_entry:
     /* finally, set the context and jump to the C handler */
     mv a0, sp
     jal rtrap
+    mv sp, a0
 
     /*
      *  disable interrupts and set the kernel thread-local
@@ -160,3 +162,7 @@ rtrap_entry:
     ld sp, 232(sp)
 
     sret
+
+rthread_resume:
+    mv sp, a0
+    j .restore_context

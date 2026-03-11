@@ -11,6 +11,7 @@ core::arch::global_asm!(include_str!("trap.S"));
 
 extern "C" {
     static rtrap_entry: u8;
+    fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
 pub const CSR_SSTATUS: u16 = 0x0100;
@@ -70,6 +71,59 @@ pub struct TrapFrame {
     pub reserved: u64,
 }
 
+/// Initializes a trap frame for a brand-new kernel thread.
+pub unsafe fn init_kernel_thread_frame(
+    frame: *mut TrapFrame,
+    stack_top: u64,
+    ip: usize,
+    arg0: usize,
+    arg1: usize,
+) {
+    *frame = TrapFrame {
+        a0: arg0 as u64,
+        a1: arg1 as u64,
+        a2: 0,
+        a3: 0,
+        a4: 0,
+        a5: 0,
+        a6: 0,
+        a7: 0,
+        t0: 0,
+        t1: 0,
+        t2: 0,
+        t3: 0,
+        t4: 0,
+        t5: 0,
+        t6: 0,
+        s0: 0,
+        s1: 0,
+        s2: 0,
+        s3: 0,
+        s4: 0,
+        s5: 0,
+        s6: 0,
+        s7: 0,
+        s8: 0,
+        s9: 0,
+        s10: 0,
+        s11: 0,
+        ra: 0,
+        gp: 0,
+        prev_sp: stack_top,
+        prev_sscratch: 0,
+        scause: 0,
+        stval: 0,
+        ip: ip as u64,
+        sstatus: 0x102,
+        reserved: 0,
+    };
+}
+
+/// Restores `frame` and enters the first scheduled kernel thread.
+pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
+    rthread_resume(frame);
+}
+
 /// Returns the contents of the riscv CSR specified in `CSR_ADDR`.
 #[inline]
 pub unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
@@ -125,12 +179,12 @@ pub fn enable_timer_interrupts() {
 ///
 /// All interrupts triggered start their journey here...
 #[no_mangle]
-extern "C" fn rtrap(frame: &mut TrapFrame) {
+extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     if frame.scause & SCAUSE_INTERRUPT != 0
         && (frame.scause & !SCAUSE_INTERRUPT) == SCAUSE_SUPERVISOR_TIMER
     {
         crate::arch::timer::handle_interrupt();
-        return;
+        return crate::sys::sched::trap_return(frame);
     }
 
     panic!(

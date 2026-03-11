@@ -50,6 +50,8 @@
 //! Reference: *Intel SDM Volume 1, Section 18*
 //!
 
+use core::ptr;
+
 use bitflags::bitflags;
 use log::{info, warn};
 use raw_cpuid::CpuId;
@@ -60,6 +62,7 @@ core::arch::global_asm!(include_str!("trap.S"), options(att_syntax));
 
 extern "C" {
     fn vstub0();
+    fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
 static mut KERNEL_GDT: GDT = GDT::new();
@@ -170,6 +173,48 @@ pub struct TrapFrame {
     pub rflags: u64,
     pub sp: u64,
     pub ss: u64,
+}
+
+/// Initializes a trap frame for a brand-new kernel thread.
+pub unsafe fn init_kernel_thread_frame(
+    frame: *mut TrapFrame,
+    stack_top: u64,
+    ip: usize,
+    arg0: usize,
+    arg1: usize,
+) {
+    ptr::write(
+        frame,
+        TrapFrame {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: arg1 as u64,
+            rdi: arg0 as u64,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            vec: 0,
+            ec: 0,
+            ip: ip as u64,
+            cs: 0x28,
+            rflags: 1 << 9,
+            sp: stack_top,
+            ss: 0x30,
+        },
+    );
+}
+
+/// Restores `frame` and enters the first scheduled kernel thread.
+pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
+    rthread_resume(frame);
 }
 
 impl GDT {
@@ -360,9 +405,9 @@ pub unsafe fn enable_features() -> CpuFeatures {
 ///
 /// All interrupts triggered start their journey here...
 #[no_mangle]
-extern "C" fn rtrap(frame: &mut TrapFrame) {
+extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     if crate::arch::timer::handle_interrupt(frame.vec) {
-        return;
+        return crate::sys::sched::trap_return(frame);
     }
 
     panic!(
@@ -373,6 +418,6 @@ extern "C" fn rtrap(frame: &mut TrapFrame) {
 
 /// Kernel syscall handler.
 #[no_mangle]
-extern "C" fn rsyscall(frame: &mut TrapFrame) {
+extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
     panic!("SYSCALL triggered at IP=0x{:X}", frame.ip);
 }

@@ -11,7 +11,10 @@ use core::time::Duration;
 
 use log::info;
 
-use crate::{arch, sys::smp::IrqSpinLock};
+use crate::{
+    arch,
+    sys::{sched, smp::IrqSpinLock},
+};
 
 /// Interval for the dummy scheduler statistics callback.
 pub const STAT_INTERVAL_NS: u64 = 10_000_000;
@@ -218,7 +221,7 @@ pub fn handle_timer_interrupt() {
 }
 
 fn scheduler_stat_tick(global: u64, percpu: u64) {
-    info!("clock: stat tick global={} cpu={}", global, percpu);
+    sched::stat_tick(global, percpu);
 }
 
 fn program_deadline(deadline_ns: u64) {
