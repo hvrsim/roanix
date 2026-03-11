@@ -331,11 +331,11 @@ pub unsafe fn enable_features() -> CpuFeatures {
         bits |= Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION;
     }
 
-    // Enable Intel CET (if supportd)
-    if ext_feats.has_cet_ss() {
-        bits |= Cr4Flags::CONTROL_FLOW_ENFORCEMENT;
-        cpufeats |= CpuFeatures::CET_SS;
-    }
+    // // Enable Intel CET (if supported)
+    // if ext_feats.has_cet_ss() {
+    //     bits |= Cr4Flags::CONTROL_FLOW_ENFORCEMENT;
+    //     cpufeats |= CpuFeatures::CET_SS;
+    // }
 
     Cr4::write(Cr4::read() | bits);
     KERNEL_GDT.load();
@@ -361,6 +361,10 @@ pub unsafe fn enable_features() -> CpuFeatures {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) {
+    if crate::arch::timer::handle_interrupt(frame.vec) {
+        return;
+    }
+
     panic!(
         "CPU trap triggered at IP=0x{:X}, vec=0x{:X}",
         frame.ip, frame.vec

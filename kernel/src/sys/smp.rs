@@ -28,6 +28,9 @@ pub struct CoreLocal {
     /// ID of current CPU core.
     pub id: usize,
 
+    /// Per-CPU timer tick counter.
+    pub ticks: u64,
+
     /// Platform specific context.
     #[allow(dead_code)]
     pub platform: PlatformFields,
@@ -50,6 +53,7 @@ impl CoreLocal {
             id: cid,
             kernel_stack: 0,
             user_stack: 0,
+            ticks: 0,
             platform: PlatformFields::new(),
         }
     }

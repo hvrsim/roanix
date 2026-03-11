@@ -13,6 +13,7 @@ use core::arch::asm;
 
 pub mod cpu;
 pub mod paging;
+pub mod timer;
 
 /// BSP's core local context.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
@@ -170,6 +171,11 @@ pub fn early() {
     cpu::enable_features();
 
     debug::register_sink(dbgcon_write);
+}
+
+/// Performs post-memory architecture initialization.
+pub fn init() {
+    timer::init();
 }
 
 /// Pauses CPU execution and waits for interrupts.

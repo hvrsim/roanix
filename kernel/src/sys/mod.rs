@@ -6,6 +6,7 @@
 //! else besides [`arch`](`crate::arch`)!
 //!
 
+pub mod clock;
 pub mod debug;
 pub mod panic;
 pub mod smp;

@@ -18,7 +18,9 @@ use x86_64::registers::model_specific::GsBase;
 use crate::sys::{debug, smp::CoreLocal};
 
 pub mod cpu;
+pub mod lapic;
 pub mod paging;
+pub mod timer;
 
 /// BSP's core local context.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
@@ -103,6 +105,11 @@ pub fn early() {
 
     set_core_local(&raw const BSP_CORE_LOCAL);
     thiscpu().platform.feats = feats;
+}
+
+/// Performs post-memory architecture initialization.
+pub fn init() {
+    timer::init();
 }
 
 /// Returns core local context.

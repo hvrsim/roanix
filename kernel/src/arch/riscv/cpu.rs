@@ -16,6 +16,11 @@ extern "C" {
 pub const CSR_SSTATUS: u16 = 0x0100;
 pub const CSR_SIE: u16 = 0x0104;
 pub const CSR_STVEC: u16 = 0x0105;
+const SCAUSE_INTERRUPT: u64 = 1 << 63;
+const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
+const SIE_SSIE: u64 = 1 << 1;
+const SIE_STIE: u64 = 1 << 5;
+const SIE_SEIE: u64 = 1 << 9;
 
 /// Represents the trap frame saved onto the kernel stack during a trap.
 ///
@@ -105,7 +110,14 @@ pub fn enable_features() {
     unsafe {
         wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
         wrcsr::<CSR_SSTATUS>((rdcsr::<CSR_SSTATUS>() | 0x2) & !(1 << 19));
-        wrcsr::<CSR_SIE>(0x202);
+        wrcsr::<CSR_SIE>(SIE_SSIE | SIE_SEIE);
+    }
+}
+
+/// Enables supervisor timer interrupts once the timer subsystem is ready.
+pub fn enable_timer_interrupts() {
+    unsafe {
+        wrcsr::<CSR_SIE>(rdcsr::<CSR_SIE>() | SIE_STIE);
     }
 }
 
@@ -114,6 +126,13 @@ pub fn enable_features() {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) {
+    if frame.scause & SCAUSE_INTERRUPT != 0
+        && (frame.scause & !SCAUSE_INTERRUPT) == SCAUSE_SUPERVISOR_TIMER
+    {
+        crate::arch::timer::handle_interrupt();
+        return;
+    }
+
     panic!(
         "CPU trap triggered at IP=0x{:X}, stval=0x{:X}, cause=0x{:X}",
         frame.ip, frame.stval, frame.scause

@@ -9,6 +9,7 @@ import argparse
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -166,6 +167,17 @@ def executable_files(directory: Path) -> List[Path]:
         if path.is_file() and os.access(path, os.X_OK):
             files.append(path)
     return sorted(files)
+
+
+def kvm_available() -> bool:
+    try:
+        mode = os.stat("/dev/kvm").st_mode
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return False
+
+    return stat.S_ISCHR(mode)
 
 
 def run(
@@ -528,14 +540,20 @@ def run_qemu(
         ensure_ovmf(script_cfg)
         build_iso(script_cfg) if use_iso else build_hdd(script_cfg)
 
-    argv = [f"qemu-system-{arch}"]
+    argv = [f"qemu-system-{arch}", "-m", "2G"]
+
+    if use_iso:
+        argv += ["-cdrom", str(script_cfg.image_iso)]
+    else:
+        argv += ["-hda", str(script_cfg.image_hdd)]
 
     if bios:
-        argv += ["-M", "q35,smm=off", "-cpu", "qemu64,+fsgsbase"]
-        if use_iso:
-            argv += ["-cdrom", str(script_cfg.image_iso), "-boot", "d"]
+        argv += ["-M", "q35,smm=off"]
+        if kvm_available():
+            argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
         else:
-            argv += ["-hda", str(script_cfg.image_hdd)]
+            argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
+
         argv += ["-serial", "stdio"]
     else:
         argv += [
@@ -544,17 +562,18 @@ def run_qemu(
         ]
 
         if arch == "x86_64":
-            argv += ["-M", "q35", "-m", "2G"]
-            if use_iso:
-                argv += ["-cpu", "qemu64,+fsgsbase", "-cdrom", str(script_cfg.image_iso)]
+            argv += ["-M", "q35"]
+            if kvm_available():
+                argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
             else:
-                argv += [
-                    "-drive",
-                    f"if=pflash,unit=1,format=raw,file={OVMF_DIR / f'ovmf-vars-{arch}.fd'}",
-                    "-hda",
-                    str(script_cfg.image_hdd),
-                ]
-            argv += ["-debugcon", "stdio"]
+                argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
+
+            argv += [
+                "-drive",
+                f"if=pflash,unit=1,format=raw,file={OVMF_DIR / f'ovmf-vars-{arch}.fd'}",
+                "-debugcon",
+                "stdio",
+            ]
         elif arch == "riscv64":
             argv += [
                 "-M",
@@ -572,10 +591,6 @@ def run_qemu(
                 "-device",
                 "usb-mouse",
             ]
-            if use_iso:
-                argv += ["-cdrom", str(script_cfg.image_iso)]
-            else:
-                argv += ["-hda", str(script_cfg.image_hdd)]
             argv += ["-serial", "stdio"]
         else:
             raise BuildError(f"Unsupported architecture: {arch}")

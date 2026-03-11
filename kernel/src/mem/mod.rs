@@ -46,8 +46,8 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[link_section = ".requests"]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
-/// Initializes the memory subsystem.
-pub fn init() {
+/// Performs early memory subsystem initialization.
+pub fn early() {
     info!("mem: hhdm=0x{:x}", hhdm_offset());
     phys::init();
 }
