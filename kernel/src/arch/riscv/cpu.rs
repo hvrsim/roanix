@@ -186,11 +186,12 @@ pub fn enable_features() {
     //   - Set the trap vector address, and the interrupt mode to direct.
     //   - Enable supervisor software and external interrupts in the 'sie' CSR.
     //   - Disable MXR (Make eXecutable Readable).
-    //   - Finally, set the SIE bit in the 'sstatus' CSR to enable interrupts.
+    //   - Keep SIE masked so bootstrap does not take interrupts until the
+    //     scheduler hands control to the first thread context.
     //
     unsafe {
         wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
-        wrcsr::<CSR_SSTATUS>((rdcsr::<CSR_SSTATUS>() | 0x2) & !(1 << 19));
+        wrcsr::<CSR_SSTATUS>(rdcsr::<CSR_SSTATUS>() & !(SSTATUS_SIE | (1 << 19)));
         wrcsr::<CSR_SIE>(SIE_SSIE | SIE_SEIE);
     }
 }

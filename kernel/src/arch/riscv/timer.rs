@@ -7,7 +7,7 @@
 
 use core::arch::asm;
 
-use log::{info, warn};
+use log::warn;
 
 use crate::dev::dtb;
 use crate::sys::clock::{self, ClockSource, EventTimer};
@@ -81,8 +81,6 @@ pub fn init() {
     clock::register_clocksource(&RISCV_CLOCKSOURCE);
     clock::register_event_timer(&SBI_EVENT_TIMER);
     super::cpu::enable_timer_interrupts();
-
-    info!("riscv/timer: timebase-frequency={} Hz", timebase_hz);
 }
 
 /// Enables local timer interrupts on a secondary hart.

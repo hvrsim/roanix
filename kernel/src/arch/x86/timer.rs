@@ -6,7 +6,6 @@
 
 use core::arch::asm;
 
-use log::info;
 use raw_cpuid::{CpuId, CpuIdReader};
 use x86_64::instructions::port::{
     PortGeneric, PortReadOnly, PortWriteOnly, ReadOnlyAccess, WriteOnlyAccess,
@@ -88,8 +87,6 @@ pub fn init() {
     lapic::init(tsc_hz);
     clock::register_clocksource(&TSC_CLOCKSOURCE);
     clock::register_event_timer(&LAPIC_EVENT_TIMER);
-
-    info!("x86/timer: calibrated TSC at {} Hz", tsc_hz);
 }
 
 /// Programs the local timer backend on a secondary CPU.

@@ -74,6 +74,16 @@ impl ClockState {
     }
 }
 
+fn format_frequency(freq_hz: u64) -> (u64, u64, &'static str) {
+    if freq_hz >= 1_000_000_000 {
+        let centi_ghz = ((freq_hz as u128) * 100 + 500_000_000) / 1_000_000_000;
+        return ((centi_ghz / 100) as u64, (centi_ghz % 100) as u64, "GHz");
+    }
+
+    let centi_khz = ((freq_hz as u128) * 100 + 500) / 1_000;
+    ((centi_khz / 100) as u64, (centi_khz % 100) as u64, "KHz")
+}
+
 /// Registers a clocksource, replacing the active source only if it scores better.
 pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
     let mut state = CLOCK_STATE.lock();
@@ -88,10 +98,13 @@ pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
 
     if should_switch {
         state.active_clocksource = Some(clocksource);
+        let (whole, frac, unit) = format_frequency(clocksource.frequency_hz());
         info!(
-            "clock: active clocksource={} ({} Hz, rating={})",
+            "clock: active clocksource={} ({}.{:02} {}, rating={})",
             clocksource.name(),
-            clocksource.frequency_hz(),
+            whole,
+            frac,
+            unit,
             clocksource.rating()
         );
     } else {

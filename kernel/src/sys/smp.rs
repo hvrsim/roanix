@@ -108,6 +108,10 @@ impl SmpState {
 static SMP_STATE: IrqSpinLock<Option<SmpState>> = IrqSpinLock::new(None);
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
+static ONLINE_ORDER_LEN: AtomicUsize = AtomicUsize::new(0);
+const ONLINE_ORDER_CAPACITY: usize = 256;
+static ONLINE_ORDER: [AtomicUsize; ONLINE_ORDER_CAPACITY] =
+    [const { AtomicUsize::new(usize::MAX) }; ONLINE_ORDER_CAPACITY];
 
 /// `spin::Mutex` wrapper that masks interrupts while holding the lock.
 pub struct IrqSpinLock<T> {
@@ -217,6 +221,10 @@ pub fn init() {
     let total_cpus = boot_cpus.len().max(1);
     TOTAL_CPUS.store(total_cpus, Ordering::Release);
     ONLINE_CPUS.store(1, Ordering::Release);
+    ONLINE_ORDER_LEN.store(0, Ordering::Release);
+    for slot in ONLINE_ORDER.iter().take(total_cpus.saturating_sub(1)) {
+        slot.store(usize::MAX, Ordering::Relaxed);
+    }
     *guard = Some(SmpState {
         boot_cpus: boot_cpus.into_boxed_slice(),
     });
@@ -244,6 +252,16 @@ pub fn start() {
     info!("smp: startup sent to {} AP(s)", total - 1);
     while online_cpus() < total {
         spin_loop();
+    }
+
+    let announced = ONLINE_ORDER_LEN.load(Ordering::Acquire).min(total.saturating_sub(1));
+    for idx in 0..announced {
+        let id = ONLINE_ORDER[idx].load(Ordering::Acquire);
+        if id == usize::MAX {
+            continue;
+        }
+
+        info!("smp: cpu{} online ({}/{})", id, idx + 2, total);
     }
 
     info!("smp: all {} CPU(s) online", total);
@@ -280,17 +298,19 @@ pub fn send_ipi(cpu_id: usize) {
 }
 
 fn mark_online(id: usize) {
-    let prev = ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
-    let total = cpu_count();
-    info!("smp: cpu{} online ({}/{})", id, prev + 1, total);
+    let slot = ONLINE_ORDER_LEN.fetch_add(1, Ordering::AcqRel);
+    if slot < ONLINE_ORDER_CAPACITY {
+        ONLINE_ORDER[slot].store(id, Ordering::Release);
+    }
+    ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
 }
 
 unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
     arch::irqset(false);
     let core_local = core_local_for_cpu(cpu).expect("smp: missing AP core-local");
     arch::init_secondary(core_local);
-    mark_online(arch::thiscpu().id);
     crate::sys::clock::start_secondary();
+    mark_online(arch::thiscpu().id);
     crate::sys::sched::start_secondary();
 }
 
