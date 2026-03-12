@@ -55,6 +55,7 @@ use core::ptr;
 use bitflags::bitflags;
 use log::{info, warn};
 use raw_cpuid::CpuId;
+use spin::Once;
 use x86_64::registers::control::*;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 
@@ -65,8 +66,9 @@ extern "C" {
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
-static mut KERNEL_GDT: GDT = GDT::new();
+static KERNEL_GDT: GDT = GDT::new();
 static mut KERNEL_IDT: [IDT; 256] = [IDT::new(); 256];
+static DESCRIPTORS_READY: Once<()> = Once::new();
 
 bitflags! {
     /// Bitmap of supported x86 extensions.
@@ -217,6 +219,9 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
     rthread_resume(frame);
 }
 
+/// Refreshes architecture-specific per-CPU state in a thread frame.
+pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame) {}
+
 impl GDT {
     /// Creates a new GDT structure.
     pub const fn new() -> Self {
@@ -306,6 +311,15 @@ impl IDT {
 
 /// Checks for (and enables) CPU feature flags.
 pub unsafe fn enable_features() -> CpuFeatures {
+    DESCRIPTORS_READY.call_once(|| {
+        for i in 0..256 {
+            let addr = (vstub0 as *const u8).wrapping_add(i * 0x10);
+            unsafe {
+                KERNEL_IDT[i] = IDT::from_address(addr as u64, 0);
+            }
+        }
+    });
+
     let cpuid = CpuId::new();
     let mut cpufeats = CpuFeatures::empty();
 
@@ -318,10 +332,9 @@ pub unsafe fn enable_features() -> CpuFeatures {
 
     // Set the groundwork for SIMD/FP instructions by disabling
     // emulation and activating CR0.MP. Also enable Write Protect
-    // becuase Intel CET requires it.
+    // because Intel CET requires it.
     Cr0::write(
-        Cr0::read()
-            | !Cr0Flags::EMULATE_COPROCESSOR
+        (Cr0::read() & !Cr0Flags::EMULATE_COPROCESSOR)
             | Cr0Flags::MONITOR_COPROCESSOR
             | Cr0Flags::WRITE_PROTECT,
     );
@@ -384,11 +397,6 @@ pub unsafe fn enable_features() -> CpuFeatures {
 
     Cr4::write(Cr4::read() | bits);
     KERNEL_GDT.load();
-
-    for i in 0..256 {
-        let addr = (vstub0 as *const u8).offset((i * 0x10) as isize);
-        KERNEL_IDT[i] = IDT::from_address(addr as u64, 0);
-    }
 
     let idtr = Descriptor {
         limit: (core::mem::size_of::<[IDT; 256]>() - 1) as u16,

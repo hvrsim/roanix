@@ -92,18 +92,20 @@ pub fn init() {
     info!("x86/timer: calibrated TSC at {} Hz", tsc_hz);
 }
 
+/// Programs the local timer backend on a secondary CPU.
+pub fn init_secondary() {
+    lapic::init_secondary();
+}
+
 /// Handles the local APIC timer interrupt.
 pub fn handle_interrupt(vec: u64) -> bool {
-    if vec == lapic::SPURIOUS_VECTOR as u64 {
-        return true;
-    }
-
-    if vec != lapic::TIMER_VECTOR as u64 {
+    if !lapic::handle_interrupt(vec) {
         return false;
     }
 
-    clock::handle_timer_interrupt();
-    lapic::eoi();
+    if vec == lapic::TIMER_VECTOR as u64 {
+        clock::handle_timer_interrupt();
+    }
 
     true
 }

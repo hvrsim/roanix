@@ -20,6 +20,9 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 /// SBI extension ID for the debug console.
 const DEBUG_EXT_ID: usize = 0x4442434E;
+const SBI_EXT_IPI: usize = 0x735049;
+const SBI_EXT_IPI_SEND: usize = 0;
+const SBI_LEGACY_SEND_IPI: usize = 0x04;
 
 /// Writes debug messages to the current debug sink.
 ///
@@ -178,6 +181,13 @@ pub fn init() {
     timer::init();
 }
 
+/// Performs per-hart initialization for a secondary core.
+pub fn init_secondary(core_local: *const CoreLocal) {
+    set_core_local(core_local);
+    cpu::enable_features();
+    timer::init_secondary();
+}
+
 /// Pauses CPU execution and waits for interrupts.
 ///
 /// **If interrupts are disabled, this will result in an infinite loop.**
@@ -187,4 +197,58 @@ pub fn wfi() -> ! {
             asm!("wfi", options(nomem, nostack, preserves_flags));
         }
     }
+}
+
+/// Sends a reschedule IPI to `cpu_id`.
+pub fn send_ipi(cpu_id: usize) {
+    let hartid = crate::sys::smp::platform_id(cpu_id).expect("riscv: invalid CPU ID for IPI");
+    let mask = 1usize;
+    let error = unsafe { sbicall3(mask, hartid as usize, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND) };
+    if error == 0 {
+        return;
+    }
+
+    assert!(
+        hartid < usize::BITS as u64,
+        "riscv: legacy SBI IPI fallback requires hartid < {}",
+        usize::BITS
+    );
+    let legacy_mask = 1usize << hartid;
+    let legacy_error = unsafe {
+        sbicall1(
+            &legacy_mask as *const usize as usize,
+            SBI_LEGACY_SEND_IPI,
+            0,
+        )
+    };
+    assert_eq!(legacy_error, 0, "riscv: SBI send_ipi failed");
+}
+
+unsafe fn sbicall1(arg0: usize, ext_id: usize, func_id: usize) -> isize {
+    let error: isize;
+
+    asm!(
+        "ecall",
+        inlateout("a0") arg0 as isize => error,
+        in("a6") func_id,
+        in("a7") ext_id,
+        lateout("a1") _,
+    );
+
+    error
+}
+
+unsafe fn sbicall3(arg0: usize, arg1: usize, arg2: usize, ext_id: usize, func_id: usize) -> isize {
+    let error: isize;
+
+    asm!(
+        "ecall",
+        inlateout("a0") arg0 as isize => error,
+        inlateout("a1") arg1 => _,
+        in("a2") arg2,
+        in("a6") func_id,
+        in("a7") ext_id,
+    );
+
+    error
 }

@@ -85,6 +85,12 @@ pub fn init() {
     info!("riscv/timer: timebase-frequency={} Hz", timebase_hz);
 }
 
+/// Enables local timer interrupts on a secondary hart.
+pub fn init_secondary() {
+    sbi_set_timer(u64::MAX);
+    super::cpu::enable_timer_interrupts();
+}
+
 /// Handles a supervisor timer interrupt.
 pub fn handle_interrupt() {
     clock::handle_timer_interrupt();

@@ -16,9 +16,14 @@ extern "C" {
 
 pub const CSR_SSTATUS: u16 = 0x0100;
 pub const CSR_SIE: u16 = 0x0104;
+pub const CSR_SIP: u16 = 0x0144;
 pub const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
+const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
+const SSTATUS_SIE: u64 = 1 << 1;
+const SSTATUS_SPIE: u64 = 1 << 5;
+const SSTATUS_SPP: u64 = 1 << 8;
 const SIE_SSIE: u64 = 1 << 1;
 const SIE_STIE: u64 = 1 << 5;
 const SIE_SEIE: u64 = 1 << 9;
@@ -108,13 +113,13 @@ pub unsafe fn init_kernel_thread_frame(
         s10: 0,
         s11: 0,
         ra: 0,
-        gp: 0,
+        gp: read_gp(),
         prev_sp: stack_top,
         prev_sscratch: 0,
         scause: 0,
         stval: 0,
         ip: ip as u64,
-        sstatus: 0x102,
+        sstatus: SSTATUS_SPP | SSTATUS_SPIE,
         reserved: 0,
     };
 }
@@ -122,6 +127,28 @@ pub unsafe fn init_kernel_thread_frame(
 /// Restores `frame` and enters the first scheduled kernel thread.
 pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
     rthread_resume(frame);
+}
+
+/// Refreshes architecture-specific per-CPU state in a thread frame.
+pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame) {
+    (*frame).prev_sscratch = crate::arch::thiscpu() as *mut crate::sys::smp::CoreLocal as u64;
+    (*frame).gp = read_gp();
+    (*frame).sstatus |= SSTATUS_SPP | SSTATUS_SPIE;
+    (*frame).sstatus &= !SSTATUS_SIE;
+}
+
+fn read_gp() -> u64 {
+    let value: u64;
+
+    unsafe {
+        asm!(
+            "mv {}, gp",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    value
 }
 
 /// Returns the contents of the riscv CSR specified in `CSR_ADDR`.
@@ -180,11 +207,20 @@ pub fn enable_timer_interrupts() {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
-    if frame.scause & SCAUSE_INTERRUPT != 0
-        && (frame.scause & !SCAUSE_INTERRUPT) == SCAUSE_SUPERVISOR_TIMER
-    {
-        crate::arch::timer::handle_interrupt();
-        return crate::sys::sched::trap_return(frame);
+    if frame.scause & SCAUSE_INTERRUPT != 0 {
+        match frame.scause & !SCAUSE_INTERRUPT {
+            SCAUSE_SUPERVISOR_TIMER => {
+                crate::arch::timer::handle_interrupt();
+                return crate::sys::sched::trap_return(frame);
+            }
+            SCAUSE_SUPERVISOR_SOFTWARE => {
+                unsafe {
+                    wrcsr::<CSR_SIP>(rdcsr::<CSR_SIP>() & !SIE_SSIE);
+                }
+                return crate::sys::sched::trap_return(frame);
+            }
+            _ => {}
+        }
     }
 
     panic!(

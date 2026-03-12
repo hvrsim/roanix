@@ -13,7 +13,7 @@
 
 use x86_64::addr::VirtAddr;
 use x86_64::instructions::{hlt, interrupts as x86_interrupts, port::*};
-use x86_64::registers::model_specific::GsBase;
+use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 
 use crate::sys::{debug, smp::CoreLocal};
 
@@ -101,9 +101,8 @@ pub fn early() {
     dbgcon_init();
     debug::register_sink(dbgcon_write);
 
-    let feats = unsafe { cpu::enable_features() };
-
     set_core_local(&raw const BSP_CORE_LOCAL);
+    let feats = unsafe { cpu::enable_features() };
     thiscpu().platform.feats = feats;
 }
 
@@ -112,10 +111,18 @@ pub fn init() {
     timer::init();
 }
 
+/// Performs per-CPU initialization for a secondary core.
+pub fn init_secondary(core_local: *const CoreLocal) {
+    set_core_local(core_local);
+    let feats = unsafe { cpu::enable_features() };
+    thiscpu().platform.feats = feats;
+    timer::init_secondary();
+}
+
 /// Returns core local context.
 ///
-/// On the x86_64 platform, kernel core local data is
-/// stored in the GS segment register.
+/// On the x86_64 platform, kernel core-local data is
+/// addressed through the GS base registers.
 ///
 /// ## Safety
 ///
@@ -132,7 +139,13 @@ pub fn thiscpu() -> &'static mut CoreLocal {
 /// Returns core local context if it is initialized.
 #[inline(always)]
 pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
-    let base = GsBase::read();
+    let mut base = GsBase::read();
+    if base.is_null() {
+        // AP entry may arrive with the kernel value still parked in
+        // IA32_KERNEL_GS_BASE until the first SWAPGS path runs.
+        base = KernelGsBase::read();
+    }
+
     if base.is_null() {
         return None;
     }
@@ -142,16 +155,16 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
 
 /// Sets the core local pointer.
 ///
-/// Writes the provided core local pointer into the GS
-/// segment register.
+/// Writes the provided core local pointer into both GS base MSRs.
 ///
-/// **This function can only be called once per core. Further
-/// calls may result in a panic!**
 pub fn set_core_local(ptr: *const CoreLocal) {
-    let base = GsBase::read();
-    assert!(base.is_null(), "x86: core-local already initialized");
+    let ptr = VirtAddr::from_ptr(ptr);
 
-    GsBase::write(VirtAddr::from_ptr(ptr));
+    // Limine may enter different CPUs with either GS slot active, depending on
+    // whether SWAPGS has already been used on that path. Keep both MSRs in sync
+    // during kernel-only execution so per-CPU state is reachable either way.
+    GsBase::write(ptr);
+    KernelGsBase::write(ptr);
 }
 
 /// Returns whether CPU interrupts are currently enabled.
@@ -179,4 +192,10 @@ pub fn wfi() -> ! {
     loop {
         hlt();
     }
+}
+
+/// Sends a reschedule IPI to `cpu_id`.
+pub fn send_ipi(cpu_id: usize) {
+    let lapic_id = crate::sys::smp::platform_id(cpu_id).expect("x86: invalid CPU ID for IPI");
+    lapic::send_ipi(lapic_id as u32);
 }

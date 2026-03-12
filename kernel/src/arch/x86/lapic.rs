@@ -1,7 +1,7 @@
 //!
 //! # Local APIC
 //!
-//! Lightweight BSP-only local APIC support for one-shot timer delivery.
+//! Local APIC support for per-CPU one-shot timer delivery.
 //!
 
 use core::arch::asm;
@@ -20,6 +20,9 @@ use crate::{
 /// Timer interrupt vector used by the local APIC.
 pub const TIMER_VECTOR: u8 = 0xE0;
 
+/// Reschedule IPI vector used for cross-core wakeups.
+pub const RESCHEDULE_VECTOR: u8 = 0xE1;
+
 /// Spurious interrupt vector used by the local APIC.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -29,6 +32,8 @@ const IA32_TSC_DEADLINE_MSR: u32 = 0x6E0;
 
 const LAPIC_EOI: u32 = 0x0B0;
 const LAPIC_SVR: u32 = 0x0F0;
+const LAPIC_ICR_LOW: u32 = 0x300;
+const LAPIC_ICR_HIGH: u32 = 0x310;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_INITIAL_COUNT: u32 = 0x380;
 const LAPIC_CURRENT_COUNT: u32 = 0x390;
@@ -69,7 +74,7 @@ impl LapicState {
     }
 }
 
-/// Initializes the BSP local APIC timer path.
+/// Initializes shared LAPIC state and programs the BSP local timer path.
 pub fn init(tsc_hz: u64) {
     let cpuid = CpuId::new();
     let features = cpuid
@@ -84,43 +89,50 @@ pub fn init(tsc_hz: u64) {
         unsafe { apic_base.write(apic_base_raw) };
     }
 
+    let deadline_capable = features.has_tsc_deadline();
     let base_pa = PhysAddr::new(apic_base_raw & !0xFFF);
     let base = ensure_mmio_mapping(base_pa);
-
-    mask_legacy_pic();
-    write_register(base, LAPIC_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
-    write_register(base, LAPIC_EOI, 0);
-
-    let deadline_capable = features.has_tsc_deadline();
     let timer_mode = if deadline_capable {
-        write_register(
-            base,
-            LAPIC_LVT_TIMER,
-            TIMER_VECTOR as u32 | LVT_TIMER_TSC_DEADLINE,
-        );
-        unsafe { Msr::new(IA32_TSC_DEADLINE_MSR).write(0) };
         TimerMode::TscDeadline
     } else {
-        write_register(base, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
-        let lapic_timer_hz = calibrate_lapic_timer(base, tsc_hz);
-        write_register(base, LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
-
-        let mut state = LAPIC_STATE.lock();
-        state.base = base;
-        state.tsc_hz = tsc_hz;
-        state.lapic_timer_hz = lapic_timer_hz;
-        state.timer_mode = TimerMode::LapicOneShot;
-        state.initialized = true;
-        info!("x86/lapic: timer mode=lapic-oneshot hz={}", lapic_timer_hz);
-        return;
+        TimerMode::LapicOneShot
     };
 
     let mut state = LAPIC_STATE.lock();
     state.base = base;
     state.tsc_hz = tsc_hz;
+    state.lapic_timer_hz = if timer_mode == TimerMode::LapicOneShot {
+        calibrate_lapic_timer(base, tsc_hz)
+    } else {
+        0
+    };
     state.timer_mode = timer_mode;
     state.initialized = true;
-    info!("x86/lapic: timer mode=tsc-deadline");
+
+    drop(state);
+
+    mask_legacy_pic();
+    init_thiscpu();
+
+    if timer_mode == TimerMode::LapicOneShot {
+        info!(
+            "x86/lapic: timer mode=lapic-oneshot hz={}",
+            LAPIC_STATE.lock().lapic_timer_hz
+        );
+    } else {
+        info!("x86/lapic: timer mode=tsc-deadline");
+    }
+}
+
+/// Programs the local APIC on a secondary CPU using shared BSP calibration.
+pub fn init_secondary() {
+    let state = LAPIC_STATE.lock();
+    assert!(
+        state.initialized,
+        "x86/lapic: init required before secondary setup"
+    );
+    drop(state);
+    init_thiscpu();
 }
 
 /// Returns the active timer backend name.
@@ -200,6 +212,29 @@ pub fn eoi() {
     }
 }
 
+/// Handles LAPIC-delivered interrupts that should just trigger rescheduling.
+pub fn handle_interrupt(vec: u64) -> bool {
+    if vec == SPURIOUS_VECTOR as u64 {
+        return true;
+    }
+
+    if vec == TIMER_VECTOR as u64 || vec == RESCHEDULE_VECTOR as u64 {
+        eoi();
+        return true;
+    }
+
+    false
+}
+
+/// Sends a fixed IPI carrying the reschedule vector to `lapic_id`.
+pub fn send_ipi(lapic_id: u32) {
+    let state = LAPIC_STATE.lock();
+    assert!(state.initialized, "x86/lapic: init required before IPI");
+
+    write_register(state.base, LAPIC_ICR_HIGH, lapic_id << 24);
+    write_register(state.base, LAPIC_ICR_LOW, RESCHEDULE_VECTOR as u32);
+}
+
 fn calibrate_lapic_timer(base: VirtAddr, tsc_hz: u64) -> u64 {
     write_register(base, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
     write_register(base, LAPIC_LVT_TIMER, TIMER_VECTOR as u32 | LVT_MASKED);
@@ -264,6 +299,44 @@ fn ensure_mmio_mapping(base_pa: PhysAddr) -> VirtAddr {
     }
 
     base
+}
+
+fn init_thiscpu() {
+    let mut apic_base = Msr::new(IA32_APIC_BASE_MSR);
+    let mut apic_base_raw = unsafe { apic_base.read() };
+    if apic_base_raw & IA32_APIC_BASE_ENABLE == 0 {
+        apic_base_raw |= IA32_APIC_BASE_ENABLE;
+        unsafe { apic_base.write(apic_base_raw) };
+    }
+
+    let state = LAPIC_STATE.lock();
+    assert!(
+        state.initialized,
+        "x86/lapic: init required before local setup"
+    );
+
+    write_register(state.base, LAPIC_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
+    write_register(state.base, LAPIC_EOI, 0);
+
+    match state.timer_mode {
+        TimerMode::TscDeadline => {
+            write_register(
+                state.base,
+                LAPIC_LVT_TIMER,
+                TIMER_VECTOR as u32 | LVT_TIMER_TSC_DEADLINE,
+            );
+            unsafe { Msr::new(IA32_TSC_DEADLINE_MSR).write(0) };
+        }
+        TimerMode::LapicOneShot => {
+            write_register(state.base, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
+            write_register(
+                state.base,
+                LAPIC_LVT_TIMER,
+                TIMER_VECTOR as u32 | LVT_MASKED,
+            );
+            write_register(state.base, LAPIC_INITIAL_COUNT, 0);
+        }
+    }
 }
 
 fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {

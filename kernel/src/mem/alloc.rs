@@ -15,7 +15,7 @@ use log::info;
 
 use crate::{
     arch,
-    mem::{self, phys, pages_for_len, PhysAddr, VirtAddr, VmFlags, PAGE_SIZE},
+    mem::{self, pages_for_len, phys, PhysAddr, VirtAddr, VmFlags, PAGE_SIZE},
     sys::smp::IrqSpinLock,
 };
 
@@ -249,7 +249,8 @@ impl HeapState {
             };
 
             let virt = heap_page_virt(start + mapped);
-            let res = unsafe { arch::paging::map_page(root, virt, phys_page.paddr(), heap_flags()) };
+            let res =
+                unsafe { arch::paging::map_page(root, virt, phys_page.paddr(), heap_flags()) };
             if res.is_err() {
                 unsafe { phys::free_page(phys_page) };
                 self.rollback_large(root, start, mapped);
@@ -409,7 +410,8 @@ impl HeapState {
             let phys = unsafe { arch::paging::unmap_page(root, virt) }
                 .expect("mem/alloc: failed to roll back heap mapping")
                 .expect("mem/alloc: missing heap mapping during rollback");
-            let page = phys::phys_to_page(phys).expect("mem/alloc: heap rollback PFN lookup failed");
+            let page =
+                phys::phys_to_page(phys).expect("mem/alloc: heap rollback PFN lookup failed");
             unsafe { phys::free_page(page) };
         }
     }
@@ -499,7 +501,10 @@ fn alloc_error(layout: Layout) -> ! {
 
 #[inline(always)]
 fn class_index(layout: Layout) -> Option<usize> {
-    let need = cmp::max(layout.size(), cmp::max(layout.align(), size_of::<FreeNode>()));
+    let need = cmp::max(
+        layout.size(),
+        cmp::max(layout.align(), size_of::<FreeNode>()),
+    );
 
     SIZE_CLASSES.iter().position(|&size| size >= need)
 }
@@ -539,7 +544,10 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
     let slot_size = SIZE_CLASSES[class];
     let slots_offset = mem::align_up(size_of::<SlabHeader>() as u64, slot_size as u64) as usize;
     let capacity = ((PAGE_SIZE as usize) - slots_offset) / slot_size;
-    assert!(capacity != 0, "mem/alloc: invalid slab capacity for class {class}");
+    assert!(
+        capacity != 0,
+        "mem/alloc: invalid slab capacity for class {class}"
+    );
 
     ptr::write(
         base.cast::<SlabHeader>(),

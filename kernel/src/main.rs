@@ -3,6 +3,8 @@
 #![feature(alloc_error_handler)]
 #![doc = include_str!("../../README.md")]
 
+extern crate alloc;
+
 use limine::{
     request::{RequestsEndMarker, RequestsStartMarker},
     BaseRevision,
@@ -46,7 +48,12 @@ unsafe extern "C" fn rmain() -> ! {
     mem::early();
     arch::init();
 
+    sys::smp::init();
     sys::sched::init();
     sys::clock::start();
+    sys::smp::start();
+    let _ = sys::sched::run(|| {
+        info!("hello from a thread on core #{}!", arch::thiscpu().id);
+    });
     sys::sched::start();
 }

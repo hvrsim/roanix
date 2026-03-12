@@ -4,28 +4,23 @@
 //! Kernel thread storage and bootstrap helpers used by the scheduler.
 //!
 
-use core::{
-    array,
-    cell::UnsafeCell,
-    mem::{align_of, size_of, MaybeUninit},
-    ptr,
-    sync::atomic::{AtomicBool, Ordering},
+use alloc::{
+    alloc::{alloc_zeroed, handle_alloc_error, Layout},
+    boxed::Box,
 };
-
-use bitflags::bitflags;
-use intrusive_collections::{intrusive_adapter, LinkedListLink};
-use spin::Lazy;
+use core::{mem::size_of, ptr};
 
 use crate::{
     arch,
-    mem::{self, VirtAddr, PAGE_SIZE},
+    mem::{VirtAddr, PAGE_SIZE},
 };
+use bitflags::bitflags;
+use intrusive_collections::{intrusive_adapter, LinkedListLink};
 
 type TrapFrame = crate::arch::cpu::TrapFrame;
 
-const MAX_THREADS: usize = 32;
-const KSTACK_PAGES: usize = 4;
-const TASK_INLINE_WORDS: usize = 8;
+const KSTACK_PAGES: usize = 16;
+const KSTACK_SIZE: usize = (KSTACK_PAGES as usize) * (PAGE_SIZE as usize);
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum ThreadClass {
@@ -39,6 +34,7 @@ pub(crate) enum ThreadState {
     Ready,
     Running,
     Idle,
+    Exited,
 }
 
 bitflags! {
@@ -69,10 +65,10 @@ pub(crate) struct Thread {
     pub(crate) slptime: u32,
     pub(crate) runtime: u32,
     pub(crate) ticks: u32,
-    pub(crate) _stack_base: VirtAddr,
+    _stack: Box<KernelStack>,
     pub(crate) stack_top: VirtAddr,
     pub(crate) frame: *mut TrapFrame,
-    task: ThreadTask,
+    task: Box<dyn KernelTask>,
 }
 
 unsafe impl Send for Thread {}
@@ -80,98 +76,27 @@ unsafe impl Sync for Thread {}
 
 intrusive_adapter!(pub(crate) ThreadAdapter = &'static Thread: Thread { runq_link: LinkedListLink });
 
-static THREAD_SLOTS: Lazy<[ThreadSlot; MAX_THREADS]> =
-    Lazy::new(|| array::from_fn(|_| ThreadSlot::new()));
+#[repr(align(16))]
+struct KernelStack([u8; KSTACK_SIZE]);
 
-struct ThreadSlot {
-    used: AtomicBool,
-    thread: UnsafeCell<MaybeUninit<Thread>>,
+trait KernelTask: Send {
+    fn run(self: Box<Self>) -> !;
 }
 
-unsafe impl Sync for ThreadSlot {}
-
-impl ThreadSlot {
-    const fn new() -> Self {
-        Self {
-            used: AtomicBool::new(false),
-            thread: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    fn try_init(&self, thread: Thread) -> Option<&'static mut Thread> {
-        if self
-            .used
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
-        }
-
-        unsafe {
-            (*self.thread.get()).write(thread);
-            Some(&mut *(*self.thread.get()).as_mut_ptr())
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-struct TaskVTable {
-    invoke: unsafe fn(*mut u8),
-}
-
-struct ThreadTask {
-    storage: [usize; TASK_INLINE_WORDS],
-    vtable: Option<TaskVTable>,
-}
-
-impl ThreadTask {
-    const fn empty() -> Self {
-        Self {
-            storage: [0; TASK_INLINE_WORDS],
-            vtable: None,
-        }
-    }
-
-    fn prepare<F, R>(&mut self, task: F)
-    where
-        F: FnOnce() -> R + Send + 'static,
-    {
-        assert!(
-            size_of::<F>() <= size_of::<[usize; TASK_INLINE_WORDS]>(),
-            "thread task too large for inline storage"
-        );
-        assert!(
-            align_of::<F>() <= align_of::<[usize; TASK_INLINE_WORDS]>(),
-            "thread task alignment exceeds inline storage"
-        );
-
-        unsafe {
-            ptr::write(self.storage.as_mut_ptr().cast::<F>(), task);
-        }
-
-        self.vtable = Some(TaskVTable {
-            invoke: invoke_task::<F, R>,
-        });
-    }
-
-    unsafe fn run(&mut self) -> ! {
-        let vtable = self.vtable.take().expect("thread task missing");
-        (vtable.invoke)(self.storage.as_mut_ptr().cast::<u8>());
-        panic!("kernel thread returned");
-    }
-}
-
-unsafe fn invoke_task<F, R>(raw: *mut u8)
+impl<F, R> KernelTask for F
 where
     F: FnOnce() -> R + Send + 'static,
 {
-    let task = raw.cast::<F>().read();
-    let _ = task();
+    fn run(self: Box<Self>) -> ! {
+        let _ = (*self)();
+        crate::sys::sched::exit_current()
+    }
 }
 
 extern "C" fn thread_entry(thread_ptr: usize) -> ! {
     let thread = unsafe { &mut *(thread_ptr as *mut Thread) };
-    unsafe { thread.task.run() }
+    let task = unsafe { ptr::read(&thread.task) };
+    task.run()
 }
 
 pub(crate) fn allocate_thread<F, R>(
@@ -186,47 +111,47 @@ pub(crate) fn allocate_thread<F, R>(
 where
     F: FnOnce() -> R + Send + 'static,
 {
-    let (stack_base, stack_top) = allocate_stack();
+    let layout = Layout::new::<KernelStack>();
+    let stack_ptr = unsafe { alloc_zeroed(layout) } as *mut KernelStack;
+    if stack_ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+
+    let mut stack = unsafe { Box::from_raw(stack_ptr) };
+    let stack_base = VirtAddr::from_ptr(stack.0.as_mut_ptr());
+    let stack_top = stack_base
+        .checked_add(KSTACK_SIZE as u64)
+        .expect("sched: stack top overflow");
     let frame_addr = stack_top.as_u64() - size_of::<TrapFrame>() as u64;
     let frame = frame_addr as *mut TrapFrame;
-
-    let mut thread_task = ThreadTask::empty();
-    thread_task.prepare(task);
-
-    let slot = THREAD_SLOTS
-        .iter()
-        .find(|slot| !slot.used.load(Ordering::Acquire))
-        .expect("sched: out of thread slots");
-    let thread = slot
-        .try_init(Thread {
-            runq_link: LinkedListLink::new(),
-            id,
-            state: if flags.contains(ThreadFlags::IDLE) {
-                ThreadState::Idle
-            } else {
-                ThreadState::Ready
-            },
-            class,
-            flags,
-            priority,
-            base_priority: priority,
-            user_priority: priority,
-            nice: 0,
-            cpu,
-            rqindex: priority,
-            slice: 0,
-            ftick: global_ticks,
-            ltick: global_ticks,
-            rltick: global_ticks,
-            slptime: 0,
-            runtime: 0,
-            ticks: 0,
-            _stack_base: stack_base,
-            stack_top,
-            frame,
-            task: thread_task,
-        })
-        .expect("sched: failed to claim thread slot");
+    let thread = Box::leak(Box::new(Thread {
+        runq_link: LinkedListLink::new(),
+        id,
+        state: if flags.contains(ThreadFlags::IDLE) {
+            ThreadState::Idle
+        } else {
+            ThreadState::Ready
+        },
+        class,
+        flags,
+        priority,
+        base_priority: priority,
+        user_priority: priority,
+        nice: 0,
+        cpu,
+        rqindex: priority,
+        slice: 0,
+        ftick: global_ticks,
+        ltick: global_ticks,
+        rltick: global_ticks,
+        slptime: 0,
+        runtime: 0,
+        ticks: 0,
+        _stack: stack,
+        stack_top,
+        frame,
+        task: Box::new(task),
+    }));
     unsafe {
         crate::arch::cpu::init_kernel_thread_frame(
             frame,
@@ -237,31 +162,6 @@ where
         );
     }
     thread
-}
-
-fn allocate_stack() -> (VirtAddr, VirtAddr) {
-    let mut base = VirtAddr::zero();
-
-    for page_idx in 0..KSTACK_PAGES {
-        let page = mem::phys::alloc_zeroed_page().expect("sched: out of physical memory for stack");
-        let virt = mem::phys_to_virt(page.paddr());
-        if page_idx == 0 {
-            base = virt;
-        } else {
-            let expected = base
-                .checked_add(page_idx as u64 * PAGE_SIZE)
-                .expect("sched: stack address overflow");
-            assert_eq!(
-                virt, expected,
-                "sched: expected contiguous stack pages during bootstrap"
-            );
-        }
-    }
-
-    let top = base
-        .checked_add(KSTACK_PAGES as u64 * PAGE_SIZE)
-        .expect("sched: stack top overflow");
-    (base, top)
 }
 
 pub(crate) extern "C" fn idle_task() -> ! {

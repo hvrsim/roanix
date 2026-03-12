@@ -1,10 +1,14 @@
 //!
 //! # Scheduler
 //!
-//! Early FreeBSD ULE-inspired kernel scheduler for Roanix.
+//! FreeBSD ULE-inspired kernel scheduler with per-CPU run queues and stealing.
 //!
 
-use core::{array, ptr};
+use alloc::{boxed::Box, vec::Vec};
+use core::{
+    array, ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use intrusive_collections::LinkedList;
 use log::info;
@@ -13,8 +17,11 @@ use crate::{
     arch,
     sys::{
         clock,
-        smp::IrqSpinLock,
-        thread::{allocate_thread, idle_task, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState},
+        smp::{self, IrqSpinLock},
+        thread::{
+            allocate_thread, idle_task, Thread, ThreadAdapter, ThreadClass, ThreadFlags,
+            ThreadState,
+        },
     },
 };
 
@@ -30,8 +37,7 @@ const MIN_INTERACT: u8 = MIN_TIMESHARE;
 const MIN_BATCH: u8 = MIN_TIMESHARE + 48;
 
 const MAX_ITHD: u8 = 15;
-const MAX_TIMESHARE: u8 = MIN_IDLE - 1;
-const MAX_BATCH: u8 = MAX_TIMESHARE;
+const MAX_BATCH: u8 = MIN_IDLE - 1;
 const MAX_INTERACT: u8 = MIN_INTERACT + 48 - 1;
 const MAX_IDLE: u8 = 255;
 
@@ -54,7 +60,7 @@ const SCHED_PRI_CPU_RANGE: u32 = PRI_BATCH_RANGE as u32 - SCHED_PRI_NRESV;
 const SRQ_BORROWING: u32 = 1 << 0;
 const SRQ_PREEMPTED: u32 = 1 << 1;
 
-static SCHEDULER: IrqSpinLock<Option<Scheduler>> = IrqSpinLock::new(None);
+static SCHEDULER: IrqSpinLock<Option<&'static Scheduler>> = IrqSpinLock::new(None);
 
 struct RunQueue {
     bits: [u64; 4],
@@ -102,13 +108,17 @@ impl RunQueue {
                 return Some(unsafe { &*(thread as *const Thread) });
             }
         }
+
         None
     }
 
     fn first_timeshare(&self, off: u8) -> Option<&'static Thread> {
         let start = MIN_BATCH.saturating_add(off);
-        self.first_in_range(start, MAX_BATCH)
-            .or_else(|| (off != 0).then(|| self.first_in_range(MIN_BATCH, start - 1)).flatten())
+        self.first_in_range(start, MAX_BATCH).or_else(|| {
+            (off != 0)
+                .then(|| self.first_in_range(MIN_BATCH, start - 1))
+                .flatten()
+        })
     }
 
     fn has_runnable(&self) -> bool {
@@ -117,38 +127,34 @@ impl RunQueue {
 }
 
 struct CpuQueue {
-    id: usize,
     runq: RunQueue,
     current: *mut Thread,
     idle: *mut Thread,
+    online: bool,
     load: usize,
     sysload: usize,
     lowpri: u8,
     ts_off: u8,
     ts_deq_off: u8,
     ts_ticks: u8,
-    switchcnt: u16,
-    oldswitchcnt: u16,
     need_resched: bool,
 }
 
 unsafe impl Send for CpuQueue {}
 
 impl CpuQueue {
-    fn new(id: usize) -> Self {
+    fn new(_id: usize) -> Self {
         Self {
-            id,
             runq: RunQueue::new(),
             current: ptr::null_mut(),
             idle: ptr::null_mut(),
+            online: _id == 0,
             load: 0,
             sysload: 0,
             lowpri: MAX_IDLE,
             ts_off: 0,
             ts_deq_off: 0,
             ts_ticks: 0,
-            switchcnt: 0,
-            oldswitchcnt: 0,
             need_resched: false,
         }
     }
@@ -165,11 +171,9 @@ impl CpuQueue {
     }
 
     fn choose_or_idle(&self) -> *mut Thread {
-        if let Some(thread) = self.choose() {
-            thread as *const Thread as *mut Thread
-        } else {
-            self.idle
-        }
+        self.choose()
+            .map(|thread| thread as *const Thread as *mut Thread)
+            .unwrap_or(self.idle)
     }
 
     fn dequeue(&mut self, thread: &'static Thread) {
@@ -189,6 +193,22 @@ impl CpuQueue {
         if counted {
             self.load += 1;
             self.sysload += 1;
+        }
+    }
+
+    fn migrate_in(&mut self, thread: &'static mut Thread, flags: u32) {
+        let counted = !thread.flags.contains(ThreadFlags::NOLOAD);
+        self.enqueue(thread, flags);
+        if counted {
+            self.load += 1;
+            self.sysload += 1;
+        }
+    }
+
+    fn migrate_out(&mut self, thread: &Thread) {
+        if !thread.flags.contains(ThreadFlags::NOLOAD) {
+            self.load = self.load.saturating_sub(1);
+            self.sysload = self.sysload.saturating_sub(1);
         }
     }
 
@@ -228,10 +248,7 @@ impl CpuQueue {
                 current_empty = false;
             } else if self
                 .runq
-                .first_in_range(
-                    MIN_BATCH + self.ts_deq_off,
-                    MIN_BATCH + self.ts_deq_off,
-                )
+                .first_in_range(MIN_BATCH + self.ts_deq_off, MIN_BATCH + self.ts_deq_off)
                 .is_some()
             {
                 break;
@@ -258,69 +275,76 @@ impl CpuQueue {
 
     fn refresh_lowpri(&mut self) {
         let current = unsafe { self.current.as_ref() };
-        let candidate = self.choose().map(|thread| thread.priority).unwrap_or(MAX_IDLE);
+        let candidate = self
+            .choose()
+            .map(|thread| thread.priority)
+            .unwrap_or(MAX_IDLE);
         self.lowpri = current
             .map(|thread| thread.priority.min(candidate))
             .unwrap_or(candidate);
     }
+
+    fn steal_candidate(&self) -> Option<*mut Thread> {
+        self.runq
+            .first_in_range(MIN_INTERACT, MAX_INTERACT)
+            .or_else(|| self.runq.first_timeshare(self.ts_deq_off))
+            .map(|thread| thread as *const Thread as *mut Thread)
+    }
 }
 
 struct Scheduler {
-    cpu: CpuQueue,
-    next_tid: usize,
+    cpus: Box<[IrqSpinLock<CpuQueue>]>,
+    next_tid: AtomicUsize,
     realstathz: u32,
     tickincr: u32,
     sched_slice: u32,
     sched_slice_min: u32,
-    global_ticks: u64,
 }
 
-unsafe impl Send for Scheduler {}
-
 impl Scheduler {
-    fn new() -> Self {
+    fn new(cpu_count: usize) -> Self {
         let realstathz = (1_000_000_000u64 / clock::STAT_INTERVAL_NS) as u32;
         let sched_slice = (realstathz / SCHED_SLICE_DEFAULT_DIVISOR).max(1);
         let sched_slice_min = (sched_slice / SCHED_SLICE_MIN_DIVISOR).max(1);
         let tickincr = 1 << SCHED_TICK_SHIFT;
+        let mut cpus = Vec::with_capacity(cpu_count);
+
+        for id in 0..cpu_count {
+            cpus.push(IrqSpinLock::new(CpuQueue::new(id)));
+        }
 
         Self {
-            cpu: CpuQueue::new(0),
-            next_tid: 1,
+            cpus: cpus.into_boxed_slice(),
+            next_tid: AtomicUsize::new(1),
             realstathz,
             tickincr,
             sched_slice,
             sched_slice_min,
-            global_ticks: 0,
         }
     }
 
-    fn bootstrap(&mut self) {
-        let idle = self.alloc_thread(
-            ThreadClass::Idle,
-            MAX_IDLE,
-            ThreadFlags::IDLE | ThreadFlags::NOLOAD,
-            || idle_task(),
-        );
-        let init = self.alloc_thread(
-            ThreadClass::Timeshare,
-            MIN_INTERACT,
-            ThreadFlags::empty(),
-            || {
-                info!("sched: init thread online");
-                loop {
-                    core::hint::spin_loop();
-                }
-            },
-        );
+    fn bootstrap(&self) {
+        for cpu_id in 0..self.cpus.len() {
+            let idle = self.alloc_thread(
+                cpu_id,
+                ThreadClass::Idle,
+                MAX_IDLE,
+                ThreadFlags::IDLE | ThreadFlags::NOLOAD,
+                || idle_task(),
+            );
+            let mut cpu = self.cpu(cpu_id).lock();
+            cpu.set_idle(idle);
+            cpu.refresh_lowpri();
+        }
+    }
 
-        self.cpu.set_idle(idle);
-        self.cpu.enqueue_new(init, 0);
-        self.cpu.refresh_lowpri();
+    fn cpu(&self, id: usize) -> &IrqSpinLock<CpuQueue> {
+        &self.cpus[id]
     }
 
     fn alloc_thread<F, R>(
-        &mut self,
+        &self,
+        cpu_id: usize,
         class: ThreadClass,
         priority: u8,
         flags: ThreadFlags,
@@ -329,13 +353,11 @@ impl Scheduler {
     where
         F: FnOnce() -> R + Send + 'static,
     {
-        let tid = self.next_tid;
-        self.next_tid += 1;
-
+        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
         allocate_thread(
             tid,
-            self.cpu.id,
-            self.global_ticks,
+            cpu_id,
+            clock::global_ticks(),
             class,
             priority,
             flags,
@@ -343,74 +365,97 @@ impl Scheduler {
         )
     }
 
-    fn spawn<F, R>(&mut self, task: F) -> usize
+    fn pick_spawn_cpu(&self) -> usize {
+        let preferred = arch::thiscpu_opt().map(|cpu| cpu.id).unwrap_or(0);
+        let mut best_id = 0usize;
+        let mut best_load = usize::MAX;
+
+        for id in 0..self.cpus.len() {
+            let cpu = self.cpu(id).lock();
+            if !cpu.online {
+                continue;
+            }
+
+            let better = cpu.load < best_load || (cpu.load == best_load && id == preferred);
+            if better {
+                best_id = id;
+                best_load = cpu.load;
+            }
+        }
+
+        best_id
+    }
+
+    fn spawn<F, R>(&self, task: F) -> usize
     where
         F: FnOnce() -> R + Send + 'static,
     {
-        let thread = self.alloc_thread(
+        self.spawn_on(
+            self.pick_spawn_cpu(),
             ThreadClass::Timeshare,
             MIN_INTERACT,
-            ThreadFlags::empty(),
             task,
-        );
-        let tid = thread.id;
-        let priority = thread.priority;
-        self.cpu.enqueue_new(thread, 0);
-
-        if let Some(current) = unsafe { self.cpu.current.as_ref() } {
-            if should_preempt(priority, current.priority) {
-                self.cpu.need_resched = true;
-            }
-        }
-        self.cpu.refresh_lowpri();
-        tid
+        )
     }
 
-    fn spawn_ithread<F, R>(&mut self, task: F, arg: u64) -> usize
+    fn spawn_ithread<F, R>(&self, task: F, arg: u64) -> usize
     where
         F: FnOnce(u64) -> R + Send + 'static,
     {
-        let thread = self.alloc_thread(
+        self.spawn_on(
+            self.pick_spawn_cpu(),
             ThreadClass::Ithread,
             MAX_ITHD,
-            ThreadFlags::empty(),
             move || task(arg),
-        );
+        )
+    }
+
+    fn spawn_on<F, R>(&self, cpu_id: usize, class: ThreadClass, priority: u8, task: F) -> usize
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let thread = self.alloc_thread(cpu_id, class, priority, ThreadFlags::empty(), task);
         let tid = thread.id;
         let priority = thread.priority;
-        self.cpu.enqueue_new(thread, 0);
+        let current_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
+        let mut kick_remote = false;
+        let mut cpu = self.cpu(cpu_id).lock();
+        cpu.enqueue_new(thread, 0);
 
-        if let Some(current) = unsafe { self.cpu.current.as_ref() } {
+        if let Some(current) = unsafe { cpu.current.as_ref() } {
             if should_preempt(priority, current.priority) {
-                self.cpu.need_resched = true;
+                cpu.need_resched = true;
             }
         }
-        self.cpu.refresh_lowpri();
+        if cpu.online && current_cpu != Some(cpu_id) {
+            kick_remote = true;
+        }
+        cpu.refresh_lowpri();
+        drop(cpu);
+
+        if kick_remote {
+            smp::send_ipi(cpu_id);
+        }
         tid
     }
 
-    fn on_tick(&mut self, global: u64) {
-        self.global_ticks = global;
-
-        let current = unsafe { self.cpu.current.as_mut() };
+    fn on_tick(&self, cpu_id: usize, global: u64) {
+        let mut cpu = self.cpu(cpu_id).lock();
+        let current = unsafe { cpu.current.as_mut() };
         let Some(current) = current else {
             return;
         };
 
-        self.cpu.oldswitchcnt = self.cpu.switchcnt;
-        self.cpu.switchcnt = self.cpu.load as u16;
-
-        if self.cpu.ts_off == self.cpu.ts_deq_off {
-            self.cpu.ts_ticks = self.cpu.ts_ticks.wrapping_add(1);
-            let advance = 2u16 - (self.cpu.ts_ticks / 4) as u16;
-            self.cpu.ts_off =
-                ((self.cpu.ts_off as u16 + advance) % PRI_BATCH_RANGE as u16) as u8;
-            self.cpu.ts_ticks %= 4;
-            self.cpu.advance_ts_deq_off(false);
+        if cpu.ts_off == cpu.ts_deq_off {
+            cpu.ts_ticks = cpu.ts_ticks.wrapping_add(1);
+            let advance = 2u16 - (cpu.ts_ticks / 4) as u16;
+            cpu.ts_off = ((cpu.ts_off as u16 + advance) % PRI_BATCH_RANGE as u16) as u8;
+            cpu.ts_ticks %= 4;
+            cpu.advance_ts_deq_off(false);
         }
 
         current.rltick = global;
-        self.pctcpu_update(current, true);
+        self.pctcpu_update(current, global, true);
 
         match current.class {
             ThreadClass::Timeshare => {
@@ -422,91 +467,215 @@ impl Scheduler {
         }
 
         if current.flags.contains(ThreadFlags::IDLE) {
-            if self.cpu.runq.has_runnable() {
-                self.cpu.need_resched = true;
-            }
-            self.cpu.refresh_lowpri();
+            cpu.need_resched = true;
+            cpu.refresh_lowpri();
             return;
         }
 
         current.slice = current.slice.saturating_add(1);
-        if current.slice >= self.cpu.slice_for(current, self.sched_slice, self.sched_slice_min) {
+        if current.slice >= cpu.slice_for(current, self.sched_slice, self.sched_slice_min) {
             current.slice = 0;
             current.flags.insert(ThreadFlags::SLICEEND);
-            self.cpu.need_resched = true;
+            cpu.need_resched = true;
         }
 
-        if let Some(best) = self.cpu.choose() {
+        if let Some(best) = cpu.choose() {
             if should_preempt(best.priority, current.priority) {
-                self.cpu.need_resched = true;
+                cpu.need_resched = true;
             }
         }
 
-        self.cpu.refresh_lowpri();
+        cpu.refresh_lowpri();
     }
 
-    fn trap_return(&mut self, frame: &mut TrapFrame) -> *mut TrapFrame {
-        let current = unsafe { self.cpu.current.as_mut() };
-        let Some(current) = current else {
-            return frame;
-        };
-
-        current.frame = frame;
-
-        let must_switch = self.cpu.need_resched
-            || (current.flags.contains(ThreadFlags::IDLE) && self.cpu.runq.has_runnable());
-        if !must_switch {
-            self.cpu.refresh_lowpri();
-            return frame;
-        }
-
-        self.cpu.need_resched = false;
-
-        if !current.flags.contains(ThreadFlags::IDLE) {
-            let flags = if current.flags.contains(ThreadFlags::SLICEEND) {
-                current.flags.remove(ThreadFlags::SLICEEND);
-                SRQ_PREEMPTED
-            } else {
-                0
+    fn trap_return(&self, cpu_id: usize, frame: &mut TrapFrame) -> *mut TrapFrame {
+        {
+            let mut cpu = self.cpu(cpu_id).lock();
+            let current = unsafe { cpu.current.as_mut() };
+            let Some(current) = current else {
+                return frame;
             };
-            self.cpu.requeue_running(current, flags);
+
+            current.frame = frame;
+
+            let must_switch = cpu.need_resched
+                || (current.flags.contains(ThreadFlags::IDLE) && cpu.runq.has_runnable());
+            if !must_switch {
+                cpu.refresh_lowpri();
+                return frame;
+            }
+
+            cpu.need_resched = false;
+
+            if !current.flags.contains(ThreadFlags::IDLE) {
+                let flags = if current.flags.contains(ThreadFlags::SLICEEND) {
+                    current.flags.remove(ThreadFlags::SLICEEND);
+                    SRQ_PREEMPTED
+                } else {
+                    0
+                };
+                cpu.requeue_running(current, flags);
+            }
         }
 
-        let next_ptr = self.cpu.choose_or_idle();
+        let need_steal = {
+            let cpu = self.cpu(cpu_id).lock();
+            let current_idle = unsafe { cpu.current.as_ref() }
+                .map(|thread| thread.flags.contains(ThreadFlags::IDLE))
+                .unwrap_or(false);
+            current_idle && !cpu.runq.has_runnable()
+        };
+        if need_steal {
+            let _ = self.try_steal(cpu_id);
+        }
+
+        let mut cpu = self.cpu(cpu_id).lock();
+        let next_ptr = cpu.choose_or_idle();
         let next = unsafe { &mut *next_ptr };
         if !next.flags.contains(ThreadFlags::IDLE) {
-            self.cpu.dequeue(unsafe { &*next_ptr });
+            cpu.dequeue(unsafe { &*next_ptr });
         }
 
         next.state = ThreadState::Running;
-        next.cpu = self.cpu.id;
-        next.rltick = self.global_ticks;
-        self.cpu.current = next;
-        self.cpu.refresh_lowpri();
-        self.activate_current(next);
+        next.cpu = cpu_id;
+        next.rltick = clock::global_ticks();
+        cpu.current = next;
+        cpu.refresh_lowpri();
+        let frame = next.frame;
+        drop(cpu);
 
-        next.frame
+        self.activate_current(next);
+        frame
     }
 
-    fn start(&mut self) -> ! {
-        let next_ptr = self.cpu.choose_or_idle();
+    fn start_cpu(&self, cpu_id: usize) -> ! {
+        arch::irqset(false);
+        {
+            let mut cpu = self.cpu(cpu_id).lock();
+            cpu.online = true;
+        }
+
+        let _ = self.try_steal(cpu_id);
+
+        let mut cpu = self.cpu(cpu_id).lock();
+        let next_ptr = cpu.choose_or_idle();
         let next = unsafe { &mut *next_ptr };
         if !next.flags.contains(ThreadFlags::IDLE) {
-            self.cpu.dequeue(unsafe { &*next_ptr });
+            cpu.dequeue(unsafe { &*next_ptr });
         }
 
         next.state = ThreadState::Running;
-        self.cpu.current = next;
-        self.cpu.refresh_lowpri();
-        self.activate_current(next);
+        next.cpu = cpu_id;
+        next.rltick = clock::global_ticks();
+        cpu.current = next;
+        cpu.refresh_lowpri();
+        drop(cpu);
 
+        self.activate_current(next);
         unsafe { crate::arch::cpu::start_first_thread(next.frame) }
+    }
+
+    fn exit_current(&self, cpu_id: usize) -> ! {
+        arch::irqset(false);
+        {
+            let mut cpu = self.cpu(cpu_id).lock();
+            let current =
+                unsafe { cpu.current.as_mut() }.expect("sched: no current thread to exit");
+            assert!(
+                !current.flags.contains(ThreadFlags::IDLE),
+                "sched: idle thread exited"
+            );
+
+            current.state = ThreadState::Exited;
+            if !current.flags.contains(ThreadFlags::NOLOAD) {
+                cpu.load = cpu.load.saturating_sub(1);
+                cpu.sysload = cpu.sysload.saturating_sub(1);
+            }
+            cpu.current = ptr::null_mut();
+            cpu.need_resched = false;
+            cpu.refresh_lowpri();
+        }
+
+        let _ = self.try_steal(cpu_id);
+
+        let mut cpu = self.cpu(cpu_id).lock();
+        let next_ptr = cpu.choose_or_idle();
+        let next = unsafe { &mut *next_ptr };
+        if !next.flags.contains(ThreadFlags::IDLE) {
+            cpu.dequeue(unsafe { &*next_ptr });
+        }
+
+        next.state = ThreadState::Running;
+        next.cpu = cpu_id;
+        next.rltick = clock::global_ticks();
+        cpu.current = next;
+        cpu.refresh_lowpri();
+        drop(cpu);
+
+        self.activate_current(next);
+        unsafe { crate::arch::cpu::start_first_thread(next.frame) }
+    }
+
+    fn try_steal(&self, dst_id: usize) -> bool {
+        for src_id in 0..self.cpus.len() {
+            if src_id == dst_id {
+                continue;
+            }
+
+            let (mut a, mut b) = if dst_id < src_id {
+                (self.cpu(dst_id).lock(), self.cpu(src_id).lock())
+            } else {
+                (self.cpu(src_id).lock(), self.cpu(dst_id).lock())
+            };
+
+            let (dst, src) = if dst_id < src_id {
+                (&mut *a, &mut *b)
+            } else {
+                (&mut *b, &mut *a)
+            };
+
+            if !dst.online || !src.online || src.load <= dst.load + 1 {
+                continue;
+            }
+            if dst.runq.has_runnable() {
+                return true;
+            }
+
+            let Some(candidate_ptr) = src.steal_candidate() else {
+                continue;
+            };
+
+            let candidate = unsafe { &*candidate_ptr };
+            src.dequeue(candidate);
+            src.migrate_out(candidate);
+
+            let thread = unsafe { &mut *candidate_ptr };
+            let priority = thread.priority;
+            thread.cpu = dst_id;
+            dst.migrate_in(thread, SRQ_BORROWING);
+
+            if let Some(current) = unsafe { dst.current.as_ref() } {
+                if should_preempt(priority, current.priority) {
+                    dst.need_resched = true;
+                }
+            }
+
+            src.refresh_lowpri();
+            dst.refresh_lowpri();
+            return true;
+        }
+
+        false
     }
 
     fn activate_current(&self, thread: &Thread) {
         let cpu = arch::thiscpu();
         cpu.kernel_stack = thread.stack_top.as_u64();
         cpu.user_stack = 0;
+        cpu.current_thread = thread.id;
+        unsafe {
+            crate::arch::cpu::prepare_thread_frame(thread.frame);
+        }
     }
 
     fn interact_score(&self, thread: &Thread) -> u32 {
@@ -542,15 +711,13 @@ impl Scheduler {
             .saturating_add((thread.nice as i32).max(0) as u32);
         let priority = if score < SCHED_INTERACT_THRESH {
             MIN_INTERACT
-                + (((MAX_INTERACT - MIN_INTERACT + 1) as u32 * score) / SCHED_INTERACT_THRESH)
-                    as u8
+                + (((MAX_INTERACT - MIN_INTERACT + 1) as u32 * score) / SCHED_INTERACT_THRESH) as u8
         } else {
             let len = tick_length(thread).max(1);
-            let cpu_pri_off = ((((SCHED_PRI_CPU_RANGE - 1) as u64 * thread.ticks as u64)
-                + len / 2)
-                / len
-                + (1u64 << SCHED_TICK_SHIFT) / 2)
-                >> SCHED_TICK_SHIFT;
+            let cpu_pri_off =
+                ((((SCHED_PRI_CPU_RANGE - 1) as u64 * thread.ticks as u64) + len / 2) / len
+                    + (1u64 << SCHED_TICK_SHIFT) / 2)
+                    >> SCHED_TICK_SHIFT;
             let nice_off = (((thread.nice as i32 - PRIO_MIN) as u32) * 5) / 4;
             (MIN_BATCH as u32 + cpu_pri_off.min((SCHED_PRI_CPU_RANGE - 1) as u64) as u32 + nice_off)
                 .min(MAX_BATCH as u32) as u8
@@ -588,13 +755,11 @@ impl Scheduler {
         thread.slptime = (thread.slptime / 5) * 4;
     }
 
-    fn pctcpu_update(&self, thread: &mut Thread, run: bool) {
-        let t = self.global_ticks;
+    fn pctcpu_update(&self, thread: &mut Thread, global: u64, run: bool) {
         let t_max = self.realstathz as u64 * SCHED_TICK_SECS;
-        let t_tgt =
-            (((t_max << SCHED_TICK_SHIFT) * SCHED_CPU_DECAY_NUMER) / SCHED_CPU_DECAY_DENOM)
-                >> SCHED_TICK_SHIFT;
-        let lu_span = t.saturating_sub(thread.ltick);
+        let t_tgt = (((t_max << SCHED_TICK_SHIFT) * SCHED_CPU_DECAY_NUMER) / SCHED_CPU_DECAY_DENOM)
+            >> SCHED_TICK_SHIFT;
+        let lu_span = global.saturating_sub(thread.ltick);
 
         if lu_span >= t_tgt {
             thread.ticks = if run {
@@ -602,17 +767,16 @@ impl Scheduler {
             } else {
                 0
             };
-            thread.ftick = t.saturating_sub(t_tgt);
-            thread.ltick = t;
+            thread.ftick = global.saturating_sub(t_tgt);
+            thread.ltick = global;
             return;
         }
 
-        if t.saturating_sub(thread.ftick) >= t_max {
+        if global.saturating_sub(thread.ftick) >= t_max {
             let len = tick_length(thread).max(1);
-            thread.ticks =
-                ((thread.ticks as u64 / len) * t_tgt.saturating_sub(lu_span)).min(u32::MAX as u64)
-                    as u32;
-            thread.ftick = t.saturating_sub(t_tgt);
+            thread.ticks = ((thread.ticks as u64 / len) * t_tgt.saturating_sub(lu_span))
+                .min(u32::MAX as u64) as u32;
+            thread.ftick = global.saturating_sub(t_tgt);
         }
 
         if run {
@@ -620,7 +784,7 @@ impl Scheduler {
                 .ticks
                 .saturating_add((lu_span << SCHED_TICK_SHIFT).min(u32::MAX as u64) as u32);
         }
-        thread.ltick = t;
+        thread.ltick = global;
     }
 }
 
@@ -644,60 +808,59 @@ fn should_preempt(pri: u8, current: u8) -> bool {
     pri <= MAX_INTERACT && current > MAX_INTERACT
 }
 
+fn scheduler() -> &'static Scheduler {
+    let guard = SCHEDULER.lock();
+    guard.as_ref().copied().expect("sched: init before use")
+}
+
 pub fn init() {
     let mut guard = SCHEDULER.lock();
     if guard.is_some() {
         return;
     }
 
-    let mut scheduler = Scheduler::new();
+    let scheduler = Box::leak(Box::new(Scheduler::new(smp::cpu_count())));
     scheduler.bootstrap();
 
     info!(
-        "sched: ULE bootstrap ready (slice={} ticks, min_slice={} ticks)",
-        scheduler.sched_slice, scheduler.sched_slice_min
+        "sched: ULE ready on {} CPU(s) (slice={} ticks, min_slice={} ticks)",
+        scheduler.cpus.len(),
+        scheduler.sched_slice,
+        scheduler.sched_slice_min
     );
     *guard = Some(scheduler);
 }
 
 pub fn start() -> ! {
-    let mut guard = SCHEDULER.lock();
-    guard.as_mut().expect("sched: init before start").start()
+    scheduler().start_cpu(0)
+}
+
+pub fn start_secondary() -> ! {
+    scheduler().start_cpu(arch::thiscpu().id)
 }
 
 pub fn run<F, R>(task: F) -> usize
 where
     F: FnOnce() -> R + Send + 'static,
 {
-    let mut guard = SCHEDULER.lock();
-    guard
-        .as_mut()
-        .expect("sched: init before run")
-        .spawn(task)
+    scheduler().spawn(task)
 }
 
 pub fn create_ithread<F, R>(task: F, arg: u64) -> usize
 where
     F: FnOnce(u64) -> R + Send + 'static,
 {
-    let mut guard = SCHEDULER.lock();
-    guard
-        .as_mut()
-        .expect("sched: init before create_ithread")
-        .spawn_ithread(task, arg)
+    scheduler().spawn_ithread(task, arg)
+}
+
+pub fn exit_current() -> ! {
+    scheduler().exit_current(arch::thiscpu().id)
 }
 
 pub fn stat_tick(global: u64, _percpu: u64) {
-    let mut guard = SCHEDULER.lock();
-    if let Some(scheduler) = guard.as_mut() {
-        scheduler.on_tick(global);
-    }
+    scheduler().on_tick(arch::thiscpu().id, global);
 }
 
 pub fn trap_return(frame: &mut TrapFrame) -> *mut TrapFrame {
-    let mut guard = SCHEDULER.lock();
-    match guard.as_mut() {
-        Some(scheduler) => scheduler.trap_return(frame),
-        None => frame,
-    }
+    scheduler().trap_return(arch::thiscpu().id, frame)
 }

@@ -25,9 +25,6 @@ pub static GLOBAL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Whether the periodic statistics timer is armed.
 static CLOCK_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Absolute nanosecond deadline for the next statistics callback.
-static NEXT_STAT_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
-
 /// Monotonic counter source used for timekeeping and delays.
 pub trait ClockSource: Sync {
     /// Human-readable source name.
@@ -126,23 +123,27 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 
 /// Starts periodic statistics delivery using one-shot deadlines.
 pub fn start() {
-    if CLOCK_STARTED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-
-    let next = monotonic_ns().saturating_add(STAT_INTERVAL_NS);
-    NEXT_STAT_DEADLINE_NS.store(next, Ordering::Release);
-    program_deadline(next);
+    let _ = CLOCK_STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    start_secondary();
 }
 
 /// Stops timer delivery if an event timer is active.
 pub fn stop() {
     CLOCK_STARTED.store(false, Ordering::Release);
-    NEXT_STAT_DEADLINE_NS.store(0, Ordering::Release);
+    arch::thiscpu().next_stat_deadline_ns = 0;
     event_timer().stop();
+}
+
+/// Arms timer delivery for the current CPU if the global clock is active.
+pub fn start_secondary() {
+    if !CLOCK_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+
+    let next = monotonic_ns().saturating_add(STAT_INTERVAL_NS);
+    let cpu = arch::thiscpu();
+    cpu.next_stat_deadline_ns = next;
+    program_deadline(next);
 }
 
 /// Busy-waits for the requested duration using the active clocksource.
@@ -188,7 +189,8 @@ pub fn handle_timer_interrupt() {
     }
 
     let now = monotonic_ns();
-    let mut next = NEXT_STAT_DEADLINE_NS.load(Ordering::Acquire);
+    let cpu = arch::thiscpu();
+    let mut next = cpu.next_stat_deadline_ns;
     let mut fired = 0u64;
 
     if next == 0 {
@@ -204,9 +206,7 @@ pub fn handle_timer_interrupt() {
         fired = 1;
     }
 
-    NEXT_STAT_DEADLINE_NS.store(next, Ordering::Release);
-
-    let cpu = arch::thiscpu();
+    cpu.next_stat_deadline_ns = next;
     cpu.ticks = cpu.ticks.wrapping_add(fired);
     let global = GLOBAL_TICKS.fetch_add(fired, Ordering::Relaxed);
 
