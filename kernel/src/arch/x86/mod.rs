@@ -53,6 +53,10 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
         unsafe {
             dbgcon_e9.write(byte);
 
+            if byte == b'\n' {
+                while status.read() & 0x20 == 0 {}
+                com1.write(b'\r');
+            }
             while status.read() & 0x20 == 0 {}
             com1.write(byte);
         }
@@ -61,6 +65,8 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     unsafe {
         dbgcon_e9.write(b'\n');
 
+        while status.read() & 0x20 == 0 {}
+        com1.write(b'\r');
         while status.read() & 0x20 == 0 {}
         com1.write(b'\n');
     }

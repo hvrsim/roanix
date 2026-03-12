@@ -2,18 +2,26 @@
 //! # Kernel Timekeeping
 //!
 //! FreeBSD-inspired split between clocksources (timekeeping) and event timers
-//! (interrupt delivery).
+//! (interrupt delivery). This also owns the per-CPU sleep timer queues used to
+//! block threads until a deadline expires.
 //!
 
+use alloc::{boxed::Box, vec::Vec};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
+use intrusive_collections::{intrusive_adapter, KeyAdapter, RBTree, RBTreeLink, UnsafeRef};
 use log::info;
+use spin::Once;
 
 use crate::{
     arch,
-    sys::{sched, smp::IrqSpinLock},
+    sys::{
+        sched,
+        smp::{self, IrqSpinLock},
+        thread::Thread,
+    },
 };
 
 /// Interval for the dummy scheduler statistics callback.
@@ -64,6 +72,7 @@ struct ClockState {
 }
 
 static CLOCK_STATE: IrqSpinLock<ClockState> = IrqSpinLock::new(ClockState::new());
+static TIMER_CPUS: Once<&'static [IrqSpinLock<TimerCpuState>]> = Once::new();
 
 impl ClockState {
     const fn new() -> Self {
@@ -71,6 +80,109 @@ impl ClockState {
             active_clocksource: None,
             event_timer: None,
         }
+    }
+}
+
+/// Intrusive sleep timer pinned on the sleeping thread's stack until expiry.
+pub struct Timer {
+    link: RBTreeLink,
+    deadline_ns: u64,
+    order: u64,
+    thread: *mut Thread,
+}
+
+unsafe impl Send for Timer {}
+unsafe impl Sync for Timer {}
+
+intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });
+
+impl<'a> KeyAdapter<'a> for TimerAdapter {
+    type Key = (u64, u64);
+
+    fn get_key(&self, timer: &'a Timer) -> Self::Key {
+        (timer.deadline_ns, timer.order)
+    }
+}
+
+struct TimerCpuState {
+    next_order: u64,
+    next_deadline_ns: u64,
+    timers: RBTree<TimerAdapter>,
+}
+
+impl Timer {
+    /// Creates a one-shot sleep timer for `thread`.
+    const fn new(thread: *mut Thread, deadline_ns: u64) -> Self {
+        Self {
+            link: RBTreeLink::new(),
+            deadline_ns,
+            order: 0,
+            thread,
+        }
+    }
+}
+
+impl TimerCpuState {
+    fn new() -> Self {
+        Self {
+            next_order: 0,
+            next_deadline_ns: 0,
+            timers: RBTree::new(TimerAdapter::new()),
+        }
+    }
+
+    /// Inserts a timer and refreshes the cached earliest deadline.
+    fn insert(&mut self, timer: &mut Timer) {
+        timer.order = self.next_order;
+        self.next_order = self.next_order.wrapping_add(1);
+        self.timers
+            .insert(unsafe { UnsafeRef::from_raw(timer as *const Timer) });
+        self.refresh_deadline();
+    }
+
+    /// Removes a timer if it is still armed.
+    fn cancel(&mut self, timer: *const Timer) -> bool {
+        if unsafe { !(*timer).link.is_linked() } {
+            return false;
+        }
+
+        unsafe {
+            self.timers.cursor_mut_from_ptr(timer).remove();
+        }
+        self.refresh_deadline();
+        true
+    }
+
+    /// Wakes every timer whose deadline has passed and returns the next one.
+    fn expire(&mut self, now_ns: u64) -> u64 {
+        loop {
+            let expired = match self.timers.front().get() {
+                Some(timer) if timer.deadline_ns <= now_ns => timer as *const Timer,
+                Some(timer) => {
+                    self.next_deadline_ns = timer.deadline_ns;
+                    return timer.deadline_ns;
+                }
+                None => {
+                    self.next_deadline_ns = 0;
+                    return 0;
+                }
+            };
+
+            let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
+                .expect("clock: timer tree cursor lost armed timer");
+            unsafe {
+                sched::wake(&mut *timer.thread);
+            }
+        }
+    }
+
+    fn refresh_deadline(&mut self) {
+        self.next_deadline_ns = self
+            .timers
+            .front()
+            .get()
+            .map(|timer| timer.deadline_ns)
+            .unwrap_or(0);
     }
 }
 
@@ -136,6 +248,7 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 
 /// Starts periodic statistics delivery using one-shot deadlines.
 pub fn start() {
+    let _ = timer_cpus();
     let _ = CLOCK_STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
     start_secondary();
 }
@@ -156,12 +269,17 @@ pub fn start_secondary() {
     let next = monotonic_ns().saturating_add(STAT_INTERVAL_NS);
     let cpu = arch::thiscpu();
     cpu.next_stat_deadline_ns = next;
-    program_deadline(next);
+    program_local_deadline(local_timer_deadline(cpu.id));
 }
 
 /// Busy-waits for the requested duration using the active clocksource.
 pub fn delay(duration: Duration) {
     delay_ns(duration_to_ns(duration));
+}
+
+/// Puts the current thread to sleep for at least the requested duration.
+pub fn sleep(duration: Duration) {
+    sleep_ns(duration_to_ns(duration));
 }
 
 /// Busy-waits for `ns` nanoseconds using the active clocksource.
@@ -176,6 +294,41 @@ pub fn delay_ns(ns: u64) {
 
     while source.counter().wrapping_sub(start) < target {
         spin_loop();
+    }
+}
+
+/// Puts the current thread to sleep for at least `ns` nanoseconds.
+pub fn sleep_ns(ns: u64) {
+    if ns == 0 {
+        return;
+    }
+
+    if !CLOCK_STARTED.load(Ordering::Acquire) {
+        delay_ns(ns);
+        return;
+    }
+
+    let cpu_id = arch::thiscpu().id;
+    let current = sched::current_thread() as *mut Thread;
+    let mut timer = Timer::new(current, monotonic_ns().saturating_add(ns));
+
+    {
+        let mut timers = timer_cpu(cpu_id).lock();
+        unsafe {
+            (&*current).prepare_park();
+        }
+        timers.insert(&mut timer);
+        program_local_deadline(timers.next_deadline_ns);
+    }
+
+    sched::park_current();
+
+    let removed = {
+        let mut timers = timer_cpu(cpu_id).lock();
+        timers.cancel(&timer as *const Timer)
+    };
+    if removed {
+        program_local_deadline(local_timer_deadline(cpu_id));
     }
 }
 
@@ -203,6 +356,7 @@ pub fn handle_timer_interrupt() {
 
     let now = monotonic_ns();
     let cpu = arch::thiscpu();
+    let cpu_id = cpu.id;
     let mut next = cpu.next_stat_deadline_ns;
     let mut fired = 0u64;
 
@@ -230,11 +384,42 @@ pub fn handle_timer_interrupt() {
         );
     }
 
-    program_deadline(next);
+    let timer_deadline = {
+        let mut timers = timer_cpu(cpu_id).lock();
+        timers.expire(now)
+    };
+    program_local_deadline(timer_deadline);
 }
 
 fn scheduler_stat_tick(global: u64, percpu: u64) {
     sched::stat_tick(global, percpu);
+}
+
+fn timer_cpus() -> &'static [IrqSpinLock<TimerCpuState>] {
+    TIMER_CPUS.call_once(|| {
+        let mut cpus = Vec::with_capacity(smp::cpu_count());
+        for _ in 0..smp::cpu_count() {
+            cpus.push(IrqSpinLock::new(TimerCpuState::new()));
+        }
+        Box::leak(cpus.into_boxed_slice())
+    })
+}
+
+fn timer_cpu(cpu_id: usize) -> &'static IrqSpinLock<TimerCpuState> {
+    &timer_cpus()[cpu_id]
+}
+
+fn local_timer_deadline(cpu_id: usize) -> u64 {
+    timer_cpu(cpu_id).lock().next_deadline_ns
+}
+
+fn program_local_deadline(timer_deadline_ns: u64) {
+    let next = combine_deadlines(arch::thiscpu().next_stat_deadline_ns, timer_deadline_ns);
+    if next == 0 {
+        event_timer().stop();
+    } else {
+        program_deadline(next);
+    }
 }
 
 fn program_deadline(deadline_ns: u64) {
@@ -245,6 +430,15 @@ fn program_deadline(deadline_ns: u64) {
     delay = delay.max(timer.min_period_ns());
     delay = delay.min(timer.max_period_ns());
     timer.set_oneshot(delay);
+}
+
+fn combine_deadlines(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, 0) => 0,
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
+    }
 }
 
 fn clocksource() -> &'static dyn ClockSource {
