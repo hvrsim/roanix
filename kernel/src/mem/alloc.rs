@@ -16,7 +16,7 @@ use log::info;
 use crate::{
     arch,
     mem::{self, pages_for_len, phys, PhysAddr, VirtAddr, VmFlags, PAGE_SIZE},
-    sys::smp::IrqSpinLock,
+    sys::sync::Mutex,
 };
 
 /// Base virtual address for the kernel heap window.
@@ -77,7 +77,7 @@ impl HeapPageMeta {
     };
 }
 
-/// Global allocator state guarded by an IRQ-safe spinlock.
+/// Global allocator state guarded by the kernel heap mutex.
 struct HeapState {
     initialized: bool,
     search_hint: usize,
@@ -420,7 +420,7 @@ impl HeapState {
 /// Global allocator facade wired into Rust's allocation hooks.
 pub struct KernelAllocator;
 
-static HEAP: IrqSpinLock<HeapState> = IrqSpinLock::new(HeapState::new());
+static HEAP: Mutex<HeapState> = Mutex::new(HeapState::new());
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;

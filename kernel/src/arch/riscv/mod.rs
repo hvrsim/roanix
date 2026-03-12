@@ -224,6 +224,13 @@ pub fn send_ipi(cpu_id: usize) {
     assert_eq!(legacy_error, 0, "riscv: SBI send_ipi failed");
 }
 
+/// Forces the current CPU through the scheduler trap path.
+pub fn reschedule() {
+    unsafe {
+        asm!("ebreak", options(nomem, nostack));
+    }
+}
+
 unsafe fn sbicall1(arg0: usize, ext_id: usize, func_id: usize) -> isize {
     let error: isize;
 

@@ -414,7 +414,7 @@ pub unsafe fn enable_features() -> CpuFeatures {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
-    if crate::arch::timer::handle_interrupt(frame.vec) {
+    if crate::arch::timer::handle_interrupt(frame.vec) || frame.vec == 3 {
         return crate::sys::sched::trap_return(frame);
     }
 

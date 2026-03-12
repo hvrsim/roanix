@@ -12,6 +12,7 @@
 //!
 
 use x86_64::addr::VirtAddr;
+use x86_64::instructions::interrupts;
 use x86_64::instructions::{hlt, interrupts as x86_interrupts, port::*};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 
@@ -198,4 +199,9 @@ pub fn wfi() -> ! {
 pub fn send_ipi(cpu_id: usize) {
     let lapic_id = crate::sys::smp::platform_id(cpu_id).expect("x86: invalid CPU ID for IPI");
     lapic::send_ipi(lapic_id as u32);
+}
+
+/// Forces the current CPU through the scheduler trap path.
+pub fn reschedule() {
+    interrupts::int3();
 }

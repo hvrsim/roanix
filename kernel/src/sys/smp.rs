@@ -254,7 +254,9 @@ pub fn start() {
         spin_loop();
     }
 
-    let announced = ONLINE_ORDER_LEN.load(Ordering::Acquire).min(total.saturating_sub(1));
+    let announced = ONLINE_ORDER_LEN
+        .load(Ordering::Acquire)
+        .min(total.saturating_sub(1));
     for idx in 0..announced {
         let id = ONLINE_ORDER[idx].load(Ordering::Acquire);
         if id == usize::MAX {

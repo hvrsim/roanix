@@ -8,7 +8,11 @@ use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error, Layout},
     boxed::Box,
 };
-use core::{mem::size_of, ptr};
+use core::{
+    mem::size_of,
+    ptr,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 use crate::{
     arch,
@@ -33,6 +37,7 @@ pub(crate) enum ThreadClass {
 pub(crate) enum ThreadState {
     Ready,
     Running,
+    Blocked,
     Idle,
     Exited,
 }
@@ -48,6 +53,7 @@ bitflags! {
 
 pub(crate) struct Thread {
     pub(crate) runq_link: LinkedListLink,
+    pub(crate) wait_next: *mut Thread,
     pub(crate) id: usize,
     pub(crate) state: ThreadState,
     pub(crate) class: ThreadClass,
@@ -68,6 +74,7 @@ pub(crate) struct Thread {
     _stack: Box<KernelStack>,
     pub(crate) stack_top: VirtAddr,
     pub(crate) frame: *mut TrapFrame,
+    park_state: AtomicU8,
     task: Box<dyn KernelTask>,
 }
 
@@ -78,6 +85,10 @@ intrusive_adapter!(pub(crate) ThreadAdapter = &'static Thread: Thread { runq_lin
 
 #[repr(align(16))]
 struct KernelStack([u8; KSTACK_SIZE]);
+
+const PARK_STATE_IDLE: u8 = 0;
+const PARK_STATE_WAITING: u8 = 1;
+const PARK_STATE_PARKED: u8 = 2;
 
 trait KernelTask: Send {
     fn run(self: Box<Self>) -> !;
@@ -90,6 +101,27 @@ where
     fn run(self: Box<Self>) -> ! {
         let _ = (*self)();
         crate::sys::sched::exit_current()
+    }
+}
+
+impl Thread {
+    pub(crate) fn prepare_park(&self) {
+        self.park_state.store(PARK_STATE_WAITING, Ordering::Release);
+    }
+
+    pub(crate) fn mark_parked(&self) -> bool {
+        self.park_state
+            .compare_exchange(
+                PARK_STATE_WAITING,
+                PARK_STATE_PARKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn wake(&self) -> bool {
+        self.park_state.swap(PARK_STATE_IDLE, Ordering::AcqRel) == PARK_STATE_PARKED
     }
 }
 
@@ -126,6 +158,7 @@ where
     let frame = frame_addr as *mut TrapFrame;
     let thread = Box::leak(Box::new(Thread {
         runq_link: LinkedListLink::new(),
+        wait_next: ptr::null_mut(),
         id,
         state: if flags.contains(ThreadFlags::IDLE) {
             ThreadState::Idle
@@ -150,6 +183,7 @@ where
         _stack: stack,
         stack_top,
         frame,
+        park_state: AtomicU8::new(PARK_STATE_IDLE),
         task: Box::new(task),
     }));
     unsafe {

@@ -498,7 +498,8 @@ impl Scheduler {
 
             current.frame = frame;
 
-            let must_switch = cpu.need_resched
+            let must_switch = current.state != ThreadState::Running
+                || cpu.need_resched
                 || (current.flags.contains(ThreadFlags::IDLE) && cpu.runq.has_runnable());
             if !must_switch {
                 cpu.refresh_lowpri();
@@ -507,7 +508,7 @@ impl Scheduler {
 
             cpu.need_resched = false;
 
-            if !current.flags.contains(ThreadFlags::IDLE) {
+            if current.state == ThreadState::Running && !current.flags.contains(ThreadFlags::IDLE) {
                 let flags = if current.flags.contains(ThreadFlags::SLICEEND) {
                     current.flags.remove(ThreadFlags::SLICEEND);
                     SRQ_PREEMPTED
@@ -614,6 +615,74 @@ impl Scheduler {
 
         self.activate_current(next);
         unsafe { crate::arch::cpu::start_first_thread(next.frame) }
+    }
+
+    fn current_thread(&self, cpu_id: usize) -> &'static mut Thread {
+        let cpu = self.cpu(cpu_id).lock();
+        let current = cpu.current;
+        drop(cpu);
+
+        assert!(
+            !current.is_null(),
+            "sched: no current thread on cpu {cpu_id}"
+        );
+        unsafe { &mut *current }
+    }
+
+    fn park_current(&self, cpu_id: usize) {
+        {
+            let mut cpu = self.cpu(cpu_id).lock();
+            let current =
+                unsafe { cpu.current.as_mut() }.expect("sched: no current thread to park");
+            assert!(
+                !current.flags.contains(ThreadFlags::IDLE),
+                "sched: idle thread cannot sleep"
+            );
+
+            if !current.mark_parked() {
+                return;
+            }
+
+            current.state = ThreadState::Blocked;
+            cpu.need_resched = true;
+            cpu.refresh_lowpri();
+        }
+
+        arch::reschedule();
+    }
+
+    fn wake_thread(&self, thread: &'static mut Thread) {
+        if !thread.wake() {
+            return;
+        }
+
+        let cpu_id = thread.cpu;
+        let priority = thread.priority;
+        let current_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
+        let mut kick_remote = false;
+        let mut cpu = self.cpu(cpu_id).lock();
+
+        assert_eq!(
+            thread.state,
+            ThreadState::Blocked,
+            "sched: attempted to wake a non-blocked thread"
+        );
+
+        cpu.enqueue(thread, 0);
+        if let Some(current) = unsafe { cpu.current.as_ref() } {
+            if should_preempt(priority, current.priority) {
+                cpu.need_resched = true;
+            }
+        }
+        if cpu.online && current_cpu != Some(cpu_id) {
+            kick_remote = true;
+        }
+        cpu.refresh_lowpri();
+        drop(cpu);
+
+        if kick_remote {
+            smp::send_ipi(cpu_id);
+        }
     }
 
     fn try_steal(&self, dst_id: usize) -> bool {
@@ -851,6 +920,18 @@ where
     F: FnOnce(u64) -> R + Send + 'static,
 {
     scheduler().spawn_ithread(task, arg)
+}
+
+pub(crate) fn current_thread() -> &'static mut Thread {
+    scheduler().current_thread(arch::thiscpu().id)
+}
+
+pub(crate) fn park_current() {
+    scheduler().park_current(arch::thiscpu().id)
+}
+
+pub(crate) fn wake(thread: &'static mut Thread) {
+    scheduler().wake_thread(thread)
 }
 
 pub fn exit_current() -> ! {
