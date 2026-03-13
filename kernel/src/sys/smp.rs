@@ -8,6 +8,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use limine::mp::RequestFlags;
 
 use limine::{mp, request::MpRequest};
 use log::info;
@@ -18,7 +19,7 @@ use crate::arch;
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
-static SMP_REQUEST: MpRequest = MpRequest::new();
+static SMP_REQUEST: MpRequest = MpRequest::new().with_flags(RequestFlags::X2APIC);
 
 /// Platform specific core-local fields.
 pub struct PlatformFields {
