@@ -847,12 +847,6 @@ pub fn init() {
     let scheduler = Box::leak(Box::new(Scheduler::new(smp::cpu_count())));
     scheduler.bootstrap();
 
-    info!(
-        "sched: ULE ready on {} CPU(s) (slice={} ticks, min_slice={} ticks)",
-        scheduler.cpus.len(),
-        scheduler.sched_slice,
-        scheduler.sched_slice_min
-    );
     *guard = Some(scheduler);
 }
 

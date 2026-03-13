@@ -62,9 +62,7 @@ static LOGGER: KLog = KLog;
 
 /// Global debug state protected by an IRQ-safe spinlock.
 static DEBUG_STATE: IrqSpinLock<DebugState> = IrqSpinLock::new(DebugState::new());
-
-/// Prevents recursive sink dispatch if a sink causes nested logging.
-static IN_SINK_DISPATCH: AtomicBool = AtomicBool::new(false);
+static PANIC_MODE: AtomicBool = AtomicBool::new(false);
 
 impl Record {
     /// Creates an empty log record.
@@ -167,7 +165,7 @@ impl log::Log for KLog {
 
     /// Captures a log record into the global ring and dispatches sinks.
     fn log(&self, record: &log::Record) {
-        if IN_SINK_DISPATCH.load(Ordering::Acquire) {
+        if PANIC_MODE.load(Ordering::Acquire) {
             return;
         }
 
@@ -183,26 +181,18 @@ impl log::Log for KLog {
 
 /// Dispatches a preformatted message buffer to all currently registered sinks.
 ///
-/// Expects the caller to hold the debug state lock. A re-entrancy guard is
-/// used to prevent nested sink dispatch loops.
+/// Expects the caller to hold the debug state lock. We keep the ring update and
+/// sink writes under the same lock so concurrent CPUs serialize console output
+/// instead of dropping records while a slow sink is draining bytes.
 #[inline]
 fn dispatch_sinks_locked(buf: *const u8, buflen: usize, sinks: &[Option<LogSink>; MAX_SINKS]) {
     if sinks.iter().all(|slot| slot.is_none()) {
         return;
     }
 
-    if IN_SINK_DISPATCH
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-
     for sink in sinks.iter().flatten() {
         sink(buf, buflen);
     }
-
-    IN_SINK_DISPATCH.store(false, Ordering::Release);
 }
 
 /// Registers a log sink callback.
@@ -214,18 +204,11 @@ pub fn register_sink(sink: LogSink) {
     for slot in &mut state.sinks {
         if slot.is_none() {
             *slot = Some(sink);
-
-            if IN_SINK_DISPATCH
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                let mut idx = state.ring.read;
-                for _ in 0..state.ring.len {
-                    let rec = state.ring.records[idx];
-                    sink(rec.buf.as_ptr(), rec.buflen);
-                    idx = (idx + 1) % RING_CAPACITY;
-                }
-                IN_SINK_DISPATCH.store(false, Ordering::Release);
+            let mut idx = state.ring.read;
+            for _ in 0..state.ring.len {
+                let rec = state.ring.records[idx];
+                sink(rec.buf.as_ptr(), rec.buflen);
+                idx = (idx + 1) % RING_CAPACITY;
             }
 
             return;
@@ -259,16 +242,28 @@ pub fn clear_sinks() {
     }
 }
 
+/// Prevents regular logs from competing with panic output.
+pub(crate) fn enter_panic_mode() {
+    PANIC_MODE.store(true, Ordering::Release);
+}
+
+/// Force-unlocks the debug sink registry for panic-time recovery.
+///
+/// # Safety
+///
+/// This must only be used after all other CPUs have been stopped or when the
+/// caller accepts that the previous lock owner will never resume.
+pub(crate) unsafe fn force_unlock_for_panic() {
+    if DEBUG_STATE.is_locked() {
+        DEBUG_STATE.force_unlock();
+    }
+}
+
 /// Writes a preformatted string buffer directly to all registered sinks
 /// without appending a new record to the ring buffer.
 pub(crate) fn write_to_sinks(buf: *const u8, buflen: usize) {
-    if IN_SINK_DISPATCH.load(Ordering::Acquire) {
-        return;
-    }
-
-    if let Some(state) = DEBUG_STATE.try_lock() {
-        dispatch_sinks_locked(buf, buflen, &state.sinks);
-    }
+    let state = DEBUG_STATE.lock();
+    dispatch_sinks_locked(buf, buflen, &state.sinks);
 }
 
 /// Connects kernel logging infra to the log crate.
@@ -277,6 +272,6 @@ pub(crate) fn write_to_sinks(buf: *const u8, buflen: usize) {
 /// since the log functions depend on a valid kernel logger.
 pub fn register() {
     log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Trace))
+        .map(|()| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 }

@@ -70,7 +70,7 @@ static KERNEL_GDT: GDT = GDT::new();
 // SAFETY: descriptor tables are initialized during per-CPU early boot before
 // concurrent Rust code starts executing on that CPU.
 static mut KERNEL_IDT: [IDT; 256] = [IDT::new(); 256];
-static DESCRIPTORS_READY: Once<()> = Once::new();
+static BSP_STARTUP: Once<()> = Once::new();
 
 bitflags! {
     /// Bitmap of supported x86 extensions.
@@ -328,16 +328,8 @@ impl IDT {
 
 /// Checks for and enables the x86 CPU features required by the kernel.
 pub fn enable_features() -> CpuFeatures {
-    DESCRIPTORS_READY.call_once(|| {
-        init_idt_entries();
-    });
-
     let cpuid = CpuId::new();
     let mut cpufeats = CpuFeatures::empty();
-
-    if let Some(brand_string) = cpuid.get_processor_brand_string() {
-        info!("cpu: model name \"{}\"", brand_string.as_str());
-    }
 
     // Enable the `syscall` and `sysret` instructions, as well as NX bit.
     unsafe {
@@ -370,6 +362,26 @@ pub fn enable_features() -> CpuFeatures {
         .get_extended_feature_info()
         .expect("cpu: unable to query for extended features with CPUID!");
 
+    BSP_STARTUP.call_once(|| {
+        if let Some(brand_string) = cpuid.get_processor_brand_string() {
+            info!("cpu: model name \"{}\"", brand_string.as_str());
+        }
+
+        if !ext_feats.has_fsgsbase() {
+            warn!("cpu: {{FS/GS}}BASE instructions are not supported!");
+        }
+
+        if !ext_feats.has_smep() {
+            warn!("cpu: SMEP not supported!");
+        }
+
+        if !ext_feats.has_smap() {
+            warn!("cpu: SMAP not supported!");
+        }
+
+        init_idt_entries();
+    });
+
     if !feats.has_pge() {
         panic!("cpu: global pages are not supported!");
     }
@@ -381,23 +393,17 @@ pub fn enable_features() -> CpuFeatures {
     // so userspace can use {RD,WR}{FS,GS}BASE instructions.
     if ext_feats.has_fsgsbase() {
         bits |= Cr4Flags::FSGSBASE;
-    } else {
-        warn!("cpu: {{FS/GS}}BASE instructions are not supported!");
     }
 
     // Enable SMEP/SMAP (if supported)
     if ext_feats.has_smep() {
         bits |= Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION;
         cpufeats |= CpuFeatures::SMEP;
-    } else {
-        warn!("cpu: SMEP not supported!");
     }
 
     if ext_feats.has_smap() {
         bits |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;
         cpufeats |= CpuFeatures::SMAP;
-    } else {
-        warn!("cpu: SMAP not supported!");
     }
 
     // Only activate PCIDs if the `invpcid` instruction is supported.
@@ -435,6 +441,8 @@ pub fn enable_features() -> CpuFeatures {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
+    crate::sys::panic::halt_if_panicking();
+
     if crate::arch::timer::handle_interrupt(frame.vec) || frame.vec == 3 {
         return crate::sys::sched::trap_return(frame);
     }

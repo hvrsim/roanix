@@ -1,18 +1,17 @@
 //!
 //! # Multicore Support
 //!
-//! This module is responsible for managing multiple CPU cores. Main duties
-//! include AP bringup and core local data definitions.
+//! CPU discovery and AP bring-up with a minimal immutable CPU table.
 //!
 
 use alloc::{boxed::Box, vec::Vec};
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use limine::{mp, request::MpRequest};
 use log::info;
-use spin::{Mutex, MutexGuard};
+use spin::{Mutex, MutexGuard, Once};
 
 use crate::arch;
 
@@ -78,42 +77,77 @@ impl CoreLocal {
     }
 }
 
-#[derive(Copy, Clone)]
-struct BootCpu {
-    id: usize,
-    key: BootCpuKey,
-    core_local: *const CoreLocal,
+struct CpuRecord {
+    logical_id: usize,
+    platform_id: u64,
+    core_local_addr: usize,
+    online: AtomicBool,
 }
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-struct BootCpuKey(u64);
 
 struct SmpState {
-    boot_cpus: Box<[BootCpu]>,
+    cpus: Box<[CpuRecord]>,
 }
 
-// SAFETY: `SmpState` is only accessed behind `SMP_STATE`.
-unsafe impl Send for SmpState {}
-// SAFETY: shared access is synchronized by `SMP_STATE`.
-unsafe impl Sync for SmpState {}
-
-impl SmpState {
-    fn by_key(&self, key: BootCpuKey) -> Option<&BootCpu> {
-        self.boot_cpus.iter().find(|entry| entry.key == key)
-    }
-
-    fn by_id(&self, id: usize) -> Option<&BootCpu> {
-        self.boot_cpus.iter().find(|entry| entry.id == id)
-    }
-}
-
-static SMP_STATE: IrqSpinLock<Option<SmpState>> = IrqSpinLock::new(None);
+static SMP_STATE: Once<SmpState> = Once::new();
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
-static ONLINE_ORDER_LEN: AtomicUsize = AtomicUsize::new(0);
-const ONLINE_ORDER_CAPACITY: usize = 256;
-static ONLINE_ORDER: [AtomicUsize; ONLINE_ORDER_CAPACITY] =
-    [const { AtomicUsize::new(usize::MAX) }; ONLINE_ORDER_CAPACITY];
+
+impl CpuRecord {
+    fn new_bsp(platform_id: u64, core_local: *const CoreLocal) -> Self {
+        Self {
+            logical_id: 0,
+            platform_id,
+            core_local_addr: core_local as usize,
+            online: AtomicBool::new(true),
+        }
+    }
+
+    fn new_ap(logical_id: usize, platform_id: u64) -> Self {
+        Self {
+            logical_id,
+            platform_id,
+            core_local_addr: Box::leak(Box::new(CoreLocal::new(logical_id))) as *mut CoreLocal
+                as usize,
+            online: AtomicBool::new(false),
+        }
+    }
+
+    fn is_online(&self) -> bool {
+        self.online.load(Ordering::Acquire)
+    }
+
+    fn core_local_ptr(&self) -> *const CoreLocal {
+        self.core_local_addr as *const CoreLocal
+    }
+
+    fn mark_online(&self) -> usize {
+        let was_online = self.online.swap(true, Ordering::AcqRel);
+        assert!(
+            !was_online,
+            "smp: cpu{} marked online twice",
+            self.logical_id
+        );
+        ONLINE_CPUS.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
+impl SmpState {
+    fn cpu_count(&self) -> usize {
+        self.cpus.len()
+    }
+
+    fn by_platform_id(&self, platform_id: u64) -> Option<&CpuRecord> {
+        self.cpus.iter().find(|cpu| cpu.platform_id == platform_id)
+    }
+
+    fn by_logical_id(&self, logical_id: usize) -> Option<&CpuRecord> {
+        self.cpus.iter().find(|cpu| cpu.logical_id == logical_id)
+    }
+}
+
+fn smp_state() -> &'static SmpState {
+    SMP_STATE.get().expect("smp: init required before use")
+}
 
 /// `spin::Mutex` wrapper that masks interrupts while holding the lock.
 pub struct IrqSpinLock<T> {
@@ -160,6 +194,22 @@ impl<T> IrqSpinLock<T> {
             irq_enabled,
         })
     }
+
+    /// Returns whether the underlying spin mutex is currently held.
+    pub fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+
+    /// Forcibly releases the underlying spin mutex without restoring the
+    /// interrupted CPU's prior interrupt state.
+    ///
+    /// # Safety
+    ///
+    /// This is only sound in fatal recovery paths where the lock owner will
+    /// never resume normal execution, such as global panic shutdown.
+    pub unsafe fn force_unlock(&self) {
+        self.inner.force_unlock();
+    }
 }
 
 impl<T> Deref for IrqSpinLockGuard<'_, T> {
@@ -188,49 +238,19 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
 
 /// Discovers CPUs exposed by the bootloader and prepares their core-local state.
 pub fn init() {
-    let mut guard = SMP_STATE.lock();
-    if guard.is_some() {
+    if SMP_STATE.get().is_some() {
         return;
     }
 
     let response = SMP_REQUEST
         .get_response()
         .expect("smp: Limine SMP response missing");
-    let bsp = bsp_key(response);
-    let mut next_id = 1usize;
-    let mut boot_cpus = Vec::with_capacity(response.cpus().len());
+    let cpus = discover_cpus(response);
+    let total = cpus.len().max(1);
 
-    for cpu in response.cpus() {
-        let cpu = *cpu;
-        let key = cpu_key(cpu);
-        let core_local = if key == bsp {
-            arch::thiscpu() as *mut CoreLocal as *const CoreLocal
-        } else {
-            Box::leak(Box::new(CoreLocal::new(next_id))) as *mut CoreLocal as *const CoreLocal
-        };
-
-        if key != bsp {
-            next_id += 1;
-        }
-
-        let id = unsafe { (&*core_local).id };
-        boot_cpus.push(BootCpu {
-            id,
-            key,
-            core_local,
-        });
-    }
-
-    let total_cpus = boot_cpus.len().max(1);
-    TOTAL_CPUS.store(total_cpus, Ordering::Release);
+    TOTAL_CPUS.store(total, Ordering::Release);
     ONLINE_CPUS.store(1, Ordering::Release);
-    ONLINE_ORDER_LEN.store(0, Ordering::Release);
-    for slot in ONLINE_ORDER.iter().take(total_cpus.saturating_sub(1)) {
-        slot.store(usize::MAX, Ordering::Relaxed);
-    }
-    *guard = Some(SmpState {
-        boot_cpus: boot_cpus.into_boxed_slice(),
-    });
+    SMP_STATE.call_once(|| SmpState { cpus });
 }
 
 /// Starts every application processor discovered during [`init`].
@@ -239,38 +259,37 @@ pub fn start() {
         Some(response) => response,
         None => return,
     };
-    let total = cpu_count();
-    if total <= 1 {
+    let state = smp_state();
+    if state.cpu_count() <= 1 {
         return;
     }
 
-    let bsp = bsp_key(response);
+    let bsp_platform_id = bsp_platform_id(response);
     for cpu in response.cpus() {
-        if cpu_key(cpu) == bsp {
+        let platform_id = cpu_platform_id(cpu);
+        if platform_id == bsp_platform_id {
             continue;
         }
 
+        let _ = state
+            .by_platform_id(platform_id)
+            .expect("smp: AP record missing during startup");
         cpu.goto_address.write(ap_entry);
     }
 
-    info!("smp: startup sent to {} AP(s)", total - 1);
-    while online_cpus() < total {
+    let deadline = crate::sys::clock::monotonic_ns().saturating_add(1_000_000_000);
+    while online_cpus() < state.cpu_count() {
+        if crate::sys::clock::monotonic_ns() >= deadline {
+            panic!(
+                "smp: timed out waiting for APs ({}/{})",
+                online_cpus(),
+                state.cpu_count()
+            );
+        }
         spin_loop();
     }
 
-    let announced = ONLINE_ORDER_LEN
-        .load(Ordering::Acquire)
-        .min(total.saturating_sub(1));
-    for idx in 0..announced {
-        let id = ONLINE_ORDER[idx].load(Ordering::Acquire);
-        if id == usize::MAX {
-            continue;
-        }
-
-        info!("smp: cpu{} online ({}/{})", id, idx + 2, total);
-    }
-
-    info!("smp: all {} CPU(s) online", total);
+    info!("smp: all {} CPU(s) online", state.cpu_count());
 }
 
 /// Returns the number of CPUs known to the kernel.
@@ -283,63 +302,75 @@ pub fn online_cpus() -> usize {
     ONLINE_CPUS.load(Ordering::Acquire)
 }
 
-fn core_local_for_cpu(cpu: &mp::Cpu) -> Option<*const CoreLocal> {
-    let key = cpu_key(cpu);
-    let guard = SMP_STATE.lock();
-    let state = guard.as_ref()?;
-    state.by_key(key).map(|entry| entry.core_local)
-}
-
 /// Returns the architecture-specific platform identifier for `cpu_id`.
 pub fn platform_id(cpu_id: usize) -> Option<u64> {
-    let guard = SMP_STATE.lock();
-    let state = guard.as_ref()?;
-    state.by_id(cpu_id).map(|entry| entry.key.0)
+    smp_state().by_logical_id(cpu_id).map(|cpu| cpu.platform_id)
 }
 
 /// Sends a reschedule IPI to `cpu_id` when it refers to another online CPU.
 pub fn send_ipi(cpu_id: usize) {
+    let state = smp_state();
     let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
-    if this_cpu == Some(cpu_id) || cpu_id >= cpu_count() {
+    let Some(target) = state.by_logical_id(cpu_id) else {
+        return;
+    };
+
+    if this_cpu == Some(cpu_id) || !target.is_online() {
         return;
     }
 
     arch::send_ipi(cpu_id);
 }
 
-fn mark_online(id: usize) {
-    let slot = ONLINE_ORDER_LEN.fetch_add(1, Ordering::AcqRel);
-    if slot < ONLINE_ORDER_CAPACITY {
-        ONLINE_ORDER[slot].store(id, Ordering::Release);
+fn discover_cpus(response: &limine::response::MpResponse) -> Box<[CpuRecord]> {
+    let bsp_platform_id = bsp_platform_id(response);
+    let mut cpus = Vec::with_capacity(response.cpus().len().max(1));
+
+    let bsp_core_local = arch::thiscpu() as *mut CoreLocal as *const CoreLocal;
+    cpus.push(CpuRecord::new_bsp(bsp_platform_id, bsp_core_local));
+
+    let mut next_logical_id = 1usize;
+    for cpu in response.cpus() {
+        if cpu_platform_id(cpu) == bsp_platform_id {
+            continue;
+        }
+
+        cpus.push(CpuRecord::new_ap(next_logical_id, cpu_platform_id(cpu)));
+        next_logical_id += 1;
     }
-    ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
+
+    cpus.into_boxed_slice()
 }
 
 unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
     arch::irqset(false);
-    let core_local = core_local_for_cpu(cpu).expect("smp: missing AP core-local");
-    arch::init_secondary(core_local);
+
+    let record = smp_state()
+        .by_platform_id(cpu_platform_id(cpu))
+        .expect("smp: missing AP record");
+
+    arch::init_secondary(record.core_local_ptr());
     crate::sys::clock::start_secondary();
-    mark_online(arch::thiscpu().id);
+    let _ = record.mark_online();
     crate::sys::sched::start_secondary();
 }
 
 #[cfg(target_arch = "x86_64")]
-fn cpu_key(cpu: &mp::Cpu) -> BootCpuKey {
-    BootCpuKey(cpu.lapic_id as u64)
+fn cpu_platform_id(cpu: &mp::Cpu) -> u64 {
+    cpu.lapic_id as u64
 }
 
 #[cfg(target_arch = "x86_64")]
-fn bsp_key(response: &limine::response::MpResponse) -> BootCpuKey {
-    BootCpuKey(response.bsp_lapic_id() as u64)
+fn bsp_platform_id(response: &limine::response::MpResponse) -> u64 {
+    response.bsp_lapic_id() as u64
 }
 
 #[cfg(target_arch = "riscv64")]
-fn cpu_key(cpu: &mp::Cpu) -> BootCpuKey {
-    BootCpuKey(cpu.hartid)
+fn cpu_platform_id(cpu: &mp::Cpu) -> u64 {
+    cpu.hartid
 }
 
 #[cfg(target_arch = "riscv64")]
-fn bsp_key(response: &limine::response::MpResponse) -> BootCpuKey {
-    BootCpuKey(response.bsp_hartid())
+fn bsp_platform_id(response: &limine::response::MpResponse) -> u64 {
+    response.bsp_hartid()
 }

@@ -222,6 +222,8 @@ pub fn enable_timer_interrupts() {
 /// All interrupts triggered start their journey here...
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
+    crate::sys::panic::halt_if_panicking();
+
     if frame.scause & SCAUSE_INTERRUPT != 0 {
         match frame.scause & !SCAUSE_INTERRUPT {
             SCAUSE_SUPERVISOR_TIMER => {

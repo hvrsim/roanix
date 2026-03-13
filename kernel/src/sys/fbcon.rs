@@ -222,6 +222,17 @@ pub fn register() -> bool {
     true
 }
 
+/// Force-unlocks the framebuffer console state for panic-time recovery.
+///
+/// # Safety
+///
+/// This must only be used after other CPUs have been stopped or abandoned.
+pub(crate) unsafe fn force_unlock_for_panic() {
+    if FBCON.is_locked() {
+        FBCON.force_unlock();
+    }
+}
+
 fn write(buf: *const u8, buflen: usize) {
     let bytes = unsafe { slice::from_raw_parts(buf, buflen) };
     let mut state = FBCON.lock();
