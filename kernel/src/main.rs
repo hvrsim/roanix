@@ -52,6 +52,7 @@ unsafe extern "C" fn rmain() -> ! {
     sys::sched::init();
     sys::clock::start();
     sys::smp::start();
+    let _ = sys::fbcon::register();
     let _ = sys::sched::run(|| {
         info!("hello from a thread on core #{}!", arch::thiscpu().id);
         sys::clock::sleep_ns(3000000000);

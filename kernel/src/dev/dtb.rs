@@ -19,8 +19,8 @@ pub fn blob() -> Option<&'static [u8]> {
         return None;
     }
 
-    let totalsize = read_be32(ptr.wrapping_add(4))? as usize;
-    Some(unsafe { core::slice::from_raw_parts(ptr, totalsize) })
+    let rawsize = unsafe { ptr.wrapping_add(4).cast::<u32>().read_unaligned() };
+    Some(unsafe { core::slice::from_raw_parts(ptr, u32::from_be(size_raw) as usize) })
 }
 
 /// Parses the Limine-provided DTB.
@@ -40,12 +40,4 @@ pub fn timebase_frequency() -> Option<u64> {
         8 => Some(u64::from_be_bytes(prop.value.try_into().ok()?)),
         _ => None,
     }
-}
-
-fn read_be32(ptr: *const u8) -> Option<u32> {
-    if ptr.is_null() {
-        return None;
-    }
-
-    Some(u32::from_be(unsafe { ptr.cast::<u32>().read_unaligned() }))
 }
