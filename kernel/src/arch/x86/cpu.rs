@@ -67,6 +67,8 @@ extern "C" {
 }
 
 static KERNEL_GDT: GDT = GDT::new();
+// SAFETY: descriptor tables are initialized during per-CPU early boot before
+// concurrent Rust code starts executing on that CPU.
 static mut KERNEL_IDT: [IDT; 256] = [IDT::new(); 256];
 static DESCRIPTORS_READY: Once<()> = Once::new();
 
@@ -82,68 +84,68 @@ bitflags! {
 
 /// Structure used by the `lgdt`/`lidt` instructions.
 #[repr(C, packed(1))]
-pub struct Descriptor {
+struct Descriptor {
     /// The size of the descriptor table minus 1.
-    pub limit: u16,
+    limit: u16,
     /// The linear base address of the GDT or IDT.
-    pub base: u64,
+    base: u64,
 }
 
 /// Representation of the x86_64 Global Descriptor Table.
 #[repr(C, packed(1))]
 struct GDT {
     /// GDT entries as raw u64s.
-    pub entries: [u64; 9],
+    entries: [u64; 9],
 
     /// Low 2 bytes of TSS limit.
-    pub tss_limit_low: u16,
+    tss_limit_low: u16,
 
     /// Low 2 bytes of TSS base address.
-    pub tss_base_low: u16,
+    tss_base_low: u16,
 
     /// Mid byte of TSS base address.
-    pub tss_base_mid: u8,
+    tss_base_mid: u8,
 
     /// TSS Flags/Access byte.
-    pub tss_access: u8,
+    tss_access: u8,
 
     /// High byte of TSS limit.
-    pub tss_limit_high: u8,
+    tss_limit_high: u8,
 
     /// High byte of TSS base address.
-    pub tss_base_high: u8,
+    tss_base_high: u8,
 
     /// Extended TSS base address.
-    pub tss_base_ext: u32,
+    tss_base_ext: u32,
 
     /// TSS reserved field.
-    pub tss_reserved: u32,
+    tss_reserved: u32,
 }
 
 /// Representation of the x86_64 Interrupt Descriptor Table.
 #[repr(C, packed(1))]
 #[derive(Copy, Clone)]
-pub struct IDT {
+struct IDT {
     /// Low 2 bytes of handler address.
-    pub offset_low: u16,
+    offset_low: u16,
 
     /// Segment selector.
-    pub selector: u16,
+    selector: u16,
 
     /// IST index.
-    pub ist: u8,
+    ist: u8,
 
     /// Type and attributes (P, DPL, S, Gate Type)
-    pub flags: u8,
+    flags: u8,
 
     /// Mid 2 bytes of handler address.
-    pub offset_mid: u16,
+    offset_mid: u16,
 
     /// High 4 bytes of handler address.
-    pub offset_high: u32,
+    offset_high: u32,
 
     // IDT reserved field.
-    pub reserved: u32,
+    reserved: u32,
 }
 
 /// Represents the trap frame saved onto the kernel stack during a trap.
@@ -152,32 +154,37 @@ pub struct IDT {
 /// routine `rtrap_entry`.
 #[repr(C)]
 pub struct TrapFrame {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
 
-    pub vec: u64,
-    pub ec: u64,
-    pub ip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub sp: u64,
-    pub ss: u64,
+    vec: u64,
+    ec: u64,
+    ip: u64,
+    cs: u64,
+    rflags: u64,
+    sp: u64,
+    ss: u64,
 }
 
 /// Initializes a trap frame for a brand-new kernel thread.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes, properly aligned for [`TrapFrame`], and
+/// point at memory reserved for the new thread's initial register state.
 pub unsafe fn init_kernel_thread_frame(
     frame: *mut TrapFrame,
     stack_top: u64,
@@ -215,16 +222,26 @@ pub unsafe fn init_kernel_thread_frame(
 }
 
 /// Restores `frame` and enters the first scheduled kernel thread.
+///
+/// # Safety
+///
+/// `frame` must contain a valid saved kernel context produced by the trap
+/// entry code or by [`init_kernel_thread_frame`].
 pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
     rthread_resume(frame);
 }
 
 /// Refreshes architecture-specific per-CPU state in a thread frame.
+///
+/// # Safety
+///
+/// `frame` must point to the current thread's saved trap frame. x86_64 does
+/// not currently need to mutate it before resume.
 pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame) {}
 
 impl GDT {
     /// Creates a new GDT structure.
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: [
                 0x0000_0000_0000_0000,
@@ -249,7 +266,7 @@ impl GDT {
     }
 
     /// Loads the GDT structure into the CPU registers.
-    pub unsafe fn load(&self) {
+    unsafe fn load(&self) {
         let gdtr = Descriptor {
             limit: (size_of::<Self>() - 1) as u16,
             base: (self as *const Self) as u64,
@@ -283,7 +300,7 @@ impl GDT {
 
 impl IDT {
     /// Creates a new IDT entry.
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         IDT {
             offset_low: 0,
             selector: 0,
@@ -296,7 +313,7 @@ impl IDT {
     }
 
     /// Creates a new IDT entry given a handler address and IST index.
-    pub const fn from_address(ptr: u64, ist: u8) -> Self {
+    const fn from_address(ptr: u64, ist: u8) -> Self {
         IDT {
             offset_low: (ptr & 0xFFFF) as u16,
             offset_mid: ((ptr >> 16) & 0xFFFF) as u16,
@@ -309,15 +326,10 @@ impl IDT {
     }
 }
 
-/// Checks for (and enables) CPU feature flags.
-pub unsafe fn enable_features() -> CpuFeatures {
+/// Checks for and enables the x86 CPU features required by the kernel.
+pub fn enable_features() -> CpuFeatures {
     DESCRIPTORS_READY.call_once(|| {
-        for i in 0..256 {
-            let addr = (vstub0 as *const u8).wrapping_add(i * 0x10);
-            unsafe {
-                KERNEL_IDT[i] = IDT::from_address(addr as u64, 0);
-            }
-        }
+        init_idt_entries();
     });
 
     let cpuid = CpuId::new();
@@ -328,16 +340,26 @@ pub unsafe fn enable_features() -> CpuFeatures {
     }
 
     // Enable the `syscall` and `sysret` instructions, as well as NX bit.
-    Efer::write(Efer::read() | EferFlags::SYSTEM_CALL_EXTENSIONS | EferFlags::NO_EXECUTE_ENABLE);
+    unsafe {
+        // SAFETY: `enable_features` is only called during CPU bring-up before
+        // concurrent execution starts on this core.
+        Efer::write(
+            Efer::read() | EferFlags::SYSTEM_CALL_EXTENSIONS | EferFlags::NO_EXECUTE_ENABLE,
+        );
+    }
 
     // Set the groundwork for SIMD/FP instructions by disabling
     // emulation and activating CR0.MP. Also enable Write Protect
     // because Intel CET requires it.
-    Cr0::write(
-        (Cr0::read() & !Cr0Flags::EMULATE_COPROCESSOR)
-            | Cr0Flags::MONITOR_COPROCESSOR
-            | Cr0Flags::WRITE_PROTECT,
-    );
+    unsafe {
+        // SAFETY: `enable_features` is only called during CPU bring-up before
+        // concurrent execution starts on this core.
+        Cr0::write(
+            (Cr0::read() & !Cr0Flags::EMULATE_COPROCESSOR)
+                | Cr0Flags::MONITOR_COPROCESSOR
+                | Cr0Flags::WRITE_PROTECT,
+        );
+    }
 
     // Ensure key CR4 features are supported.
     let feats = cpuid
@@ -395,16 +417,15 @@ pub unsafe fn enable_features() -> CpuFeatures {
     //     cpufeats |= CpuFeatures::CET_SS;
     // }
 
-    Cr4::write(Cr4::read() | bits);
-    KERNEL_GDT.load();
-
-    let idtr = Descriptor {
-        limit: (core::mem::size_of::<[IDT; 256]>() - 1) as u16,
-        base: (&raw const KERNEL_IDT as *const IDT) as u64,
-    };
-
-    let idtr_ptr: u64 = &idtr as *const Descriptor as u64;
-    core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr);
+    unsafe {
+        // SAFETY: `enable_features` is only called during CPU bring-up before
+        // concurrent execution starts on this core.
+        Cr4::write(Cr4::read() | bits);
+    }
+    unsafe {
+        KERNEL_GDT.load();
+        load_idt();
+    }
 
     cpufeats
 }
@@ -428,4 +449,22 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
 #[no_mangle]
 extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
     panic!("SYSCALL triggered at IP=0x{:X}", frame.ip);
+}
+
+fn init_idt_entries() {
+    for idx in 0..256 {
+        let addr = (vstub0 as *const u8).wrapping_add(idx * 0x10);
+        unsafe {
+            KERNEL_IDT[idx] = IDT::from_address(addr as u64, 0);
+        }
+    }
+}
+
+unsafe fn load_idt() {
+    let idtr = Descriptor {
+        limit: (core::mem::size_of::<[IDT; 256]>() - 1) as u16,
+        base: (&raw const KERNEL_IDT as *const IDT) as u64,
+    };
+    let idtr_ptr = &idtr as *const Descriptor as u64;
+    core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr);
 }

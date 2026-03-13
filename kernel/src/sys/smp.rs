@@ -92,7 +92,9 @@ struct SmpState {
     boot_cpus: Box<[BootCpu]>,
 }
 
+// SAFETY: `SmpState` is only accessed behind `SMP_STATE`.
 unsafe impl Send for SmpState {}
+// SAFETY: shared access is synchronized by `SMP_STATE`.
 unsafe impl Sync for SmpState {}
 
 impl SmpState {
@@ -184,6 +186,7 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
     }
 }
 
+/// Discovers CPUs exposed by the bootloader and prepares their core-local state.
 pub fn init() {
     let mut guard = SMP_STATE.lock();
     if guard.is_some() {
@@ -230,6 +233,7 @@ pub fn init() {
     });
 }
 
+/// Starts every application processor discovered during [`init`].
 pub fn start() {
     let response = match SMP_REQUEST.get_response() {
         Some(response) => response,
@@ -269,10 +273,12 @@ pub fn start() {
     info!("smp: all {} CPU(s) online", total);
 }
 
+/// Returns the number of CPUs known to the kernel.
 pub fn cpu_count() -> usize {
     TOTAL_CPUS.load(Ordering::Acquire)
 }
 
+/// Returns the number of CPUs that have completed bring-up.
 pub fn online_cpus() -> usize {
     ONLINE_CPUS.load(Ordering::Acquire)
 }
@@ -284,12 +290,14 @@ fn core_local_for_cpu(cpu: &mp::Cpu) -> Option<*const CoreLocal> {
     state.by_key(key).map(|entry| entry.core_local)
 }
 
+/// Returns the architecture-specific platform identifier for `cpu_id`.
 pub fn platform_id(cpu_id: usize) -> Option<u64> {
     let guard = SMP_STATE.lock();
     let state = guard.as_ref()?;
     state.by_id(cpu_id).map(|entry| entry.key.0)
 }
 
+/// Sends a reschedule IPI to `cpu_id` when it refers to another online CPU.
 pub fn send_ipi(cpu_id: usize) {
     let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
     if this_cpu == Some(cpu_id) || cpu_id >= cpu_count() {

@@ -14,10 +14,10 @@ extern "C" {
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
-pub const CSR_SSTATUS: u16 = 0x0100;
-pub const CSR_SIE: u16 = 0x0104;
-pub const CSR_SIP: u16 = 0x0144;
-pub const CSR_STVEC: u16 = 0x0105;
+const CSR_SSTATUS: u16 = 0x0100;
+const CSR_SIE: u16 = 0x0104;
+const CSR_SIP: u16 = 0x0144;
+const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_BREAKPOINT: u64 = 3;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
@@ -35,49 +35,54 @@ const SIE_SEIE: u64 = 1 << 9;
 /// routine `rtrap_entry`.
 #[repr(C)]
 pub struct TrapFrame {
-    pub a0: u64,
-    pub a1: u64,
-    pub a2: u64,
-    pub a3: u64,
-    pub a4: u64,
-    pub a5: u64,
-    pub a6: u64,
-    pub a7: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
 
-    pub t0: u64,
-    pub t1: u64,
-    pub t2: u64,
-    pub t3: u64,
-    pub t4: u64,
-    pub t5: u64,
-    pub t6: u64,
+    t0: u64,
+    t1: u64,
+    t2: u64,
+    t3: u64,
+    t4: u64,
+    t5: u64,
+    t6: u64,
 
-    pub s0: u64,
-    pub s1: u64,
-    pub s2: u64,
-    pub s3: u64,
-    pub s4: u64,
-    pub s5: u64,
-    pub s6: u64,
-    pub s7: u64,
-    pub s8: u64,
-    pub s9: u64,
-    pub s10: u64,
-    pub s11: u64,
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+    s4: u64,
+    s5: u64,
+    s6: u64,
+    s7: u64,
+    s8: u64,
+    s9: u64,
+    s10: u64,
+    s11: u64,
 
-    pub ra: u64,
-    pub gp: u64,
-    pub prev_sp: u64,
-    pub prev_sscratch: u64,
+    ra: u64,
+    gp: u64,
+    prev_sp: u64,
+    prev_sscratch: u64,
 
-    pub scause: u64,
-    pub stval: u64,
-    pub ip: u64,
-    pub sstatus: u64,
-    pub reserved: u64,
+    scause: u64,
+    stval: u64,
+    ip: u64,
+    sstatus: u64,
+    reserved: u64,
 }
 
 /// Initializes a trap frame for a brand-new kernel thread.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes, properly aligned for [`TrapFrame`], and
+/// point at memory reserved for the new thread's initial register state.
 pub unsafe fn init_kernel_thread_frame(
     frame: *mut TrapFrame,
     stack_top: u64,
@@ -126,11 +131,21 @@ pub unsafe fn init_kernel_thread_frame(
 }
 
 /// Restores `frame` and enters the first scheduled kernel thread.
+///
+/// # Safety
+///
+/// `frame` must contain a valid saved kernel context produced by the trap
+/// entry code or by [`init_kernel_thread_frame`].
 pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
     rthread_resume(frame);
 }
 
 /// Refreshes architecture-specific per-CPU state in a thread frame.
+///
+/// # Safety
+///
+/// `frame` must be the saved context for the thread about to resume on the
+/// current hart.
 pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame) {
     (*frame).prev_sscratch = crate::arch::thiscpu() as *mut crate::sys::smp::CoreLocal as u64;
     (*frame).gp = read_gp();
@@ -152,9 +167,8 @@ fn read_gp() -> u64 {
     value
 }
 
-/// Returns the contents of the riscv CSR specified in `CSR_ADDR`.
 #[inline]
-pub unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
+unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
     let v: u64;
 
     asm!(
@@ -167,9 +181,8 @@ pub unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
     v
 }
 
-/// Writes `val` to the riscv CSR specified in `CSR_ADDR`.
 #[inline]
-pub unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
+unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
     asm!(
         "csrw {csr_addr}, {input}",
         csr_addr = const CSR_ADDR,

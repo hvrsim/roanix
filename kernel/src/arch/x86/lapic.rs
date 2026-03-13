@@ -82,15 +82,8 @@ pub fn init(tsc_hz: u64) {
         .expect("x86/lapic: CPUID feature leaf missing");
     assert!(features.has_apic(), "x86/lapic: local APIC not supported");
 
-    let mut apic_base = Msr::new(IA32_APIC_BASE_MSR);
-    let mut apic_base_raw = unsafe { apic_base.read() };
-    if apic_base_raw & IA32_APIC_BASE_ENABLE == 0 {
-        apic_base_raw |= IA32_APIC_BASE_ENABLE;
-        unsafe { apic_base.write(apic_base_raw) };
-    }
-
     let deadline_capable = features.has_tsc_deadline();
-    let base_pa = PhysAddr::new(apic_base_raw & !0xFFF);
+    let base_pa = local_apic_base_pa();
     let base = ensure_mmio_mapping(base_pa);
     let timer_mode = if deadline_capable {
         TimerMode::TscDeadline
@@ -272,17 +265,19 @@ fn mask_legacy_pic() {
 }
 
 fn read_register(base: VirtAddr, offset: u32) -> u32 {
-    unsafe { read_volatile(base.checked_add(offset as u64).unwrap().as_ptr::<u32>()) }
+    unsafe { read_volatile(register_addr(base, offset).as_ptr::<u32>()) }
 }
 
 fn write_register(base: VirtAddr, offset: u32, value: u32) {
     unsafe {
-        write_volatile(
-            base.checked_add(offset as u64).unwrap().as_mut_ptr::<u32>(),
-            value,
-        );
-        read_volatile(base.checked_add(LAPIC_SVR as u64).unwrap().as_ptr::<u32>());
+        write_volatile(register_addr(base, offset).as_mut_ptr::<u32>(), value);
+        read_volatile(register_addr(base, LAPIC_SVR).as_ptr::<u32>());
     }
+}
+
+fn register_addr(base: VirtAddr, offset: u32) -> VirtAddr {
+    base.checked_add(offset as u64)
+        .expect("x86/lapic: MMIO register address overflow")
 }
 
 fn ensure_mmio_mapping(base_pa: PhysAddr) -> VirtAddr {
@@ -302,12 +297,7 @@ fn ensure_mmio_mapping(base_pa: PhysAddr) -> VirtAddr {
 }
 
 fn init_thiscpu() {
-    let mut apic_base = Msr::new(IA32_APIC_BASE_MSR);
-    let mut apic_base_raw = unsafe { apic_base.read() };
-    if apic_base_raw & IA32_APIC_BASE_ENABLE == 0 {
-        apic_base_raw |= IA32_APIC_BASE_ENABLE;
-        unsafe { apic_base.write(apic_base_raw) };
-    }
+    let _ = local_apic_base_pa();
 
     let state = LAPIC_STATE.lock();
     assert!(
@@ -337,6 +327,17 @@ fn init_thiscpu() {
             write_register(state.base, LAPIC_INITIAL_COUNT, 0);
         }
     }
+}
+
+fn local_apic_base_pa() -> PhysAddr {
+    let mut apic_base = Msr::new(IA32_APIC_BASE_MSR);
+    let mut raw = unsafe { apic_base.read() };
+    if raw & IA32_APIC_BASE_ENABLE == 0 {
+        raw |= IA32_APIC_BASE_ENABLE;
+        unsafe { apic_base.write(raw) };
+    }
+
+    PhysAddr::new(raw & !0xFFF)
 }
 
 fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {

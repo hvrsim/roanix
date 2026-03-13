@@ -1,8 +1,8 @@
 //!
 //! # Address Types
 //!
-//! Address and page-size types and helpers functions used by the
-//! memory subsystem.
+//! Small typed wrappers and alignment helpers used throughout the memory
+//! subsystem.
 //!
 
 use core::fmt;
@@ -80,7 +80,7 @@ impl PhysAddr {
     /// Adds `bytes` and returns `None` on overflow.
     pub const fn checked_add(self, bytes: u64) -> Option<Self> {
         match self.0.checked_add(bytes) {
-            Some(v) => Some(Self(v)),
+            Some(value) => Some(Self(value)),
             None => None,
         }
     }
@@ -136,7 +136,7 @@ impl VirtAddr {
     /// Adds `bytes` and returns `None` on overflow.
     pub const fn checked_add(self, bytes: u64) -> Option<Self> {
         match self.0.checked_add(bytes) {
-            Some(v) => Some(Self(v)),
+            Some(value) => Some(Self(value)),
             None => None,
         }
     }

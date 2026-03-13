@@ -28,7 +28,7 @@ use crate::{
 pub const PAGEDB_ADDR: u64 = 0xFFFF_B000_0000_0000;
 
 /// Pointer to the contiguous PFN database backing all physical page metadata.
-pub const PAGEDB: *mut Page = PAGEDB_ADDR as *mut Page;
+const PAGEDB: *mut Page = PAGEDB_ADDR as *mut Page;
 
 /// Per-page allocation state tracked by the physical memory manager.
 #[repr(u8)]
@@ -47,7 +47,7 @@ pub enum PageState {
 /// Metadata record for one physical page frame.
 #[repr(C)]
 pub struct Page {
-    /// Intrusive linked-list link used by allocator free/zero queues.
+    /// Intrusive linked-list link used by allocator free queues.
     link: LinkedListLink,
     /// Physical base address of this page.
     paddr: u64,
@@ -82,7 +82,11 @@ impl Page {
     }
 }
 
+// SAFETY: `Page` metadata lives in a permanently mapped global PFN database and
+// concurrent mutation is coordinated through the PMM lock plus atomic state.
 unsafe impl Send for Page {}
+// SAFETY: shared references only expose immutable metadata reads and the atomic
+// page state.
 unsafe impl Sync for Page {}
 
 intrusive_adapter!(PageAdapter = &'static Page: Page { link: LinkedListLink });
@@ -93,16 +97,14 @@ struct PmmState {
     used_pages: usize,
     /// Number of free dirty pages.
     free_pages: usize,
-    /// Number of free pre-zeroed pages.
-    zero_pages: usize,
     /// Number of physical pages covered by the PFN database.
-    pagedb_pages: usize,
+    total_pages: usize,
+    /// Number of pages consumed by the PFN database mapping itself.
+    pagedb_page_count: usize,
     /// Physical base address of PFN database storage.
     pagedb_phys_base: u64,
     /// Queue of free dirty pages.
     free: LinkedList<PageAdapter>,
-    /// Queue of free zeroed pages.
-    zero: LinkedList<PageAdapter>,
 }
 
 /// Global PMM instance. `None` means allocator has not been initialized yet.
@@ -119,26 +121,19 @@ pub fn init() {
     let mmap = mem::memory_map_entries();
     let mut max_usable_end = 0u64;
 
-    let etype = |e: &Entry| match e.entry_type {
-        EntryType::USABLE => "usable",
-        EntryType::RESERVED => "reserved",
-        EntryType::ACPI_RECLAIMABLE => "acpi_reclaimable",
-        EntryType::ACPI_NVS => "acpi_nvs",
-        EntryType::BAD_MEMORY => "bad_memory",
-        EntryType::BOOTLOADER_RECLAIMABLE => "bootloader_reclaimable",
-        EntryType::EXECUTABLE_AND_MODULES => "executable_and_modules",
-        EntryType::FRAMEBUFFER => "framebuffer",
-        _ => "unknown",
-    };
-
     debug!("mem/phys: memory map structure:");
     for e in mmap.iter() {
         let end = e.base.saturating_add(e.length);
 
-        debug!("mem/phys: \t[{:016x}-{:016x}] {}", e.base, end, etype(e));
+        debug!(
+            "mem/phys: \t[{:016x}-{:016x}] {}",
+            e.base,
+            end,
+            entry_type_name(e)
+        );
 
-        if e.entry_type == EntryType::USABLE {
-            max_usable_end = max_usable_end.max(align_down(end, PAGE_SIZE));
+        if let Some((_, usable_end)) = usable_page_range(e) {
+            max_usable_end = max_usable_end.max(usable_end);
         }
     }
 
@@ -159,12 +154,9 @@ pub fn init() {
     let mut largest_usable = 0u64;
 
     for e in mmap {
-        if e.entry_type != EntryType::USABLE {
+        let Some((start, end)) = usable_page_range(e) else {
             continue;
-        }
-
-        let start = align_up(e.base, PAGE_SIZE);
-        let end = align_down(e.base.saturating_add(e.length), PAGE_SIZE);
+        };
         let span = end.saturating_sub(start);
 
         largest_usable = largest_usable.max(span);
@@ -209,20 +201,16 @@ pub fn init() {
     let mut state = PmmState {
         used_pages: 0,
         free_pages: 0,
-        zero_pages: 0,
-        pagedb_pages: pagedb_pages as usize,
+        total_pages,
+        pagedb_page_count: pagedb_pages as usize,
         pagedb_phys_base,
         free: LinkedList::new(PageAdapter::NEW),
-        zero: LinkedList::new(PageAdapter::NEW),
     };
 
     for e in mmap {
-        if e.entry_type != EntryType::USABLE {
+        let Some((start, end)) = usable_page_range(e) else {
             continue;
-        }
-
-        let start = align_up(e.base, PAGE_SIZE);
-        let end = align_down(e.base.saturating_add(e.length), PAGE_SIZE);
+        };
         let mut pa = start;
 
         while pa < end {
@@ -244,7 +232,7 @@ pub fn init() {
     info!(
         "mem/phys: pagedb active: phys=[0x{:x}-0x{:x}] used={} free={} bootstrap_pages={}",
         state.pagedb_phys_base,
-        state.pagedb_phys_base + state.pagedb_pages as u64 * PAGE_SIZE,
+        state.pagedb_phys_base + state.pagedb_page_count as u64 * PAGE_SIZE,
         state.used_pages,
         state.free_pages,
         bootstrap_pages,
@@ -271,7 +259,7 @@ pub fn phys_to_page(pa: PhysAddr) -> Option<&'static Page> {
     let st = guard.as_ref()?;
     let idx = (pa.as_u64() / PAGE_SIZE) as usize;
 
-    if idx >= st.pagedb_pages {
+    if idx >= st.total_pages {
         return None;
     }
     drop(guard);
@@ -283,24 +271,10 @@ pub fn phys_to_page(pa: PhysAddr) -> Option<&'static Page> {
 pub fn alloc_page() -> Option<&'static Page> {
     let mut guard = PMM.lock();
     let st = guard.as_mut()?;
-
-    if let Some(page) = st.zero.pop_front() {
-        st.zero_pages -= 1;
-        page.state.store(PageState::Used as u8, Ordering::Relaxed);
-        st.used_pages += 1;
-        return Some(page);
-    }
-
     let page = st.free.pop_front()?;
     st.free_pages -= 1;
 
-    unsafe {
-        ptr::write_bytes(
-            mem::phys_to_virt(page.paddr()).as_mut_ptr::<u8>(),
-            0,
-            PAGE_SIZE as usize,
-        );
-    }
+    zero_page(page.paddr());
 
     page.state.store(PageState::Used as u8, Ordering::Relaxed);
     st.used_pages += 1;
@@ -330,18 +304,17 @@ pub fn alloc_zeroed_phys() -> Option<PhysAddr> {
         PhysAddr::new(pa)
     };
 
-    unsafe {
-        ptr::write_bytes(
-            mem::phys_to_virt(pa).as_mut_ptr::<u8>(),
-            0,
-            PAGE_SIZE as usize,
-        );
-    }
+    zero_page(pa);
 
     Some(pa)
 }
 
 /// Frees a page previously returned by allocation and places it on the free list.
+///
+/// # Safety
+///
+/// `page` must refer to a live PMM-managed page that is no longer accessed
+/// through any virtual mapping, device, or alias once it is returned.
 pub unsafe fn free_page(page: &'static Page) {
     let mut guard = PMM.lock();
     let st = guard.as_mut().expect("mem/phys: not initialized");
@@ -358,4 +331,38 @@ pub unsafe fn free_page(page: &'static Page) {
 
     st.free.push_back(page);
     st.free_pages += 1;
+}
+
+fn entry_type_name(entry: &Entry) -> &'static str {
+    match entry.entry_type {
+        EntryType::USABLE => "usable",
+        EntryType::RESERVED => "reserved",
+        EntryType::ACPI_RECLAIMABLE => "acpi_reclaimable",
+        EntryType::ACPI_NVS => "acpi_nvs",
+        EntryType::BAD_MEMORY => "bad_memory",
+        EntryType::BOOTLOADER_RECLAIMABLE => "bootloader_reclaimable",
+        EntryType::EXECUTABLE_AND_MODULES => "executable_and_modules",
+        EntryType::FRAMEBUFFER => "framebuffer",
+        _ => "unknown",
+    }
+}
+
+fn usable_page_range(entry: &Entry) -> Option<(u64, u64)> {
+    if entry.entry_type != EntryType::USABLE {
+        return None;
+    }
+
+    let start = align_up(entry.base, PAGE_SIZE);
+    let end = align_down(entry.base.saturating_add(entry.length), PAGE_SIZE);
+    (start < end).then_some((start, end))
+}
+
+fn zero_page(pa: PhysAddr) {
+    unsafe {
+        ptr::write_bytes(
+            mem::phys_to_virt(pa).as_mut_ptr::<u8>(),
+            0,
+            PAGE_SIZE as usize,
+        );
+    }
 }

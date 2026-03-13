@@ -143,12 +143,12 @@ struct CpuQueue {
 unsafe impl Send for CpuQueue {}
 
 impl CpuQueue {
-    fn new(_id: usize) -> Self {
+    fn new(id: usize) -> Self {
         Self {
             runq: RunQueue::new(),
             current: ptr::null_mut(),
             idle: ptr::null_mut(),
-            online: _id == 0,
+            online: id == 0,
             load: 0,
             sysload: 0,
             lowpri: MAX_IDLE,
@@ -187,17 +187,8 @@ impl CpuQueue {
         }
     }
 
-    fn enqueue_new(&mut self, thread: &'static mut Thread, flags: u32) {
-        let counted = !thread.flags.contains(ThreadFlags::NOLOAD);
-        self.enqueue(thread, flags);
-        if counted {
-            self.load += 1;
-            self.sysload += 1;
-        }
-    }
-
-    fn migrate_in(&mut self, thread: &'static mut Thread, flags: u32) {
-        let counted = !thread.flags.contains(ThreadFlags::NOLOAD);
+    fn enqueue_tracked(&mut self, thread: &'static mut Thread, flags: u32) {
+        let counted = thread.counts_towards_load();
         self.enqueue(thread, flags);
         if counted {
             self.load += 1;
@@ -206,22 +197,25 @@ impl CpuQueue {
     }
 
     fn migrate_out(&mut self, thread: &Thread) {
-        if !thread.flags.contains(ThreadFlags::NOLOAD) {
+        if thread.counts_towards_load() {
             self.load = self.load.saturating_sub(1);
             self.sysload = self.sysload.saturating_sub(1);
         }
     }
 
-    fn requeue_running(&mut self, thread: &'static mut Thread, flags: u32) {
-        self.enqueue(thread, flags);
-    }
-
     fn enqueue(&mut self, thread: &'static mut Thread, flags: u32) {
         let idx = self.queue_index(thread.priority, flags);
-        thread.state = ThreadState::Ready;
-        thread.rqindex = idx;
+        thread.mark_ready(idx);
         self.lowpri = self.lowpri.min(thread.priority);
         self.runq.add(idx, thread, flags);
+    }
+
+    fn consider_preemption(&mut self, priority: u8) {
+        if let Some(current) = unsafe { self.current.as_ref() } {
+            if should_preempt(priority, current.priority) {
+                self.need_resched = true;
+            }
+        }
     }
 
     fn queue_index(&self, priority: u8, flags: u32) -> u8 {
@@ -289,6 +283,20 @@ impl CpuQueue {
             .first_in_range(MIN_INTERACT, MAX_INTERACT)
             .or_else(|| self.runq.first_timeshare(self.ts_deq_off))
             .map(|thread| thread as *const Thread as *mut Thread)
+    }
+
+    fn take_next_thread(&mut self, cpu_id: usize, global_ticks: u64) -> *mut Thread {
+        let next_ptr = self.choose_or_idle();
+        if !unsafe { &*next_ptr }.is_idle() {
+            self.dequeue(unsafe { &*next_ptr });
+        }
+
+        unsafe {
+            (&mut *next_ptr).mark_running(cpu_id, global_ticks);
+        }
+        self.current = next_ptr;
+        self.refresh_lowpri();
+        next_ptr
     }
 }
 
@@ -420,13 +428,8 @@ impl Scheduler {
         let current_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
         let mut kick_remote = false;
         let mut cpu = self.cpu(cpu_id).lock();
-        cpu.enqueue_new(thread, 0);
-
-        if let Some(current) = unsafe { cpu.current.as_ref() } {
-            if should_preempt(priority, current.priority) {
-                cpu.need_resched = true;
-            }
-        }
+        cpu.enqueue_tracked(thread, 0);
+        cpu.consider_preemption(priority);
         if cpu.online && current_cpu != Some(cpu_id) {
             kick_remote = true;
         }
@@ -466,7 +469,7 @@ impl Scheduler {
             ThreadClass::Ithread | ThreadClass::Idle => {}
         }
 
-        if current.flags.contains(ThreadFlags::IDLE) {
+        if current.is_idle() {
             cpu.need_resched = true;
             cpu.refresh_lowpri();
             return;
@@ -508,14 +511,13 @@ impl Scheduler {
 
             cpu.need_resched = false;
 
-            if current.state == ThreadState::Running && !current.flags.contains(ThreadFlags::IDLE) {
-                let flags = if current.flags.contains(ThreadFlags::SLICEEND) {
-                    current.flags.remove(ThreadFlags::SLICEEND);
+            if current.state == ThreadState::Running && !current.is_idle() {
+                let flags = if current.take_slice_end() {
                     SRQ_PREEMPTED
                 } else {
                     0
                 };
-                cpu.requeue_running(current, flags);
+                cpu.enqueue(current, flags);
             }
         }
 
@@ -530,21 +532,8 @@ impl Scheduler {
             let _ = self.try_steal(cpu_id);
         }
 
-        let mut cpu = self.cpu(cpu_id).lock();
-        let next_ptr = cpu.choose_or_idle();
-        let next = unsafe { &mut *next_ptr };
-        if !next.flags.contains(ThreadFlags::IDLE) {
-            cpu.dequeue(unsafe { &*next_ptr });
-        }
-
-        next.state = ThreadState::Running;
-        next.cpu = cpu_id;
-        next.rltick = clock::global_ticks();
-        cpu.current = next;
-        cpu.refresh_lowpri();
+        let next = self.schedule_next(cpu_id);
         let frame = next.frame;
-        drop(cpu);
-
         self.activate_current(next);
         frame
     }
@@ -557,20 +546,7 @@ impl Scheduler {
         }
 
         let _ = self.try_steal(cpu_id);
-
-        let mut cpu = self.cpu(cpu_id).lock();
-        let next_ptr = cpu.choose_or_idle();
-        let next = unsafe { &mut *next_ptr };
-        if !next.flags.contains(ThreadFlags::IDLE) {
-            cpu.dequeue(unsafe { &*next_ptr });
-        }
-
-        next.state = ThreadState::Running;
-        next.cpu = cpu_id;
-        next.rltick = clock::global_ticks();
-        cpu.current = next;
-        cpu.refresh_lowpri();
-        drop(cpu);
+        let next = self.schedule_next(cpu_id);
 
         self.activate_current(next);
         unsafe { crate::arch::cpu::start_first_thread(next.frame) }
@@ -582,13 +558,10 @@ impl Scheduler {
             let mut cpu = self.cpu(cpu_id).lock();
             let current =
                 unsafe { cpu.current.as_mut() }.expect("sched: no current thread to exit");
-            assert!(
-                !current.flags.contains(ThreadFlags::IDLE),
-                "sched: idle thread exited"
-            );
+            assert!(!current.is_idle(), "sched: idle thread exited");
 
-            current.state = ThreadState::Exited;
-            if !current.flags.contains(ThreadFlags::NOLOAD) {
+            current.mark_exited();
+            if current.counts_towards_load() {
                 cpu.load = cpu.load.saturating_sub(1);
                 cpu.sysload = cpu.sysload.saturating_sub(1);
             }
@@ -598,23 +571,17 @@ impl Scheduler {
         }
 
         let _ = self.try_steal(cpu_id);
-
-        let mut cpu = self.cpu(cpu_id).lock();
-        let next_ptr = cpu.choose_or_idle();
-        let next = unsafe { &mut *next_ptr };
-        if !next.flags.contains(ThreadFlags::IDLE) {
-            cpu.dequeue(unsafe { &*next_ptr });
-        }
-
-        next.state = ThreadState::Running;
-        next.cpu = cpu_id;
-        next.rltick = clock::global_ticks();
-        cpu.current = next;
-        cpu.refresh_lowpri();
-        drop(cpu);
+        let next = self.schedule_next(cpu_id);
 
         self.activate_current(next);
         unsafe { crate::arch::cpu::start_first_thread(next.frame) }
+    }
+
+    fn schedule_next(&self, cpu_id: usize) -> &'static mut Thread {
+        let mut cpu = self.cpu(cpu_id).lock();
+        let next = cpu.take_next_thread(cpu_id, clock::global_ticks());
+        drop(cpu);
+        unsafe { &mut *next }
     }
 
     fn current_thread(&self, cpu_id: usize) -> &'static mut Thread {
@@ -634,16 +601,13 @@ impl Scheduler {
             let mut cpu = self.cpu(cpu_id).lock();
             let current =
                 unsafe { cpu.current.as_mut() }.expect("sched: no current thread to park");
-            assert!(
-                !current.flags.contains(ThreadFlags::IDLE),
-                "sched: idle thread cannot sleep"
-            );
+            assert!(!current.is_idle(), "sched: idle thread cannot sleep");
 
             if !current.mark_parked() {
                 return;
             }
 
-            current.state = ThreadState::Blocked;
+            current.mark_blocked();
             cpu.need_resched = true;
             cpu.refresh_lowpri();
         }
@@ -669,11 +633,7 @@ impl Scheduler {
         );
 
         cpu.enqueue(thread, 0);
-        if let Some(current) = unsafe { cpu.current.as_ref() } {
-            if should_preempt(priority, current.priority) {
-                cpu.need_resched = true;
-            }
-        }
+        cpu.consider_preemption(priority);
         if cpu.online && current_cpu != Some(cpu_id) {
             kick_remote = true;
         }
@@ -721,13 +681,8 @@ impl Scheduler {
             let thread = unsafe { &mut *candidate_ptr };
             let priority = thread.priority;
             thread.cpu = dst_id;
-            dst.migrate_in(thread, SRQ_BORROWING);
-
-            if let Some(current) = unsafe { dst.current.as_ref() } {
-                if should_preempt(priority, current.priority) {
-                    dst.need_resched = true;
-                }
-            }
+            dst.enqueue_tracked(thread, SRQ_BORROWING);
+            dst.consider_preemption(priority);
 
             src.refresh_lowpri();
             dst.refresh_lowpri();
@@ -882,6 +837,7 @@ fn scheduler() -> &'static Scheduler {
     guard.as_ref().copied().expect("sched: init before use")
 }
 
+/// Initializes the global scheduler and installs per-CPU idle threads.
 pub fn init() {
     let mut guard = SCHEDULER.lock();
     if guard.is_some() {
@@ -900,14 +856,17 @@ pub fn init() {
     *guard = Some(scheduler);
 }
 
+/// Starts scheduling on the bootstrap CPU and never returns.
 pub fn start() -> ! {
     scheduler().start_cpu(0)
 }
 
+/// Starts scheduling on the current secondary CPU and never returns.
 pub fn start_secondary() -> ! {
     scheduler().start_cpu(arch::thiscpu().id)
 }
 
+/// Spawns a regular timeshare kernel thread and returns its thread ID.
 pub fn run<F, R>(task: F) -> usize
 where
     F: FnOnce() -> R + Send + 'static,
@@ -915,6 +874,7 @@ where
     scheduler().spawn(task)
 }
 
+/// Spawns an interrupt-thread style task with the supplied argument.
 pub fn create_ithread<F, R>(task: F, arg: u64) -> usize
 where
     F: FnOnce(u64) -> R + Send + 'static,
@@ -922,26 +882,32 @@ where
     scheduler().spawn_ithread(task, arg)
 }
 
+/// Returns the thread currently executing on this CPU.
 pub(crate) fn current_thread() -> &'static mut Thread {
     scheduler().current_thread(arch::thiscpu().id)
 }
 
+/// Parks the current thread until a matching wake event occurs.
 pub(crate) fn park_current() {
     scheduler().park_current(arch::thiscpu().id)
 }
 
+/// Wakes a previously parked thread and requeues it on its owner CPU.
 pub(crate) fn wake(thread: &'static mut Thread) {
     scheduler().wake_thread(thread)
 }
 
+/// Terminates the current thread and immediately schedules a replacement.
 pub fn exit_current() -> ! {
     scheduler().exit_current(arch::thiscpu().id)
 }
 
+/// Delivers a scheduler statistics tick for the current CPU.
 pub fn stat_tick(global: u64, _percpu: u64) {
     scheduler().on_tick(arch::thiscpu().id, global);
 }
 
+/// Handles reschedule decisions before returning from a trap.
 pub fn trap_return(frame: &mut TrapFrame) -> *mut TrapFrame {
     scheduler().trap_return(arch::thiscpu().id, frame)
 }

@@ -84,14 +84,17 @@ impl ClockState {
 }
 
 /// Intrusive sleep timer pinned on the sleeping thread's stack until expiry.
-pub struct Timer {
+struct Timer {
     link: RBTreeLink,
     deadline_ns: u64,
     order: u64,
     thread: *mut Thread,
 }
 
+// SAFETY: timers are only moved by intrusive collections while protected by
+// the owning per-CPU timer lock.
 unsafe impl Send for Timer {}
+// SAFETY: shared access is read-only and coordinated by the timer tree lock.
 unsafe impl Sync for Timer {}
 
 intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });

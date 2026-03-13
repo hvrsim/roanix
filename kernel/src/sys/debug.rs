@@ -41,9 +41,6 @@ struct Record {
 
     /// CPU responsible for the message.
     cpu: usize,
-
-    /// Time when log message was sent (represented as UNIX epoch).
-    timestamp: u64,
 }
 
 /// Fixed-size ring buffer containing the latest kernel logs.
@@ -77,7 +74,6 @@ impl Record {
             buflen: 0,
             level: 0,
             cpu: 0,
-            timestamp: 0,
         }
     }
 
@@ -92,9 +88,8 @@ impl Record {
         };
 
         let mut rec = Self {
-            level: level,
+            level,
             cpu: crate::arch::thiscpu_opt().map_or(0, |cpu| cpu.id),
-            timestamp: 0,
             ..Self::empty()
         };
 

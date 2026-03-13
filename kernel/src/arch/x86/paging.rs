@@ -58,6 +58,11 @@ pub fn active_root() -> PhysAddr {
 }
 
 /// Activates the given page-table root.
+///
+/// # Safety
+///
+/// `root` must refer to a valid, currently mapped top-level x86_64 page table
+/// whose contents are suitable for immediate execution on the current CPU.
 pub unsafe fn activate_root(root: PhysAddr) -> Result<()> {
     if !root.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
@@ -71,6 +76,12 @@ pub unsafe fn activate_root(root: PhysAddr) -> Result<()> {
 }
 
 /// Maps one 4 KiB page.
+///
+/// # Safety
+///
+/// `root` must point to a valid writable page-table hierarchy owned by the
+/// caller. The caller must ensure the mapping change is synchronized against
+/// other CPUs and that `phys` is safe to expose at `virt` with `flags`.
 pub unsafe fn map_page(
     root: PhysAddr,
     virt: VirtAddr,
@@ -82,15 +93,12 @@ pub unsafe fn map_page(
     }
 
     let v = virt.as_u64();
-    let idx_l4 = ((v >> 39) & 0x1ff) as usize;
-    let idx_l3 = ((v >> 30) & 0x1ff) as usize;
-    let idx_l2 = ((v >> 21) & 0x1ff) as usize;
-    let idx_l1 = ((v >> 12) & 0x1ff) as usize;
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(v);
     let mut table = root;
     let user = flags.contains(VmFlags::USER);
 
     for idx in [idx_l4, idx_l3, idx_l2] {
-        let entry_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx);
+        let entry_ptr = entry_ptr(table, idx);
         let entry = entry_ptr.read_volatile();
 
         if entry & PTE_PRESENT != 0 {
@@ -110,7 +118,7 @@ pub unsafe fn map_page(
         table = frame;
     }
 
-    let leaf_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx_l1);
+    let leaf_ptr = entry_ptr(table, idx_l1);
     if leaf_ptr.read_volatile() & PTE_PRESENT != 0 {
         return Err(PagingError::AlreadyMapped);
     }
@@ -138,30 +146,30 @@ pub unsafe fn map_page(
 }
 
 /// Unmaps one 4 KiB page and returns the removed physical address.
+///
+/// # Safety
+///
+/// `root` must point to a valid writable page-table hierarchy owned by the
+/// caller, and the caller must ensure no concurrent user will access `virt`
+/// while the mapping is being removed.
 pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAddr>> {
     if !root.is_page_aligned() || !virt.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
 
     let v = virt.as_u64();
-    let idx_l4 = ((v >> 39) & 0x1ff) as usize;
-    let idx_l3 = ((v >> 30) & 0x1ff) as usize;
-    let idx_l2 = ((v >> 21) & 0x1ff) as usize;
-    let idx_l1 = ((v >> 12) & 0x1ff) as usize;
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(v);
     let mut table = root;
 
     for idx in [idx_l4, idx_l3, idx_l2] {
-        let entry = mem::phys_to_virt(table)
-            .as_mut_ptr::<u64>()
-            .add(idx)
-            .read_volatile();
+        let entry = entry_ptr(table, idx).read_volatile();
         if entry & PTE_PRESENT == 0 || entry & PTE_HUGE != 0 {
             return Err(PagingError::NotMapped);
         }
         table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
     }
 
-    let leaf_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx_l1);
+    let leaf_ptr = entry_ptr(table, idx_l1);
     let leaf = leaf_ptr.read_volatile();
     if leaf & PTE_PRESENT == 0 {
         return Err(PagingError::NotMapped);
@@ -173,26 +181,22 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
 }
 
 /// Translates a virtual address to physical using `root`.
+///
+/// # Safety
+///
+/// `root` must refer to a valid page-table hierarchy that remains mapped for
+/// the duration of the walk.
 pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     let v = virt.as_u64();
-    let idx_l4 = ((v >> 39) & 0x1ff) as usize;
-    let idx_l3 = ((v >> 30) & 0x1ff) as usize;
-    let idx_l2 = ((v >> 21) & 0x1ff) as usize;
-    let idx_l1 = ((v >> 12) & 0x1ff) as usize;
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(v);
 
-    let l4e = mem::phys_to_virt(root)
-        .as_mut_ptr::<u64>()
-        .add(idx_l4)
-        .read_volatile();
+    let l4e = entry_ptr(root, idx_l4).read_volatile();
     if l4e & PTE_PRESENT == 0 {
         return None;
     }
 
     let l3_tbl = PhysAddr::new(l4e & ENTRY_ADDR_MASK);
-    let l3e = mem::phys_to_virt(l3_tbl)
-        .as_mut_ptr::<u64>()
-        .add(idx_l3)
-        .read_volatile();
+    let l3e = entry_ptr(l3_tbl, idx_l3).read_volatile();
     if l3e & PTE_PRESENT == 0 {
         return None;
     }
@@ -203,10 +207,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     }
 
     let l2_tbl = PhysAddr::new(l3e & ENTRY_ADDR_MASK);
-    let l2e = mem::phys_to_virt(l2_tbl)
-        .as_mut_ptr::<u64>()
-        .add(idx_l2)
-        .read_volatile();
+    let l2e = entry_ptr(l2_tbl, idx_l2).read_volatile();
     if l2e & PTE_PRESENT == 0 {
         return None;
     }
@@ -217,14 +218,24 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     }
 
     let l1_tbl = PhysAddr::new(l2e & ENTRY_ADDR_MASK);
-    let l1e = mem::phys_to_virt(l1_tbl)
-        .as_mut_ptr::<u64>()
-        .add(idx_l1)
-        .read_volatile();
+    let l1e = entry_ptr(l1_tbl, idx_l1).read_volatile();
     if l1e & PTE_PRESENT == 0 {
         return None;
     }
 
     let base = (l1e & ENTRY_ADDR_MASK) & !(PAGE_SIZE - 1);
     Some(PhysAddr::new(base | (v & (PAGE_SIZE - 1))))
+}
+
+fn page_table_indexes(virt: u64) -> [usize; 4] {
+    [
+        ((virt >> 39) & 0x1ff) as usize,
+        ((virt >> 30) & 0x1ff) as usize,
+        ((virt >> 21) & 0x1ff) as usize,
+        ((virt >> 12) & 0x1ff) as usize,
+    ]
+}
+
+unsafe fn entry_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
+    mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx)
 }

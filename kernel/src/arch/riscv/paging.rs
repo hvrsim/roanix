@@ -61,14 +61,18 @@ pub fn active_root() -> PhysAddr {
 }
 
 /// Activates the given page-table root while preserving SATP mode/ASID.
+///
+/// # Safety
+///
+/// `root` must refer to a valid, currently mapped top-level RISC-V page table
+/// whose contents are suitable for immediate execution on the current hart.
 pub unsafe fn activate_root(root: PhysAddr) -> Result<()> {
     if !root.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
 
     let satp = read_satp();
-
-    let mode = satp >> SATP_MODE_SHIFT;
+    let mode = satp_mode(satp);
     let asid = (satp >> SATP_ASID_SHIFT) & 0xffff;
     let ppn = root.as_u64() >> 12;
     if ppn > SATP_PPN_MASK {
@@ -81,6 +85,12 @@ pub unsafe fn activate_root(root: PhysAddr) -> Result<()> {
 }
 
 /// Maps one 4 KiB page.
+///
+/// # Safety
+///
+/// `root` must point to a valid writable page-table hierarchy owned by the
+/// caller. The caller must ensure the mapping change is synchronized against
+/// other harts and that `phys` is safe to expose at `virt` with `flags`.
 pub unsafe fn map_page(
     root: PhysAddr,
     virt: VirtAddr,
@@ -91,21 +101,15 @@ pub unsafe fn map_page(
         return Err(PagingError::UnalignedAddress);
     }
 
-    let satp = read_satp();
-    let levels = match satp >> SATP_MODE_SHIFT {
-        8 => 3,  // SV39
-        9 => 4,  // SV48
-        10 => 5, // SV57
-        _ => 3,
-    };
+    let levels = paging_levels(read_satp());
 
     let v = virt.as_u64();
     let mut table = root;
 
     for level in (1..levels).rev() {
-        let idx = ((v >> (12 + level * 9)) & 0x1ff) as usize;
+        let idx = table_index(v, level);
         debug_assert!(idx < ENTRIES_PER_TABLE);
-        let entry_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx);
+        let entry_ptr = pte_ptr(table, idx);
         let pte = entry_ptr.read_volatile();
 
         if pte & PTE_V != 0 {
@@ -121,9 +125,9 @@ pub unsafe fn map_page(
         table = frame;
     }
 
-    let leaf_idx = ((v >> 12) & 0x1ff) as usize;
+    let leaf_idx = table_index(v, 0);
     debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-    let leaf_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(leaf_idx);
+    let leaf_ptr = pte_ptr(table, leaf_idx);
     if leaf_ptr.read_volatile() & PTE_V != 0 {
         return Err(PagingError::AlreadyMapped);
     }
@@ -159,29 +163,26 @@ pub unsafe fn map_page(
 }
 
 /// Unmaps one 4 KiB page and returns the removed physical address.
+///
+/// # Safety
+///
+/// `root` must point to a valid writable page-table hierarchy owned by the
+/// caller, and the caller must ensure no concurrent user will access `virt`
+/// while the mapping is being removed.
 pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAddr>> {
     if !root.is_page_aligned() || !virt.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
 
-    let satp = read_satp();
-    let levels = match satp >> SATP_MODE_SHIFT {
-        8 => 3,  // SV39
-        9 => 4,  // SV48
-        10 => 5, // SV57
-        _ => 3,
-    };
+    let levels = paging_levels(read_satp());
 
     let v = virt.as_u64();
     let mut table = root;
 
     for level in (1..levels).rev() {
-        let idx = ((v >> (12 + level * 9)) & 0x1ff) as usize;
+        let idx = table_index(v, level);
         debug_assert!(idx < ENTRIES_PER_TABLE);
-        let pte = mem::phys_to_virt(table)
-            .as_mut_ptr::<u64>()
-            .add(idx)
-            .read_volatile();
+        let pte = pte_ptr(table, idx).read_volatile();
 
         if pte & PTE_V == 0 {
             return Err(PagingError::NotMapped);
@@ -193,9 +194,9 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
         table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
     }
 
-    let leaf_idx = ((v >> 12) & 0x1ff) as usize;
+    let leaf_idx = table_index(v, 0);
     debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-    let leaf_ptr = mem::phys_to_virt(table).as_mut_ptr::<u64>().add(leaf_idx);
+    let leaf_ptr = pte_ptr(table, leaf_idx);
     let pte = leaf_ptr.read_volatile();
     if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) == 0 {
         return Err(PagingError::NotMapped);
@@ -207,25 +208,21 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
 }
 
 /// Translates a virtual address to physical using `root`.
+///
+/// # Safety
+///
+/// `root` must refer to a valid page-table hierarchy that remains mapped for
+/// the duration of the walk.
 pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
-    let satp = read_satp();
-    let levels = match satp >> SATP_MODE_SHIFT {
-        8 => 3,  // SV39
-        9 => 4,  // SV48
-        10 => 5, // SV57
-        _ => 3,
-    };
+    let levels = paging_levels(read_satp());
 
     let v = virt.as_u64();
     let mut table = root;
 
     for level in (0..levels).rev() {
-        let idx = ((v >> (12 + level * 9)) & 0x1ff) as usize;
+        let idx = table_index(v, level);
         debug_assert!(idx < ENTRIES_PER_TABLE);
-        let pte = mem::phys_to_virt(table)
-            .as_mut_ptr::<u64>()
-            .add(idx)
-            .read_volatile();
+        let pte = pte_ptr(table, idx).read_volatile();
         if pte & PTE_V == 0 {
             return None;
         }
@@ -259,6 +256,27 @@ fn read_satp() -> u64 {
         );
     }
     satp
+}
+
+fn satp_mode(satp: u64) -> u64 {
+    satp >> SATP_MODE_SHIFT
+}
+
+fn paging_levels(satp: u64) -> usize {
+    match satp_mode(satp) {
+        8 => 3,  // SV39
+        9 => 4,  // SV48
+        10 => 5, // SV57
+        _ => 3,
+    }
+}
+
+fn table_index(virt: u64, level: usize) -> usize {
+    ((virt >> (12 + level * 9)) & 0x1ff) as usize
+}
+
+unsafe fn pte_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
+    mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx)
 }
 
 /// Writes a new value to the `satp` CSR.

@@ -4,6 +4,8 @@
 //! Minimal DTB accessors used during early platform discovery.
 //!
 
+use core::slice;
+
 use limine::request::DeviceTreeBlobRequest;
 
 #[used]
@@ -15,12 +17,8 @@ static DEVICE_TREE_BLOB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::
 pub fn blob() -> Option<&'static [u8]> {
     let response = DEVICE_TREE_BLOB_REQUEST.get_response()?;
     let ptr = response.dtb_ptr() as *const u8;
-    if ptr.is_null() {
-        return None;
-    }
-
-    let rawsize = unsafe { ptr.wrapping_add(4).cast::<u32>().read_unaligned() };
-    Some(unsafe { core::slice::from_raw_parts(ptr, u32::from_be(size_raw) as usize) })
+    let len = dtb_len(ptr)?;
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
 /// Parses the Limine-provided DTB.
@@ -40,4 +38,13 @@ pub fn timebase_frequency() -> Option<u64> {
         8 => Some(u64::from_be_bytes(prop.value.try_into().ok()?)),
         _ => None,
     }
+}
+
+fn dtb_len(ptr: *const u8) -> Option<usize> {
+    if ptr.is_null() {
+        return None;
+    }
+
+    let raw_len = unsafe { ptr.add(4).cast::<u32>().read_unaligned() };
+    Some(u32::from_be(raw_len) as usize)
 }

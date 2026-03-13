@@ -1,8 +1,8 @@
 //!
 //! # Riscv64 Subsystem
 //!
-//! Kernel support layer for the riscv platform, including drivers for
-//! the SBI interface, on-chip timer, interrupt controllers and more!
+//! Kernel support layer for the riscv64 platform, including drivers for the
+//! SBI interface, timer, interrupt delivery, and hart-local state.
 //!
 //! For a general riscv reference, I highly recommend the riscv ISA
 //! manuals. You can grab the latest copies [here](https://github.com/riscv/riscv-isa-manual/releases/tag/latest).
@@ -16,6 +16,8 @@ pub mod paging;
 pub mod timer;
 
 /// BSP's core local context.
+// SAFETY: this bootstrap instance is only referenced through a raw pointer
+// during early bring-up before hart-local state becomes shared.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 /// SBI extension ID for the debug console.
@@ -24,19 +26,28 @@ const SBI_EXT_IPI: usize = 0x735049;
 const SBI_EXT_IPI_SEND: usize = 0;
 const SBI_LEGACY_SEND_IPI: usize = 0x04;
 
+/// Result tuple returned by an SBI call.
+#[derive(Copy, Clone)]
+pub(crate) struct SbiRet {
+    /// SBI status code, where `0` indicates success.
+    pub(crate) error: isize,
+}
+
 /// Writes debug messages to the current debug sink.
 ///
 /// On all riscv64 platforms, we use the SBI debug console API.
 fn dbgcon_write(buf: *const u8, buflen: usize) {
+    // SAFETY: the debug subsystem only calls sinks with a live buffer for the
+    // duration of the callback.
     let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
 
     let putc = |byte: u8| {
-        let (error, _) = unsafe { sbicall(byte as usize, DEBUG_EXT_ID, 2) };
+        let ret = sbi_call1(byte as usize, DEBUG_EXT_ID, 2);
 
         // Invoke the legacy SBI v0.1 `console_putchar` extension as a
         // fallback for platforms/firmware that do not implement DBCN.
-        if error != 0 {
-            let _ = unsafe { sbicall(byte as usize, 0x01, 0) };
+        if ret.error != 0 {
+            let _ = sbi_call1(byte as usize, 0x01, 0);
         }
     };
 
@@ -47,36 +58,16 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     putc(b'\n');
 }
 
-/// Invokes SBI firmware API using the `ecall` instruction.
-///
-/// **SAFETY:** This function intentionally discards errors returned by the API.
-#[inline]
-unsafe fn sbicall(arg: usize, ext_id: usize, func_id: usize) -> (isize, usize) {
-    let error: isize;
-    let value: usize;
-
-    asm!(
-        "ecall",
-        inlateout("a0") arg as isize => error,
-        in("a6") func_id,
-        in("a7") ext_id,
-        lateout("a1") value,
-    );
-
-    (error, value)
-}
-
 /// Returns core local context.
 ///
-/// On the riscv64 platform, kernel core local data is
-/// stored in the TP register.
+/// On riscv64, kernel core-local data is stored in the TP register.
 ///
 /// ## Safety
 ///
-/// The kernel thread-local context isn't valid until
-/// [`set_core_local`]('set_core_local') is called, which
+/// The kernel thread-local context isn't valid until [`set_core_local`] is
+/// called, which
 /// happens very early in boot. If you find yourself requiring
-/// thread local context super early in boot, consider moving
+/// thread-local context super early in boot, consider moving
 /// your init stage into a later part of the boot pipeline.
 #[inline(always)]
 pub fn thiscpu() -> &'static mut CoreLocal {
@@ -103,6 +94,7 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
         return None;
     }
 
+    // SAFETY: TP is only initialized from stable `CoreLocal` allocations.
     Some(unsafe { &mut *(value as *mut CoreLocal) })
 }
 
@@ -203,8 +195,7 @@ pub fn wfi() -> ! {
 pub fn send_ipi(cpu_id: usize) {
     let hartid = crate::sys::smp::platform_id(cpu_id).expect("riscv: invalid CPU ID for IPI");
     let mask = 1usize;
-    let error = unsafe { sbicall3(mask, hartid as usize, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND) };
-    if error == 0 {
+    if sbi_call3(mask, hartid as usize, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND).error == 0 {
         return;
     }
 
@@ -214,14 +205,12 @@ pub fn send_ipi(cpu_id: usize) {
         usize::BITS
     );
     let legacy_mask = 1usize << hartid;
-    let legacy_error = unsafe {
-        sbicall1(
-            &legacy_mask as *const usize as usize,
-            SBI_LEGACY_SEND_IPI,
-            0,
-        )
-    };
-    assert_eq!(legacy_error, 0, "riscv: SBI send_ipi failed");
+    let legacy_error = sbi_call1(
+        &legacy_mask as *const usize as usize,
+        SBI_LEGACY_SEND_IPI,
+        0,
+    );
+    assert_eq!(legacy_error.error, 0, "riscv: SBI send_ipi failed");
 }
 
 /// Forces the current CPU through the scheduler trap path.
@@ -231,31 +220,40 @@ pub fn reschedule() {
     }
 }
 
-unsafe fn sbicall1(arg0: usize, ext_id: usize, func_id: usize) -> isize {
-    let error: isize;
-
-    asm!(
-        "ecall",
-        inlateout("a0") arg0 as isize => error,
-        in("a6") func_id,
-        in("a7") ext_id,
-        lateout("a1") _,
-    );
-
-    error
+/// Invokes an SBI call that only needs `a0`.
+pub(crate) fn sbi_call1(arg0: usize, ext_id: usize, func_id: usize) -> SbiRet {
+    unsafe { sbi_call(arg0, 0, 0, ext_id, func_id) }
 }
 
-unsafe fn sbicall3(arg0: usize, arg1: usize, arg2: usize, ext_id: usize, func_id: usize) -> isize {
+/// Invokes an SBI call that needs `a0`, `a1`, and `a2`.
+pub(crate) fn sbi_call3(
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    ext_id: usize,
+    func_id: usize,
+) -> SbiRet {
+    unsafe { sbi_call(arg0, arg1, arg2, ext_id, func_id) }
+}
+
+/// # Safety
+///
+/// The caller must ensure the targeted SBI extension/function ID pair is valid
+/// for the running firmware and that the register arguments match that call's
+/// ABI contract.
+unsafe fn sbi_call(arg0: usize, arg1: usize, arg2: usize, ext_id: usize, func_id: usize) -> SbiRet {
     let error: isize;
+    let value: usize;
 
     asm!(
         "ecall",
         inlateout("a0") arg0 as isize => error,
-        inlateout("a1") arg1 => _,
+        inlateout("a1") arg1 => value,
         in("a2") arg2,
         in("a6") func_id,
         in("a7") ext_id,
     );
 
-    error
+    let _ = value;
+    SbiRet { error }
 }

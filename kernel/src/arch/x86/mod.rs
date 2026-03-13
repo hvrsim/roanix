@@ -1,9 +1,9 @@
 //!
 //! # x86_64 Subsystem
 //!
-//! Implements a support interface for the kernel to interact with the x86_64
-//! platform. Drivers for on-chip devices, such as the TSC and APIC are
-//! provided by this module aswell.
+//! Implements the support interface the kernel uses to interact with the
+//! x86_64 platform. Drivers for on-chip devices such as the TSC and APIC are
+//! provided by this module as well.
 //!
 //! Code in this module often references the *Intel SDM* for register references
 //! and ISA semantics.
@@ -24,6 +24,8 @@ pub mod paging;
 pub mod timer;
 
 /// BSP's core local context.
+// SAFETY: this bootstrap instance is only addressed through a raw pointer
+// during early bring-up before per-CPU state becomes shared.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 ///
@@ -43,6 +45,8 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 /// ```
 ///
 fn dbgcon_write(buf: *const u8, buflen: usize) {
+    // SAFETY: the debug subsystem only calls sinks with a live buffer for the
+    // duration of the callback.
     let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
 
     let mut dbgcon_e9: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0xE9);
@@ -109,7 +113,7 @@ pub fn early() {
     debug::register_sink(dbgcon_write);
 
     set_core_local(&raw const BSP_CORE_LOCAL);
-    let feats = unsafe { cpu::enable_features() };
+    let feats = cpu::enable_features();
     thiscpu().platform.feats = feats;
 }
 
@@ -121,22 +125,22 @@ pub fn init() {
 /// Performs per-CPU initialization for a secondary core.
 pub fn init_secondary(core_local: *const CoreLocal) {
     set_core_local(core_local);
-    let feats = unsafe { cpu::enable_features() };
+    let feats = cpu::enable_features();
     thiscpu().platform.feats = feats;
     timer::init_secondary();
 }
 
 /// Returns core local context.
 ///
-/// On the x86_64 platform, kernel core-local data is
-/// addressed through the GS base registers.
+/// On x86_64, kernel core-local data is addressed through the GS base
+/// registers.
 ///
 /// ## Safety
 ///
-/// The kernel thread-local context isn't valid until
-/// [`set_core_local`]('set_core_local') is called, which
+/// The kernel thread-local context isn't valid until [`set_core_local`] is
+/// called, which
 /// happens very early in boot. If you find yourself requiring
-/// thread local context super early in boot, consider moving
+/// thread-local context super early in boot, consider moving
 /// your init stage into a later part of the boot pipeline.
 #[inline(always)]
 pub fn thiscpu() -> &'static mut CoreLocal {
@@ -157,6 +161,7 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
         return None;
     }
 
+    // SAFETY: GS base is only initialized from stable `CoreLocal` allocations.
     Some(unsafe { &mut *base.as_mut_ptr::<CoreLocal>() })
 }
 

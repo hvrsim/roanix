@@ -26,7 +26,8 @@ const ACTIVE_SPIN_ITERS: usize = 8;
 ///
 /// The uncontended path is a single compare-exchange. Under short contention it
 /// spins briefly to avoid scheduler traffic, then falls back to FIFO sleeping
-/// waiters to avoid burning CPU time.
+/// waiters to avoid burning CPU time. Waiters sleep through the kernel
+/// scheduler, so blocking while holding the lock can delay unrelated threads.
 pub struct Mutex<T: ?Sized> {
     state: AtomicU8,
     waiters: IrqSpinLock<WaitQueue>,
@@ -119,9 +120,12 @@ impl WaitQueue {
     }
 }
 
+// SAFETY: wait queues are only manipulated while holding `waiters`.
 unsafe impl Send for WaitQueue {}
 
+// SAFETY: the protected value is only reachable through the mutex protocol.
 unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+// SAFETY: shared references synchronize interior mutation through the mutex.
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
@@ -142,6 +146,8 @@ impl<T> Mutex<T> {
 
 impl<T: ?Sized> Mutex<T> {
     /// Locks the mutex and returns a guard for the protected value.
+    ///
+    /// Contended callers briefly spin, then park and wait in FIFO order.
     #[inline]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         if self.try_lock_fast() {
@@ -151,7 +157,7 @@ impl<T: ?Sized> Mutex<T> {
         self.lock_slow()
     }
 
-    /// Attempts to lock the mutex without spinning.
+    /// Attempts to lock the mutex without spinning or parking.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.try_lock_fast().then(|| MutexGuard::new(self))
@@ -236,6 +242,8 @@ impl<T: ?Sized> Mutex<T> {
         };
 
         unsafe {
+            // SAFETY: waiters are enqueued from live scheduler threads and
+            // removed under the wait-queue lock before waking.
             sched::wake(&mut *waiter);
         }
     }

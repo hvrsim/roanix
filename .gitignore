@@ -19,3 +19,7 @@ book/book/
 
 # custom scripts
 *.sh
+
+# agent skills
+.agents/
+skills-lock.json

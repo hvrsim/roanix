@@ -109,32 +109,18 @@ fn read_time() -> u64 {
 }
 
 fn sbi_set_timer(deadline: u64) {
-    let error = unsafe { sbicall1(deadline as usize, SBI_EXT_TIME, SBI_TIME_SET_TIMER) };
-    if error == 0 {
+    let ret = super::sbi_call1(deadline as usize, SBI_EXT_TIME, SBI_TIME_SET_TIMER);
+    if ret.error == 0 {
         return;
     }
 
-    let legacy_error = unsafe { sbicall1(deadline as usize, SBI_LEGACY_SET_TIMER, 0) };
-    if legacy_error != 0 {
+    let legacy = super::sbi_call1(deadline as usize, SBI_LEGACY_SET_TIMER, 0);
+    if legacy.error != 0 {
         panic!(
             "riscv/timer: SBI set_timer failed (time ext={}, legacy={})",
-            error, legacy_error
+            ret.error, legacy.error
         );
     }
-}
-
-unsafe fn sbicall1(arg0: usize, ext_id: usize, func_id: usize) -> isize {
-    let error: isize;
-
-    asm!(
-        "ecall",
-        inlateout("a0") arg0 as isize => error,
-        in("a6") func_id,
-        in("a7") ext_id,
-        lateout("a1") _,
-    );
-
-    error
 }
 
 fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {

@@ -286,11 +286,7 @@ impl HeapState {
         let root = arch::paging::active_root();
 
         for idx in start..(start + pages) {
-            let virt = heap_page_virt(idx);
-            let phys = unsafe { arch::paging::unmap_page(root, virt) }
-                .expect("mem/alloc: failed to unmap large heap page")
-                .expect("mem/alloc: missing large heap mapping");
-            let page = phys::phys_to_page(phys).expect("mem/alloc: heap page missing PFN metadata");
+            let page = self.take_mapped_page(root, idx, "large");
             unsafe { phys::free_page(page) };
             self.pages[idx] = HeapPageMeta::FREE;
         }
@@ -393,12 +389,7 @@ impl HeapState {
 
     fn release_page(&mut self, page_idx: usize) {
         let root = arch::paging::active_root();
-        let virt = heap_page_virt(page_idx);
-        let phys = unsafe { arch::paging::unmap_page(root, virt) }
-            .expect("mem/alloc: failed to unmap slab page")
-            .expect("mem/alloc: missing slab page mapping");
-        let page = phys::phys_to_page(phys).expect("mem/alloc: slab page missing PFN metadata");
-
+        let page = self.take_mapped_page(root, page_idx, "slab");
         unsafe { phys::free_page(page) };
         self.pages[page_idx] = HeapPageMeta::FREE;
         self.search_hint = self.search_hint.min(page_idx);
@@ -406,18 +397,31 @@ impl HeapState {
 
     fn rollback_large(&mut self, root: PhysAddr, start: usize, mapped: usize) {
         for idx in start..(start + mapped) {
-            let virt = heap_page_virt(idx);
-            let phys = unsafe { arch::paging::unmap_page(root, virt) }
-                .expect("mem/alloc: failed to roll back heap mapping")
-                .expect("mem/alloc: missing heap mapping during rollback");
-            let page =
-                phys::phys_to_page(phys).expect("mem/alloc: heap rollback PFN lookup failed");
+            let page = self.take_mapped_page(root, idx, "rollback");
             unsafe { phys::free_page(page) };
         }
+    }
+
+    fn take_mapped_page(
+        &self,
+        root: PhysAddr,
+        page_idx: usize,
+        context: &str,
+    ) -> &'static phys::Page {
+        let virt = heap_page_virt(page_idx);
+        let phys = unsafe { arch::paging::unmap_page(root, virt) }
+            .unwrap_or_else(|_| panic!("mem/alloc: failed to unmap {context} heap page"))
+            .unwrap_or_else(|| panic!("mem/alloc: missing {context} heap mapping"));
+        phys::phys_to_page(phys)
+            .unwrap_or_else(|| panic!("mem/alloc: {context} heap page missing PFN metadata"))
     }
 }
 
 /// Global allocator facade wired into Rust's allocation hooks.
+///
+/// This type is installed as the kernel's single heap allocator through
+/// [`GLOBAL_ALLOCATOR`], which delegates all operations to the page-backed
+/// heap state guarded by [`HEAP`].
 pub struct KernelAllocator;
 
 static HEAP: Mutex<HeapState> = Mutex::new(HeapState::new());
