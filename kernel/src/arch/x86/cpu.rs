@@ -50,7 +50,7 @@
 //! Reference: *Intel SDM Volume 1, Section 18*
 //!
 
-use core::ptr;
+use core::{mem::size_of, ptr};
 
 use bitflags::bitflags;
 use log::{info, warn};
@@ -66,7 +66,7 @@ extern "C" {
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
-static KERNEL_GDT: GDT = GDT::new();
+static KERNEL_GDT: Gdt = Gdt::new();
 // SAFETY: descriptor tables are initialized during per-CPU early boot before
 // concurrent Rust code starts executing on that CPU.
 static mut KERNEL_IDT: [IDT; 256] = [IDT::new(); 256];
@@ -93,33 +93,9 @@ struct Descriptor {
 
 /// Representation of the x86_64 Global Descriptor Table.
 #[repr(C, packed(1))]
-struct GDT {
+struct Gdt {
     /// GDT entries as raw u64s.
     entries: [u64; 9],
-
-    /// Low 2 bytes of TSS limit.
-    tss_limit_low: u16,
-
-    /// Low 2 bytes of TSS base address.
-    tss_base_low: u16,
-
-    /// Mid byte of TSS base address.
-    tss_base_mid: u8,
-
-    /// TSS Flags/Access byte.
-    tss_access: u8,
-
-    /// High byte of TSS limit.
-    tss_limit_high: u8,
-
-    /// High byte of TSS base address.
-    tss_base_high: u8,
-
-    /// Extended TSS base address.
-    tss_base_ext: u32,
-
-    /// TSS reserved field.
-    tss_reserved: u32,
 }
 
 /// Representation of the x86_64 Interrupt Descriptor Table.
@@ -239,7 +215,7 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 /// not currently need to mutate it before resume.
 pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame) {}
 
-impl GDT {
+impl Gdt {
     /// Creates a new GDT structure.
     const fn new() -> Self {
         Self {
@@ -254,14 +230,6 @@ impl GDT {
                 0x00af_fa00_0000_ffff,
                 0x008f_f200_0000_ffff,
             ],
-            tss_limit_low: 0,
-            tss_base_low: 0,
-            tss_base_mid: 0,
-            tss_access: 0,
-            tss_limit_high: 0,
-            tss_base_high: 0,
-            tss_base_ext: 0,
-            tss_reserved: 0,
         }
     }
 
@@ -442,14 +410,32 @@ pub fn enable_features() -> CpuFeatures {
 #[no_mangle]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
+    if frame.vec < 32 {
+        panic!(
+            "CPU trap triggered at IP=0x{:X}, vec=0x{:X}, CR2=0x{:X}",
+            frame.ip,
+            frame.vec,
+            Cr2::read_raw()
+        );
+    }
 
-    if crate::arch::timer::handle_interrupt(frame.vec) || frame.vec == 3 {
-        return crate::sys::sched::trap_return(frame);
+    let _interrupt = crate::sys::smp::enter_interrupt_context();
+
+    match crate::arch::timer::handle_interrupt(frame.vec) {
+        crate::arch::timer::InterruptAction::Reschedule => {
+            return crate::sys::sched::trap_return(frame);
+        }
+        crate::arch::timer::InterruptAction::Handled => {
+            return frame;
+        }
+        crate::arch::timer::InterruptAction::Unhandled => {}
     }
 
     panic!(
-        "CPU trap triggered at IP=0x{:X}, vec=0x{:X}",
-        frame.ip, frame.vec
+        "CPU trap triggered at IP=0x{:X}, vec=0x{:X}, CR2=0x{:X}",
+        frame.ip,
+        frame.vec,
+        Cr2::read_raw()
     );
 }
 

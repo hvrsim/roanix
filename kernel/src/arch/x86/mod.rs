@@ -11,8 +11,9 @@
 //! *You may download the SDM [here.](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)*
 //!
 
+use core::arch::asm;
+
 use x86_64::addr::VirtAddr;
-use x86_64::instructions::interrupts;
 use x86_64::instructions::{hlt, interrupts as x86_interrupts, port::*};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 
@@ -214,5 +215,7 @@ pub fn send_ipi(cpu_id: usize) {
 
 /// Forces the current CPU through the scheduler trap path.
 pub fn reschedule() {
-    interrupts::int3();
+    unsafe {
+        asm!("int {vector}", vector = const lapic::SELF_RESCHEDULE_VECTOR);
+    }
 }

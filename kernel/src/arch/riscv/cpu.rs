@@ -19,7 +19,6 @@ const CSR_SIE: u16 = 0x0104;
 const CSR_SIP: u16 = 0x0144;
 const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
-const SCAUSE_BREAKPOINT: u64 = 3;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
 const SSTATUS_SIE: u64 = 1 << 1;
@@ -225,9 +224,10 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
 
     if frame.scause & SCAUSE_INTERRUPT != 0 {
+        let _interrupt = crate::sys::smp::enter_interrupt_context();
         match frame.scause & !SCAUSE_INTERRUPT {
             SCAUSE_SUPERVISOR_TIMER => {
-                crate::arch::timer::handle_interrupt();
+                crate::sys::clock::handle_local_timer_interrupt();
                 return crate::sys::sched::trap_return(frame);
             }
             SCAUSE_SUPERVISOR_SOFTWARE => {
@@ -238,11 +238,6 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             }
             _ => {}
         }
-    }
-
-    if frame.scause == SCAUSE_BREAKPOINT {
-        frame.ip = frame.ip.wrapping_add(4);
-        return crate::sys::sched::trap_return(frame);
     }
 
     panic!(

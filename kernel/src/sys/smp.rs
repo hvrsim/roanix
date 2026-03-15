@@ -1,25 +1,53 @@
 //!
-//! # Multicore Support
+//! # Symmetric Multiprocessing
 //!
-//! CPU discovery and AP bring-up with a minimal immutable CPU table.
+//! This module owns CPU discovery, per-core bootstrap state, and the kernel's
+//! small IPI work queue.
+//!
+//! The IPI path is intentionally tiny:
+//!
+//! - callers submit a small `Copy` callback through [`send_ipi`]
+//! - the callback is copied into the target CPU's lock-protected mailbox
+//! - the target CPU is nudged with an architecture IPI or local software
+//!   reschedule interrupt
+//! - [`drain_ipi_queue`] runs the callback on the destination CPU before that
+//!   CPU returns from the interrupt/trap path
+//!
+//! This keeps cross-core coordination allocation-free, works in early kernel
+//! contexts, and lets subsystems express intent directly instead of smuggling
+//! state through ad-hoc interrupt side effects.
 //!
 
 use alloc::{boxed::Box, vec::Vec};
 use core::hint::spin_loop;
+use core::mem::{align_of, size_of};
 use core::ops::{Deref, DerefMut};
+use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use limine::mp::RequestFlags;
 
 use limine::{mp, request::MpRequest};
 use log::info;
 use spin::{Mutex, MutexGuard, Once};
 
-use crate::arch;
+#[cfg(target_arch = "x86_64")]
+use limine::mp::RequestFlags;
+
+use crate::{
+    arch,
+    sys::{clock::PerCpuClock, sched::PerCpuScheduler},
+};
 
 #[used]
 #[doc(hidden)]
 #[link_section = ".requests"]
+#[cfg(target_arch = "x86_64")]
 static SMP_REQUEST: MpRequest = MpRequest::new().with_flags(RequestFlags::X2APIC);
+
+#[used]
+#[doc(hidden)]
+#[link_section = ".requests"]
+#[cfg(target_arch = "riscv64")]
+static SMP_REQUEST: MpRequest = MpRequest::new();
 
 /// Platform specific core-local fields.
 pub struct PlatformFields {
@@ -39,14 +67,20 @@ pub struct CoreLocal {
     /// ID of current CPU core.
     pub id: usize,
 
-    /// Per-CPU timer tick counter.
-    pub ticks: u64,
-
-    /// Next local scheduler deadline in monotonic nanoseconds.
-    pub next_stat_deadline_ns: u64,
-
     /// Currently running thread ID on this CPU, if any.
     pub current_thread: usize,
+
+    /// Timer state owned by this CPU.
+    pub(crate) clock: Once<PerCpuClock>,
+
+    /// Scheduler state owned by this CPU.
+    pub(crate) scheduler: Once<PerCpuScheduler>,
+
+    /// Deferred IPI work queued for this CPU.
+    pub(crate) ipi: Once<PerCpuIpi>,
+
+    /// Nesting depth for trap/interrupt handling on this CPU.
+    pub interrupt_depth: usize,
 
     /// Platform specific context.
     #[allow(dead_code)]
@@ -70,12 +104,19 @@ impl CoreLocal {
             id: cid,
             kernel_stack: 0,
             user_stack: 0,
-            ticks: 0,
-            next_stat_deadline_ns: 0,
             current_thread: 0,
+            clock: Once::new(),
+            scheduler: Once::new(),
+            ipi: Once::new(),
+            interrupt_depth: 0,
             platform: PlatformFields::new(),
         }
     }
+}
+
+/// RAII guard marking execution inside trap/interrupt context on the local CPU.
+pub struct InterruptContextGuard {
+    active: bool,
 }
 
 struct CpuRecord {
@@ -87,6 +128,40 @@ struct CpuRecord {
 
 struct SmpState {
     cpus: Box<[CpuRecord]>,
+}
+
+const IPI_QUEUE_CAPACITY: usize = 32;
+const IPI_INLINE_WORDS: usize = 4;
+const IPI_INLINE_BYTES: usize = IPI_INLINE_WORDS * size_of::<usize>();
+
+#[repr(C)]
+struct InlineIpiPayload {
+    words: [usize; IPI_INLINE_WORDS],
+}
+
+struct IpiJob {
+    invoke: unsafe fn(*const u8),
+    size: u8,
+    payload: InlineIpiPayload,
+}
+
+struct IpiQueue {
+    head: usize,
+    len: usize,
+    jobs: [Option<IpiJob>; IPI_QUEUE_CAPACITY],
+}
+
+pub(crate) struct PerCpuIpi {
+    queue: IrqSpinLock<IpiQueue>,
+}
+
+/// Broadcast selector used by [`send_ipi`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IpiTarget {
+    /// Deliver to every other online CPU.
+    All,
+    /// Deliver to one logical CPU, which may be the current CPU.
+    Single(usize),
 }
 
 static SMP_STATE: Once<SmpState> = Once::new();
@@ -146,11 +221,138 @@ impl SmpState {
     }
 }
 
+impl InlineIpiPayload {
+    const fn zeroed() -> Self {
+        Self {
+            words: [0; IPI_INLINE_WORDS],
+        }
+    }
+}
+
+impl IpiJob {
+    fn new<F>(callback: F) -> Self
+    where
+        F: FnOnce() + Copy + Send + 'static,
+    {
+        assert!(
+            size_of::<F>() <= IPI_INLINE_BYTES,
+            "smp: IPI callback size {} exceeds {} bytes",
+            size_of::<F>(),
+            IPI_INLINE_BYTES
+        );
+        assert!(
+            align_of::<F>() <= align_of::<InlineIpiPayload>(),
+            "smp: IPI callback alignment {} exceeds {}",
+            align_of::<F>(),
+            align_of::<InlineIpiPayload>()
+        );
+
+        let mut payload = InlineIpiPayload::zeroed();
+        if size_of::<F>() != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    (&callback as *const F).cast::<u8>(),
+                    payload.words.as_mut_ptr().cast::<u8>(),
+                    size_of::<F>(),
+                );
+            }
+        }
+
+        Self {
+            invoke: invoke_ipi_job::<F>,
+            size: size_of::<F>() as u8,
+            payload,
+        }
+    }
+
+    fn is_equivalent(&self, other: &Self) -> bool {
+        self.size == 0 && other.size == 0 && self.invoke as usize == other.invoke as usize
+    }
+
+    unsafe fn run(self) {
+        (self.invoke)(self.payload.words.as_ptr().cast::<u8>());
+    }
+}
+
+impl IpiQueue {
+    const fn new() -> Self {
+        Self {
+            head: 0,
+            len: 0,
+            jobs: [const { None }; IPI_QUEUE_CAPACITY],
+        }
+    }
+
+    fn push(&mut self, job: IpiJob) -> bool {
+        if self.contains_equivalent(&job) {
+            return false;
+        }
+
+        assert!(self.len < IPI_QUEUE_CAPACITY, "smp: cpu IPI queue overflow");
+
+        let slot = (self.head + self.len) % IPI_QUEUE_CAPACITY;
+        self.jobs[slot] = Some(job);
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<IpiJob> {
+        if self.len == 0 {
+            return None;
+        }
+
+        let slot = self.head;
+        let job = self.jobs[slot].take();
+        self.head = (self.head + 1) % IPI_QUEUE_CAPACITY;
+        self.len -= 1;
+        job
+    }
+
+    fn contains_equivalent(&self, needle: &IpiJob) -> bool {
+        if needle.size != 0 {
+            return false;
+        }
+
+        for offset in 0..self.len {
+            let slot = (self.head + offset) % IPI_QUEUE_CAPACITY;
+            if self.jobs[slot]
+                .as_ref()
+                .map(|job| job.is_equivalent(needle))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+impl PerCpuIpi {
+    fn new() -> Self {
+        Self {
+            queue: IrqSpinLock::new(IpiQueue::new()),
+        }
+    }
+}
+
 fn smp_state() -> &'static SmpState {
     SMP_STATE.get().expect("smp: init required before use")
 }
 
+unsafe fn invoke_ipi_job<F>(payload: *const u8)
+where
+    F: FnOnce() + Copy + Send + 'static,
+{
+    let callback = ptr::read(payload.cast::<F>());
+    callback();
+}
+
 /// `spin::Mutex` wrapper that masks interrupts while holding the lock.
+///
+/// Unlike [`crate::sys::sync::Mutex`], this lock is valid in interrupt
+/// context. It is the kernel's primitive for data that must be reachable from
+/// trap handlers while still preventing local IRQ re-entry deadlocks.
 pub struct IrqSpinLock<T> {
     inner: Mutex<T>,
 }
@@ -237,6 +439,22 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
     }
 }
 
+impl Drop for InterruptContextGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let cpu = arch::thiscpu();
+        assert!(
+            cpu.interrupt_depth == 1,
+            "smp: interrupt context underflow on cpu{}",
+            cpu.id
+        );
+        cpu.interrupt_depth = 0;
+    }
+}
+
 /// Discovers CPUs exposed by the bootloader and prepares their core-local state.
 pub fn init() {
     if SMP_STATE.get().is_some() {
@@ -252,6 +470,13 @@ pub fn init() {
     TOTAL_CPUS.store(total, Ordering::Release);
     ONLINE_CPUS.store(1, Ordering::Release);
     SMP_STATE.call_once(|| SmpState { cpus });
+
+    for cpu_id in 0..total {
+        core_local(cpu_id)
+            .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
+            .ipi
+            .call_once(PerCpuIpi::new);
+    }
 }
 
 /// Starts every application processor discovered during [`init`].
@@ -290,6 +515,17 @@ pub fn start() {
         spin_loop();
     }
 
+    while scheduler_online_aps() + 1 < state.cpu_count() {
+        if crate::sys::clock::monotonic_ns() >= deadline {
+            panic!(
+                "smp: timed out waiting for AP schedulers ({}/{})",
+                scheduler_online_aps() + 1,
+                state.cpu_count()
+            );
+        }
+        spin_loop();
+    }
+
     info!("smp: all {} CPU(s) online", state.cpu_count());
 }
 
@@ -308,19 +544,167 @@ pub fn platform_id(cpu_id: usize) -> Option<u64> {
     smp_state().by_logical_id(cpu_id).map(|cpu| cpu.platform_id)
 }
 
-/// Sends a reschedule IPI to `cpu_id` when it refers to another online CPU.
-pub fn send_ipi(cpu_id: usize) {
-    let state = smp_state();
-    let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
-    let Some(target) = state.by_logical_id(cpu_id) else {
-        return;
+/// Returns the immutable core-local record for `cpu_id`.
+pub(crate) fn core_local(cpu_id: usize) -> Option<&'static CoreLocal> {
+    smp_state()
+        .by_logical_id(cpu_id)
+        .map(|cpu| unsafe { &*cpu.core_local_ptr() })
+}
+
+/// Returns whether `cpu_id` is currently online.
+pub fn is_online(cpu_id: usize) -> bool {
+    smp_state()
+        .by_logical_id(cpu_id)
+        .map(CpuRecord::is_online)
+        .unwrap_or(false)
+}
+
+/// Marks the local CPU as executing inside trap/interrupt context.
+pub fn enter_interrupt_context() -> InterruptContextGuard {
+    let Some(cpu) = arch::thiscpu_opt() else {
+        return InterruptContextGuard { active: false };
     };
 
-    if this_cpu == Some(cpu_id) || !target.is_online() {
+    assert!(
+        !arch::irqstate(),
+        "smp: interrupt entered with IRQs enabled on cpu{}",
+        cpu.id
+    );
+    assert!(
+        cpu.interrupt_depth == 0,
+        "smp: nested interrupt on cpu{}",
+        cpu.id
+    );
+
+    cpu.interrupt_depth = 1;
+    InterruptContextGuard { active: true }
+}
+
+/// Returns whether the local CPU is currently handling a trap/interrupt.
+pub fn in_interrupt_context() -> bool {
+    arch::thiscpu_opt()
+        .map(|cpu| cpu.interrupt_depth != 0)
+        .unwrap_or(false)
+}
+
+/// Queues `callback` for one or more CPUs and nudges them through the kernel's
+/// IPI path.
+///
+/// The callback is copied into a fixed-size per-CPU mailbox, so it must be:
+///
+/// - `Copy`, because broadcast delivery duplicates the callback
+/// - small enough to fit in the inline IPI payload
+/// - `Send + 'static`, because it executes later on another CPU
+///
+/// [`IpiTarget::All`] broadcasts to every other online CPU. Use
+/// [`IpiTarget::Single`] with the local CPU id when the current CPU also needs
+/// to observe the callback.
+///
+/// Returns the number of CPUs that accepted a new queued callback.
+pub fn send_ipi<F>(callback: F, target: IpiTarget) -> usize
+where
+    F: FnOnce() + Copy + Send + 'static,
+{
+    let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
+    let mut queued = 0usize;
+
+    match target {
+        IpiTarget::All => {
+            for cpu_id in 0..cpu_count() {
+                if Some(cpu_id) == this_cpu || !is_online(cpu_id) {
+                    continue;
+                }
+
+                if queue_ipi_job(cpu_id, callback) {
+                    kick_cpu(cpu_id, this_cpu);
+                    queued += 1;
+                }
+            }
+        }
+        IpiTarget::Single(cpu_id) => {
+            if queue_ipi_job(cpu_id, callback) {
+                kick_cpu(cpu_id, this_cpu);
+                queued = 1;
+            }
+        }
+    }
+
+    queued
+}
+
+/// Executes all pending IPI callbacks queued for the current CPU.
+///
+/// This is called from the scheduler's trap-return path so every delivered IPI
+/// callback runs before the CPU decides whether to resume or switch threads.
+pub(crate) fn drain_ipi_queue() {
+    let cpu_id = arch::thiscpu().id;
+    let queue = &core_local(cpu_id)
+        .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
+        .ipi
+        .get()
+        .unwrap_or_else(|| panic!("smp: cpu{cpu_id} IPI queue not initialized"))
+        .queue;
+
+    loop {
+        let job = {
+            let mut queue = queue.lock();
+            queue.pop()
+        };
+
+        let Some(job) = job else {
+            return;
+        };
+
+        unsafe {
+            job.run();
+        }
+    }
+}
+
+fn queue_ipi_job<F>(cpu_id: usize, callback: F) -> bool
+where
+    F: FnOnce() + Copy + Send + 'static,
+{
+    let Some(target) = smp_state().by_logical_id(cpu_id) else {
+        return false;
+    };
+    if !target.is_online() {
+        return false;
+    }
+
+    core_local(cpu_id)
+        .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
+        .ipi
+        .get()
+        .unwrap_or_else(|| panic!("smp: cpu{cpu_id} IPI queue not initialized"))
+        .queue
+        .lock()
+        .push(IpiJob::new(callback))
+}
+
+fn kick_cpu(cpu_id: usize, this_cpu: Option<usize>) {
+    if this_cpu == Some(cpu_id) {
+        if arch::irqstate() && !in_interrupt_context() {
+            arch::reschedule();
+        }
         return;
     }
 
     arch::send_ipi(cpu_id);
+}
+
+fn scheduler_online_aps() -> usize {
+    let mut ready = 0usize;
+
+    for cpu_id in 1..cpu_count() {
+        let Some(scheduler) = core_local(cpu_id).and_then(|core| core.scheduler.get()) else {
+            continue;
+        };
+
+        ready += usize::from(scheduler.is_online());
+    }
+
+    ready
 }
 
 fn discover_cpus(response: &limine::response::MpResponse) -> Box<[CpuRecord]> {
@@ -351,6 +735,7 @@ unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
         .expect("smp: missing AP record");
 
     arch::init_secondary(record.core_local_ptr());
+    crate::mem::alloc::register_tlb_cpu(record.logical_id);
     crate::sys::clock::start_secondary();
     let _ = record.mark_online();
     crate::sys::sched::start_secondary();

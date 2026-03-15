@@ -215,8 +215,13 @@ pub fn send_ipi(cpu_id: usize) {
 
 /// Forces the current CPU through the scheduler trap path.
 pub fn reschedule() {
+    assert!(
+        irqstate(),
+        "riscv: local reschedule requires interrupts to be enabled"
+    );
+
     unsafe {
-        asm!("ebreak", options(nomem, nostack));
+        asm!("csrsi sip, 0x2", "wfi");
     }
 }
 

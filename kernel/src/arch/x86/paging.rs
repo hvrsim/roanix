@@ -180,6 +180,11 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
     Ok(Some(PhysAddr::new(leaf & ENTRY_ADDR_MASK)))
 }
 
+/// Flushes the current CPU's TLB entry for `virt`.
+pub fn flush_page(virt: VirtAddr) {
+    tlb::flush(X86VirtAddr::new(virt.as_u64()));
+}
+
 /// Translates a virtual address to physical using `root`.
 ///
 /// # Safety

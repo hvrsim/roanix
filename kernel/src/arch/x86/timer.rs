@@ -1,17 +1,16 @@
 //!
 //! # x86 Timekeeping
 //!
-//! TSC clocksource plus local-APIC-backed event timer.
+//! TSC-backed timekeeping plus LAPIC deadline delivery.
 //!
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use raw_cpuid::{CpuId, CpuIdReader};
 use x86_64::instructions::port::{
     PortGeneric, PortReadOnly, PortWriteOnly, ReadOnlyAccess, WriteOnlyAccess,
 };
-
-use crate::sys::clock::{self, ClockSource, EventTimer};
 
 use super::lapic;
 
@@ -20,54 +19,17 @@ const PIT_TARGET: u32 = 0x3FFF;
 const PIT_MAX_COUNT: u32 = 0xFFFF;
 const CALIBRATION_MS: u32 = 10;
 
-static TSC_CLOCKSOURCE: TscClockSource = TscClockSource;
-static LAPIC_EVENT_TIMER: LapicEventTimer = LapicEventTimer;
-static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
-struct TscClockSource;
-struct LapicEventTimer;
-
-impl ClockSource for TscClockSource {
-    fn name(&self) -> &'static str {
-        "tsc"
-    }
-
-    fn rating(&self) -> u32 {
-        4000
-    }
-
-    fn frequency_hz(&self) -> u64 {
-        TSC_HZ.load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn counter(&self) -> u64 {
-        rdtsc()
-    }
+/// Result of dispatching an x86 local interrupt vector through the timer/LAPIC
+/// path.
+pub enum InterruptAction {
+    Unhandled,
+    Handled,
+    Reschedule,
 }
 
-impl EventTimer for LapicEventTimer {
-    fn name(&self) -> &'static str {
-        lapic::timer_name()
-    }
-
-    fn min_period_ns(&self) -> u64 {
-        lapic::min_period_ns()
-    }
-
-    fn max_period_ns(&self) -> u64 {
-        lapic::max_period_ns()
-    }
-
-    fn set_oneshot(&self, delay_ns: u64) {
-        lapic::set_oneshot(delay_ns);
-    }
-
-    fn stop(&self) {
-        lapic::stop_timer();
-    }
-}
-
-/// Initializes the x86 clocksource and event timer.
+/// Initializes the x86 counter source and local timer hardware.
 pub fn init() {
     let cpuid = CpuId::new();
     let feature_info = cpuid
@@ -81,12 +43,8 @@ pub fn init() {
         .unwrap_or(false);
     assert!(invariant_tsc, "x86/timer: invariant TSC required");
 
-    let tsc_hz = calibrate_tsc(&cpuid);
-    TSC_HZ.store(tsc_hz, core::sync::atomic::Ordering::Relaxed);
-
-    lapic::init(tsc_hz);
-    clock::register_clocksource(&TSC_CLOCKSOURCE);
-    clock::register_event_timer(&LAPIC_EVENT_TIMER);
+    TSC_HZ.store(calibrate_tsc(&cpuid), Ordering::Relaxed);
+    lapic::init(counter_frequency_hz());
 }
 
 /// Programs the local timer backend on a secondary CPU.
@@ -94,17 +52,68 @@ pub fn init_secondary() {
     lapic::init_secondary();
 }
 
-/// Handles the local APIC timer interrupt.
-pub fn handle_interrupt(vec: u64) -> bool {
-    if !lapic::handle_interrupt(vec) {
-        return false;
+/// Returns the active counter source name.
+pub fn counter_name() -> &'static str {
+    "tsc"
+}
+
+/// Returns the active event timer name.
+pub fn timer_name() -> &'static str {
+    lapic::timer_name()
+}
+
+/// Returns the counter frequency in Hz.
+pub fn counter_frequency_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// Returns the current raw cycle counter.
+pub fn counter() -> u64 {
+    rdtsc()
+}
+
+/// Returns the minimum programmable deadline delta in nanoseconds.
+pub fn min_deadline_ns() -> u64 {
+    lapic::min_period_ns()
+}
+
+/// Returns the maximum programmable deadline delta in nanoseconds.
+pub fn max_deadline_ns() -> u64 {
+    lapic::max_period_ns()
+}
+
+/// Programs the next local timer interrupt for `deadline_ns`.
+pub fn set_deadline(deadline_ns: u64, now_ns: u64) {
+    lapic::set_oneshot(deadline_ns.saturating_sub(now_ns));
+}
+
+/// Stops local timer delivery.
+pub fn stop() {
+    lapic::stop_timer();
+}
+
+/// Handles LAPIC timer, reschedule, and spurious vectors.
+pub fn handle_interrupt(vec: u64) -> InterruptAction {
+    if vec == lapic::SPURIOUS_VECTOR as u64 {
+        return InterruptAction::Handled;
     }
 
     if vec == lapic::TIMER_VECTOR as u64 {
-        clock::handle_timer_interrupt();
+        lapic::eoi();
+        crate::sys::clock::handle_local_timer_interrupt();
+        return InterruptAction::Reschedule;
     }
 
-    true
+    if vec == lapic::RESCHEDULE_VECTOR as u64 {
+        lapic::eoi();
+        return InterruptAction::Reschedule;
+    }
+
+    if vec == lapic::SELF_RESCHEDULE_VECTOR as u64 {
+        return InterruptAction::Reschedule;
+    }
+
+    InterruptAction::Unhandled
 }
 
 fn calibrate_tsc<R: CpuIdReader>(cpuid: &CpuId<R>) -> u64 {
@@ -146,19 +155,19 @@ fn pit_calibrate_tsc(reference_hz: u64) -> u64 {
     }
 
     let start = rdtsc();
-    let current = loop {
-        unsafe { pit_cmd.write(0x00) };
+    loop {
+        unsafe {
+            pit_cmd.write(0x00);
+        }
 
         let low = unsafe { pit_ch0_read.read() };
         let high = unsafe { pit_ch0_read.read() };
         let current = ((high as u16) << 8) | low as u16;
-
         if current as u32 <= PIT_TARGET {
-            break current;
+            break;
         }
-    };
+    }
 
-    let _ = current;
     let measured_hz = rdtsc().wrapping_sub(start) / cal_ms as u64 * 1000;
 
     if irq_enabled {

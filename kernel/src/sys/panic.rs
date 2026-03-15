@@ -236,7 +236,7 @@ fn shoot_down_other_cpus(owner: usize) {
 
     for cpu_id in 0..total {
         if cpu_id != owner {
-            smp::send_ipi(cpu_id);
+            let _ = smp::send_ipi(halt_if_panicking, smp::IpiTarget::Single(cpu_id));
         }
     }
 }

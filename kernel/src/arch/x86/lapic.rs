@@ -9,12 +9,12 @@ use core::ptr::{read_volatile, write_volatile};
 
 use log::info;
 use raw_cpuid::CpuId;
+use spin::Once;
 use x86_64::registers::model_specific::Msr;
 
 use crate::{
     arch,
     mem::{self, PhysAddr, VirtAddr, VmFlags},
-    sys::smp::IrqSpinLock,
 };
 
 /// Timer interrupt vector used by the local APIC.
@@ -22,6 +22,9 @@ pub const TIMER_VECTOR: u8 = 0xE0;
 
 /// Reschedule IPI vector used for cross-core wakeups.
 pub const RESCHEDULE_VECTOR: u8 = 0xE1;
+
+/// Software-only reschedule vector used on the local CPU.
+pub const SELF_RESCHEDULE_VECTOR: u8 = 0xE2;
 
 /// Spurious interrupt vector used by the local APIC.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
@@ -58,7 +61,6 @@ enum TimerMode {
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ApicAccess {
-    Uninit,
     XApic { base: VirtAddr },
     X2Apic,
 }
@@ -69,22 +71,9 @@ struct LapicState {
     timer_mode: TimerMode,
     tsc_hz: u64,
     lapic_timer_hz: u64,
-    initialized: bool,
 }
 
-static LAPIC_STATE: IrqSpinLock<LapicState> = IrqSpinLock::new(LapicState::new());
-
-impl LapicState {
-    const fn new() -> Self {
-        Self {
-            access: ApicAccess::Uninit,
-            timer_mode: TimerMode::TscDeadline,
-            tsc_hz: 0,
-            lapic_timer_hz: 0,
-            initialized: false,
-        }
-    }
-}
+static LAPIC_STATE: Once<LapicState> = Once::new();
 
 impl TimerMode {
     fn name(self) -> &'static str {
@@ -98,15 +87,24 @@ impl TimerMode {
 impl ApicAccess {
     fn name(self) -> &'static str {
         match self {
-            Self::Uninit => "uninitialized",
             Self::XApic { .. } => "xapic",
             Self::X2Apic => "x2apic",
         }
     }
 }
 
+fn lapic_state() -> &'static LapicState {
+    LAPIC_STATE
+        .get()
+        .expect("x86/lapic: init required before use")
+}
+
 /// Initializes shared LAPIC state and programs the BSP local timer path.
 pub fn init(tsc_hz: u64) {
+    if LAPIC_STATE.get().is_some() {
+        return;
+    }
+
     let cpuid = CpuId::new();
     let features = cpuid
         .get_feature_info()
@@ -120,28 +118,28 @@ pub fn init(tsc_hz: u64) {
         TimerMode::LocalOneShot
     };
 
-    {
-        let mut state = LAPIC_STATE.lock();
-        *state = LapicState {
-            access,
-            timer_mode,
-            tsc_hz,
-            lapic_timer_hz: 0,
-            initialized: true,
-        };
-    }
-
     mask_legacy_pic();
-    init_thiscpu();
+    init_thiscpu(access, timer_mode);
+
+    let lapic_timer_hz = if timer_mode == TimerMode::LocalOneShot {
+        calibrate_lapic_timer(access, tsc_hz)
+    } else {
+        0
+    };
+
+    LAPIC_STATE.call_once(|| LapicState {
+        access,
+        timer_mode,
+        tsc_hz,
+        lapic_timer_hz,
+    });
 
     if timer_mode == TimerMode::LocalOneShot {
-        let hz = calibrate_lapic_timer(access, tsc_hz);
-        LAPIC_STATE.lock().lapic_timer_hz = hz;
         info!(
             "x86/lapic: mode={} timer={} hz={}",
             access.name(),
             timer_mode.name(),
-            hz
+            lapic_timer_hz
         );
     } else {
         info!(
@@ -154,17 +152,13 @@ pub fn init(tsc_hz: u64) {
 
 /// Programs the local APIC on a secondary CPU using BSP-selected settings.
 pub fn init_secondary() {
-    let state = *LAPIC_STATE.lock();
-    assert!(
-        state.initialized,
-        "x86/lapic: init required before secondary setup"
-    );
-    init_thiscpu();
+    let state = lapic_state();
+    init_thiscpu(state.access, state.timer_mode);
 }
 
 /// Returns the active timer backend name.
 pub fn timer_name() -> &'static str {
-    let state = *LAPIC_STATE.lock();
+    let state = lapic_state();
     match state.timer_mode {
         TimerMode::TscDeadline => "lapic-tsc-deadline",
         TimerMode::LocalOneShot => "lapic-oneshot",
@@ -173,8 +167,7 @@ pub fn timer_name() -> &'static str {
 
 /// Arms the local APIC timer in one-shot mode.
 pub fn set_oneshot(delay_ns: u64) {
-    let state = *LAPIC_STATE.lock();
-    assert!(state.initialized, "x86/lapic: init required before arm");
+    let state = lapic_state();
 
     match state.timer_mode {
         TimerMode::TscDeadline => {
@@ -197,10 +190,7 @@ pub fn set_oneshot(delay_ns: u64) {
 
 /// Stops timer delivery on the current CPU.
 pub fn stop_timer() {
-    let state = *LAPIC_STATE.lock();
-    if !state.initialized {
-        return;
-    }
+    let state = lapic_state();
 
     write_register(state.access, LAPIC_INITIAL_COUNT, 0);
     if state.timer_mode == TimerMode::TscDeadline {
@@ -220,10 +210,7 @@ pub fn min_period_ns() -> u64 {
 
 /// Returns the maximum programmable interval.
 pub fn max_period_ns() -> u64 {
-    let state = *LAPIC_STATE.lock();
-    if !state.initialized {
-        return u64::MAX;
-    }
+    let state = lapic_state();
 
     match state.timer_mode {
         TimerMode::TscDeadline => u64::MAX,
@@ -235,10 +222,7 @@ pub fn max_period_ns() -> u64 {
 
 /// Issues an end-of-interrupt to the local APIC.
 pub fn eoi() {
-    let state = *LAPIC_STATE.lock();
-    if state.initialized {
-        write_register(state.access, LAPIC_EOI, 0);
-    }
+    write_register(lapic_state().access, LAPIC_EOI, 0);
 }
 
 /// Handles LAPIC-delivered timer, IPI, and spurious vectors.
@@ -257,8 +241,7 @@ pub fn handle_interrupt(vec: u64) -> bool {
 
 /// Sends a fixed reschedule IPI to `lapic_id`.
 pub fn send_ipi(lapic_id: u32) {
-    let state = *LAPIC_STATE.lock();
-    assert!(state.initialized, "x86/lapic: init required before IPI");
+    let state = lapic_state();
     send_fixed_ipi(state.access, lapic_id, RESCHEDULE_VECTOR);
 }
 
@@ -273,40 +256,30 @@ fn detect_access_mode(x2apic_supported: bool) -> ApicAccess {
     }
 }
 
-fn init_thiscpu() {
-    let state = *LAPIC_STATE.lock();
-    assert!(
-        state.initialized,
-        "x86/lapic: init required before local setup"
-    );
-
-    enable_access_mode(state.access);
+fn init_thiscpu(access: ApicAccess, timer_mode: TimerMode) {
+    enable_access_mode(access);
 
     // Reset the software-enable bit first so we start from a known state even
     // if firmware or the bootloader left LAPIC state behind.
-    write_register(state.access, LAPIC_SVR, 0);
-    clear_in_service(state.access);
-    write_register(state.access, LAPIC_TPR, 0);
-    write_register(state.access, LAPIC_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
-    write_register(state.access, LAPIC_EOI, 0);
+    write_register(access, LAPIC_SVR, 0);
+    clear_in_service(access);
+    write_register(access, LAPIC_TPR, 0);
+    write_register(access, LAPIC_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
+    write_register(access, LAPIC_EOI, 0);
 
-    match state.timer_mode {
+    match timer_mode {
         TimerMode::TscDeadline => {
             write_msr(IA32_TSC_DEADLINE_MSR, 0);
             write_register(
-                state.access,
+                access,
                 LAPIC_LVT_TIMER,
                 TIMER_VECTOR as u32 | LVT_TIMER_TSC_DEADLINE,
             );
         }
         TimerMode::LocalOneShot => {
-            write_register(state.access, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
-            write_register(
-                state.access,
-                LAPIC_LVT_TIMER,
-                TIMER_VECTOR as u32 | LVT_MASKED,
-            );
-            write_register(state.access, LAPIC_INITIAL_COUNT, 0);
+            write_register(access, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
+            write_register(access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32 | LVT_MASKED);
+            write_register(access, LAPIC_INITIAL_COUNT, 0);
         }
     }
 }
@@ -314,7 +287,6 @@ fn init_thiscpu() {
 fn enable_access_mode(access: ApicAccess) {
     let raw = read_msr(IA32_APIC_BASE_MSR);
     match access {
-        ApicAccess::Uninit => unreachable!("x86/lapic: access mode not initialized"),
         ApicAccess::XApic { .. } => {
             let enabled = raw | IA32_APIC_BASE_GLOBAL_ENABLE;
             if enabled != raw {
@@ -368,7 +340,6 @@ fn calibrate_lapic_timer(access: ApicAccess, tsc_hz: u64) -> u64 {
 
 fn send_fixed_ipi(access: ApicAccess, lapic_id: u32, vector: u8) {
     match access {
-        ApicAccess::Uninit => unreachable!("x86/lapic: access mode not initialized"),
         ApicAccess::XApic { .. } => {
             write_register(access, LAPIC_ICR_HIGH, lapic_id << 24);
             write_register(access, LAPIC_ICR_LOW, vector as u32);
@@ -410,7 +381,6 @@ fn ensure_xapic_mapping(base_pa: PhysAddr) -> VirtAddr {
 
 fn read_register(access: ApicAccess, offset: u32) -> u32 {
     match access {
-        ApicAccess::Uninit => unreachable!("x86/lapic: access mode not initialized"),
         ApicAccess::XApic { base } => {
             // SAFETY: `base` is a stable mapping of the architectural LAPIC
             // MMIO page and `offset` is a fixed register offset within it.
@@ -422,7 +392,6 @@ fn read_register(access: ApicAccess, offset: u32) -> u32 {
 
 fn write_register(access: ApicAccess, offset: u32, value: u32) {
     match access {
-        ApicAccess::Uninit => unreachable!("x86/lapic: access mode not initialized"),
         ApicAccess::XApic { base } => {
             // SAFETY: `base` is a stable mapping of the architectural LAPIC
             // MMIO page and `offset` resolves to a 32-bit LAPIC register.
@@ -438,7 +407,6 @@ fn write_register(access: ApicAccess, offset: u32, value: u32) {
 
 fn write_register64(access: ApicAccess, offset: u32, value: u64) {
     match access {
-        ApicAccess::Uninit => unreachable!("x86/lapic: access mode not initialized"),
         ApicAccess::XApic { .. } => panic!("x86/lapic: 64-bit register write requires x2APIC"),
         ApicAccess::X2Apic => write_msr(x2apic_msr(offset), value),
     }

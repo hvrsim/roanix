@@ -207,6 +207,11 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
     Ok(Some(PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12)))
 }
 
+/// Flushes the current hart's TLB entry for `virt`.
+pub fn flush_page(virt: VirtAddr) {
+    sfence_vma(Some(virt));
+}
+
 /// Translates a virtual address to physical using `root`.
 ///
 /// # Safety

@@ -53,10 +53,6 @@ unsafe extern "C" fn rmain() -> ! {
     sys::sched::init();
     sys::clock::start();
     sys::smp::start();
-    let _ = sys::sched::run(|| {
-        info!("hello from a thread on core #{}!", arch::thiscpu().id);
-        sys::clock::sleep_ns(3000000000);
-        log::warn!("I just slept 3 seconds!");
-    });
+    let _ = sys::fireworks::start();
     sys::sched::start();
 }

@@ -9,11 +9,15 @@ use core::{
     hint::spin_loop,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    ptr,
     sync::atomic::{AtomicU8, Ordering},
 };
 
-use crate::sys::{sched, smp::IrqSpinLock, thread::Thread};
+use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink, UnsafeRef};
+
+use crate::{
+    arch,
+    sys::{sched, smp::IrqSpinLock, thread::Thread},
+};
 
 const STATE_LOCKED: u8 = 1 << 0;
 const STATE_QUEUED: u8 = 1 << 1;
@@ -28,9 +32,12 @@ const ACTIVE_SPIN_ITERS: usize = 8;
 /// spins briefly to avoid scheduler traffic, then falls back to FIFO sleeping
 /// waiters to avoid burning CPU time. Waiters sleep through the kernel
 /// scheduler, so blocking while holding the lock can delay unrelated threads.
+///
+/// This lock is forbidden in interrupt context. Trap handlers must use
+/// [`IrqSpinLock`] instead.
 pub struct Mutex<T: ?Sized> {
     state: AtomicU8,
-    waiters: IrqSpinLock<WaitQueue>,
+    waiters: IrqSpinLock<Option<WaitQueue>>,
     value: UnsafeCell<T>,
 }
 
@@ -42,13 +49,20 @@ pub struct MutexGuard<'a, T: ?Sized> {
 }
 
 struct WaitQueue {
-    head: *mut Thread,
-    tail: *mut Thread,
+    list: LinkedList<MutexWaiterAdapter>,
 }
 
 struct SpinWait {
     step: u32,
 }
+
+struct MutexWaiter {
+    link: LinkedListLink,
+    thread: *mut Thread,
+    park_seq: u64,
+}
+
+intrusive_adapter!(MutexWaiterAdapter = UnsafeRef<MutexWaiter>: MutexWaiter { link: LinkedListLink });
 
 impl SpinWait {
     const fn new() -> Self {
@@ -67,15 +81,14 @@ impl SpinWait {
 }
 
 impl WaitQueue {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            head: ptr::null_mut(),
-            tail: ptr::null_mut(),
+            list: LinkedList::new(MutexWaiterAdapter::NEW),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.head.is_null()
+        self.list.is_empty()
     }
 
     fn state_bits(&self) -> u8 {
@@ -86,37 +99,24 @@ impl WaitQueue {
         }
     }
 
-    fn push(&mut self, thread: *mut Thread) {
-        assert!(!thread.is_null(), "sync: queued null waiter");
-        unsafe {
-            (*thread).wait_next = ptr::null_mut();
-        }
-
-        if self.tail.is_null() {
-            self.head = thread;
-        } else {
-            unsafe {
-                (*self.tail).wait_next = thread;
-            }
-        }
-
-        self.tail = thread;
+    fn push(&mut self, waiter: &MutexWaiter) {
+        self.list
+            .push_back(unsafe { UnsafeRef::from_raw(waiter as *const MutexWaiter) });
     }
 
-    fn pop(&mut self) -> Option<*mut Thread> {
-        let thread = self.head;
-        if thread.is_null() {
-            return None;
+    fn pop(&mut self) -> Option<UnsafeRef<MutexWaiter>> {
+        self.list.pop_front()
+    }
+
+    fn remove(&mut self, waiter: *const MutexWaiter) -> bool {
+        if unsafe { !(*waiter).link.is_linked() } {
+            return false;
         }
 
-        self.head = unsafe { (*thread).wait_next };
-        if self.head.is_null() {
-            self.tail = ptr::null_mut();
-        }
         unsafe {
-            (*thread).wait_next = ptr::null_mut();
+            self.list.cursor_mut_from_ptr(waiter).remove();
         }
-        Some(thread)
+        true
     }
 }
 
@@ -133,7 +133,7 @@ impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicU8::new(0),
-            waiters: IrqSpinLock::new(WaitQueue::new()),
+            waiters: IrqSpinLock::new(None),
             value: UnsafeCell::new(value),
         }
     }
@@ -150,6 +150,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Contended callers briefly spin, then park and wait in FIFO order.
     #[inline]
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        assert_mutex_context();
         if self.try_lock_fast() {
             return MutexGuard::new(self);
         }
@@ -160,6 +161,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Attempts to lock the mutex without spinning or parking.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        assert_mutex_context();
         self.try_lock_fast().then(|| MutexGuard::new(self))
     }
 
@@ -200,7 +202,8 @@ impl<T: ?Sized> Mutex<T> {
         }
 
         loop {
-            let mut waiters = self.waiters.lock();
+            let mut waiters_guard = self.waiters.lock();
+            let waiters = waiters_guard.get_or_insert_with(WaitQueue::new);
             let state = self.state.load(Ordering::Acquire);
 
             if state & STATE_LOCKED == 0 {
@@ -210,41 +213,77 @@ impl<T: ?Sized> Mutex<T> {
                     .compare_exchange(state, next, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
                 {
-                    drop(waiters);
+                    drop(waiters_guard);
                     return MutexGuard::new(self);
                 }
                 continue;
             }
 
-            let current = sched::current_thread() as *mut Thread;
-            unsafe {
-                (&*current).prepare_park();
+            // Parking requires a trap return to complete the context switch.
+            // If IRQs are currently masked, keep spinning instead of enqueuing
+            // a sleeper that cannot be rescheduled promptly.
+            if !arch::irqstate() {
+                drop(waiters_guard);
+                backoff.spin();
+                continue;
             }
-            waiters.push(current);
-            self.state.fetch_or(STATE_QUEUED, Ordering::Release);
-            drop(waiters);
 
-            sched::park_current();
+            let Some(current) = sched::current_thread_opt() else {
+                drop(waiters_guard);
+                backoff.spin();
+                continue;
+            };
+            let seq = unsafe { (&*current).prepare_park() };
+            let waiter = core::pin::pin!(MutexWaiter::new(current, seq));
+            waiters.push(waiter.as_ref().get_ref());
+            self.state.fetch_or(STATE_QUEUED, Ordering::Release);
+            drop(waiters_guard);
+
+            sched::park_current(seq);
+
+            let mut waiters_guard = self.waiters.lock();
+            let waiter_ptr = waiter.as_ref().get_ref() as *const MutexWaiter;
+            if let Some(waiters) = waiters_guard.as_mut() {
+                if waiters.remove(waiter_ptr) && waiters.is_empty() {
+                    self.state.fetch_and(!STATE_QUEUED, Ordering::AcqRel);
+                }
+            }
         }
     }
 
     #[inline]
     fn unlock(&self) {
-        let waiter = {
-            let mut waiters = self.waiters.lock();
-            let Some(waiter) = waiters.pop() else {
-                self.state.store(0, Ordering::Release);
+        assert_mutex_context();
+        loop {
+            let waiter = {
+                let mut waiters_guard = self.waiters.lock();
+                let Some(waiters) = waiters_guard.as_mut() else {
+                    self.state.store(0, Ordering::Release);
+                    return;
+                };
+
+                // Keep the remaining sleepers attached to the mutex. Draining
+                // the whole queue into a stack-local list can strand waiters
+                // forever if the unlocking thread is preempted mid-drain.
+                let waiter = waiters.pop();
+                let queued = !waiters.is_empty();
+                if !queued {
+                    *waiters_guard = None;
+                }
+                self.state
+                    .store(if queued { STATE_QUEUED } else { 0 }, Ordering::Release);
+                waiter
+            };
+
+            let Some(waiter) = waiter else {
                 return;
             };
 
-            self.state.store(waiters.state_bits(), Ordering::Release);
-            waiter
-        };
-
-        unsafe {
-            // SAFETY: waiters are enqueued from live scheduler threads and
-            // removed under the wait-queue lock before waking.
-            sched::wake(&mut *waiter);
+            // Retry on stale wake races so we never drop all wakeups for a
+            // queue that still has blocked sleepers.
+            if sched::wake(waiter.thread, waiter.park_seq) {
+                return;
+            }
         }
     }
 }
@@ -271,6 +310,16 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
     }
 }
 
+impl MutexWaiter {
+    fn new(thread: *mut Thread, park_seq: u64) -> Self {
+        Self {
+            link: LinkedListLink::new(),
+            thread,
+            park_seq,
+        }
+    }
+}
+
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
@@ -289,4 +338,12 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.mutex.unlock();
     }
+}
+
+#[inline]
+fn assert_mutex_context() {
+    assert!(
+        !crate::sys::smp::in_interrupt_context(),
+        "sync: sleeping mutex used from interrupt context"
+    );
 }

@@ -8,20 +8,15 @@
 
 use core::{ptr, slice};
 
-use limine::{framebuffer::MemoryModel, request::FramebufferRequest};
+use limine::framebuffer::MemoryModel;
 
-use crate::sys::{debug, smp::IrqSpinLock};
+use crate::sys::{debug, framebuffer::FRAMEBUFFER_REQUEST, smp::IrqSpinLock};
 
 const FONT_WIDTH: usize = 8;
 const FONT_HEIGHT: usize = 16;
 const FONT_BYTES: usize = FONT_HEIGHT * 256;
 const FONT: &[u8; FONT_BYTES] = include_bytes!("fbcon_font.bin");
 const FG_RGB: u32 = 0xD8DEE9;
-
-#[used]
-#[doc(hidden)]
-#[link_section = ".requests"]
-static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 static FBCON: IrqSpinLock<Option<FbCon>> = IrqSpinLock::new(None);
 

@@ -116,6 +116,17 @@ static mut BOOTSTRAP_NEXT: u64 = 0;
 /// End of bootstrap page-table allocation range.
 static mut BOOTSTRAP_END: u64 = 0;
 
+/// Snapshot of physical page allocator usage.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PhysStats {
+    /// Total physical pages tracked by the PFN database.
+    pub total_pages: usize,
+    /// Physical pages currently allocated.
+    pub used_pages: usize,
+    /// Physical pages currently free.
+    pub free_pages: usize,
+}
+
 /// Initializes the physical memory manager and PFN database from Limine memory map entries.
 pub fn init() {
     let mmap = mem::memory_map_entries();
@@ -269,15 +280,17 @@ pub fn phys_to_page(pa: PhysAddr) -> Option<&'static Page> {
 
 /// Allocates one physical page, zeroing it before returning.
 pub fn alloc_page() -> Option<&'static Page> {
-    let mut guard = PMM.lock();
-    let st = guard.as_mut()?;
-    let page = st.free.pop_front()?;
-    st.free_pages -= 1;
+    let page = {
+        let mut guard = PMM.lock();
+        let st = guard.as_mut()?;
+        let page = st.free.pop_front()?;
+        st.free_pages -= 1;
+        page.state.store(PageState::Used as u8, Ordering::Relaxed);
+        st.used_pages += 1;
+        page
+    };
 
     zero_page(page.paddr());
-
-    page.state.store(PageState::Used as u8, Ordering::Relaxed);
-    st.used_pages += 1;
     Some(page)
 }
 
@@ -331,6 +344,17 @@ pub unsafe fn free_page(page: &'static Page) {
 
     st.free.push_back(page);
     st.free_pages += 1;
+}
+
+/// Returns a point-in-time snapshot of physical page allocator usage.
+pub fn stats() -> Option<PhysStats> {
+    let guard = PMM.lock();
+    let st = guard.as_ref()?;
+    Some(PhysStats {
+        total_pages: st.total_pages,
+        used_pages: st.used_pages,
+        free_pages: st.free_pages,
+    })
 }
 
 fn entry_type_name(entry: &Entry) -> &'static str {

@@ -272,6 +272,6 @@ pub(crate) fn write_to_sinks(buf: *const u8, buflen: usize) {
 /// since the log functions depend on a valid kernel logger.
 pub fn register() {
     log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Info))
+        .map(|()| log::set_max_level(log::LevelFilter::Trace))
         .unwrap();
 }

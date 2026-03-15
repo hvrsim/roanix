@@ -10,8 +10,7 @@ use alloc::{
 };
 use core::{
     mem::size_of,
-    ptr,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU64, AtomicU8, Ordering},
 };
 
 use crate::{
@@ -23,8 +22,10 @@ use intrusive_collections::{intrusive_adapter, LinkedListLink};
 
 type TrapFrame = crate::arch::cpu::TrapFrame;
 
-const KSTACK_PAGES: usize = 16;
+const KSTACK_PAGES: usize = 32;
 const KSTACK_SIZE: usize = (KSTACK_PAGES as usize) * (PAGE_SIZE as usize);
+const STACK_CANARY_WORDS: usize = 8;
+const STACK_CANARY: u64 = 0xC0DE_CAFE_D15C_A11A;
 
 /// Scheduler class assigned to a kernel thread.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -78,8 +79,8 @@ pub(crate) struct Thread {
     /// Intrusive link used by per-priority run queues.
     pub(crate) runq_link: LinkedListLink,
 
-    /// Singly linked wait-queue pointer used by sleeping mutexes.
-    pub(crate) wait_next: *mut Thread,
+    /// Intrusive link used by the scheduler reaper queue.
+    pub(crate) reap_link: LinkedListLink,
 
     /// Monotonic thread identifier assigned by the scheduler.
     pub(crate) id: usize,
@@ -144,8 +145,11 @@ pub(crate) struct Thread {
     /// Parking handshake shared between the scheduler and wait sites.
     park_state: AtomicU8,
 
+    /// Monotonic sequence that tags the current blocking attempt.
+    park_seq: AtomicU64,
+
     /// Heap-allocated entry closure that runs when the thread starts.
-    task: Box<dyn KernelTask>,
+    task: Option<Box<dyn KernelTask>>,
 }
 
 // SAFETY: `Thread` instances are scheduler-owned, live for the lifetime of the
@@ -156,6 +160,7 @@ unsafe impl Sync for Thread {}
 
 // Intrusive list adapter used by scheduler run queues.
 intrusive_adapter!(pub(crate) ThreadAdapter = &'static Thread: Thread { runq_link: LinkedListLink });
+intrusive_adapter!(pub(crate) ExitedThreadAdapter = &'static Thread: Thread { reap_link: LinkedListLink });
 
 #[repr(align(16))]
 struct KernelStack([u8; KSTACK_SIZE]);
@@ -163,6 +168,13 @@ struct KernelStack([u8; KSTACK_SIZE]);
 const PARK_STATE_IDLE: u8 = 0;
 const PARK_STATE_WAITING: u8 = 1;
 const PARK_STATE_PARKED: u8 = 2;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum WakeResult {
+    Stale,
+    Pending,
+    Parked,
+}
 
 trait KernelTask: Send {
     fn run(self: Box<Self>) -> !;
@@ -179,6 +191,11 @@ where
 }
 
 impl Thread {
+    /// Returns whether this thread is currently linked into a run queue.
+    pub(crate) fn is_runq_linked(&self) -> bool {
+        self.runq_link.is_linked()
+    }
+
     /// Returns whether this thread is the per-CPU idle task.
     pub(crate) fn is_idle(&self) -> bool {
         self.flags.contains(ThreadFlags::IDLE)
@@ -222,12 +239,21 @@ impl Thread {
     }
 
     /// Publishes an intent to sleep before yielding to the scheduler.
-    pub(crate) fn prepare_park(&self) {
+    pub(crate) fn prepare_park(&self) -> u64 {
+        let seq = self
+            .park_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         self.park_state.store(PARK_STATE_WAITING, Ordering::Release);
+        seq
     }
 
     /// Finalizes the park handshake if no wakeup raced with parking.
-    pub(crate) fn mark_parked(&self) -> bool {
+    pub(crate) fn mark_parked(&self, seq: u64) -> bool {
+        if self.park_seq.load(Ordering::Acquire) != seq {
+            return false;
+        }
+
         self.park_state
             .compare_exchange(
                 PARK_STATE_WAITING,
@@ -239,14 +265,75 @@ impl Thread {
     }
 
     /// Wakes a parked thread and reports whether it must be requeued.
-    pub(crate) fn wake(&self) -> bool {
-        self.park_state.swap(PARK_STATE_IDLE, Ordering::AcqRel) == PARK_STATE_PARKED
+    pub(crate) fn wake(&self, seq: u64) -> WakeResult {
+        loop {
+            let state = self.park_state.load(Ordering::Acquire);
+            match state {
+                PARK_STATE_WAITING => {
+                    if self.park_seq.load(Ordering::Acquire) != seq {
+                        return WakeResult::Stale;
+                    }
+                    if self
+                        .park_state
+                        .compare_exchange(
+                            PARK_STATE_WAITING,
+                            PARK_STATE_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return WakeResult::Pending;
+                    }
+                }
+                PARK_STATE_PARKED => {
+                    if self.park_seq.load(Ordering::Acquire) != seq {
+                        return WakeResult::Stale;
+                    }
+                    if self
+                        .park_state
+                        .compare_exchange(
+                            PARK_STATE_PARKED,
+                            PARK_STATE_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return WakeResult::Parked;
+                    }
+                }
+                _ => return WakeResult::Stale,
+            }
+        }
+    }
+
+    /// Returns whether the saved trap frame pointer still resides in this
+    /// thread's kernel stack allocation.
+    pub(crate) fn has_valid_frame_ptr(&self) -> bool {
+        let frame = self.frame as usize as u64;
+        let stack_top = self.stack_top.as_u64();
+        let stack_base = stack_top.saturating_sub(KSTACK_SIZE as u64);
+
+        frame >= stack_base && frame + size_of::<TrapFrame>() as u64 <= stack_top
+    }
+
+    /// Returns whether the low-end stack canary is still intact.
+    pub(crate) fn has_valid_stack_canary(&self) -> bool {
+        self._stack
+            .0
+            .chunks_exact(size_of::<u64>())
+            .take(STACK_CANARY_WORDS)
+            .all(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()) == STACK_CANARY)
     }
 }
 
 extern "C" fn thread_entry(thread_ptr: usize) -> ! {
     let thread = unsafe { &mut *(thread_ptr as *mut Thread) };
-    let task = unsafe { ptr::read(&thread.task) };
+    let task = thread
+        .task
+        .take()
+        .expect("thread: missing task in thread entry");
     task.run()
 }
 
@@ -270,6 +357,13 @@ where
     }
 
     let mut stack = unsafe { Box::from_raw(stack_ptr) };
+    for chunk in stack
+        .0
+        .chunks_exact_mut(size_of::<u64>())
+        .take(STACK_CANARY_WORDS)
+    {
+        chunk.copy_from_slice(&STACK_CANARY.to_ne_bytes());
+    }
     let stack_base = VirtAddr::from_ptr(stack.0.as_mut_ptr());
     let stack_top = stack_base
         .checked_add(KSTACK_SIZE as u64)
@@ -283,7 +377,7 @@ where
     };
     let thread = Box::leak(Box::new(Thread {
         runq_link: LinkedListLink::new(),
-        wait_next: ptr::null_mut(),
+        reap_link: LinkedListLink::new(),
         id,
         state,
         class,
@@ -305,7 +399,8 @@ where
         stack_top,
         frame,
         park_state: AtomicU8::new(PARK_STATE_IDLE),
-        task: Box::new(task),
+        park_seq: AtomicU64::new(0),
+        task: Some(Box::new(task)),
     }));
     unsafe {
         crate::arch::cpu::init_kernel_thread_frame(
@@ -317,6 +412,16 @@ where
         );
     }
     thread
+}
+
+/// Reclaims a thread allocation after it has permanently exited.
+///
+/// # Safety
+///
+/// `thread` must point to a thread that is no longer runnable or executing on
+/// any CPU.
+pub(crate) unsafe fn free_thread(thread: *mut Thread) {
+    drop(Box::from_raw(thread));
 }
 
 /// Default idle loop that halts until the next interrupt arrives.
