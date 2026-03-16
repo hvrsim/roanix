@@ -9,8 +9,9 @@
 use core::{ptr, slice};
 
 use limine::framebuffer::MemoryModel;
+use limine::request::FramebufferRequest;
 
-use crate::sys::{debug, framebuffer::FRAMEBUFFER_REQUEST, smp::IrqSpinLock};
+use crate::sys::{debug, smp::IrqSpinLock};
 
 const FONT_WIDTH: usize = 8;
 const FONT_HEIGHT: usize = 16;
@@ -20,12 +21,18 @@ const FG_RGB: u32 = 0xD8DEE9;
 
 static FBCON: IrqSpinLock<Option<FbCon>> = IrqSpinLock::new(None);
 
+#[used]
+#[doc(hidden)]
+#[link_section = ".requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
 struct FbCon {
     base: *mut u8,
     width: usize,
     height: usize,
     pitch: usize,
     bytes_per_pixel: usize,
+    fb_len: usize,
     cols: usize,
     rows: usize,
     cursor_x: usize,
@@ -54,6 +61,7 @@ impl FbCon {
         if width < FONT_WIDTH || height < FONT_HEIGHT {
             return None;
         }
+        let fb_len = pitch.checked_mul(height)?;
 
         let mut console = Self {
             base: fb.addr(),
@@ -61,6 +69,7 @@ impl FbCon {
             height,
             pitch,
             bytes_per_pixel,
+            fb_len,
             cols: width / FONT_WIDTH,
             rows: height / FONT_HEIGHT,
             cursor_x: 0,
@@ -81,7 +90,7 @@ impl FbCon {
 
     fn clear(&mut self) {
         unsafe {
-            ptr::write_bytes(self.base, 0, self.pitch * self.height);
+            ptr::write_bytes(self.base, 0, self.fb_len);
         }
     }
 
@@ -140,12 +149,36 @@ impl FbCon {
             return;
         }
 
-        let offset = y * self.pitch + x * self.bytes_per_pixel;
+        let row = match y.checked_mul(self.pitch) {
+            Some(v) => v,
+            None => return,
+        };
+        let col = match x.checked_mul(self.bytes_per_pixel) {
+            Some(v) => v,
+            None => return,
+        };
+        let offset = match row.checked_add(col) {
+            Some(v) => v,
+            None => return,
+        };
+        let end = match offset.checked_add(self.bytes_per_pixel) {
+            Some(v) => v,
+            None => return,
+        };
+        if end > self.fb_len {
+            return;
+        }
+
         unsafe {
+            let pixel = self.base.add(offset);
             for idx in 0..self.bytes_per_pixel {
-                self.base
-                    .add(offset + idx)
-                    .write_volatile((color >> (idx * 8)) as u8);
+                let shift = idx.saturating_mul(8);
+                let byte = if shift < u32::BITS as usize {
+                    (color >> shift) as u8
+                } else {
+                    0
+                };
+                pixel.add(idx).write_volatile(byte);
             }
         }
     }
@@ -160,8 +193,14 @@ impl FbCon {
     }
 
     fn scroll(&mut self) {
-        let row_bytes = self.pitch * FONT_HEIGHT;
-        let visible = self.pitch * self.height;
+        let row_bytes = match self.pitch.checked_mul(FONT_HEIGHT) {
+            Some(v) => v,
+            None => return,
+        };
+        let visible = self.fb_len;
+        if row_bytes > visible {
+            return;
+        }
         unsafe {
             ptr::copy(self.base.add(row_bytes), self.base, visible - row_bytes);
             ptr::write_bytes(self.base.add(visible - row_bytes), 0, row_bytes);

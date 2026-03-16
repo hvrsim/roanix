@@ -521,31 +521,6 @@ pub struct KernelAllocator;
 static HEAP: Mutex<HeapState> = Mutex::new(HeapState::new());
 static HEAP_TLB_SHOOTDOWN: TlbShootdownState = TlbShootdownState::new();
 
-/// Snapshot of kernel heap usage.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct HeapStats {
-    /// Whether the heap allocator has been initialized.
-    pub initialized: bool,
-    /// Total pages reserved for the heap window.
-    pub total_pages: usize,
-    /// Pages currently free inside the heap window.
-    pub free_pages: usize,
-    /// Temporarily reserved heap pages not yet classified as slab/large.
-    pub reserved_pages: usize,
-    /// Heap pages retired pending TLB visibility on all CPUs.
-    pub retired_pages: usize,
-    /// Heap pages currently backing slab allocators.
-    pub slab_pages: usize,
-    /// Heap pages currently backing large allocations.
-    pub large_pages: usize,
-    /// Bytes currently occupied by live slab allocations.
-    pub slab_used_bytes: usize,
-    /// Free bytes sitting inside active slab pages.
-    pub slab_free_bytes: usize,
-    /// Bytes backing live large allocations.
-    pub large_bytes: usize,
-}
-
 struct HeapGuard<'a> {
     guard: crate::sys::sync::MutexGuard<'a, HeapState>,
 }
@@ -624,13 +599,6 @@ pub fn init() {
         HEAP_BASE + HEAP_SIZE,
         HEAP_SIZE / (1024 * 1024),
     );
-}
-
-/// Returns a point-in-time snapshot of heap allocator usage.
-pub fn stats() -> HeapStats {
-    let mut heap = heap_lock();
-    heap.collect_retired();
-    heap.stats()
 }
 
 /// Handles kernel allocation failures.
@@ -766,41 +734,6 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
     }
 
     slab.free_head = free_head;
-}
-
-impl HeapState {
-    fn stats(&self) -> HeapStats {
-        let mut stats = HeapStats {
-            initialized: self.initialized,
-            total_pages: HEAP_PAGES,
-            ..HeapStats::default()
-        };
-
-        for (page_idx, meta) in self.pages.iter().copied().enumerate() {
-            match meta.kind {
-                PageKind::Free => stats.free_pages += 1,
-                PageKind::Busy => stats.reserved_pages += 1,
-                PageKind::Retired => stats.retired_pages += 1,
-                PageKind::Slab => {
-                    stats.slab_pages += 1;
-
-                    let slab = unsafe { slab_header(page_idx) };
-                    let slot_size = SIZE_CLASSES[meta.class as usize];
-                    let free_slots = slab.free_count as usize;
-                    let used_slots = slab.capacity as usize - free_slots;
-                    stats.slab_free_bytes += free_slots * slot_size;
-                    stats.slab_used_bytes += used_slots * slot_size;
-                }
-                PageKind::LargeHead => {
-                    let pages = meta.aux as usize;
-                    stats.large_pages += pages;
-                    stats.large_bytes += pages * PAGE_SIZE as usize;
-                }
-                PageKind::LargeTail => {}
-            }
-        }
-        stats
-    }
 }
 
 impl TlbShootdownState {

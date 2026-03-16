@@ -270,6 +270,11 @@ impl IpiJob {
     }
 
     unsafe fn run(self) {
+        assert!(
+            self.invoke as usize != 0,
+            "smp: invalid IPI callback pointer (size={})",
+            self.size
+        );
         (self.invoke)(self.payload.words.as_ptr().cast::<u8>());
     }
 }

@@ -134,7 +134,7 @@ impl LocalClockState {
         (true, self.refresh_programmed_deadline())
     }
 
-    fn on_interrupt(&mut self, now_ns: u64) -> (u64, u64, Option<u64>) {
+    fn on_interrupt(&mut self, now_ns: u64) -> (u64, u64, u64) {
         let fired = self.advance_stat_ticks(now_ns);
         let local_ticks = self.ticks;
 
@@ -145,8 +145,8 @@ impl LocalClockState {
         }
 
         self.refresh_timer_deadline();
-        let next = self.refresh_programmed_deadline();
-        (fired, local_ticks, next)
+        let _ = self.refresh_programmed_deadline();
+        (fired, local_ticks, self.armed_deadline_ns)
     }
 
     fn ticks(&self) -> u64 {
@@ -155,20 +155,19 @@ impl LocalClockState {
 
     fn advance_stat_ticks(&mut self, now_ns: u64) -> u64 {
         let mut next = self.next_stat_deadline_ns;
-        let mut fired = 0u64;
-
         if next == 0 {
-            next = now_ns.saturating_add(STAT_INTERVAL_NS);
-            fired = 1;
-        } else {
-            while next <= now_ns {
-                fired += 1;
-                next = next.saturating_add(STAT_INTERVAL_NS);
-            }
-            if fired == 0 {
-                fired = 1;
-                next = next.saturating_add(STAT_INTERVAL_NS);
-            }
+            self.next_stat_deadline_ns = now_ns.saturating_add(STAT_INTERVAL_NS);
+            return 0;
+        }
+
+        if now_ns < next {
+            return 0;
+        }
+
+        let mut fired = 0u64;
+        while next <= now_ns {
+            fired = fired.wrapping_add(1);
+            next = next.saturating_add(STAT_INTERVAL_NS);
         }
 
         self.next_stat_deadline_ns = next;
@@ -271,16 +270,34 @@ pub fn sleep_ns(ns: u64) {
     }
 
     if !CLOCK_STARTED.load(Ordering::Acquire) {
+        panic!("clock: sleep_ns() called while clock infra down");
         delay_ns(ns);
         return;
     }
 
     if !arch::irqstate() || smp::in_interrupt_context() {
+        panic!("clock: sleep_ns() called from outside thread!");
         delay_ns(ns);
         return;
     }
 
+    // Keep timer setup on one CPU so the queue owner, measured timebase, and
+    // programmed local deadline always match even under preemption pressure.
+    let irq_enabled = arch::irqstate();
+    arch::irqset(false);
+
     let current = sched::current_thread();
+    // Idle must never block through the scheduler sleep path; if a caller
+    // reaches here while idle is current, fall back to local delay.
+    if unsafe { (&*current).is_idle() } {
+        if irq_enabled {
+            arch::irqset(true);
+        }
+        panic!("clock: sleep_ns() called from IDLE thread!");
+        delay_ns(ns);
+        return;
+    }
+
     let timer_cpu = arch::thiscpu().id;
     let seq = unsafe { (&*current).prepare_park() };
     let now_ns = monotonic_ns();
@@ -292,6 +309,9 @@ pub fn sleep_ns(ns: u64) {
     };
     if let Some(deadline) = arm {
         apply_deadline(deadline, now_ns);
+    }
+    if irq_enabled {
+        arch::irqset(true);
     }
 
     sched::park_current(seq);
@@ -306,7 +326,7 @@ pub fn sleep_ns(ns: u64) {
     };
     if removed {
         if let Some(deadline) = arm {
-            apply_deadline(deadline, now_ns);
+            apply_deadline_for_cpu(timer_cpu, deadline, now_ns);
         }
     }
 }
@@ -346,9 +366,7 @@ pub fn handle_local_timer_interrupt() {
         sched::stat_tick(global, local);
     }
 
-    if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
-    }
+    apply_deadline(arm, now_ns);
 }
 
 fn bootstrap_local_clocks() {
@@ -384,6 +402,22 @@ fn apply_deadline(deadline_ns: u64, now_ns: u64) {
     let clamped = deadline_ns.max(now_ns.saturating_add(min_ns));
     let capped = now_ns.saturating_add(max_ns);
     arch::timer::set_deadline(clamped.min(capped), now_ns);
+}
+
+fn apply_deadline_for_cpu(cpu_id: usize, deadline_ns: u64, now_ns_hint: u64) {
+    let this_cpu = arch::thiscpu().id;
+    if this_cpu == cpu_id {
+        apply_deadline(deadline_ns, now_ns_hint);
+        return;
+    }
+
+    let _ = smp::send_ipi(
+        move || {
+            let now_ns = monotonic_ns();
+            apply_deadline(deadline_ns, now_ns);
+        },
+        smp::IpiTarget::Single(cpu_id),
+    );
 }
 
 fn log_clock_configuration() {

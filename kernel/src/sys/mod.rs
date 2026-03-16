@@ -9,10 +9,9 @@
 pub mod clock;
 pub mod debug;
 pub mod fbcon;
-pub mod fireworks;
-pub mod framebuffer;
 pub mod panic;
 pub mod sched;
+pub mod sched_test;
 pub mod smp;
 pub mod sync;
 pub mod thread;

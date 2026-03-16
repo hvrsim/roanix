@@ -53,6 +53,6 @@ unsafe extern "C" fn rmain() -> ! {
     sys::sched::init();
     sys::clock::start();
     sys::smp::start();
-    let _ = sys::fireworks::start();
+    sys::sched_test::schedule();
     sys::sched::start();
 }

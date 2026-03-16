@@ -190,7 +190,8 @@ pub unsafe fn init_kernel_thread_frame(
             ec: 0,
             ip: ip as u64,
             cs: 0x28,
-            rflags: 1 << 9,
+            // IF=1 and bit 1 must remain set for architectural validity.
+            rflags: (1 << 9) | (1 << 1),
             sp: stack_top,
             ss: 0x30,
         },
@@ -411,32 +412,134 @@ pub fn enable_features() -> CpuFeatures {
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
     if frame.vec < 32 {
-        panic!(
-            "CPU trap triggered at IP=0x{:X}, vec=0x{:X}, CR2=0x{:X}",
+        let (cpu_id, tid) = crate::arch::thiscpu_opt()
+            .map(|cpu| (cpu.id, cpu.current_thread))
+            .unwrap_or((usize::MAX, 0));
+        log::error!(
+            "x86/trap: exception ip=0x{:X} vec=0x{:X} ec=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
             frame.ip,
             frame.vec,
-            Cr2::read_raw()
+            frame.ec,
+            Cr2::read_raw(),
+            frame.cs,
+            frame.ss,
+            frame.sp,
+            frame.rflags,
+            cpu_id,
+            tid,
         );
+        panic!("x86/trap: exception while returning from kernel trap");
     }
 
     let _interrupt = crate::sys::smp::enter_interrupt_context();
 
-    match crate::arch::timer::handle_interrupt(frame.vec) {
-        crate::arch::timer::InterruptAction::Reschedule => {
-            return crate::sys::sched::trap_return(frame);
+    let next = match crate::arch::timer::handle_interrupt(frame.vec) {
+        crate::arch::timer::InterruptAction::Reschedule => crate::sys::sched::trap_return(frame),
+        crate::arch::timer::InterruptAction::Handled => frame,
+        crate::arch::timer::InterruptAction::Unhandled => {
+            let (cpu_id, tid) = crate::arch::thiscpu_opt()
+                .map(|cpu| (cpu.id, cpu.current_thread))
+                .unwrap_or((usize::MAX, 0));
+            panic!(
+                "CPU trap triggered at IP=0x{:X}, vec=0x{:X}, ec=0x{:X}, CR2=0x{:X}, cs=0x{:X}, ss=0x{:X}, sp=0x{:X}, rflags=0x{:X}, cpu={}, tid={}",
+                frame.ip,
+                frame.vec,
+                frame.ec,
+                Cr2::read_raw(),
+                frame.cs,
+                frame.ss,
+                frame.sp,
+                frame.rflags,
+                cpu_id,
+                tid,
+            );
         }
-        crate::arch::timer::InterruptAction::Handled => {
-            return frame;
-        }
-        crate::arch::timer::InterruptAction::Unhandled => {}
+    };
+
+    // Validate the frame selected for resume before returning to assembly.
+    // Under sustained scheduler stress, catching corrupt selectors here
+    // provides far better diagnostics than letting `iretq` fault with partial
+    // context.
+    let next_ref = unsafe { &*next };
+    let next_ip = next_ref.ip;
+    let next_cs = next_ref.cs;
+    let next_ss = next_ref.ss;
+    let next_sp = next_ref.sp;
+    let next_rflags = next_ref.rflags;
+
+    if next_cs != 0x28 && next_cs != 0x3B {
+        let (cpu_id, tid) = crate::arch::thiscpu_opt()
+            .map(|cpu| (cpu.id, cpu.current_thread))
+            .unwrap_or((usize::MAX, 0));
+        panic!(
+            "x86/trap: invalid next frame ptr=0x{:X} ip=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} vec=0x{:X} cpu={} tid={}",
+            next as usize as u64,
+            next_ip,
+            next_cs,
+            next_ss,
+            next_sp,
+            next_rflags,
+            frame.vec,
+            cpu_id,
+            tid,
+        );
+    }
+    // For kernel-to-kernel returns (`cs=0x28`), iretq does not consume SS/RSP.
+    // Validate SS only for usermode resumes where SS is architecturally used.
+    if next_cs == 0x3B && next_ss != 0x43 {
+        panic!(
+            "x86/trap: invalid ss for cs ptr=0x{:X} ip=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} vec=0x{:X} cpu={} tid={}",
+            next as usize as u64,
+            next_ip,
+            next_cs,
+            next_ss,
+            next_sp,
+            next_rflags,
+            frame.vec,
+            crate::arch::thiscpu().id,
+            crate::arch::thiscpu().current_thread
+        );
+    }
+    if !is_canonical_addr(next_ip) || !is_canonical_addr(next_sp) {
+        panic!(
+            "x86/trap: non-canonical resume frame=0x{:X} ip=0x{:X} sp=0x{:X} cs=0x{:X} ss=0x{:X} vec=0x{:X} cpu={} tid={}",
+            next as usize as u64,
+            next_ip,
+            next_sp,
+            next_cs,
+            next_ss,
+            frame.vec,
+            crate::arch::thiscpu().id,
+            crate::arch::thiscpu().current_thread
+        );
+    }
+    if next_rflags & (1 << 1) == 0 {
+        panic!(
+            "x86/trap: invalid rflags frame=0x{:X} ip=0x{:X} rflags=0x{:X} cs=0x{:X} ss=0x{:X} vec=0x{:X} cpu={} tid={}",
+            next as usize as u64,
+            next_ip,
+            next_rflags,
+            next_cs,
+            next_ss,
+            frame.vec,
+            crate::arch::thiscpu().id,
+            crate::arch::thiscpu().current_thread
+        );
     }
 
-    panic!(
-        "CPU trap triggered at IP=0x{:X}, vec=0x{:X}, CR2=0x{:X}",
-        frame.ip,
-        frame.vec,
-        Cr2::read_raw()
-    );
+    let next_addr = next as usize as u64;
+    if next_addr < 0xFFFF_8000_0000_0000 {
+        panic!(
+            "x86/trap: invalid return frame=0x{:X} from vec=0x{:X} ip=0x{:X} cpu{} tid={}",
+            next_addr,
+            frame.vec,
+            frame.ip,
+            crate::arch::thiscpu().id,
+            crate::arch::thiscpu().current_thread
+        );
+    }
+
+    next
 }
 
 /// Kernel syscall handler.
@@ -451,6 +554,16 @@ fn init_idt_entries() {
         unsafe {
             KERNEL_IDT[idx] = IDT::from_address(addr as u64, 0);
         }
+    }
+}
+
+#[inline(always)]
+fn is_canonical_addr(addr: u64) -> bool {
+    let sign = (addr >> 47) & 1;
+    if sign == 0 {
+        (addr >> 48) == 0
+    } else {
+        (addr >> 48) == 0xFFFF
     }
 }
 

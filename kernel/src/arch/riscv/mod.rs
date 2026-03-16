@@ -221,7 +221,11 @@ pub fn reschedule() {
     );
 
     unsafe {
-        asm!("csrsi sip, 0x2", "wfi");
+        // Trigger a supervisor-software interrupt and return immediately.
+        // Executing `wfi` here can race with immediate trap delivery: SSIP may
+        // be serviced and cleared before `wfi`, leaving the hart sleeping
+        // unexpectedly until an unrelated interrupt arrives.
+        asm!("csrsi sip, 0x2", options(nomem, nostack, preserves_flags));
     }
 }
 
