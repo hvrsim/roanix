@@ -23,7 +23,7 @@ use intrusive_collections::{intrusive_adapter, LinkedListLink};
 type TrapFrame = crate::arch::cpu::TrapFrame;
 
 const KSTACK_PAGES: usize = 32;
-const KSTACK_SIZE: usize = (KSTACK_PAGES as usize) * (PAGE_SIZE as usize);
+const KSTACK_SIZE: usize = KSTACK_PAGES * (PAGE_SIZE as usize);
 const STACK_CANARY_WORDS: usize = 8;
 const STACK_CANARY: u64 = 0xC0DE_CAFE_D15C_A11A;
 

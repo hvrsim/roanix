@@ -27,7 +27,7 @@ pub const fn align_up(value: u64, align: u64) -> u64 {
     let mask = align - 1;
     match value.checked_add(mask) {
         Some(v) => v & !mask,
-        None => u64::MAX & !mask,
+        None => !mask,
     }
 }
 

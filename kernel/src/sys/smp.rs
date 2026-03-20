@@ -97,6 +97,12 @@ impl PlatformFields {
     }
 }
 
+impl Default for PlatformFields {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CoreLocal {
     /// Creates a new core local context, with CPU ID `cid`.
     pub const fn new(cid: usize) -> Self {
@@ -741,7 +747,7 @@ unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
 
     arch::init_secondary(record.core_local_ptr());
     crate::mem::alloc::register_tlb_cpu(record.logical_id);
-    crate::sys::clock::start_secondary();
+    crate::sys::clock::start();
     let _ = record.mark_online();
     crate::sys::sched::start_secondary();
 }

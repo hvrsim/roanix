@@ -16,8 +16,11 @@ pub mod paging;
 pub mod timer;
 
 /// BSP's core local context.
-// SAFETY: this bootstrap instance is only referenced through a raw pointer
-// during early bring-up before hart-local state becomes shared.
+///
+/// # Safety
+///
+/// This bootstrap instance is only referenced through a raw pointer
+/// during early bring-up before hart-local state becomes shared.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 /// SBI extension ID for the debug console.

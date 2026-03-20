@@ -12,6 +12,8 @@ use x86_64::instructions::port::{
     PortGeneric, PortReadOnly, PortWriteOnly, ReadOnlyAccess, WriteOnlyAccess,
 };
 
+use crate::sys::clock::{self, ClockSource, EventTimer};
+
 use super::lapic;
 
 const PIT_TICK_RATE: u32 = 1_193_182;
@@ -20,6 +22,51 @@ const PIT_MAX_COUNT: u32 = 0xFFFF;
 const CALIBRATION_MS: u32 = 10;
 
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+static TSC_CLOCKSOURCE: TscClockSource = TscClockSource;
+static LAPIC_EVENT_TIMER: LapicEventTimer = LapicEventTimer;
+
+struct TscClockSource;
+struct LapicEventTimer;
+
+impl ClockSource for TscClockSource {
+    fn name(&self) -> &'static str {
+        "tsc"
+    }
+
+    fn rating(&self) -> u32 {
+        4000
+    }
+
+    fn frequency_hz(&self) -> u64 {
+        TSC_HZ.load(Ordering::Relaxed)
+    }
+
+    fn counter(&self) -> u64 {
+        rdtsc()
+    }
+}
+
+impl EventTimer for LapicEventTimer {
+    fn name(&self) -> &'static str {
+        lapic::timer_name()
+    }
+
+    fn min_period_ns(&self) -> u64 {
+        lapic::min_period_ns()
+    }
+
+    fn max_period_ns(&self) -> u64 {
+        lapic::max_period_ns()
+    }
+
+    fn set_oneshot(&self, delay_ns: u64) {
+        lapic::set_oneshot(delay_ns);
+    }
+
+    fn stop(&self) {
+        lapic::stop_timer();
+    }
+}
 
 /// Result of dispatching an x86 local interrupt vector through the timer/LAPIC
 /// path.
@@ -43,53 +90,17 @@ pub fn init() {
         .unwrap_or(false);
     assert!(invariant_tsc, "x86/timer: invariant TSC required");
 
-    TSC_HZ.store(calibrate_tsc(&cpuid), Ordering::Relaxed);
-    lapic::init(counter_frequency_hz());
+    let tsc_hz = calibrate_tsc(&cpuid);
+    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+
+    lapic::init(tsc_hz);
+    clock::register_clocksource(&TSC_CLOCKSOURCE);
+    clock::register_event_timer(&LAPIC_EVENT_TIMER);
 }
 
 /// Programs the local timer backend on a secondary CPU.
 pub fn init_secondary() {
     lapic::init_secondary();
-}
-
-/// Returns the active counter source name.
-pub fn counter_name() -> &'static str {
-    "tsc"
-}
-
-/// Returns the active event timer name.
-pub fn timer_name() -> &'static str {
-    lapic::timer_name()
-}
-
-/// Returns the counter frequency in Hz.
-pub fn counter_frequency_hz() -> u64 {
-    TSC_HZ.load(Ordering::Relaxed)
-}
-
-/// Returns the current raw cycle counter.
-pub fn counter() -> u64 {
-    rdtsc()
-}
-
-/// Returns the minimum programmable deadline delta in nanoseconds.
-pub fn min_deadline_ns() -> u64 {
-    lapic::min_period_ns()
-}
-
-/// Returns the maximum programmable deadline delta in nanoseconds.
-pub fn max_deadline_ns() -> u64 {
-    lapic::max_period_ns()
-}
-
-/// Programs the next local timer interrupt for `deadline_ns`.
-pub fn set_deadline(deadline_ns: u64, now_ns: u64) {
-    lapic::set_oneshot(deadline_ns.saturating_sub(now_ns));
-}
-
-/// Stops local timer delivery.
-pub fn stop() {
-    lapic::stop_timer();
 }
 
 /// Handles LAPIC timer, reschedule, and spurious vectors.

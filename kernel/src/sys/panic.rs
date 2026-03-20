@@ -200,7 +200,7 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
 #[inline(always)]
 fn frame_ptr_in_bounds(ptr: usize, stack_ptr: usize) -> bool {
     ptr != 0
-        && ptr % core::mem::align_of::<usize>() == 0
+        && ptr.is_multiple_of(core::mem::align_of::<usize>())
         && ptr >= stack_ptr
         && ptr.saturating_sub(stack_ptr) < BACKTRACE_STACK_WINDOW
 }

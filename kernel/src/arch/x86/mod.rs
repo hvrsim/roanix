@@ -199,12 +199,9 @@ pub fn irqset(enable: bool) {
 ///
 /// Pauses CPU execution and waits for interrupts.
 ///
-/// **If interrupts are disabled, this will result in an infinite loop.**
-///
-pub fn wfi() -> ! {
-    loop {
-        hlt();
-    }
+#[inline(always)]
+pub fn wfi() {
+    hlt();
 }
 
 /// Sends a reschedule IPI to `cpu_id`.

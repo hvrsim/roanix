@@ -69,7 +69,7 @@ extern "C" {
 static KERNEL_GDT: Gdt = Gdt::new();
 // SAFETY: descriptor tables are initialized during per-CPU early boot before
 // concurrent Rust code starts executing on that CPU.
-static mut KERNEL_IDT: [IDT; 256] = [IDT::new(); 256];
+static mut KERNEL_IDT: [Idt; 256] = [Idt::new(); 256];
 static BSP_STARTUP: Once<()> = Once::new();
 
 bitflags! {
@@ -101,7 +101,7 @@ struct Gdt {
 /// Representation of the x86_64 Interrupt Descriptor Table.
 #[repr(C, packed(1))]
 #[derive(Copy, Clone)]
-struct IDT {
+struct Idt {
     /// Low 2 bytes of handler address.
     offset_low: u16,
 
@@ -267,10 +267,10 @@ impl Gdt {
     }
 }
 
-impl IDT {
+impl Idt {
     /// Creates a new IDT entry.
     const fn new() -> Self {
-        IDT {
+        Idt {
             offset_low: 0,
             selector: 0,
             ist: 0,
@@ -283,7 +283,7 @@ impl IDT {
 
     /// Creates a new IDT entry given a handler address and IST index.
     const fn from_address(ptr: u64, ist: u8) -> Self {
-        IDT {
+        Idt {
             offset_low: (ptr & 0xFFFF) as u16,
             offset_mid: ((ptr >> 16) & 0xFFFF) as u16,
             offset_high: (ptr >> 32) as u32,
@@ -348,7 +348,7 @@ pub fn enable_features() -> CpuFeatures {
             warn!("cpu: SMAP not supported!");
         }
 
-        init_idt_entries();
+        unsafe { init_idt_entries() };
     });
 
     if !feats.has_pge() {
@@ -548,12 +548,10 @@ extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
     panic!("SYSCALL triggered at IP=0x{:X}", frame.ip);
 }
 
-fn init_idt_entries() {
-    for idx in 0..256 {
+unsafe fn init_idt_entries() {
+    for (idx, elem) in KERNEL_IDT.iter_mut().enumerate() {
         let addr = (vstub0 as *const u8).wrapping_add(idx * 0x10);
-        unsafe {
-            KERNEL_IDT[idx] = IDT::from_address(addr as u64, 0);
-        }
+        *elem = Idt::from_address(addr as u64, 0);
     }
 }
 
@@ -569,8 +567,8 @@ fn is_canonical_addr(addr: u64) -> bool {
 
 unsafe fn load_idt() {
     let idtr = Descriptor {
-        limit: (core::mem::size_of::<[IDT; 256]>() - 1) as u16,
-        base: (&raw const KERNEL_IDT as *const IDT) as u64,
+        limit: (core::mem::size_of::<[Idt; 256]>() - 1) as u16,
+        base: (&raw const KERNEL_IDT as *const Idt) as u64,
     };
     let idtr_ptr = &idtr as *const Descriptor as u64;
     core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr);

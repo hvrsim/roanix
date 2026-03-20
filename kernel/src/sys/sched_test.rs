@@ -7,6 +7,7 @@
 //! This is designed to run on boot once SMP is online so scheduler issues
 //! surface quickly with actionable logging.
 //!
+#![allow(clippy::all)]
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{
@@ -36,7 +37,7 @@ const STALL_BUDGET_MS: u64 = 4_000;
 const WATCHDOG_POLL_MS: u64 = 200;
 const WATCHDOG_LOG_MS: u64 = 1_000;
 const TOTAL_TIMEOUT_SECS: u64 = 60;
-const LOG_WORKER_LIFECYCLE: bool = false;
+const LOG_WORKER_LIFECYCLE: bool = true;
 const ENABLE_IPI_PROBE: bool = false;
 const SLEEP_TAIL_GUARD_NS: u64 = 5_000_000;
 
@@ -812,7 +813,8 @@ fn log_worker_stall_details(
             sleeping_for_ms,
         );
 
-        let thread_ptr = state.worker_thread_ptr[id].load(Ordering::Acquire) as *const crate::sys::thread::Thread;
+        let thread_ptr = state.worker_thread_ptr[id].load(Ordering::Acquire)
+            as *const crate::sys::thread::Thread;
         if !thread_ptr.is_null() {
             let thread = unsafe { &*thread_ptr };
             warn!(

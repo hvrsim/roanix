@@ -7,84 +7,77 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use log::warn;
-
 use crate::dev::dtb;
+use crate::sys::clock::{self, ClockSource, EventTimer};
 
 const SBI_EXT_TIME: usize = 0x54494D45;
 const SBI_TIME_SET_TIMER: usize = 0;
 const SBI_LEGACY_SET_TIMER: usize = 0x00;
-const QEMU_VIRT_TIMEBASE_HZ: u64 = 10_000_000;
 
 static TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
+static RISCV_CLOCKSOURCE: RiscvClockSource = RiscvClockSource;
+static SBI_EVENT_TIMER: SbiEventTimer = SbiEventTimer;
+
+struct RiscvClockSource;
+struct SbiEventTimer;
+
+impl ClockSource for RiscvClockSource {
+    fn name(&self) -> &'static str {
+        "riscv-time"
+    }
+
+    fn rating(&self) -> u32 {
+        3000
+    }
+
+    fn frequency_hz(&self) -> u64 {
+        TIMEBASE_HZ.load(Ordering::Relaxed)
+    }
+
+    fn counter(&self) -> u64 {
+        read_time()
+    }
+}
+
+impl EventTimer for SbiEventTimer {
+    fn name(&self) -> &'static str {
+        "sbi-timer"
+    }
+
+    fn min_period_ns(&self) -> u64 {
+        1
+    }
+
+    fn max_period_ns(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn set_oneshot(&self, delay_ns: u64) {
+        let delta = ns_to_cycles(TIMEBASE_HZ.load(Ordering::Relaxed), delay_ns);
+        sbi_set_timer(read_time().wrapping_add(delta));
+    }
+
+    fn stop(&self) {
+        sbi_set_timer(u64::MAX);
+    }
+}
 
 /// Initializes the riscv counter source and SBI timer delivery.
 pub fn init() {
-    let timebase_hz = dtb::timebase_frequency().unwrap_or_else(|| {
-        warn!(
-            "riscv/timer: timebase-frequency missing from device tree, falling back to {} Hz",
-            QEMU_VIRT_TIMEBASE_HZ
-        );
-        QEMU_VIRT_TIMEBASE_HZ
-    });
+    let timebase_hz =
+        dtb::timebase_frequency().expect("riscv/timer: timebase freq missing from DTB!");
 
     TIMEBASE_HZ.store(timebase_hz, Ordering::Relaxed);
-    stop();
+    sbi_set_timer(u64::MAX);
+    clock::register_clocksource(&RISCV_CLOCKSOURCE);
+    clock::register_event_timer(&SBI_EVENT_TIMER);
     super::cpu::enable_timer_interrupts();
 }
 
 /// Enables local timer interrupts on a secondary hart.
 pub fn init_secondary() {
-    stop();
-    super::cpu::enable_timer_interrupts();
-}
-
-/// Returns the active counter source name.
-pub fn counter_name() -> &'static str {
-    "riscv-time"
-}
-
-/// Returns the active event timer name.
-pub fn timer_name() -> &'static str {
-    "sbi-timer"
-}
-
-/// Returns the counter frequency in Hz.
-pub fn counter_frequency_hz() -> u64 {
-    TIMEBASE_HZ.load(Ordering::Relaxed)
-}
-
-/// Returns the current raw cycle counter.
-pub fn counter() -> u64 {
-    read_time()
-}
-
-/// Returns the minimum programmable deadline delta in nanoseconds.
-pub fn min_deadline_ns() -> u64 {
-    1
-}
-
-/// Returns the maximum programmable deadline delta in nanoseconds.
-pub fn max_deadline_ns() -> u64 {
-    u64::MAX
-}
-
-/// Programs the next local timer interrupt for `deadline_ns`.
-pub fn set_deadline(deadline_ns: u64, _now_ns: u64) {
-    let delta = ns_to_cycles(
-        counter_frequency_hz(),
-        deadline_ns.saturating_sub(monotonic_ns()),
-    );
-    sbi_set_timer(read_time().wrapping_add(delta));
-}
-
-/// Stops local timer delivery.
-pub fn stop() {
     sbi_set_timer(u64::MAX);
-}
-
-fn monotonic_ns() -> u64 {
-    cycles_to_ns(counter_frequency_hz(), read_time())
+    super::cpu::enable_timer_interrupts();
 }
 
 fn read_time() -> u64 {
@@ -123,9 +116,4 @@ fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {
         / 1_000_000_000u128)
         .max(1)
         .min(u64::MAX as u128) as u64
-}
-
-fn cycles_to_ns(freq_hz: u64, cycles: u64) -> u64 {
-    ((cycles as u128).saturating_mul(1_000_000_000u128) / freq_hz as u128).min(u64::MAX as u128)
-        as u64
 }

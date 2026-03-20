@@ -636,9 +636,7 @@ fn align_up_pages(value: usize, align: usize) -> usize {
 fn occupied_span(meta: HeapPageMeta) -> usize {
     match meta.kind {
         PageKind::Free => 1,
-        PageKind::Busy | PageKind::LargeTail | PageKind::Retired => {
-            cmp::max(meta.aux as usize, 1)
-        }
+        PageKind::Busy | PageKind::LargeTail | PageKind::Retired => cmp::max(meta.aux as usize, 1),
         PageKind::Slab => 1,
         PageKind::LargeHead => cmp::max(meta.aux as usize, 1),
     }
@@ -652,7 +650,7 @@ fn heap_page_virt(page_idx: usize) -> VirtAddr {
 #[inline(always)]
 fn ptr_page_index(ptr: *mut u8) -> Option<usize> {
     let raw = ptr as usize as u64;
-    if raw < HEAP_BASE || raw >= HEAP_BASE + HEAP_SIZE {
+    if !(HEAP_BASE..HEAP_BASE + HEAP_SIZE).contains(&raw) {
         return None;
     }
 
@@ -782,7 +780,10 @@ fn queue_retired_page(page_idx: usize, paddr: PhysAddr) -> u64 {
         panic!("mem/alloc: heap TLB retire queue exhausted");
     }
 
-    let seq = shootdown.reserved_seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    let seq = shootdown
+        .reserved_seq
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     if seq == 0 {
         panic!("mem/alloc: heap TLB retire sequence wrapped");
     }
