@@ -6,8 +6,8 @@
 //!
 //! The IPI path is intentionally tiny:
 //!
-//! - callers submit a small `Copy` callback through [`send_ipi`]
-//! - the callback is copied into the target CPU's lock-protected mailbox
+//! - callers submit a small `fn()` callback through [`send_ipi`]
+//! - the callback pointer is queued in the target CPU's lock-protected mailbox
 //! - the target CPU is nudged with an architecture IPI or local software
 //!   reschedule interrupt
 //! - [`drain_ipi_queue`] runs the callback on the destination CPU before that
@@ -20,9 +20,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 use core::hint::spin_loop;
-use core::mem::{align_of, size_of};
 use core::ops::{Deref, DerefMut};
-use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use limine::{mp, request::MpRequest};
@@ -54,9 +52,18 @@ pub struct PlatformFields {
     /// Bitmap of supported x86 extensions.
     #[cfg(target_arch = "x86_64")]
     pub feats: arch::cpu::CpuFeatures,
+    /// Calibrated local TSC frequency in Hz.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_hz: u64,
+    /// Calibrated local APIC timer frequency in Hz, or `0` when unused.
+    #[cfg(target_arch = "x86_64")]
+    pub lapic_timer_hz: u64,
 }
 
 /// Kernel context unique to each CPU core.
+///
+/// The RISC-V trap entry assembly indexes the leading fields by fixed offsets.
+#[repr(C)]
 pub struct CoreLocal {
     /// Stack used by the kernel on IRQs.
     pub kernel_stack: u64,
@@ -93,6 +100,10 @@ impl PlatformFields {
         PlatformFields {
             #[cfg(target_arch = "x86_64")]
             feats: arch::cpu::CpuFeatures::empty(),
+            #[cfg(target_arch = "x86_64")]
+            tsc_hz: 0,
+            #[cfg(target_arch = "x86_64")]
+            lapic_timer_hz: 0,
         }
     }
 }
@@ -137,18 +148,9 @@ struct SmpState {
 }
 
 const IPI_QUEUE_CAPACITY: usize = 32;
-const IPI_INLINE_WORDS: usize = 4;
-const IPI_INLINE_BYTES: usize = IPI_INLINE_WORDS * size_of::<usize>();
-
-#[repr(C)]
-struct InlineIpiPayload {
-    words: [usize; IPI_INLINE_WORDS],
-}
 
 struct IpiJob {
-    invoke: unsafe fn(*const u8),
-    size: u8,
-    payload: InlineIpiPayload,
+    callback: fn(),
 }
 
 struct IpiQueue {
@@ -227,61 +229,17 @@ impl SmpState {
     }
 }
 
-impl InlineIpiPayload {
-    const fn zeroed() -> Self {
-        Self {
-            words: [0; IPI_INLINE_WORDS],
-        }
-    }
-}
-
 impl IpiJob {
-    fn new<F>(callback: F) -> Self
-    where
-        F: FnOnce() + Copy + Send + 'static,
-    {
-        assert!(
-            size_of::<F>() <= IPI_INLINE_BYTES,
-            "smp: IPI callback size {} exceeds {} bytes",
-            size_of::<F>(),
-            IPI_INLINE_BYTES
-        );
-        assert!(
-            align_of::<F>() <= align_of::<InlineIpiPayload>(),
-            "smp: IPI callback alignment {} exceeds {}",
-            align_of::<F>(),
-            align_of::<InlineIpiPayload>()
-        );
-
-        let mut payload = InlineIpiPayload::zeroed();
-        if size_of::<F>() != 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    (&callback as *const F).cast::<u8>(),
-                    payload.words.as_mut_ptr().cast::<u8>(),
-                    size_of::<F>(),
-                );
-            }
-        }
-
-        Self {
-            invoke: invoke_ipi_job::<F>,
-            size: size_of::<F>() as u8,
-            payload,
-        }
+    fn new(callback: fn()) -> Self {
+        Self { callback }
     }
 
     fn is_equivalent(&self, other: &Self) -> bool {
-        self.size == 0 && other.size == 0 && self.invoke as usize == other.invoke as usize
+        self.callback as usize == other.callback as usize
     }
 
-    unsafe fn run(self) {
-        assert!(
-            self.invoke as usize != 0,
-            "smp: invalid IPI callback pointer (size={})",
-            self.size
-        );
-        (self.invoke)(self.payload.words.as_ptr().cast::<u8>());
+    fn run(self) {
+        (self.callback)();
     }
 }
 
@@ -320,10 +278,6 @@ impl IpiQueue {
     }
 
     fn contains_equivalent(&self, needle: &IpiJob) -> bool {
-        if needle.size != 0 {
-            return false;
-        }
-
         for offset in 0..self.len {
             let slot = (self.head + offset) % IPI_QUEUE_CAPACITY;
             if self.jobs[slot]
@@ -349,14 +303,6 @@ impl PerCpuIpi {
 
 fn smp_state() -> &'static SmpState {
     SMP_STATE.get().expect("smp: init required before use")
-}
-
-unsafe fn invoke_ipi_job<F>(payload: *const u8)
-where
-    F: FnOnce() + Copy + Send + 'static,
-{
-    let callback = ptr::read(payload.cast::<F>());
-    callback();
 }
 
 /// `spin::Mutex` wrapper that masks interrupts while holding the lock.
@@ -601,21 +547,14 @@ pub fn in_interrupt_context() -> bool {
 /// Queues `callback` for one or more CPUs and nudges them through the kernel's
 /// IPI path.
 ///
-/// The callback is copied into a fixed-size per-CPU mailbox, so it must be:
-///
-/// - `Copy`, because broadcast delivery duplicates the callback
-/// - small enough to fit in the inline IPI payload
-/// - `Send + 'static`, because it executes later on another CPU
+/// The callback must be a plain `'static` function item.
 ///
 /// [`IpiTarget::All`] broadcasts to every other online CPU. Use
 /// [`IpiTarget::Single`] with the local CPU id when the current CPU also needs
 /// to observe the callback.
 ///
 /// Returns the number of CPUs that accepted a new queued callback.
-pub fn send_ipi<F>(callback: F, target: IpiTarget) -> usize
-where
-    F: FnOnce() + Copy + Send + 'static,
-{
+pub fn send_ipi(callback: fn(), target: IpiTarget) -> usize {
     let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
     let mut queued = 0usize;
 
@@ -666,16 +605,11 @@ pub(crate) fn drain_ipi_queue() {
             return;
         };
 
-        unsafe {
-            job.run();
-        }
+        job.run();
     }
 }
 
-fn queue_ipi_job<F>(cpu_id: usize, callback: F) -> bool
-where
-    F: FnOnce() + Copy + Send + 'static,
-{
+fn queue_ipi_job(cpu_id: usize, callback: fn()) -> bool {
     let Some(target) = smp_state().by_logical_id(cpu_id) else {
         return false;
     };

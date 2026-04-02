@@ -112,26 +112,26 @@ pub(crate) struct Thread {
     /// Run-queue bucket index currently holding the thread.
     pub(crate) rqindex: u8,
 
-    /// Scheduler tick count consumed in the current slice.
-    pub(crate) slice: u32,
+    /// Nanoseconds consumed in the current slice.
+    pub(crate) slice_ns: u64,
 
-    /// First tick in the current CPU-usage decay window.
-    pub(crate) ftick: u64,
+    /// Start of the current CPU-usage decay window.
+    pub(crate) cpu_window_start_ns: u64,
 
-    /// Last tick when CPU usage accounting was refreshed.
-    pub(crate) ltick: u64,
+    /// Last point where CPU usage accounting was refreshed.
+    pub(crate) cpu_last_update_ns: u64,
 
-    /// Last tick when the thread actually ran.
-    pub(crate) rltick: u64,
+    /// Last point where the thread executed.
+    pub(crate) last_run_ns: u64,
 
     /// Accumulated sleep time used by interactivity heuristics.
-    pub(crate) slptime: u32,
+    pub(crate) slptime_ns: u64,
 
     /// Accumulated runtime used by interactivity heuristics.
-    pub(crate) runtime: u32,
+    pub(crate) runtime_ns: u64,
 
-    /// Fixed-point CPU usage estimate.
-    pub(crate) ticks: u32,
+    /// Fixed-point CPU usage estimate in nanoseconds.
+    pub(crate) cpu_estimate: u64,
 
     /// Backing allocation for the kernel stack.
     _stack: Box<KernelStack>,
@@ -222,11 +222,11 @@ impl Thread {
         self.state = ThreadState::Exited;
     }
 
-    /// Marks the thread as running on `cpu_id` at `global_ticks`.
-    pub(crate) fn mark_running(&mut self, cpu_id: usize, global_ticks: u64) {
+    /// Marks the thread as running on `cpu_id` at `now_ns`.
+    pub(crate) fn mark_running(&mut self, cpu_id: usize, now_ns: u64) {
         self.state = ThreadState::Running;
         self.cpu = cpu_id;
-        self.rltick = global_ticks;
+        self.last_run_ns = now_ns;
     }
 
     /// Clears and returns the deferred slice-end flag.
@@ -341,7 +341,7 @@ extern "C" fn thread_entry(thread_ptr: usize) -> ! {
 pub(crate) fn allocate_thread<F, R>(
     id: usize,
     cpu: usize,
-    global_ticks: u64,
+    now_ns: u64,
     class: ThreadClass,
     priority: u8,
     flags: ThreadFlags,
@@ -388,13 +388,13 @@ where
         nice: 0,
         cpu,
         rqindex: priority,
-        slice: 0,
-        ftick: global_ticks,
-        ltick: global_ticks,
-        rltick: global_ticks,
-        slptime: 0,
-        runtime: 0,
-        ticks: 0,
+        slice_ns: 0,
+        cpu_window_start_ns: now_ns,
+        cpu_last_update_ns: now_ns,
+        last_run_ns: now_ns,
+        slptime_ns: 0,
+        runtime_ns: 0,
+        cpu_estimate: 0,
         _stack: stack,
         stack_top,
         frame,

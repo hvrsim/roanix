@@ -165,13 +165,23 @@ pub fn timer_name() -> &'static str {
     }
 }
 
+/// Returns the calibrated TSC frequency shared by all CPUs.
+pub fn calibrated_tsc_hz() -> u64 {
+    lapic_state().tsc_hz
+}
+
+/// Returns the calibrated LAPIC timer frequency shared by all CPUs.
+pub fn calibrated_timer_hz() -> u64 {
+    lapic_state().lapic_timer_hz
+}
+
 /// Arms the local APIC timer in one-shot mode.
 pub fn set_oneshot(delay_ns: u64) {
     let state = lapic_state();
 
     match state.timer_mode {
         TimerMode::TscDeadline => {
-            let deadline = rdtsc().wrapping_add(ns_to_cycles(state.tsc_hz, delay_ns));
+            let deadline = rdtsc().wrapping_add(ns_to_cycles(local_tsc_hz(), delay_ns));
             write_msr(IA32_TSC_DEADLINE_MSR, deadline);
             write_register(
                 state.access,
@@ -180,7 +190,7 @@ pub fn set_oneshot(delay_ns: u64) {
             );
         }
         TimerMode::LocalOneShot => {
-            let count = ns_to_lapic_ticks(state.lapic_timer_hz, delay_ns);
+            let count = ns_to_lapic_ticks(local_lapic_timer_hz(), delay_ns);
             write_register(state.access, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
             write_register(state.access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
             write_register(state.access, LAPIC_INITIAL_COUNT, count);
@@ -215,7 +225,7 @@ pub fn max_period_ns() -> u64 {
     match state.timer_mode {
         TimerMode::TscDeadline => u64::MAX,
         TimerMode::LocalOneShot => ((u32::MAX as u128).saturating_mul(1_000_000_000u128)
-            / state.lapic_timer_hz as u128)
+            / local_lapic_timer_hz() as u128)
             .min(u64::MAX as u128) as u64,
     }
 }
@@ -415,6 +425,18 @@ fn write_register64(access: ApicAccess, offset: u32, value: u64) {
 fn x2apic_msr(offset: u32) -> u32 {
     debug_assert_eq!(offset & 0xF, 0);
     X2APIC_MSR_BASE + (offset >> 4)
+}
+
+fn local_tsc_hz() -> u64 {
+    let hz = arch::thiscpu().platform.tsc_hz;
+    debug_assert!(hz != 0, "x86/lapic: local TSC frequency not initialized");
+    hz
+}
+
+fn local_lapic_timer_hz() -> u64 {
+    let hz = arch::thiscpu().platform.lapic_timer_hz;
+    debug_assert!(hz != 0, "x86/lapic: local timer frequency not initialized");
+    hz
 }
 
 fn register_addr(base: VirtAddr, offset: u32) -> VirtAddr {

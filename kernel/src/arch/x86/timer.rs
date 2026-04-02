@@ -1,11 +1,10 @@
 //!
-//! # x86 Timekeeping
+//! # x86 Platform Timers
 //!
-//! TSC-backed timekeeping plus LAPIC deadline delivery.
+//! Timers and counters for the x86 platform, backed by LAPIC/TSC.
 //!
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use raw_cpuid::{CpuId, CpuIdReader};
 use x86_64::instructions::port::{
@@ -21,7 +20,6 @@ const PIT_TARGET: u32 = 0x3FFF;
 const PIT_MAX_COUNT: u32 = 0xFFFF;
 const CALIBRATION_MS: u32 = 10;
 
-static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static TSC_CLOCKSOURCE: TscClockSource = TscClockSource;
 static LAPIC_EVENT_TIMER: LapicEventTimer = LapicEventTimer;
 
@@ -38,7 +36,7 @@ impl ClockSource for TscClockSource {
     }
 
     fn frequency_hz(&self) -> u64 {
-        TSC_HZ.load(Ordering::Relaxed)
+        super::thiscpu().platform.tsc_hz
     }
 
     fn counter(&self) -> u64 {
@@ -91,9 +89,11 @@ pub fn init() {
     assert!(invariant_tsc, "x86/timer: invariant TSC required");
 
     let tsc_hz = calibrate_tsc(&cpuid);
-    TSC_HZ.store(tsc_hz, Ordering::Relaxed);
-
     lapic::init(tsc_hz);
+    let platform = &mut super::thiscpu().platform;
+    platform.tsc_hz = tsc_hz;
+    platform.lapic_timer_hz = lapic::calibrated_timer_hz();
+
     clock::register_clocksource(&TSC_CLOCKSOURCE);
     clock::register_event_timer(&LAPIC_EVENT_TIMER);
 }
@@ -101,6 +101,9 @@ pub fn init() {
 /// Programs the local timer backend on a secondary CPU.
 pub fn init_secondary() {
     lapic::init_secondary();
+    let platform = &mut super::thiscpu().platform;
+    platform.tsc_hz = lapic::calibrated_tsc_hz();
+    platform.lapic_timer_hz = lapic::calibrated_timer_hz();
 }
 
 /// Handles LAPIC timer, reschedule, and spurious vectors.

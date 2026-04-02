@@ -40,6 +40,33 @@ pub fn timebase_frequency() -> Option<u64> {
     }
 }
 
+/// Returns whether every CPU node advertises the `sstc` extension.
+///
+/// This checks the preferred `riscv,isa-extensions` string array first, then
+/// falls back to the deprecated `riscv,isa` property when needed.
+pub fn all_cpus_support_sstc() -> Option<bool> {
+    let fdt = parse()?;
+    let mut any = false;
+    for cpu in fdt.cpus() {
+        any = true;
+        if !cpu_supports_sstc(cpu) {
+            return Some(false);
+        }
+    }
+    Some(any)
+}
+
+fn cpu_supports_sstc(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+    cpu.property("riscv,isa-extensions")
+        .map(|p| core::str::from_utf8(p.value).is_ok_and(|s| s.split('\0').any(|x| x == "sstc")))
+        .or_else(|| {
+            cpu.property("riscv,isa")
+                .and_then(|p| p.as_str())
+                .map(|s| s.split('_').any(|x| x == "sstc"))
+        })
+        .unwrap_or(false)
+}
+
 fn dtb_len(ptr: *const u8) -> Option<usize> {
     if ptr.is_null() {
         return None;

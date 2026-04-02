@@ -130,17 +130,7 @@ pub fn set_core_local(ptr: *const CoreLocal) {
 /// Returns whether CPU interrupts are currently enabled.
 #[inline(always)]
 pub fn irqstate() -> bool {
-    let sstatus: usize;
-
-    unsafe {
-        asm!(
-            "csrr {}, sstatus",
-            out(reg) sstatus,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    sstatus & 0x2 != 0
+    unsafe { cpu::rdcsr::<{ cpu::CSR_SSTATUS }>() & cpu::SSTATUS_SIE != 0 }
 }
 
 /// Enables or disables CPU interrupts.
@@ -148,15 +138,9 @@ pub fn irqstate() -> bool {
 pub fn irqset(enable: bool) {
     unsafe {
         if enable {
-            asm!(
-                "csrsi sstatus, 0x2",
-                options(nomem, nostack, preserves_flags)
-            );
+            cpu::set_csr_bits::<{ cpu::CSR_SSTATUS }>(cpu::SSTATUS_SIE);
         } else {
-            asm!(
-                "csrci sstatus, 0x2",
-                options(nomem, nostack, preserves_flags)
-            );
+            cpu::clear_csr_bits::<{ cpu::CSR_SSTATUS }>(cpu::SSTATUS_SIE);
         }
     }
 }
@@ -228,7 +212,7 @@ pub fn reschedule() {
         // Executing `wfi` here can race with immediate trap delivery: SSIP may
         // be serviced and cleared before `wfi`, leaving the hart sleeping
         // unexpectedly until an unrelated interrupt arrives.
-        asm!("csrsi sip, 0x2", options(nomem, nostack, preserves_flags));
+        cpu::set_csr_bits::<{ cpu::CSR_SIP }>(cpu::SIE_SSIE);
     }
 }
 

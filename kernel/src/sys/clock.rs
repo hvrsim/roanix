@@ -20,14 +20,10 @@ use crate::{
         thread::Thread,
     },
 };
-use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Interval between scheduler accounting ticks.
-pub const STAT_INTERVAL_NS: u64 = 10_000_000;
-
-/// Global tick counter updated from local timer interrupts.
-static GLOBAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static CLOCK_SETUP: Once<()> = Once::new();
+static CLOCKSOURCE: Once<&'static dyn ClockSource> = Once::new();
+static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
 
 /// Monotonic counter source used for timekeeping and delays.
 pub trait ClockSource: Sync {
@@ -44,7 +40,7 @@ pub trait ClockSource: Sync {
     fn counter(&self) -> u64;
 }
 
-/// One-shot interrupt source used to deliver deadlines.
+/// One-shot local interrupt source used to deliver deadlines on the current CPU.
 pub trait EventTimer: Sync {
     /// Human-readable timer name.
     fn name(&self) -> &'static str;
@@ -60,22 +56,6 @@ pub trait EventTimer: Sync {
 
     /// Stops timer delivery, if supported.
     fn stop(&self);
-}
-
-struct ClockState {
-    active_clocksource: Option<&'static dyn ClockSource>,
-    event_timer: Option<&'static dyn EventTimer>,
-}
-
-static CLOCK_STATE: IrqSpinLock<ClockState> = IrqSpinLock::new(ClockState::new());
-
-impl ClockState {
-    const fn new() -> Self {
-        Self {
-            active_clocksource: None,
-            event_timer: None,
-        }
-    }
 }
 
 /// Local timer state stored in [`crate::sys::smp::CoreLocal`].
@@ -100,6 +80,12 @@ struct Timer {
     park_seq: u64,
 }
 
+#[derive(Copy, Clone)]
+struct ExpiredTimer {
+    thread: *mut Thread,
+    park_seq: u64,
+}
+
 // SAFETY: timers are only linked/unlinked while protected by the local timer
 // lock for their owning CPU.
 unsafe impl Send for Timer {}
@@ -118,8 +104,7 @@ impl<'a> KeyAdapter<'a> for TimerAdapter {
 
 struct LocalClockState {
     next_order: u64,
-    ticks: u64,
-    next_stat_deadline_ns: u64,
+    next_scheduler_deadline_ns: u64,
     next_timer_deadline_ns: u64,
     armed_deadline_ns: u64,
     timers: RBTree<TimerAdapter>,
@@ -141,23 +126,19 @@ impl LocalClockState {
     fn new() -> Self {
         Self {
             next_order: 0,
-            ticks: 0,
-            next_stat_deadline_ns: 0,
+            next_scheduler_deadline_ns: 0,
             next_timer_deadline_ns: 0,
             armed_deadline_ns: 0,
             timers: RBTree::new(TimerAdapter::new()),
         }
     }
 
-    fn start(&mut self, now_ns: u64) -> Option<u64> {
-        if self.next_stat_deadline_ns == 0 {
-            self.next_stat_deadline_ns = now_ns.saturating_add(STAT_INTERVAL_NS);
-        }
+    fn start(&mut self) -> Option<u64> {
         self.refresh_programmed_deadline()
     }
 
     fn stop(&mut self) -> Option<u64> {
-        self.next_stat_deadline_ns = 0;
+        self.next_scheduler_deadline_ns = 0;
         self.refresh_programmed_deadline()
     }
 
@@ -182,45 +163,28 @@ impl LocalClockState {
         (true, self.refresh_programmed_deadline())
     }
 
-    fn on_interrupt(&mut self, now_ns: u64) -> (u64, u64, u64) {
-        let fired = self.advance_stat_ticks(now_ns);
-        let local_ticks = self.ticks;
+    fn take_expired(&mut self, now_ns: u64) -> Option<ExpiredTimer> {
+        let expired = self.expired_front(now_ns)?;
+        let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
+            .expect("clock: timer tree lost armed timer");
+        Some(ExpiredTimer {
+            thread: timer.thread,
+            park_seq: timer.park_seq,
+        })
+    }
 
-        while let Some(expired) = self.expired_front(now_ns) {
-            let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
-                .expect("clock: timer tree lost armed timer");
-            let _ = sched::wake(timer.thread, timer.park_seq);
-        }
-
+    fn finish_interrupt(&mut self, now_ns: u64) -> Option<u64> {
         self.refresh_timer_deadline();
-        let _ = self.refresh_programmed_deadline();
-        (fired, local_ticks, self.armed_deadline_ns)
+        if self.next_scheduler_deadline_ns != 0 && self.next_scheduler_deadline_ns <= now_ns {
+            self.next_scheduler_deadline_ns = 0;
+        }
+        self.armed_deadline_ns = 0;
+        self.refresh_programmed_deadline()
     }
 
-    fn ticks(&self) -> u64 {
-        self.ticks
-    }
-
-    fn advance_stat_ticks(&mut self, now_ns: u64) -> u64 {
-        let mut next = self.next_stat_deadline_ns;
-        if next == 0 {
-            self.next_stat_deadline_ns = now_ns.saturating_add(STAT_INTERVAL_NS);
-            return 0;
-        }
-
-        if now_ns < next {
-            return 0;
-        }
-
-        let mut fired = 0u64;
-        while next <= now_ns {
-            fired = fired.wrapping_add(1);
-            next = next.saturating_add(STAT_INTERVAL_NS);
-        }
-
-        self.next_stat_deadline_ns = next;
-        self.ticks = self.ticks.wrapping_add(fired);
-        fired
+    fn set_scheduler_deadline(&mut self, deadline_ns: u64) -> Option<u64> {
+        self.next_scheduler_deadline_ns = deadline_ns;
+        self.refresh_programmed_deadline()
     }
 
     fn expired_front(&self, now_ns: u64) -> Option<*const Timer> {
@@ -240,7 +204,7 @@ impl LocalClockState {
     }
 
     fn combined_deadline(&self) -> u64 {
-        match (self.next_stat_deadline_ns, self.next_timer_deadline_ns) {
+        match (self.next_scheduler_deadline_ns, self.next_timer_deadline_ns) {
             (0, 0) => 0,
             (0, deadline) | (deadline, 0) => deadline,
             (a, b) => a.min(b),
@@ -258,62 +222,43 @@ impl LocalClockState {
     }
 }
 
-/// Registers a clocksource, replacing the active source only if it scores better.
+/// Registers the active clocksource.
 pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
-    let mut state = CLOCK_STATE.lock();
-    let should_switch = state
-        .active_clocksource
-        .map(|current| {
-            clocksource.rating() > current.rating()
-                || (clocksource.rating() == current.rating()
-                    && clocksource.frequency_hz() > current.frequency_hz())
-        })
-        .unwrap_or(true);
+    assert!(
+        CLOCKSOURCE.get().is_none(),
+        "clock: clocksource already registered"
+    );
+    CLOCKSOURCE.call_once(|| clocksource);
 
-    if should_switch {
-        state.active_clocksource = Some(clocksource);
-        let (whole, frac, unit) = format_frequency(clocksource.frequency_hz());
-        info!(
-            "clock: active clocksource={} ({}.{:02} {}, rating={})",
-            clocksource.name(),
-            whole,
-            frac,
-            unit,
-            clocksource.rating()
-        );
-    } else {
-        let active = state
-            .active_clocksource
-            .expect("clock: active clocksource missing after registration");
-        info!(
-            "clock: ignored clocksource {} (rating={}), active={}",
-            clocksource.name(),
-            clocksource.rating(),
-            active.name()
-        );
-    }
+    let (whole, frac, unit) = format_frequency(clocksource.frequency_hz());
+    info!(
+        "clock: active clocksource={} ({}.{:02} {}, rating={})",
+        clocksource.name(),
+        whole,
+        frac,
+        unit,
+        clocksource.rating()
+    );
 }
 
 /// Registers the kernel event timer.
 ///
 /// The event timer is single-assignment on purpose.
 pub fn register_event_timer(timer: &'static dyn EventTimer) {
-    let mut state = CLOCK_STATE.lock();
     assert!(
-        state.event_timer.is_none(),
+        EVENT_TIMER.get().is_none(),
         "clock: event timer already registered"
     );
-
-    state.event_timer = Some(timer);
+    EVENT_TIMER.call_once(|| timer);
     info!("clock: registered event timer {}", timer.name());
 }
 
-/// Starts periodic scheduler accounting and local timer delivery.
+/// Starts local timer delivery on the current CPU.
 pub fn start() {
     CLOCK_SETUP.call_once(bootstrap_clocks);
 
     let now_ns = monotonic_ns();
-    let arm = local_clock().lock().start(now_ns);
+    let arm = local_clock().lock().start();
 
     if let Some(deadline) = arm {
         apply_deadline(deadline, now_ns);
@@ -338,37 +283,45 @@ pub fn sleep(duration: Duration) {
     sleep_ns(duration_to_ns(duration));
 }
 
-/// Returns the global tick count.
-pub fn global_ticks() -> u64 {
-    GLOBAL_TICKS.load(Ordering::Relaxed)
-}
-
-/// Returns the tick count for the current CPU.
-pub fn percpu_ticks() -> u64 {
-    local_clock().lock().ticks()
-}
-
 /// Returns monotonic nanoseconds derived from the active local counter.
 pub fn monotonic_ns() -> u64 {
-    cycles_to_ns(clocksource().frequency_hz(), clocksource().counter())
+    let source = clocksource();
+    cycles_to_ns(source.frequency_hz(), source.counter())
+}
+
+/// Updates the current CPU's scheduler deadline and re-arms the local timer if
+/// needed.
+pub fn set_scheduler_deadline(deadline_ns: u64) {
+    let now_ns = monotonic_ns();
+    let arm = {
+        let mut local = local_clock().lock();
+        local.set_scheduler_deadline(deadline_ns)
+    };
+
+    if let Some(deadline) = arm {
+        apply_deadline(deadline, now_ns);
+    }
 }
 
 /// Handles a local timer interrupt on the current CPU.
 pub fn handle_local_timer_interrupt() {
     let now_ns = monotonic_ns();
-    let (fired, local_ticks, arm) = {
-        let mut local = local_clock().lock();
-        local.on_interrupt(now_ns)
-    };
 
-    let global_base = GLOBAL_TICKS.fetch_add(fired, Ordering::Relaxed);
-    for offset in 0..fired {
-        let global = global_base.wrapping_add(offset + 1);
-        let local = local_ticks.wrapping_sub(fired - offset - 1);
-        sched::stat_tick(global, local);
+    while let Some(expired) = {
+        let mut local = local_clock().lock();
+        local.take_expired(now_ns)
+    } {
+        let _ = sched::wake(expired.thread, expired.park_seq);
     }
 
-    apply_deadline(arm, now_ns);
+    let arm = {
+        let mut local = local_clock().lock();
+        local.finish_interrupt(now_ns)
+    };
+
+    if let Some(deadline) = arm {
+        apply_deadline(deadline, now_ns);
+    }
 }
 
 fn delay_ns(ns: u64) {
@@ -376,9 +329,10 @@ fn delay_ns(ns: u64) {
         return;
     }
 
-    let start = clocksource().counter();
-    let target = ns_to_cycles(clocksource().frequency_hz(), ns);
-    while clocksource().counter().wrapping_sub(start) < target {
+    let source = clocksource();
+    let start = source.counter();
+    let target = ns_to_cycles(source.frequency_hz(), ns);
+    while source.counter().wrapping_sub(start) < target {
         spin_loop();
     }
 }
@@ -465,16 +419,17 @@ fn clock_for_cpu(cpu_id: usize) -> &'static IrqSpinLock<LocalClockState> {
 }
 
 fn apply_deadline(deadline_ns: u64, now_ns: u64) {
+    let timer = event_timer();
     if deadline_ns == 0 {
-        event_timer().stop();
+        timer.stop();
         return;
     }
 
-    let min_ns = event_timer().min_period_ns();
-    let max_ns = event_timer().max_period_ns();
+    let min_ns = timer.min_period_ns();
+    let max_ns = timer.max_period_ns();
     let delay_ns = deadline_ns.saturating_sub(now_ns).clamp(min_ns, max_ns);
 
-    event_timer().set_oneshot(delay_ns);
+    timer.set_oneshot(delay_ns);
 }
 
 fn apply_deadline_for_cpu(cpu_id: usize, deadline_ns: u64, now_ns_hint: u64) {
@@ -484,13 +439,15 @@ fn apply_deadline_for_cpu(cpu_id: usize, deadline_ns: u64, now_ns_hint: u64) {
         return;
     }
 
-    let _ = smp::send_ipi(
-        move || {
-            let now_ns = monotonic_ns();
-            apply_deadline(deadline_ns, now_ns);
-        },
-        smp::IpiTarget::Single(cpu_id),
-    );
+    let _ = smp::send_ipi(reapply_local_deadline_ipi, smp::IpiTarget::Single(cpu_id));
+}
+
+fn reapply_local_deadline_ipi() {
+    let deadline_ns = {
+        let local = local_clock().lock();
+        local.armed_deadline_ns
+    };
+    apply_deadline(deadline_ns, monotonic_ns());
 }
 
 fn format_frequency(freq_hz: u64) -> (u64, u64, &'static str) {
@@ -510,17 +467,13 @@ fn duration_to_ns(duration: Duration) -> u64 {
 }
 
 fn clocksource() -> &'static dyn ClockSource {
-    CLOCK_STATE
-        .lock()
-        .active_clocksource
+    *CLOCKSOURCE
+        .get()
         .expect("clock: no active clocksource registered")
 }
 
 fn event_timer() -> &'static dyn EventTimer {
-    CLOCK_STATE
-        .lock()
-        .event_timer
-        .expect("clock: no event timer registered")
+    *EVENT_TIMER.get().expect("clock: no event timer registered")
 }
 
 fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {

@@ -14,18 +14,18 @@ extern "C" {
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
-const CSR_SSTATUS: u16 = 0x0100;
-const CSR_SIE: u16 = 0x0104;
-const CSR_SIP: u16 = 0x0144;
+pub(crate) const CSR_SSTATUS: u16 = 0x0100;
+pub(crate) const CSR_SIE: u16 = 0x0104;
+pub(crate) const CSR_SIP: u16 = 0x0144;
 const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
-const SSTATUS_SIE: u64 = 1 << 1;
+pub(crate) const SSTATUS_SIE: u64 = 1 << 1;
 const SSTATUS_SPIE: u64 = 1 << 5;
 const SSTATUS_SPP: u64 = 1 << 8;
-const SIE_SSIE: u64 = 1 << 1;
-const SIE_STIE: u64 = 1 << 5;
+pub(crate) const SIE_SSIE: u64 = 1 << 1;
+pub(crate) const SIE_STIE: u64 = 1 << 5;
 const SIE_SEIE: u64 = 1 << 9;
 
 /// Represents the trap frame saved onto the kernel stack during a trap.
@@ -167,7 +167,7 @@ fn read_gp() -> u64 {
 }
 
 #[inline]
-unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
+pub(crate) unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
     let v: u64;
 
     asm!(
@@ -181,13 +181,23 @@ unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
 }
 
 #[inline]
-unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
+pub(crate) unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
     asm!(
         "csrw {csr_addr}, {input}",
         csr_addr = const CSR_ADDR,
         input = in(reg) val,
         options(nomem, nostack, preserves_flags)
     );
+}
+
+#[inline]
+pub(crate) unsafe fn set_csr_bits<const CSR_ADDR: u16>(mask: u64) {
+    wrcsr::<CSR_ADDR>(rdcsr::<CSR_ADDR>() | mask);
+}
+
+#[inline]
+pub(crate) unsafe fn clear_csr_bits<const CSR_ADDR: u16>(mask: u64) {
+    wrcsr::<CSR_ADDR>(rdcsr::<CSR_ADDR>() & !mask);
 }
 
 /// Configures CPU features and control registers.
@@ -204,7 +214,7 @@ pub fn enable_features() {
     //
     unsafe {
         wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
-        wrcsr::<CSR_SSTATUS>(rdcsr::<CSR_SSTATUS>() & !(SSTATUS_SIE | (1 << 19)));
+        clear_csr_bits::<CSR_SSTATUS>(SSTATUS_SIE | (1 << 19));
         wrcsr::<CSR_SIE>(SIE_SSIE | SIE_SEIE);
     }
 }
@@ -212,7 +222,7 @@ pub fn enable_features() {
 /// Enables supervisor timer interrupts once the timer subsystem is ready.
 pub fn enable_timer_interrupts() {
     unsafe {
-        wrcsr::<CSR_SIE>(rdcsr::<CSR_SIE>() | SIE_STIE);
+        set_csr_bits::<CSR_SIE>(SIE_STIE);
     }
 }
 
@@ -232,7 +242,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             }
             SCAUSE_SUPERVISOR_SOFTWARE => {
                 unsafe {
-                    wrcsr::<CSR_SIP>(rdcsr::<CSR_SIP>() & !SIE_SSIE);
+                    clear_csr_bits::<CSR_SIP>(SIE_SSIE);
                 }
                 return crate::sys::sched::trap_return(frame);
             }
