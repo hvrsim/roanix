@@ -9,7 +9,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use limine::request::ExecutableFileRequest;
-use xmas_elf::{sections::*, symbol_table::*, ElfFile};
+use xmas_elf::{ElfFile, sections::*, symbol_table::*};
 
 use crate::{
     arch,
@@ -18,7 +18,7 @@ use crate::{
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static KERNEL_FILE: ExecutableFileRequest = ExecutableFileRequest::new();
 
 /// Atomic flag to indicate a kernel panic is active.
@@ -82,6 +82,8 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
     let mut rbp: usize;
     let rsp: usize;
 
+    // SAFETY: these instructions only snapshot the current frame and stack
+    // pointers into declared output registers.
     unsafe {
         core::arch::asm!("mov {}, rbp", out(reg) rbp);
         core::arch::asm!("mov {}, rsp", out(reg) rsp);
@@ -100,7 +102,10 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
             _ => break,
         };
 
+        // SAFETY: both addresses passed `frame_ptr_in_bounds` for the current
+        // stack window and are naturally aligned frame slots.
         let next_rbp = unsafe { *(next_rbp_addr as *const usize) };
+        // SAFETY: `rip_addr` was separately bounds-checked above.
         let rip = unsafe { *(rip_addr as *const usize) };
 
         if rip == 0 {
@@ -143,6 +148,8 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
     let mut fp: usize;
     let sp: usize;
 
+    // SAFETY: these instructions only snapshot the current frame and stack
+    // pointers into declared output registers.
     unsafe {
         core::arch::asm!("mv {}, fp", out(reg) fp);
         core::arch::asm!("mv {}, sp", out(reg) sp);
@@ -163,6 +170,7 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
             Some(addr) if frame_ptr_in_bounds(addr, sp) => addr,
             _ => break,
         };
+        // SAFETY: `rip_addr` passed the current stack-window bounds check.
         let rip = unsafe { *(rip_addr as *const usize) };
 
         if rip == 0 {
@@ -189,6 +197,7 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
             plog!("{depth:>2}: 0x{rip:016x} - <unknown>");
         }
 
+        // SAFETY: `prev_fp_addr` passed the current stack-window bounds check.
         let next_fp = unsafe { *(prev_fp_addr as *const usize) };
         if !frame_ptr_in_bounds(next_fp, sp) || next_fp <= fp {
             break;
@@ -261,6 +270,8 @@ fn prepare_panic_output() {
     shoot_down_other_cpus(owner);
     wait_for_other_cpus();
 
+    // SAFETY: every other CPU has stopped or been abandoned, so stale lock
+    // owners cannot resume after panic recovery force-unlocks them.
     unsafe {
         debug::force_unlock_for_panic();
         fbcon::force_unlock_for_panic();
@@ -297,6 +308,8 @@ fn rust_panic(info: &PanicInfo) -> ! {
 
     if let Some(resp) = KERNEL_FILE.get_response() {
         let file = resp.file();
+        // SAFETY: Limine keeps the kernel image mapped and reports its exact
+        // byte length for the kernel lifetime.
         let slice = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
         if let Ok(efile) = ElfFile::new(slice) {
             let symtab = efile

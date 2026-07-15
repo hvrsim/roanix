@@ -6,7 +6,7 @@
 
 use core::arch::asm;
 
-use crate::mem::{self, phys, PhysAddr, VirtAddr, VmFlags};
+use crate::mem::{self, PhysAddr, VirtAddr, VmFlags, phys};
 
 /// Number of entries in one RISC-V page table.
 const ENTRIES_PER_TABLE: usize = 512;
@@ -79,7 +79,8 @@ pub unsafe fn activate_root(root: PhysAddr) -> Result<()> {
         return Err(PagingError::InvalidAddress);
     }
 
-    write_satp((mode << SATP_MODE_SHIFT) | (asid << SATP_ASID_SHIFT) | ppn);
+    // SAFETY: the caller guarantees the newly encoded root is valid.
+    unsafe { write_satp((mode << SATP_MODE_SHIFT) | (asid << SATP_ASID_SHIFT) | ppn) };
     sfence_vma(None);
     Ok(())
 }
@@ -106,60 +107,64 @@ pub unsafe fn map_page(
     let v = virt.as_u64();
     let mut table = root;
 
-    for level in (1..levels).rev() {
-        let idx = table_index(v, level);
-        debug_assert!(idx < ENTRIES_PER_TABLE);
-        let entry_ptr = pte_ptr(table, idx);
-        let pte = entry_ptr.read_volatile();
+    // SAFETY: the caller guarantees the hierarchy is valid and writable for
+    // the duration of this walk.
+    unsafe {
+        for level in (1..levels).rev() {
+            let idx = table_index(v, level);
+            debug_assert!(idx < ENTRIES_PER_TABLE);
+            let entry_ptr = pte_ptr(table, idx);
+            let pte = entry_ptr.read_volatile();
 
-        if pte & PTE_V != 0 {
-            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                return Err(PagingError::HugePageConflict);
+            if pte & PTE_V != 0 {
+                if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                    return Err(PagingError::HugePageConflict);
+                }
+                table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
+                continue;
             }
-            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
-            continue;
+
+            let frame = phys::alloc_zeroed_phys().ok_or(PagingError::OutOfMemory)?;
+            entry_ptr.write_volatile(((frame.as_u64() >> 12) << 10) | PTE_V);
+            table = frame;
         }
 
-        let frame = phys::alloc_zeroed_phys().ok_or(PagingError::OutOfMemory)?;
-        entry_ptr.write_volatile(((frame.as_u64() >> 12) << 10) | PTE_V);
-        table = frame;
-    }
+        let leaf_idx = table_index(v, 0);
+        debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
+        let leaf_ptr = pte_ptr(table, leaf_idx);
+        if leaf_ptr.read_volatile() & PTE_V != 0 {
+            return Err(PagingError::AlreadyMapped);
+        }
 
-    let leaf_idx = table_index(v, 0);
-    debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-    let leaf_ptr = pte_ptr(table, leaf_idx);
-    if leaf_ptr.read_volatile() & PTE_V != 0 {
-        return Err(PagingError::AlreadyMapped);
-    }
+        let mut norm = flags;
+        if !norm.intersects(VmFlags::READ | VmFlags::WRITE | VmFlags::EXECUTE) {
+            norm |= VmFlags::READ;
+        }
+        if norm.contains(VmFlags::WRITE) {
+            norm |= VmFlags::READ;
+        }
 
-    let mut norm = flags;
-    if !norm.intersects(VmFlags::READ | VmFlags::WRITE | VmFlags::EXECUTE) {
-        norm |= VmFlags::READ;
-    }
-    if norm.contains(VmFlags::WRITE) {
-        norm |= VmFlags::READ;
-    }
+        let mut bits = PTE_V | PTE_A;
+        if norm.contains(VmFlags::READ) {
+            bits |= PTE_R;
+        }
+        if norm.contains(VmFlags::WRITE) {
+            bits |= PTE_W | PTE_D;
+        }
+        if norm.contains(VmFlags::EXECUTE) {
+            bits |= PTE_X;
+        }
+        if norm.contains(VmFlags::USER) {
+            bits |= PTE_U;
+        }
+        if norm.contains(VmFlags::GLOBAL) {
+            bits |= PTE_G;
+        }
 
-    let mut bits = PTE_V | PTE_A;
-    if norm.contains(VmFlags::READ) {
-        bits |= PTE_R;
+        leaf_ptr.write_volatile(((phys.as_u64() >> 12) << 10) | bits);
+        sfence_vma(Some(virt));
+        Ok(())
     }
-    if norm.contains(VmFlags::WRITE) {
-        bits |= PTE_W | PTE_D;
-    }
-    if norm.contains(VmFlags::EXECUTE) {
-        bits |= PTE_X;
-    }
-    if norm.contains(VmFlags::USER) {
-        bits |= PTE_U;
-    }
-    if norm.contains(VmFlags::GLOBAL) {
-        bits |= PTE_G;
-    }
-
-    leaf_ptr.write_volatile(((phys.as_u64() >> 12) << 10) | bits);
-    sfence_vma(Some(virt));
-    Ok(())
 }
 
 /// Unmaps one 4 KiB page and returns the removed physical address.
@@ -179,32 +184,36 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
     let v = virt.as_u64();
     let mut table = root;
 
-    for level in (1..levels).rev() {
-        let idx = table_index(v, level);
-        debug_assert!(idx < ENTRIES_PER_TABLE);
-        let pte = pte_ptr(table, idx).read_volatile();
+    // SAFETY: the caller guarantees the hierarchy remains valid and
+    // exclusively writable during the removal.
+    unsafe {
+        for level in (1..levels).rev() {
+            let idx = table_index(v, level);
+            debug_assert!(idx < ENTRIES_PER_TABLE);
+            let pte = pte_ptr(table, idx).read_volatile();
 
-        if pte & PTE_V == 0 {
+            if pte & PTE_V == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+
+            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
+        }
+
+        let leaf_idx = table_index(v, 0);
+        debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
+        let leaf_ptr = pte_ptr(table, leaf_idx);
+        let pte = leaf_ptr.read_volatile();
+        if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) == 0 {
             return Err(PagingError::NotMapped);
         }
-        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-            return Err(PagingError::HugePageConflict);
-        }
 
-        table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
+        leaf_ptr.write_volatile(0);
+        sfence_vma(Some(virt));
+        Ok(Some(PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12)))
     }
-
-    let leaf_idx = table_index(v, 0);
-    debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-    let leaf_ptr = pte_ptr(table, leaf_idx);
-    let pte = leaf_ptr.read_volatile();
-    if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) == 0 {
-        return Err(PagingError::NotMapped);
-    }
-
-    leaf_ptr.write_volatile(0);
-    sfence_vma(Some(virt));
-    Ok(Some(PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12)))
 }
 
 /// Flushes the current hart's TLB entry for `virt`.
@@ -224,35 +233,41 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     let v = virt.as_u64();
     let mut table = root;
 
-    for level in (0..levels).rev() {
-        let idx = table_index(v, level);
-        debug_assert!(idx < ENTRIES_PER_TABLE);
-        let pte = pte_ptr(table, idx).read_volatile();
-        if pte & PTE_V == 0 {
-            return None;
+    // SAFETY: the caller guarantees that every present table remains mapped
+    // for the duration of this read-only walk.
+    unsafe {
+        for level in (0..levels).rev() {
+            let idx = table_index(v, level);
+            debug_assert!(idx < ENTRIES_PER_TABLE);
+            let pte = pte_ptr(table, idx).read_volatile();
+            if pte & PTE_V == 0 {
+                return None;
+            }
+
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                let shift = 12 + (level as u64) * 9;
+                let mask = (1u64 << shift) - 1;
+                let base = (PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12).as_u64()) & !mask;
+                return Some(PhysAddr::new(base | (v & mask)));
+            }
+
+            if level == 0 {
+                return None;
+            }
+
+            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
         }
 
-        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-            let shift = 12 + (level as u64) * 9;
-            let mask = (1u64 << shift) - 1;
-            let base = (PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12).as_u64()) & !mask;
-            return Some(PhysAddr::new(base | (v & mask)));
-        }
-
-        if level == 0 {
-            return None;
-        }
-
-        table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
+        None
     }
-
-    None
 }
 
 /// Reads and returns the current `satp` CSR value.
 #[inline(always)]
 fn read_satp() -> u64 {
     let satp: u64;
+    // SAFETY: reading SATP is valid in supervisor mode and only snapshots the
+    // current address-space configuration.
     unsafe {
         asm!(
             "csrr {}, satp",
@@ -281,35 +296,47 @@ fn table_index(virt: u64, level: usize) -> usize {
 }
 
 unsafe fn pte_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
-    mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx)
+    // SAFETY: callers guarantee `table` is mapped and `idx` is a valid
+    // page-table index.
+    unsafe { mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx) }
 }
 
 /// Writes a new value to the `satp` CSR.
 #[inline(always)]
 unsafe fn write_satp(value: u64) {
-    asm!(
-        "csrw satp, {}",
-        in(reg) value,
-        options(nomem, nostack, preserves_flags)
-    );
+    // SAFETY: the caller guarantees `value` encodes a valid SATP state.
+    unsafe {
+        asm!(
+            "csrw satp, {}",
+            in(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 /// Executes `sfence.vma` globally or for one virtual address when provided.
 #[inline(always)]
 fn sfence_vma(addr: Option<VirtAddr>) {
     match addr {
-        Some(virt) => unsafe {
-            asm!(
-                "sfence.vma {addr}, x0",
-                addr = in(reg) virt.as_u64(),
-                options(nomem, nostack, preserves_flags)
-            );
-        },
-        None => unsafe {
-            asm!(
-                "sfence.vma x0, x0",
-                options(nomem, nostack, preserves_flags)
-            );
-        },
+        Some(virt) => {
+            // SAFETY: invalidating the current hart's translation for this
+            // virtual address has no memory-safety preconditions.
+            unsafe {
+                asm!(
+                    "sfence.vma {addr}, x0",
+                    addr = in(reg) virt.as_u64(),
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+        }
+        None => {
+            // SAFETY: a global local-hart TLB invalidation is always valid.
+            unsafe {
+                asm!(
+                    "sfence.vma x0, x0",
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+        }
     }
 }

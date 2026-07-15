@@ -92,7 +92,7 @@ impl Record {
         };
 
         let path = record.file().map_or("???", |f| f);
-        let line = record.line().map_or(0, |l| l);
+        let line = record.line().unwrap_or(0);
 
         write!(
             &mut rec,
@@ -172,7 +172,6 @@ impl log::Log for KLog {
         let rec = Record::from_log_record(record);
         let mut state = DEBUG_STATE.lock();
         state.ring.push(rec);
-
         dispatch_sinks_locked(rec.buf.as_ptr(), rec.buflen, &state.sinks);
     }
 
@@ -181,9 +180,8 @@ impl log::Log for KLog {
 
 /// Dispatches a preformatted message buffer to all currently registered sinks.
 ///
-/// Expects the caller to hold the debug state lock. We keep the ring update and
-/// sink writes under the same lock so concurrent CPUs serialize console output
-/// instead of dropping records while a slow sink is draining bytes.
+/// Expects the caller to hold the debug state lock. Sink writes remain under
+/// that lock so each log record stays byte-serialized on text consoles.
 #[inline]
 fn dispatch_sinks_locked(buf: *const u8, buflen: usize, sinks: &[Option<LogSink>; MAX_SINKS]) {
     if sinks.iter().all(|slot| slot.is_none()) {
@@ -237,9 +235,7 @@ pub fn unregister_sink(sink: LogSink) -> bool {
 /// Removes all currently registered sinks.
 pub fn clear_sinks() {
     let mut state = DEBUG_STATE.lock();
-    for slot in &mut state.sinks {
-        *slot = None;
-    }
+    state.sinks.fill(None);
 }
 
 /// Prevents regular logs from competing with panic output.
@@ -255,7 +251,8 @@ pub(crate) fn enter_panic_mode() {
 /// caller accepts that the previous lock owner will never resume.
 pub(crate) unsafe fn force_unlock_for_panic() {
     if DEBUG_STATE.is_locked() {
-        DEBUG_STATE.force_unlock();
+        // SAFETY: upheld by this function's panic-only caller contract.
+        unsafe { DEBUG_STATE.force_unlock() };
     }
 }
 

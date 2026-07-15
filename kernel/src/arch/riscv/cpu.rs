@@ -9,7 +9,7 @@ use core::arch::asm;
 
 core::arch::global_asm!(include_str!("trap.S"));
 
-extern "C" {
+unsafe extern "C" {
     static rtrap_entry: u8;
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
@@ -89,44 +89,48 @@ pub unsafe fn init_kernel_thread_frame(
     arg0: usize,
     arg1: usize,
 ) {
-    *frame = TrapFrame {
-        a0: arg0 as u64,
-        a1: arg1 as u64,
-        a2: 0,
-        a3: 0,
-        a4: 0,
-        a5: 0,
-        a6: 0,
-        a7: 0,
-        t0: 0,
-        t1: 0,
-        t2: 0,
-        t3: 0,
-        t4: 0,
-        t5: 0,
-        t6: 0,
-        s0: 0,
-        s1: 0,
-        s2: 0,
-        s3: 0,
-        s4: 0,
-        s5: 0,
-        s6: 0,
-        s7: 0,
-        s8: 0,
-        s9: 0,
-        s10: 0,
-        s11: 0,
-        ra: 0,
-        gp: read_gp(),
-        prev_sp: stack_top,
-        prev_sscratch: 0,
-        scause: 0,
-        stval: 0,
-        ip: ip as u64,
-        sstatus: SSTATUS_SPP | SSTATUS_SPIE,
-        reserved: 0,
-    };
+    // SAFETY: the caller guarantees that `frame` is valid and exclusively
+    // writable for a complete `TrapFrame`.
+    unsafe {
+        *frame = TrapFrame {
+            a0: arg0 as u64,
+            a1: arg1 as u64,
+            a2: 0,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+            a6: 0,
+            a7: 0,
+            t0: 0,
+            t1: 0,
+            t2: 0,
+            t3: 0,
+            t4: 0,
+            t5: 0,
+            t6: 0,
+            s0: 0,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
+            ra: 0,
+            gp: read_gp(),
+            prev_sp: stack_top,
+            prev_sscratch: 0,
+            scause: 0,
+            stval: 0,
+            ip: ip as u64,
+            sstatus: SSTATUS_SPP | SSTATUS_SPIE,
+            reserved: 0,
+        };
+    }
 }
 
 /// Restores `frame` and enters the first scheduled kernel thread.
@@ -136,7 +140,8 @@ pub unsafe fn init_kernel_thread_frame(
 /// `frame` must contain a valid saved kernel context produced by the trap
 /// entry code or by [`init_kernel_thread_frame`].
 pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
-    rthread_resume(frame);
+    // SAFETY: upheld by this function's caller contract.
+    unsafe { rthread_resume(frame) };
 }
 
 /// Refreshes architecture-specific per-CPU state in a thread frame.
@@ -146,15 +151,25 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 /// `frame` must be the saved context for the thread about to resume on the
 /// current hart.
 pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame) {
-    (*frame).prev_sscratch = crate::arch::thiscpu() as *mut crate::sys::smp::CoreLocal as u64;
-    (*frame).gp = read_gp();
-    (*frame).sstatus |= SSTATUS_SPP | SSTATUS_SPIE;
-    (*frame).sstatus &= !SSTATUS_SIE;
+    // SAFETY: the caller guarantees `frame` is valid and exclusively owned.
+    unsafe {
+        (*frame).prev_sscratch = crate::arch::thiscpu() as *const crate::sys::smp::CoreLocal as u64;
+        (*frame).gp = read_gp();
+        (*frame).sstatus |= SSTATUS_SPP | SSTATUS_SPIE;
+        (*frame).sstatus &= !SSTATUS_SIE;
+    }
+}
+
+/// Returns the saved instruction pointer from a trap frame.
+pub fn trap_frame_ip(frame: &TrapFrame) -> u64 {
+    frame.ip
 }
 
 fn read_gp() -> u64 {
     let value: u64;
 
+    // SAFETY: this instruction only copies the current global-pointer register
+    // into a declared output.
     unsafe {
         asm!(
             "mv {}, gp",
@@ -166,38 +181,60 @@ fn read_gp() -> u64 {
     value
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn rdcsr<const CSR_ADDR: u16>() -> u64 {
     let v: u64;
 
-    asm!(
-        "csrr {output}, {csr_addr}",
-        output = out(reg) v,
-        csr_addr = const CSR_ADDR,
-        options(nomem, nostack, preserves_flags)
-    );
+    // SAFETY: the caller chooses a CSR that is readable at supervisor level.
+    unsafe {
+        asm!(
+            "csrr {output}, {csr_addr}",
+            output = out(reg) v,
+            csr_addr = const CSR_ADDR,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     v
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn wrcsr<const CSR_ADDR: u16>(val: u64) {
-    asm!(
-        "csrw {csr_addr}, {input}",
-        csr_addr = const CSR_ADDR,
-        input = in(reg) val,
-        options(nomem, nostack, preserves_flags)
-    );
+    // SAFETY: the caller chooses a writable CSR and a valid value.
+    unsafe {
+        asm!(
+            "csrw {csr_addr}, {input}",
+            csr_addr = const CSR_ADDR,
+            input = in(reg) val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn set_csr_bits<const CSR_ADDR: u16>(mask: u64) {
-    wrcsr::<CSR_ADDR>(rdcsr::<CSR_ADDR>() | mask);
+    // SAFETY: the caller chooses a writable CSR and valid set mask.
+    unsafe {
+        asm!(
+            "csrs {csr_addr}, {mask}",
+            csr_addr = const CSR_ADDR,
+            mask = in(reg) mask,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn clear_csr_bits<const CSR_ADDR: u16>(mask: u64) {
-    wrcsr::<CSR_ADDR>(rdcsr::<CSR_ADDR>() & !mask);
+    // SAFETY: the caller chooses a writable CSR and valid clear mask.
+    unsafe {
+        asm!(
+            "csrc {csr_addr}, {mask}",
+            csr_addr = const CSR_ADDR,
+            mask = in(reg) mask,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 /// Configures CPU features and control registers.
@@ -212,6 +249,8 @@ pub fn enable_features() {
     //   - Keep SIE masked so bootstrap does not take interrupts until the
     //     scheduler hands control to the first thread context.
     //
+    // SAFETY: these supervisor CSRs are configured during per-hart bring-up
+    // before interrupts or scheduling are enabled.
     unsafe {
         wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
         clear_csr_bits::<CSR_SSTATUS>(SSTATUS_SIE | (1 << 19));
@@ -221,6 +260,8 @@ pub fn enable_features() {
 
 /// Enables supervisor timer interrupts once the timer subsystem is ready.
 pub fn enable_timer_interrupts() {
+    // SAFETY: `sie.STIE` is writable in supervisor mode and the timer backend
+    // has been initialized before this call.
     unsafe {
         set_csr_bits::<CSR_SIE>(SIE_STIE);
     }
@@ -229,7 +270,7 @@ pub fn enable_timer_interrupts() {
 /// Kernel trap handler.
 ///
 /// All interrupts triggered start their journey here...
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
 
@@ -241,6 +282,8 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 return crate::sys::sched::trap_return(frame);
             }
             SCAUSE_SUPERVISOR_SOFTWARE => {
+                // SAFETY: clearing the local SSIP bit acknowledges the
+                // supervisor software interrupt currently being handled.
                 unsafe {
                     clear_csr_bits::<CSR_SIP>(SIE_SSIE);
                 }

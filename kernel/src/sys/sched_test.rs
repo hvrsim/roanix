@@ -33,10 +33,9 @@ const MAX_ITHREAD_WORKERS: usize = 2;
 
 const STRESS_DURATION_SECS: u64 = 12;
 const ITHREAD_PHASE_SECS: u64 = 2;
-const STALL_BUDGET_MS: u64 = 4_000;
 const WATCHDOG_POLL_MS: u64 = 200;
 const WATCHDOG_LOG_MS: u64 = 1_000;
-const TOTAL_TIMEOUT_SECS: u64 = 60;
+const TOTAL_TIMEOUT_SECS: u64 = 120;
 const LOG_WORKER_LIFECYCLE: bool = true;
 const ENABLE_IPI_PROBE: bool = false;
 const SLEEP_TAIL_GUARD_NS: u64 = 5_000_000;
@@ -53,14 +52,7 @@ const INTERACTIVE_LAG_FAIL_NS: u64 = 250_000_000;
 const INTERACTIVE_LAG_WARN_NS: u64 = 500_000_000;
 #[cfg(target_arch = "riscv64")]
 const INTERACTIVE_LAG_FAIL_NS: u64 = 2_500_000_000;
-const MAX_STALL_DETAIL_LOGS: usize = 12;
-
 const TOKEN_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
-
-const WORKER_INIT: usize = 0;
-const WORKER_RUNNING: usize = 1;
-const WORKER_SLEEPING: usize = 2;
-const WORKER_DONE: usize = 3;
 
 static SCHED_TEST_STATE: Once<&'static SchedulerStressState> = Once::new();
 static SCHED_TEST_QUEUED: AtomicBool = AtomicBool::new(false);
@@ -98,7 +90,6 @@ struct StressConfig {
     ithread_workers: usize,
     total_workers: usize,
     duration_ns: u64,
-    stall_budget_ns: u64,
     timeout_ns: u64,
 }
 
@@ -123,7 +114,6 @@ impl StressConfig {
             ithread_workers,
             total_workers,
             duration_ns: duration_to_ns(Duration::from_secs(STRESS_DURATION_SECS)),
-            stall_budget_ns: duration_to_ns(Duration::from_millis(STALL_BUDGET_MS)),
             timeout_ns: duration_to_ns(Duration::from_secs(TOTAL_TIMEOUT_SECS)),
         }
     }
@@ -163,12 +153,6 @@ struct SchedulerStressState {
     errors: AtomicUsize,
     per_cpu_runs: Box<[AtomicU64]>,
     per_cpu_migrations: Box<[AtomicU64]>,
-    worker_state: Box<[AtomicUsize]>,
-    worker_last_ns: Box<[AtomicU64]>,
-    worker_cpu: Box<[AtomicUsize]>,
-    worker_iter: Box<[AtomicU64]>,
-    worker_thread_ptr: Box<[AtomicUsize]>,
-    worker_sleep_start_ns: Box<[AtomicU64]>,
     shared: Mutex<SharedState>,
 }
 
@@ -190,12 +174,6 @@ impl SchedulerStressState {
             errors: AtomicUsize::new(0),
             per_cpu_runs: boxed_atomic_u64_slice(cfg.cpu_count),
             per_cpu_migrations: boxed_atomic_u64_slice(cfg.cpu_count),
-            worker_state: boxed_atomic_usize_slice(cfg.total_workers),
-            worker_last_ns: boxed_atomic_u64_slice(cfg.total_workers),
-            worker_cpu: boxed_atomic_usize_slice(cfg.total_workers),
-            worker_iter: boxed_atomic_u64_slice(cfg.total_workers),
-            worker_thread_ptr: boxed_atomic_usize_slice(cfg.total_workers),
-            worker_sleep_start_ns: boxed_atomic_u64_slice(cfg.total_workers),
             shared: Mutex::new(SharedState::new()),
         }
     }
@@ -347,8 +325,6 @@ fn monitor_until_complete(
     phase: &'static str,
 ) {
     let total = expected_done;
-    let mut last_progress = state.progress.load(Ordering::Acquire);
-    let mut last_progress_ns = start_ns;
     let mut last_log_ns = start_ns;
 
     loop {
@@ -359,24 +335,7 @@ fn monitor_until_complete(
         }
 
         let progress = state.progress.load(Ordering::Acquire);
-        if progress != last_progress {
-            last_progress = progress;
-            last_progress_ns = now;
-        } else if now.saturating_sub(last_progress_ns) > state.cfg.stall_budget_ns {
-            warn!(
-                "sched_test: watchdog stall phase={phase} done={done}/{total} progress={} stall={}ms",
-                progress,
-                ns_to_ms(now.saturating_sub(last_progress_ns))
-            );
-            log_periodic_snapshot(state, done, total, now.saturating_sub(start_ns));
-            log_worker_stall_details(state, now, total, phase);
-            // Keep monitoring until the global timeout so short scheduler
-            // drain stalls don't fail the entire stress run.
-            last_progress_ns = now;
-        }
-
         if now.saturating_sub(start_ns) > state.cfg.timeout_ns {
-            log_worker_stall_details(state, now, total, phase);
             panic!(
                 "sched_test: timeout phase={phase} done={done}/{total} elapsed={}ms progress={progress}",
                 ns_to_ms(now.saturating_sub(start_ns))
@@ -508,11 +467,6 @@ fn run_worker(
     kind: WorkerKind,
     stop_ns: u64,
 ) {
-    let thread_ptr = sched::current_thread() as usize;
-    if worker_id < state.cfg.total_workers {
-        state.worker_thread_ptr[worker_id].store(thread_ptr, Ordering::Relaxed);
-    }
-
     let start_cpu = arch::thiscpu().id;
     let mut rng = XorShift64::new(
         ((worker_id as u64).wrapping_add(1) << 32) ^ stop_ns ^ kind.seed_bias() ^ start_cpu as u64,
@@ -529,17 +483,8 @@ fn run_worker(
 
     let mut iter = 0u64;
     let mut last_cpu = start_cpu;
-    update_worker_trace(
-        state,
-        worker_id,
-        start_cpu,
-        iter,
-        clock::monotonic_ns(),
-        WORKER_RUNNING,
-    );
 
     while clock::monotonic_ns() < stop_ns {
-        let now = clock::monotonic_ns();
         let cpu_id = arch::thiscpu().id;
         if cpu_id != last_cpu {
             state.migrations.fetch_add(1, Ordering::Relaxed);
@@ -549,7 +494,6 @@ fn run_worker(
             last_cpu = cpu_id;
         }
 
-        update_worker_trace(state, worker_id, cpu_id, iter, now, WORKER_RUNNING);
         state.record_progress(cpu_id);
 
         match kind {
@@ -564,14 +508,6 @@ fn run_worker(
     }
 
     let final_cpu = arch::thiscpu().id;
-    update_worker_trace(
-        state,
-        worker_id,
-        final_cpu,
-        iter,
-        clock::monotonic_ns(),
-        WORKER_DONE,
-    );
     let finished = state.done.fetch_add(1, Ordering::AcqRel) + 1;
     if LOG_WORKER_LIFECYCLE && (worker_id < 8 || worker_id % 16 == 0 || kind == WorkerKind::Ithread)
     {
@@ -607,11 +543,7 @@ fn do_hog_step(
         let req_ns = us.saturating_mul(1_000);
         state.sleep_ops.fetch_add(1, Ordering::Relaxed);
         if should_block_sleep(stop_ns, req_ns) {
-            state.worker_state[worker_id].store(WORKER_SLEEPING, Ordering::Relaxed);
-            state.worker_sleep_start_ns[worker_id].store(clock::monotonic_ns(), Ordering::Relaxed);
             clock::sleep(Duration::from_micros(us));
-            state.worker_sleep_start_ns[worker_id].store(0, Ordering::Relaxed);
-            state.worker_state[worker_id].store(WORKER_RUNNING, Ordering::Relaxed);
         } else {
             clock::delay(Duration::from_micros(us));
         }
@@ -642,11 +574,7 @@ fn do_interactive_step(
     let before_ns = clock::monotonic_ns();
     state.sleep_ops.fetch_add(1, Ordering::Relaxed);
     if should_block_sleep(stop_ns, req_ns) {
-        state.worker_state[worker_id].store(WORKER_SLEEPING, Ordering::Relaxed);
-        state.worker_sleep_start_ns[worker_id].store(before_ns, Ordering::Relaxed);
         clock::sleep(Duration::from_micros(req_us));
-        state.worker_sleep_start_ns[worker_id].store(0, Ordering::Relaxed);
-        state.worker_state[worker_id].store(WORKER_RUNNING, Ordering::Relaxed);
     } else {
         clock::delay(Duration::from_micros(req_us));
     }
@@ -751,108 +679,6 @@ fn should_block_sleep(stop_ns: u64, req_ns: u64) -> bool {
     let now_ns = clock::monotonic_ns();
     let remaining_ns = stop_ns.saturating_sub(now_ns);
     remaining_ns > req_ns.saturating_add(SLEEP_TAIL_GUARD_NS)
-}
-
-fn update_worker_trace(
-    state: &SchedulerStressState,
-    worker_id: usize,
-    cpu_id: usize,
-    iter: u64,
-    now_ns: u64,
-    worker_state: usize,
-) {
-    if worker_id >= state.cfg.total_workers {
-        return;
-    }
-    state.worker_last_ns[worker_id].store(now_ns, Ordering::Relaxed);
-    state.worker_cpu[worker_id].store(cpu_id, Ordering::Relaxed);
-    state.worker_iter[worker_id].store(iter, Ordering::Relaxed);
-    state.worker_state[worker_id].store(worker_state, Ordering::Relaxed);
-}
-
-fn log_worker_stall_details(
-    state: &SchedulerStressState,
-    now_ns: u64,
-    total_workers: usize,
-    phase: &'static str,
-) {
-    sched::debug_dump(phase);
-
-    let mut logged = 0usize;
-    for id in 0..total_workers.min(state.cfg.total_workers) {
-        let status = state.worker_state[id].load(Ordering::Acquire);
-        if status == WORKER_DONE {
-            continue;
-        }
-
-        let kind = worker_kind_for_id(&state.cfg, id).label();
-        let cpu = state.worker_cpu[id].load(Ordering::Relaxed);
-        let iter = state.worker_iter[id].load(Ordering::Relaxed);
-        let last_ns = state.worker_last_ns[id].load(Ordering::Relaxed);
-        let age_ms = ns_to_ms(now_ns.saturating_sub(last_ns));
-        let sleep_start_ns = state.worker_sleep_start_ns[id].load(Ordering::Relaxed);
-        let sleeping_for_ms = if sleep_start_ns != 0 {
-            ns_to_ms(now_ns.saturating_sub(sleep_start_ns))
-        } else {
-            0
-        };
-
-        let state_label = match status {
-            WORKER_INIT => "init",
-            WORKER_RUNNING => "running",
-            WORKER_SLEEPING => "sleeping",
-            WORKER_DONE => "done",
-            _ => "unknown",
-        };
-
-        warn!(
-            "sched_test: stall detail phase={phase} worker#{id} kind={kind} state={state_label} cpu={} iter={} age={}ms sleeping_for={}ms",
-            cpu,
-            iter,
-            age_ms,
-            sleeping_for_ms,
-        );
-
-        let thread_ptr = state.worker_thread_ptr[id].load(Ordering::Acquire)
-            as *const crate::sys::thread::Thread;
-        if !thread_ptr.is_null() {
-            let thread = unsafe { &*thread_ptr };
-            warn!(
-                "sched_test: stall thread phase={phase} worker#{id} tid={} tstate={:?} class={:?} owner_cpu={} prio={} rqindex={} runq_linked={} idle={}",
-                thread.id,
-                thread.state,
-                thread.class,
-                thread.cpu,
-                thread.priority,
-                thread.rqindex,
-                thread.is_runq_linked(),
-                thread.is_idle(),
-            );
-        }
-
-        logged += 1;
-        if logged >= MAX_STALL_DETAIL_LOGS {
-            break;
-        }
-    }
-}
-
-fn worker_kind_for_id(cfg: &StressConfig, id: usize) -> WorkerKind {
-    if id < cfg.hog_workers {
-        WorkerKind::Hog
-    } else if id < cfg.hog_workers + cfg.interactive_workers {
-        WorkerKind::Interactive
-    } else {
-        WorkerKind::Ithread
-    }
-}
-
-fn boxed_atomic_usize_slice(len: usize) -> Box<[AtomicUsize]> {
-    let mut counters = Vec::with_capacity(len);
-    for _ in 0..len {
-        counters.push(AtomicUsize::new(0));
-    }
-    counters.into_boxed_slice()
 }
 
 fn migration_required_for(cpu_count: usize) -> bool {

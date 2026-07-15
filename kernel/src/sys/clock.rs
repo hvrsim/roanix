@@ -6,9 +6,10 @@
 //!
 
 use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
-use intrusive_collections::{intrusive_adapter, KeyAdapter, RBTree, RBTreeLink, UnsafeRef};
+use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::info;
 use spin::Once;
 
@@ -78,6 +79,7 @@ struct Timer {
     order: u64,
     thread: *mut Thread,
     park_seq: u64,
+    fired: AtomicBool,
 }
 
 #[derive(Copy, Clone)]
@@ -118,6 +120,7 @@ impl Timer {
             order: 0,
             thread,
             park_seq,
+            fired: AtomicBool::new(false),
         }
     }
 }
@@ -145,6 +148,8 @@ impl LocalClockState {
     fn insert_timer(&mut self, timer: &mut Timer) -> Option<u64> {
         timer.order = self.next_order;
         self.next_order = self.next_order.wrapping_add(1);
+        // SAFETY: the pinned timer outlives its tree membership and the local
+        // clock lock serializes all link manipulation.
         self.timers
             .insert(unsafe { UnsafeRef::from_raw(timer as *const Timer) });
         self.refresh_timer_deadline();
@@ -152,10 +157,13 @@ impl LocalClockState {
     }
 
     fn cancel_timer(&mut self, timer: *const Timer) -> (bool, Option<u64>) {
+        // SAFETY: callers pass the pinned timer associated with this local
+        // queue and hold the queue lock.
         if unsafe { !(*timer).link.is_linked() } {
             return (false, None);
         }
 
+        // SAFETY: the linked timer belongs to this tree and the lock is held.
         unsafe {
             self.timers.cursor_mut_from_ptr(timer).remove();
         }
@@ -165,8 +173,11 @@ impl LocalClockState {
 
     fn take_expired(&mut self, now_ns: u64) -> Option<ExpiredTimer> {
         let expired = self.expired_front(now_ns)?;
+        // SAFETY: `expired_front` returned the currently linked front element
+        // while this tree is exclusively borrowed.
         let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
             .expect("clock: timer tree lost armed timer");
+        timer.fired.store(true, Ordering::Release);
         Some(ExpiredTimer {
             thread: timer.thread,
             park_seq: timer.park_seq,
@@ -346,12 +357,15 @@ fn sleep_ns(ns: u64) {
 
     // Keep timer setup on one CPU so the queue owner, measured timebase,
     // and programmed local deadline always match.
-    let irq_enabled = arch::irqstate();
     arch::irqset(false);
 
     let current = sched::current_thread();
     let timer_cpu = arch::thiscpu().id;
-    let seq = unsafe { (&*current).prepare_park() };
+    // SAFETY: the scheduler guarantees the current-thread pointer remains live
+    // while that thread is executing.
+    let thread = unsafe { &*current };
+    thread.pin_migration();
+    let seq = thread.prepare_park();
     let now_ns = monotonic_ns();
     let mut timer = core::pin::pin!(Timer::new(current, now_ns.saturating_add(ns), seq));
 
@@ -364,26 +378,24 @@ fn sleep_ns(ns: u64) {
         apply_deadline(deadline, now_ns);
     }
 
-    if irq_enabled {
-        arch::irqset(true);
-    }
-
-    sched::park_current(seq);
+    sched::park_current(current, seq);
     let now_ns = monotonic_ns();
 
-    let (removed, arm) = {
-        // The scheduler may resume this thread on a different CPU, but the
-        // timer remains linked in the source CPU's timer tree until it fires or
-        // gets canceled.
-        let mut local = clock_for_cpu(timer_cpu).lock();
-        local.cancel_timer(timer.as_ref().get_ref() as *const Timer)
-    };
+    if !timer.as_ref().get_ref().fired.load(Ordering::Acquire) {
+        let (removed, arm) = {
+            // The scheduler may resume this thread on a different CPU, but the
+            // timer remains linked in the source CPU's timer tree until it fires or
+            // gets canceled.
+            let mut local = clock_for_cpu(timer_cpu).lock();
+            local.cancel_timer(timer.as_ref().get_ref() as *const Timer)
+        };
 
-    if removed {
-        if let Some(deadline) = arm {
+        if removed && let Some(deadline) = arm {
             apply_deadline_for_cpu(timer_cpu, deadline, now_ns);
         }
     }
+
+    thread.unpin_migration();
 }
 
 fn bootstrap_clocks() {

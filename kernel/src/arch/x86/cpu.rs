@@ -61,7 +61,7 @@ use x86_64::registers::model_specific::{Efer, EferFlags};
 
 core::arch::global_asm!(include_str!("trap.S"), options(att_syntax));
 
-extern "C" {
+unsafe extern "C" {
     fn vstub0();
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
@@ -75,9 +75,13 @@ static BSP_STARTUP: Once<()> = Once::new();
 bitflags! {
     /// Bitmap of supported x86 extensions.
     pub struct CpuFeatures: u32 {
+        /// Supervisor-mode execution prevention.
         const SMEP = 0b0001;
+        /// Supervisor-mode access prevention.
         const SMAP = 0b0010;
+        /// Process-context identifiers.
         const PCID = 0b0100;
+        /// Control-flow enforcement shadow stacks.
         const CET_SS = 0b1000;
     }
 }
@@ -168,34 +172,38 @@ pub unsafe fn init_kernel_thread_frame(
     arg0: usize,
     arg1: usize,
 ) {
-    ptr::write(
-        frame,
-        TrapFrame {
-            rax: 0,
-            rbx: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: arg1 as u64,
-            rdi: arg0 as u64,
-            rbp: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            vec: 0,
-            ec: 0,
-            ip: ip as u64,
-            cs: 0x28,
-            // IF=1 and bit 1 must remain set for architectural validity.
-            rflags: (1 << 9) | (1 << 1),
-            sp: stack_top,
-            ss: 0x30,
-        },
-    );
+    // SAFETY: the caller guarantees that `frame` is valid and exclusively
+    // writable for a complete `TrapFrame`.
+    unsafe {
+        ptr::write(
+            frame,
+            TrapFrame {
+                rax: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rsi: arg1 as u64,
+                rdi: arg0 as u64,
+                rbp: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+                vec: 0,
+                ec: 0,
+                ip: ip as u64,
+                cs: 0x28,
+                // IF=1 and bit 1 must remain set for architectural validity.
+                rflags: (1 << 9) | (1 << 1),
+                sp: stack_top,
+                ss: 0x30,
+            },
+        );
+    }
 }
 
 /// Restores `frame` and enters the first scheduled kernel thread.
@@ -205,7 +213,8 @@ pub unsafe fn init_kernel_thread_frame(
 /// `frame` must contain a valid saved kernel context produced by the trap
 /// entry code or by [`init_kernel_thread_frame`].
 pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
-    rthread_resume(frame);
+    // SAFETY: upheld by this function's caller contract.
+    unsafe { rthread_resume(frame) };
 }
 
 /// Refreshes architecture-specific per-CPU state in a thread frame.
@@ -215,6 +224,11 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 /// `frame` must point to the current thread's saved trap frame. x86_64 does
 /// not currently need to mutate it before resume.
 pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame) {}
+
+/// Returns the saved instruction pointer from a trap frame.
+pub fn trap_frame_ip(frame: &TrapFrame) -> u64 {
+    frame.ip
+}
 
 impl Gdt {
     /// Creates a new GDT structure.
@@ -243,27 +257,31 @@ impl Gdt {
 
         let gdtr_ptr: u64 = &gdtr as *const Descriptor as u64;
 
-        core::arch::asm!(
-            "lgdt ({gdtr})",
-            "push $0x28",
-            "lea 1f(%rip), %rax",
-            "push %rax",
-            "lretq",
-            "1:",
+        // SAFETY: `gdtr` points to this static GDT and the selectors match its
+        // kernel code/data entries.
+        unsafe {
+            core::arch::asm!(
+                "lgdt ({gdtr})",
+                "push $0x28",
+                "lea 1f(%rip), %rax",
+                "push %rax",
+                "lretq",
+                "1:",
 
-            "mov $0x30, %eax",
-            "mov %eax, %ds",
-            "mov %eax, %es",
-            "mov %eax, %fs",
-            "mov %eax, %gs",
-            "mov %eax, %ss",
+                "mov $0x30, %eax",
+                "mov %eax, %ds",
+                "mov %eax, %es",
+                "mov %eax, %fs",
+                "mov %eax, %gs",
+                "mov %eax, %ss",
 
-            gdtr = in(reg) gdtr_ptr,
+                gdtr = in(reg) gdtr_ptr,
 
-            // clobber rax since we use it for setting the segement regs.
-            out("rax") _,
-            options(att_syntax, preserves_flags)
-        );
+                // Clobber RAX since it is used to load segment registers.
+                out("rax") _,
+                options(att_syntax, preserves_flags)
+            );
+        }
     }
 }
 
@@ -348,6 +366,8 @@ pub fn enable_features() -> CpuFeatures {
             warn!("cpu: SMAP not supported!");
         }
 
+        // SAFETY: BSP startup is serialized by `BSP_STARTUP`, so the static
+        // IDT is initialized exactly once before it is loaded.
         unsafe { init_idt_entries() };
     });
 
@@ -392,11 +412,13 @@ pub fn enable_features() -> CpuFeatures {
     //     cpufeats |= CpuFeatures::CET_SS;
     // }
 
+    // SAFETY: `enable_features` is only called during CPU bring-up before
+    // concurrent execution starts on this core.
     unsafe {
-        // SAFETY: `enable_features` is only called during CPU bring-up before
-        // concurrent execution starts on this core.
         Cr4::write(Cr4::read() | bits);
     }
+    // SAFETY: both descriptor tables are fully initialized and remain static
+    // for the lifetime of the kernel.
     unsafe {
         KERNEL_GDT.load();
         load_idt();
@@ -408,7 +430,7 @@ pub fn enable_features() -> CpuFeatures {
 /// Kernel trap handler.
 ///
 /// All interrupts triggered start their journey here...
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
     if frame.vec < 32 {
@@ -460,6 +482,8 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     // Under sustained scheduler stress, catching corrupt selectors here
     // provides far better diagnostics than letting `iretq` fault with partial
     // context.
+    // SAFETY: trap dispatch returns either the current frame or a scheduler
+    // frame that remains live until assembly resumes it.
     let next_ref = unsafe { &*next };
     let next_ip = next_ref.ip;
     let next_cs = next_ref.cs;
@@ -543,15 +567,18 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
 }
 
 /// Kernel syscall handler.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
     panic!("SYSCALL triggered at IP=0x{:X}", frame.ip);
 }
 
 unsafe fn init_idt_entries() {
-    for (idx, elem) in KERNEL_IDT.iter_mut().enumerate() {
+    let idt = (&raw mut KERNEL_IDT).cast::<Idt>();
+    for idx in 0..256 {
         let addr = (vstub0 as *const u8).wrapping_add(idx * 0x10);
-        *elem = Idt::from_address(addr as u64, 0);
+        // SAFETY: `idt` points to the 256-element static IDT and each index is
+        // initialized exactly once during single-threaded CPU setup.
+        unsafe { idt.add(idx).write(Idt::from_address(addr as u64, 0)) };
     }
 }
 
@@ -571,5 +598,7 @@ unsafe fn load_idt() {
         base: (&raw const KERNEL_IDT as *const Idt) as u64,
     };
     let idtr_ptr = &idtr as *const Descriptor as u64;
-    core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr);
+    // SAFETY: `idtr_ptr` references a live descriptor for the initialized
+    // static IDT.
+    unsafe { core::arch::asm!("lidt [{idtr}]", idtr = in(reg) idtr_ptr) };
 }

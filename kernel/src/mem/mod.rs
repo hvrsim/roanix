@@ -16,7 +16,7 @@ pub mod addr;
 pub mod alloc;
 pub mod phys;
 
-pub use addr::{align_down, align_up, pages_for_len, PhysAddr, VirtAddr, PAGE_SIZE};
+pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 
 bitflags! {
     /// Virtual memory mapping permissions and attributes used by low-level paging.
@@ -39,12 +39,12 @@ bitflags! {
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 /// Performs early memory subsystem initialization.

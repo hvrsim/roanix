@@ -37,13 +37,13 @@ use crate::{
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 #[cfg(target_arch = "x86_64")]
 static SMP_REQUEST: MpRequest = MpRequest::new().with_flags(RequestFlags::X2APIC);
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 #[cfg(target_arch = "riscv64")]
 static SMP_REQUEST: MpRequest = MpRequest::new();
 
@@ -368,7 +368,8 @@ impl<T> IrqSpinLock<T> {
     /// This is only sound in fatal recovery paths where the lock owner will
     /// never resume normal execution, such as global panic shutdown.
     pub unsafe fn force_unlock(&self) {
-        self.inner.force_unlock();
+        // SAFETY: upheld by this method's caller contract.
+        unsafe { self.inner.force_unlock() };
     }
 }
 
@@ -383,6 +384,15 @@ impl<T> Deref for IrqSpinLockGuard<'_, T> {
 impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard.as_mut().unwrap()
+    }
+}
+
+impl<T> IrqSpinLockGuard<'_, T> {
+    /// Releases the lock but keeps local IRQs masked for a following
+    /// sleep/reschedule handoff.
+    pub fn unlock_keep_irqs_disabled(&mut self) {
+        drop(self.guard.take());
+        self.irq_enabled = false;
     }
 }
 
@@ -402,7 +412,9 @@ impl Drop for InterruptContextGuard {
             return;
         }
 
-        let cpu = arch::thiscpu();
+        // SAFETY: trap handling keeps local interrupts disabled, so no
+        // interrupt-context mutation can alias this borrow.
+        let cpu = unsafe { arch::thiscpu_mut() };
         assert!(
             cpu.interrupt_depth == 1,
             "smp: interrupt context underflow on cpu{}",
@@ -503,9 +515,10 @@ pub fn platform_id(cpu_id: usize) -> Option<u64> {
 
 /// Returns the immutable core-local record for `cpu_id`.
 pub(crate) fn core_local(cpu_id: usize) -> Option<&'static CoreLocal> {
-    smp_state()
-        .by_logical_id(cpu_id)
-        .map(|cpu| unsafe { &*cpu.core_local_ptr() })
+    let cpu = smp_state().by_logical_id(cpu_id)?;
+    // SAFETY: each record stores a stable, leaked `CoreLocal` allocation that
+    // remains valid for the kernel lifetime.
+    Some(unsafe { &*cpu.core_local_ptr() })
 }
 
 /// Returns whether `cpu_id` is currently online.
@@ -533,14 +546,20 @@ pub fn enter_interrupt_context() -> InterruptContextGuard {
         cpu.id
     );
 
-    cpu.interrupt_depth = 1;
+    // SAFETY: interrupt entry runs with local interrupts disabled and the
+    // assertions above rule out nested mutation.
+    unsafe { arch::thiscpu_mut() }.interrupt_depth = 1;
     InterruptContextGuard { active: true }
 }
 
 /// Returns whether the local CPU is currently handling a trap/interrupt.
 pub fn in_interrupt_context() -> bool {
     arch::thiscpu_opt()
-        .map(|cpu| cpu.interrupt_depth != 0)
+        // Trap handlers in this kernel keep local IRQs masked for their full
+        // lifetime. Once thread code has resumed with IRQs restored, treat the
+        // CPU as normal thread context even if the depth bit lags behind for a
+        // handoff path.
+        .map(|cpu| cpu.interrupt_depth != 0 && !arch::irqstate())
         .unwrap_or(false)
 }
 
@@ -656,7 +675,7 @@ fn discover_cpus(response: &limine::response::MpResponse) -> Box<[CpuRecord]> {
     let bsp_platform_id = bsp_platform_id(response);
     let mut cpus = Vec::with_capacity(response.cpus().len().max(1));
 
-    let bsp_core_local = arch::thiscpu() as *mut CoreLocal as *const CoreLocal;
+    let bsp_core_local = arch::thiscpu() as *const CoreLocal;
     cpus.push(CpuRecord::new_bsp(bsp_platform_id, bsp_core_local));
 
     let mut next_logical_id = 1usize;

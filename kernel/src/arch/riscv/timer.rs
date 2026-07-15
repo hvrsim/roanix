@@ -91,6 +91,8 @@ pub fn init_secondary() {
 fn read_time() -> u64 {
     let value: u64;
 
+    // SAFETY: `rdtime` only reads the architectural time counter into a
+    // declared output register.
     unsafe {
         asm!(
             "rdtime {}",
@@ -103,6 +105,8 @@ fn read_time() -> u64 {
 }
 
 fn write_stimecmp(deadline: u64) {
+    // SAFETY: Sstc support is established before this backend is selected, so
+    // `stimecmp` is writable in supervisor mode.
     unsafe {
         super::cpu::wrcsr::<CSR_STIMECMP>(deadline);
     }

@@ -10,16 +10,15 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
+use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
 use limine::memory_map::{Entry, EntryType};
 use log::{debug, info};
 
 use crate::{
     arch,
     mem::{
-        self,
-        addr::{align_down, align_up, pages_for_len, PAGE_SIZE},
-        PhysAddr, VirtAddr, VmFlags,
+        self, PhysAddr, VirtAddr, VmFlags,
+        addr::{PAGE_SIZE, align_down, align_up, pages_for_len},
     },
     sys::smp::IrqSpinLock,
 };
@@ -188,11 +187,15 @@ pub fn init() {
     let pagedb_phys_end = pagedb_phys_base + pagedb_pages * PAGE_SIZE;
     let bootstrap_end = pagedb_phys_base + chunk_size;
 
+    // SAFETY: physical-memory initialization is single-threaded and these
+    // cursors are only consumed by bootstrap page-table allocation.
     unsafe {
         BOOTSTRAP_NEXT = pagedb_phys_end;
         BOOTSTRAP_END = bootstrap_end;
     }
 
+    // SAFETY: the selected physical chunk is exclusively reserved here, and
+    // the PFN database virtual range is unused before these mappings.
     unsafe {
         let root = arch::paging::active_root();
         let flags = VmFlags::READ | VmFlags::WRITE | VmFlags::GLOBAL;
@@ -225,6 +228,8 @@ pub fn init() {
         let mut pa = start;
 
         while pa < end {
+            // SAFETY: every usable physical page lies below `max_usable_end`,
+            // which sized and initialized the PFN database.
             let page = unsafe { &*PAGEDB.add((pa / PAGE_SIZE) as usize) };
 
             if pa >= pagedb_phys_base && pa < bootstrap_end {
@@ -240,6 +245,12 @@ pub fn init() {
         }
     }
 
+    let bootstrap_reserved_pages = ((bootstrap_end - pagedb_phys_base) / PAGE_SIZE) as usize;
+    assert_eq!(
+        state.used_pages, bootstrap_reserved_pages,
+        "mem/phys: bootstrap PFNDB reservation accounting mismatch"
+    );
+
     info!(
         "mem/phys: pagedb active: phys=[0x{:x}-0x{:x}] used={} free={} bootstrap_pages={}",
         state.pagedb_phys_base,
@@ -251,6 +262,8 @@ pub fn init() {
 
     *PMM.lock() = Some(state);
 
+    // SAFETY: PMM publication ends all bootstrap allocations before the
+    // single-threaded initialization phase completes.
     unsafe {
         BOOTSTRAP_NEXT = 0;
         BOOTSTRAP_END = 0;
@@ -275,6 +288,8 @@ pub fn phys_to_page(pa: PhysAddr) -> Option<&'static Page> {
     }
     drop(guard);
 
+    // SAFETY: `idx` was bounds-checked against the initialized PFN database,
+    // whose mapping remains live for the kernel lifetime.
     Some(unsafe { &*PAGEDB.add(idx) })
 }
 
@@ -308,6 +323,8 @@ pub fn alloc_zeroed_phys() -> Option<PhysAddr> {
         return Some(page.paddr());
     }
 
+    // SAFETY: this fallback is reachable only during single-threaded PMM
+    // initialization before `PMM` is published.
     let pa = unsafe {
         if BOOTSTRAP_NEXT >= BOOTSTRAP_END {
             return None;
@@ -382,6 +399,8 @@ fn usable_page_range(entry: &Entry) -> Option<(u64, u64)> {
 }
 
 fn zero_page(pa: PhysAddr) {
+    // SAFETY: callers exclusively own `pa`, and the HHDM permanently maps the
+    // complete page writable.
     unsafe {
         ptr::write_bytes(
             mem::phys_to_virt(pa).as_mut_ptr::<u8>(),

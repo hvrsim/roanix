@@ -5,20 +5,20 @@
 //!
 
 use alloc::{
-    alloc::{alloc_zeroed, handle_alloc_error, Layout},
+    alloc::{Layout, alloc_zeroed, handle_alloc_error},
     boxed::Box,
 };
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::{
     arch,
-    mem::{VirtAddr, PAGE_SIZE},
+    mem::{PAGE_SIZE, VirtAddr},
 };
 use bitflags::bitflags;
-use intrusive_collections::{intrusive_adapter, LinkedListLink};
+use intrusive_collections::{LinkedListLink, intrusive_adapter};
 
 type TrapFrame = crate::arch::cpu::TrapFrame;
 
@@ -41,6 +41,7 @@ pub(crate) enum ThreadClass {
 }
 
 /// High-level lifecycle state tracked by the scheduler.
+#[repr(u8)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum ThreadState {
     /// Runnable and queued on a CPU run queue.
@@ -71,6 +72,9 @@ bitflags! {
 
         /// Remembers that the thread consumed its timeslice.
         const SLICEEND = 1 << 2;
+
+        /// Prevents the thread from migrating to another CPU.
+        const NO_MIGRATE = 1 << 3;
     }
 }
 
@@ -145,6 +149,12 @@ pub(crate) struct Thread {
     /// Parking handshake shared between the scheduler and wait sites.
     park_state: AtomicU8,
 
+    /// Atomically published lifecycle state used by cross-CPU wake/wait code.
+    state_atomic: AtomicU8,
+
+    /// Dynamic scheduler pin count used to keep short critical sections local.
+    migration_pins: AtomicUsize,
+
     /// Monotonic sequence that tags the current blocking attempt.
     park_seq: AtomicU64,
 
@@ -191,6 +201,23 @@ where
 }
 
 impl Thread {
+    fn publish_state(&mut self, state: ThreadState) {
+        self.state = state;
+        self.state_atomic.store(state as u8, Ordering::Release);
+    }
+
+    /// Returns the last scheduler lifecycle state published for this thread.
+    pub(crate) fn observed_state(&self) -> ThreadState {
+        match self.state_atomic.load(Ordering::Acquire) {
+            x if x == ThreadState::Ready as u8 => ThreadState::Ready,
+            x if x == ThreadState::Running as u8 => ThreadState::Running,
+            x if x == ThreadState::Blocked as u8 => ThreadState::Blocked,
+            x if x == ThreadState::Idle as u8 => ThreadState::Idle,
+            x if x == ThreadState::Exited as u8 => ThreadState::Exited,
+            value => panic!("thread: invalid published state {value}"),
+        }
+    }
+
     /// Returns whether this thread is currently linked into a run queue.
     pub(crate) fn is_runq_linked(&self) -> bool {
         self.runq_link.is_linked()
@@ -206,25 +233,43 @@ impl Thread {
         !self.flags.contains(ThreadFlags::NOLOAD)
     }
 
+    /// Returns whether the thread may migrate to another CPU.
+    pub(crate) fn can_migrate(&self) -> bool {
+        !self.flags.contains(ThreadFlags::NO_MIGRATE)
+            && self.migration_pins.load(Ordering::Acquire) == 0
+    }
+
+    /// Prevents the scheduler from migrating this thread until the matching
+    /// unpin completes.
+    pub(crate) fn pin_migration(&self) {
+        self.migration_pins.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Releases one dynamic migration pin.
+    pub(crate) fn unpin_migration(&self) {
+        let previous = self.migration_pins.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "thread: migration pin underflow");
+    }
+
     /// Marks the thread runnable on run-queue bucket `rqindex`.
     pub(crate) fn mark_ready(&mut self, rqindex: u8) {
-        self.state = ThreadState::Ready;
+        self.publish_state(ThreadState::Ready);
         self.rqindex = rqindex;
     }
 
     /// Marks the thread blocked until a wake event arrives.
     pub(crate) fn mark_blocked(&mut self) {
-        self.state = ThreadState::Blocked;
+        self.publish_state(ThreadState::Blocked);
     }
 
     /// Marks the thread as permanently exited.
     pub(crate) fn mark_exited(&mut self) {
-        self.state = ThreadState::Exited;
+        self.publish_state(ThreadState::Exited);
     }
 
     /// Marks the thread as running on `cpu_id` at `now_ns`.
     pub(crate) fn mark_running(&mut self, cpu_id: usize, now_ns: u64) {
-        self.state = ThreadState::Running;
+        self.publish_state(ThreadState::Running);
         self.cpu = cpu_id;
         self.last_run_ns = now_ns;
     }
@@ -322,13 +367,17 @@ impl Thread {
     pub(crate) fn has_valid_stack_canary(&self) -> bool {
         self._stack
             .0
-            .chunks_exact(size_of::<u64>())
+            .as_chunks::<{ size_of::<u64>() }>()
+            .0
+            .iter()
             .take(STACK_CANARY_WORDS)
-            .all(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()) == STACK_CANARY)
+            .all(|bytes| u64::from_ne_bytes(*bytes) == STACK_CANARY)
     }
 }
 
 extern "C" fn thread_entry(thread_ptr: usize) -> ! {
+    // SAFETY: the scheduler passes the leaked `Thread` pointer used to create
+    // this initial frame and starts it exactly once.
     let thread = unsafe { &mut *(thread_ptr as *mut Thread) };
     let task = thread
         .task
@@ -351,18 +400,23 @@ where
     F: FnOnce() -> R + Send + 'static,
 {
     let layout = Layout::new::<KernelStack>();
+    // SAFETY: `layout` describes `KernelStack`; null is handled immediately.
     let stack_ptr = unsafe { alloc_zeroed(layout) } as *mut KernelStack;
     if stack_ptr.is_null() {
         handle_alloc_error(layout);
     }
 
+    // SAFETY: `stack_ptr` is a fresh allocation with the exact `KernelStack`
+    // layout and ownership transfers into this box.
     let mut stack = unsafe { Box::from_raw(stack_ptr) };
     for chunk in stack
         .0
-        .chunks_exact_mut(size_of::<u64>())
+        .as_chunks_mut::<{ size_of::<u64>() }>()
+        .0
+        .iter_mut()
         .take(STACK_CANARY_WORDS)
     {
-        chunk.copy_from_slice(&STACK_CANARY.to_ne_bytes());
+        *chunk = STACK_CANARY.to_ne_bytes();
     }
     let stack_base = VirtAddr::from_ptr(stack.0.as_mut_ptr());
     let stack_top = stack_base
@@ -399,9 +453,13 @@ where
         stack_top,
         frame,
         park_state: AtomicU8::new(PARK_STATE_IDLE),
+        state_atomic: AtomicU8::new(state as u8),
+        migration_pins: AtomicUsize::new(0),
         park_seq: AtomicU64::new(0),
         task: Some(Box::new(task)),
     }));
+    // SAFETY: `frame` points inside the exclusively owned stack allocation and
+    // is properly aligned for the architecture trap frame.
     unsafe {
         crate::arch::cpu::init_kernel_thread_frame(
             frame,
@@ -421,7 +479,8 @@ where
 /// `thread` must point to a thread that is no longer runnable or executing on
 /// any CPU.
 pub(crate) unsafe fn free_thread(thread: *mut Thread) {
-    drop(Box::from_raw(thread));
+    // SAFETY: upheld by this function's ownership contract.
+    drop(unsafe { Box::from_raw(thread) });
 }
 
 /// Default idle loop that halts until the next interrupt arrives.

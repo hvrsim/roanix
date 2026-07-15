@@ -17,7 +17,7 @@ use log::info;
 
 use crate::{
     arch,
-    mem::{self, pages_for_len, phys, PhysAddr, VirtAddr, VmFlags, PAGE_SIZE},
+    mem::{self, PAGE_SIZE, PhysAddr, VirtAddr, VmFlags, pages_for_len, phys},
     sys::{self, sync::Mutex},
 };
 
@@ -180,6 +180,8 @@ impl HeapState {
             page_idx = self.grow_slab(class)?;
         }
 
+        // SAFETY: partial lists only contain mapped slab pages and the heap
+        // lock gives this operation unique access.
         let slab = unsafe { slab_header(page_idx as usize) };
         let node = slab.free_head;
         if node.is_null() {
@@ -187,6 +189,7 @@ impl HeapState {
         }
 
         let was_empty = slab.free_count == slab.capacity;
+        // SAFETY: `node` came from this slab's validated free list.
         slab.free_head = unsafe { (*node).next };
         slab.free_count -= 1;
 
@@ -203,10 +206,13 @@ impl HeapState {
 
     fn dealloc_slab(&mut self, page_idx: usize, ptr: *mut u8) -> Option<u64> {
         let class = self.pages[page_idx].class as usize;
+        // SAFETY: `page_idx` was derived from an allocation owned by this slab
+        // and the heap lock gives unique access.
         let slab = unsafe { slab_header(page_idx) };
         let was_full = slab.free_count == 0;
         let node = ptr.cast::<FreeNode>();
 
+        // SAFETY: `ptr` is a live slot in this slab and is being returned once.
         unsafe {
             (*node).next = slab.free_head;
         }
@@ -237,14 +243,18 @@ impl HeapState {
         let root = arch::paging::active_root();
         let phys_page = phys::alloc_zeroed_page()?;
 
+        // SAFETY: the reserved heap virtual page is currently unmapped and the
+        // new physical page is exclusively owned by the allocator.
         let mapped =
             unsafe { arch::paging::map_page(root, page_va, phys_page.paddr(), heap_flags()) };
         if mapped.is_err() {
+            // SAFETY: mapping failed, so no alias to this page was published.
             unsafe { phys::free_page(phys_page) };
             self.clear_run(page_idx, 1);
             return None;
         }
 
+        // SAFETY: the page was just mapped exclusively for this slab class.
         unsafe { init_slab_page(page_idx, class) };
         self.pages[page_idx] = HeapPageMeta {
             kind: PageKind::Slab,
@@ -275,9 +285,12 @@ impl HeapState {
             };
 
             let virt = heap_page_virt(start + mapped);
+            // SAFETY: this reserved virtual page is currently unmapped and the
+            // physical page is exclusively owned by this allocation.
             let res =
                 unsafe { arch::paging::map_page(root, virt, phys_page.paddr(), heap_flags()) };
             if res.is_err() {
+                // SAFETY: mapping failed, so no alias to this page was exposed.
                 unsafe { phys::free_page(phys_page) };
                 self.rollback_large(root, start, mapped);
                 self.clear_run(start, pages);
@@ -366,13 +379,15 @@ impl HeapState {
         while idx + pages <= end {
             let mut ok = true;
 
-            for probe in idx..(idx + pages) {
+            let mut probe = idx;
+            while probe < idx + pages {
                 let meta = self.pages[probe];
                 if meta.kind != PageKind::Free {
                     idx = align_up_pages(probe + occupied_span(meta), align_pages);
                     ok = false;
                     break;
                 }
+                probe += 1;
             }
 
             if ok {
@@ -384,11 +399,13 @@ impl HeapState {
     }
 
     fn insert_partial(&mut self, class: usize, page_idx: u32) {
+        // SAFETY: partial-list links are only manipulated under the heap lock.
         let slab = unsafe { slab_header(page_idx as usize) };
         slab.prev = NONE_PAGE;
         slab.next = self.partial[class];
 
         if slab.next != NONE_PAGE {
+            // SAFETY: `slab.next` names another mapped slab in this list.
             unsafe { slab_header(slab.next as usize) }.prev = page_idx;
         }
 
@@ -396,17 +413,20 @@ impl HeapState {
     }
 
     fn remove_partial(&mut self, class: usize, page_idx: u32) {
+        // SAFETY: partial-list links are only manipulated under the heap lock.
         let slab = unsafe { slab_header(page_idx as usize) };
         let next = slab.next;
         let prev = slab.prev;
 
         if prev != NONE_PAGE {
+            // SAFETY: `prev` names another mapped slab in this list.
             unsafe { slab_header(prev as usize) }.next = next;
         } else {
             self.partial[class] = next;
         }
 
         if next != NONE_PAGE {
+            // SAFETY: `next` names another mapped slab in this list.
             unsafe { slab_header(next as usize) }.prev = prev;
         }
 
@@ -425,6 +445,7 @@ impl HeapState {
     fn rollback_large(&mut self, root: PhysAddr, start: usize, mapped: usize) {
         for idx in start..(start + mapped) {
             let page = self.take_mapped_page(root, idx, "rollback");
+            // SAFETY: rollback removed the only heap mapping of this page.
             unsafe { phys::free_page(page) };
         }
     }
@@ -436,6 +457,8 @@ impl HeapState {
         context: &str,
     ) -> &'static phys::Page {
         let virt = heap_page_virt(page_idx);
+        // SAFETY: the heap lock serializes page-table changes for this reserved
+        // heap address, and the mapping is no longer accessible after removal.
         let phys = unsafe { arch::paging::unmap_page(root, virt) }
             .unwrap_or_else(|_| panic!("mem/alloc: failed to unmap {context} heap page"))
             .unwrap_or_else(|| panic!("mem/alloc: missing {context} heap mapping"));
@@ -450,6 +473,8 @@ impl HeapState {
         span: usize,
     ) -> Option<u64> {
         if sys::smp::online_cpus() <= 1 {
+            // SAFETY: the page was unmapped above and no remote TLB can retain
+            // an alias in the single-CPU case.
             unsafe { phys::free_page(page) };
             self.pages[page_idx] = HeapPageMeta::FREE;
             return None;
@@ -505,6 +530,8 @@ impl HeapState {
 
         let page = phys::phys_to_page(paddr)
             .unwrap_or_else(|| panic!("mem/alloc: retired heap page missing PFN metadata"));
+        // SAFETY: every tracked CPU acknowledged the TLB invalidation before
+        // this retired page became reclaimable.
         unsafe { phys::free_page(page) };
         self.pages[page_idx] = HeapPageMeta::FREE;
         self.search_hint = self.search_hint.min(page_idx);
@@ -528,6 +555,8 @@ struct HeapGuard<'a> {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
+// SAFETY: all allocator entry points serialize heap metadata through `HEAP`;
+// returned regions are disjoint and page mappings remain live until dealloc.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         heap_lock().alloc(layout)
@@ -546,19 +575,23 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = heap_lock().alloc(layout);
         if !ptr.is_null() && layout.size() != 0 {
-            ptr::write_bytes(ptr, 0, layout.size());
+            // SAFETY: a successful allocation is writable for `layout.size()`.
+            unsafe { ptr::write_bytes(ptr, 0, layout.size()) };
         }
         ptr
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.size() == 0 {
-            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-            return self.alloc(new_layout);
+            // SAFETY: `layout.align()` is a valid allocation alignment.
+            let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            // SAFETY: delegated to the `GlobalAlloc` contract of `realloc`.
+            return unsafe { self.alloc(new_layout) };
         }
 
         if new_size == 0 {
-            self.dealloc(ptr, layout);
+            // SAFETY: delegated to the `GlobalAlloc` contract of `realloc`.
+            unsafe { self.dealloc(ptr, layout) };
             return layout.align() as *mut u8;
         }
 
@@ -567,20 +600,26 @@ unsafe impl GlobalAlloc for KernelAllocator {
             heap.usable_size(ptr)
         };
 
-        if let Some(current) = current {
-            if new_size <= current {
-                return ptr;
-            }
+        if let Some(current) = current
+            && new_size <= current
+        {
+            return ptr;
         }
 
-        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-        let new_ptr = self.alloc(new_layout);
+        // SAFETY: `layout.align()` is a valid allocation alignment.
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        // SAFETY: delegated to the `GlobalAlloc` contract of `realloc`.
+        let new_ptr = unsafe { self.alloc(new_layout) };
         if new_ptr.is_null() {
             return null_mut();
         }
 
-        ptr::copy_nonoverlapping(ptr, new_ptr, cmp::min(layout.size(), new_size));
-        self.dealloc(ptr, layout);
+        // SAFETY: both allocations are live, disjoint, and valid for the
+        // copied minimum size.
+        unsafe {
+            ptr::copy_nonoverlapping(ptr, new_ptr, cmp::min(layout.size(), new_size));
+            self.dealloc(ptr, layout);
+        }
         new_ptr
     }
 }
@@ -658,7 +697,9 @@ fn ptr_page_index(ptr: *mut u8) -> Option<usize> {
 }
 
 unsafe fn slab_header(page_idx: usize) -> &'static mut SlabHeader {
-    &mut *heap_page_virt(page_idx).as_mut_ptr::<SlabHeader>()
+    // SAFETY: callers only request mapped slab pages while holding the heap
+    // lock, which guarantees unique access to the header.
+    unsafe { &mut *heap_page_virt(page_idx).as_mut_ptr::<SlabHeader>() }
 }
 
 /// Flushes allocator-requested heap TLB invalidations on the current CPU.
@@ -709,29 +750,33 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
         "mem/alloc: invalid slab capacity for class {class}"
     );
 
-    ptr::write(
-        base.cast::<SlabHeader>(),
-        SlabHeader {
-            next: NONE_PAGE,
-            prev: NONE_PAGE,
-            class: class as u16,
-            capacity: capacity as u16,
-            free_count: capacity as u16,
-            _reserved: 0,
-            free_head: null_mut(),
-        },
-    );
+    // SAFETY: the caller reserved and mapped this page exclusively for the
+    // selected slab class; all computed slots remain within the page.
+    unsafe {
+        ptr::write(
+            base.cast::<SlabHeader>(),
+            SlabHeader {
+                next: NONE_PAGE,
+                prev: NONE_PAGE,
+                class: class as u16,
+                capacity: capacity as u16,
+                free_count: capacity as u16,
+                _reserved: 0,
+                free_head: null_mut(),
+            },
+        );
 
-    let slab = &mut *base.cast::<SlabHeader>();
-    let mut free_head = null_mut();
+        let slab = &mut *base.cast::<SlabHeader>();
+        let mut free_head = null_mut();
 
-    for slot in (0..capacity).rev() {
-        let node = base.add(slots_offset + slot * slot_size).cast::<FreeNode>();
-        ptr::write(node, FreeNode { next: free_head });
-        free_head = node;
+        for slot in (0..capacity).rev() {
+            let node = base.add(slots_offset + slot * slot_size).cast::<FreeNode>();
+            ptr::write(node, FreeNode { next: free_head });
+            free_head = node;
+        }
+
+        slab.free_head = free_head;
     }
-
-    slab.free_head = free_head;
 }
 
 impl TlbShootdownState {

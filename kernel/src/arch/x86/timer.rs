@@ -69,8 +69,11 @@ impl EventTimer for LapicEventTimer {
 /// Result of dispatching an x86 local interrupt vector through the timer/LAPIC
 /// path.
 pub enum InterruptAction {
+    /// The vector does not belong to the timer/LAPIC path.
     Unhandled,
+    /// The interrupt was handled without requiring a schedule decision.
     Handled,
+    /// The interrupt requests a scheduler trap return.
     Reschedule,
 }
 
@@ -90,7 +93,9 @@ pub fn init() {
 
     let tsc_hz = calibrate_tsc(&cpuid);
     lapic::init(tsc_hz);
-    let platform = &mut super::thiscpu().platform;
+    // SAFETY: timer initialization runs with exclusive access to this CPU's
+    // core-local state before normal scheduling begins.
+    let platform = &mut unsafe { super::thiscpu_mut() }.platform;
     platform.tsc_hz = tsc_hz;
     platform.lapic_timer_hz = lapic::calibrated_timer_hz();
 
@@ -101,7 +106,8 @@ pub fn init() {
 /// Programs the local timer backend on a secondary CPU.
 pub fn init_secondary() {
     lapic::init_secondary();
-    let platform = &mut super::thiscpu().platform;
+    // SAFETY: the secondary CPU is not online until initialization completes.
+    let platform = &mut unsafe { super::thiscpu_mut() }.platform;
     platform.tsc_hz = lapic::calibrated_tsc_hz();
     platform.lapic_timer_hz = lapic::calibrated_timer_hz();
 }
@@ -162,6 +168,8 @@ fn pit_calibrate_tsc(reference_hz: u64) -> u64 {
     let mut pit_ch0_write: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x40);
     let mut pit_ch0_read: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(0x40);
 
+    // SAFETY: local IRQs are disabled and the PIT ports are exclusively used
+    // for this calibration interval.
     unsafe {
         pit_cmd.write(0x30);
         pit_ch0_write.write(initial_low);
@@ -170,11 +178,14 @@ fn pit_calibrate_tsc(reference_hz: u64) -> u64 {
 
     let start = rdtsc();
     loop {
+        // SAFETY: latching the PIT count is valid while calibration owns it.
         unsafe {
             pit_cmd.write(0x00);
         }
 
+        // SAFETY: the latched channel-0 count is read low byte then high byte.
         let low = unsafe { pit_ch0_read.read() };
+        // SAFETY: this is the high byte paired with the preceding low byte.
         let high = unsafe { pit_ch0_read.read() };
         let current = ((high as u16) << 8) | low as u16;
         if current as u32 <= PIT_TARGET {
@@ -204,6 +215,8 @@ fn rdtsc() -> u64 {
     let low: u32;
     let high: u32;
 
+    // SAFETY: `lfence; rdtsc` only reads architectural timing state and
+    // declares all modified registers.
     unsafe {
         asm!(
             "lfence",

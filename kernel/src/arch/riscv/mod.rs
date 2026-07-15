@@ -65,15 +65,10 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
 ///
 /// On riscv64, kernel core-local data is stored in the TP register.
 ///
-/// ## Safety
-///
 /// The kernel thread-local context isn't valid until [`set_core_local`] is
-/// called, which
-/// happens very early in boot. If you find yourself requiring
-/// thread-local context super early in boot, consider moving
-/// your init stage into a later part of the boot pipeline.
+/// called, which happens very early in boot.
 #[inline(always)]
-pub fn thiscpu() -> &'static mut CoreLocal {
+pub fn thiscpu() -> &'static CoreLocal {
     thiscpu_opt().expect("riscv: thiscpu called before TP was initialized")
 }
 
@@ -82,9 +77,34 @@ pub fn thiscpu() -> &'static mut CoreLocal {
 /// **NOTE: This function should only be used by the kernel logger,
 /// since it's the only module that runs before corelocal setup.**
 #[inline(always)]
-pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
+pub fn thiscpu_opt() -> Option<&'static CoreLocal> {
+    let ptr = thiscpu_ptr()?;
+
+    // SAFETY: TP is only initialized from stable `CoreLocal` allocations.
+    Some(unsafe { &*ptr })
+}
+
+/// Returns mutable core-local context for the current hart.
+///
+/// # Safety
+///
+/// The caller must have exclusive access to the current hart's `CoreLocal` for
+/// the duration of the returned borrow. In practice this requires early boot
+/// or local interrupts to be disabled.
+#[inline(always)]
+pub unsafe fn thiscpu_mut() -> &'static mut CoreLocal {
+    let ptr = thiscpu_ptr().expect("riscv: thiscpu called before TP was initialized");
+
+    // SAFETY: the caller guarantees exclusive access to this hart's state.
+    unsafe { &mut *ptr }
+}
+
+#[inline(always)]
+fn thiscpu_ptr() -> Option<*mut CoreLocal> {
     let value: usize;
 
+    // SAFETY: reading TP only snapshots the hart-local pointer installed by
+    // `set_core_local`.
     unsafe {
         asm!(
             "mv {}, tp",
@@ -97,8 +117,7 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
         return None;
     }
 
-    // SAFETY: TP is only initialized from stable `CoreLocal` allocations.
-    Some(unsafe { &mut *(value as *mut CoreLocal) })
+    Some(value as *mut CoreLocal)
 }
 
 /// Sets the core local pointer.
@@ -110,6 +129,8 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
 pub fn set_core_local(ptr: *const CoreLocal) {
     let value: usize;
 
+    // SAFETY: this runs once during hart bring-up; `ptr` refers to a stable
+    // `CoreLocal` allocation that outlives the hart.
     unsafe {
         asm!(
             "mv {}, tp",
@@ -130,17 +151,26 @@ pub fn set_core_local(ptr: *const CoreLocal) {
 /// Returns whether CPU interrupts are currently enabled.
 #[inline(always)]
 pub fn irqstate() -> bool {
+    // SAFETY: SSTATUS is readable in supervisor mode.
     unsafe { cpu::rdcsr::<{ cpu::CSR_SSTATUS }>() & cpu::SSTATUS_SIE != 0 }
 }
 
 /// Enables or disables CPU interrupts.
 #[inline(always)]
 pub fn irqset(enable: bool) {
+    // SAFETY: toggling SSTATUS.SIE is the architecture-defined local interrupt
+    // control operation in supervisor mode.
     unsafe {
         if enable {
-            cpu::set_csr_bits::<{ cpu::CSR_SSTATUS }>(cpu::SSTATUS_SIE);
+            asm!(
+                "csrsi sstatus, 0x2",
+                options(nomem, nostack, preserves_flags)
+            );
         } else {
-            cpu::clear_csr_bits::<{ cpu::CSR_SSTATUS }>(cpu::SSTATUS_SIE);
+            asm!(
+                "csrci sstatus, 0x2",
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }
@@ -168,13 +198,11 @@ pub fn init_secondary(core_local: *const CoreLocal) {
 }
 
 /// Pauses CPU execution and waits for interrupts.
-///
-/// **If interrupts are disabled, this will result in an infinite loop.**
-pub fn wfi() -> ! {
-    loop {
-        unsafe {
-            asm!("wfi", options(nomem, nostack, preserves_flags));
-        }
+#[inline(always)]
+pub fn wfi() {
+    // SAFETY: WFI only suspends this hart until an interrupt/event arrives.
+    unsafe {
+        asm!("wfi", options(nomem, nostack, preserves_flags));
     }
 }
 
@@ -191,7 +219,7 @@ pub fn send_ipi(cpu_id: usize) {
         "riscv: legacy SBI IPI fallback requires hartid < {}",
         usize::BITS
     );
-    let legacy_mask = 1usize << hartid;
+    let legacy_mask = 1usize << (hartid as usize);
     let legacy_error = sbi_call1(
         &legacy_mask as *const usize as usize,
         SBI_LEGACY_SEND_IPI,
@@ -207,17 +235,26 @@ pub fn reschedule() {
         "riscv: local reschedule requires interrupts to be enabled"
     );
 
+    // A direct local `sip.SSIP` write with SIE already enabled can interrupt
+    // the hart at the CSR write itself, leaving `sepc` on that instruction.
+    // After trap return the hart can re-execute the same write and livelock in
+    // a software-interrupt loop.
+    //
+    // Raise the pending bit with interrupts masked, then restore SIE. The
+    // interrupt is delivered only after reenabling, so `sepc` no longer points
+    // at the SSIP source instruction.
+    irqset(false);
+    // SAFETY: SSIP is the hart-local supervisor software interrupt pending bit.
     unsafe {
-        // Trigger a supervisor-software interrupt and return immediately.
-        // Executing `wfi` here can race with immediate trap delivery: SSIP may
-        // be serviced and cleared before `wfi`, leaving the hart sleeping
-        // unexpectedly until an unrelated interrupt arrives.
         cpu::set_csr_bits::<{ cpu::CSR_SIP }>(cpu::SIE_SSIE);
     }
+    irqset(true);
 }
 
 /// Invokes an SBI call that only needs `a0`.
 pub(crate) fn sbi_call1(arg0: usize, ext_id: usize, func_id: usize) -> SbiRet {
+    // SAFETY: this wrapper is only used with fixed SBI calls whose argument
+    // layouts are encoded at each call site.
     unsafe { sbi_call(arg0, 0, 0, ext_id, func_id) }
 }
 
@@ -229,6 +266,8 @@ pub(crate) fn sbi_call3(
     ext_id: usize,
     func_id: usize,
 ) -> SbiRet {
+    // SAFETY: this wrapper is only used with fixed SBI calls whose argument
+    // layouts are encoded at each call site.
     unsafe { sbi_call(arg0, arg1, arg2, ext_id, func_id) }
 }
 
@@ -241,14 +280,18 @@ unsafe fn sbi_call(arg0: usize, arg1: usize, arg2: usize, ext_id: usize, func_id
     let error: isize;
     let value: usize;
 
-    asm!(
-        "ecall",
-        inlateout("a0") arg0 as isize => error,
-        inlateout("a1") arg1 => value,
-        in("a2") arg2,
-        in("a6") func_id,
-        in("a7") ext_id,
-    );
+    // SAFETY: the caller guarantees that the extension/function IDs and
+    // register arguments satisfy the selected SBI ABI.
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") arg0 as isize => error,
+            inlateout("a1") arg1 => value,
+            in("a2") arg2,
+            in("a6") func_id,
+            in("a7") ext_id,
+        );
+    }
 
     let _ = value;
     SbiRet { error }

@@ -23,7 +23,7 @@ static FBCON: IrqSpinLock<Option<FbCon>> = IrqSpinLock::new(None);
 
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 struct FbCon {
@@ -40,6 +40,8 @@ struct FbCon {
     fg: u32,
 }
 
+// SAFETY: framebuffer access is serialized through `FBCON`; the raw pointer
+// references bootloader-owned memory that remains mapped for the kernel life.
 unsafe impl Send for FbCon {}
 
 impl FbCon {
@@ -89,6 +91,8 @@ impl FbCon {
     }
 
     fn clear(&mut self) {
+        // SAFETY: `base..base + fb_len` is the validated framebuffer mapping
+        // exclusively accessed through this locked console.
         unsafe {
             ptr::write_bytes(self.base, 0, self.fb_len);
         }
@@ -169,6 +173,8 @@ impl FbCon {
             return;
         }
 
+        // SAFETY: the checked offset and pixel width stay inside the validated
+        // framebuffer mapping.
         unsafe {
             let pixel = self.base.add(offset);
             for idx in 0..self.bytes_per_pixel {
@@ -201,6 +207,8 @@ impl FbCon {
         if row_bytes > visible {
             return;
         }
+        // SAFETY: source and destination are ranges within the same validated
+        // framebuffer; `ptr::copy` permits overlap while scrolling.
         unsafe {
             ptr::copy(self.base.add(row_bytes), self.base, visible - row_bytes);
             ptr::write_bytes(self.base.add(visible - row_bytes), 0, row_bytes);
@@ -263,11 +271,14 @@ pub fn register() -> bool {
 /// This must only be used after other CPUs have been stopped or abandoned.
 pub(crate) unsafe fn force_unlock_for_panic() {
     if FBCON.is_locked() {
-        FBCON.force_unlock();
+        // SAFETY: upheld by this function's panic-only caller contract.
+        unsafe { FBCON.force_unlock() };
     }
 }
 
 fn write(buf: *const u8, buflen: usize) {
+    // SAFETY: the debug subsystem invokes sinks with a live buffer for the
+    // duration of this callback.
     let bytes = unsafe { slice::from_raw_parts(buf, buflen) };
     let mut state = FBCON.lock();
     if let Some(console) = state.as_mut() {

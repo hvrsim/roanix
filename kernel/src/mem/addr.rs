@@ -5,7 +5,7 @@
 //! subsystem.
 //!
 
-use core::fmt;
+use core::{fmt, ptr};
 
 /// Log2 of page size.
 pub const PAGE_SHIFT: u64 = 12;
@@ -14,24 +14,27 @@ pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 /// Align `value` down to `align` bytes.
+#[must_use]
 #[inline(always)]
 pub const fn align_down(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
     value & !(align - 1)
 }
 
 /// Align `value` up to `align` bytes.
+#[must_use]
 #[inline(always)]
 pub const fn align_up(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
     let mask = align - 1;
     match value.checked_add(mask) {
         Some(v) => v & !mask,
-        None => !mask,
+        None => panic!("alignment overflow"),
     }
 }
 
 /// Returns how many pages are needed to cover `len` bytes.
+#[must_use]
 #[inline(always)]
 pub const fn pages_for_len(len: u64) -> u64 {
     if len == 0 {
@@ -42,6 +45,7 @@ pub const fn pages_for_len(len: u64) -> u64 {
 }
 
 /// Physical address wrapper.
+#[must_use]
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct PhysAddr(u64);
@@ -93,6 +97,7 @@ impl fmt::LowerHex for PhysAddr {
 }
 
 /// Virtual address wrapper.
+#[must_use]
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct VirtAddr(u64);
@@ -103,9 +108,12 @@ impl VirtAddr {
         Self(raw)
     }
 
-    /// Constructs a virtual address from a pointer.
+    /// Captures the exposed address of `ptr`.
+    ///
+    /// This intentionally discards pointer provenance. It is intended for
+    /// architecture registers, page tables, and HHDM/MMIO address arithmetic.
     pub fn from_ptr<T>(ptr: *const T) -> Self {
-        Self(ptr as usize as u64)
+        Self(ptr.addr() as u64)
     }
 
     /// Zero address.
@@ -141,14 +149,20 @@ impl VirtAddr {
         }
     }
 
-    /// Returns this address as immutable pointer.
+    /// Reconstructs an immutable pointer with exposed provenance.
+    ///
+    /// Dereferencing the result additionally requires a valid mapping,
+    /// alignment for `T`, initialization, and Rust aliasing guarantees.
     pub const fn as_ptr<T>(self) -> *const T {
-        self.0 as usize as *const T
+        ptr::with_exposed_provenance(self.0 as usize)
     }
 
-    /// Returns this address as mutable pointer.
+    /// Reconstructs a mutable pointer with exposed provenance.
+    ///
+    /// Dereferencing the result additionally requires exclusive access, a
+    /// valid mapping, alignment for `T`, and initialization.
     pub const fn as_mut_ptr<T>(self) -> *mut T {
-        self.0 as usize as *mut T
+        ptr::with_exposed_provenance_mut(self.0 as usize)
     }
 }
 

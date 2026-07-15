@@ -614,6 +614,36 @@ def cmd_kernel(cfg: Config) -> None:
     build_kernel(cfg)
 
 
+def cmd_check(cfg: Config) -> None:
+    run(
+        cfg,
+        ["cargo", "check", "--target", cfg.rust_target],
+        cwd=KERNEL_DIR,
+        step=f"cargo check kernel ({cfg.arch})",
+    )
+
+
+def cmd_clippy(cfg: Config) -> None:
+    run(
+        cfg,
+        ["cargo", "clippy", "--target", cfg.rust_target, "--", "-D", "warnings"],
+        cwd=KERNEL_DIR,
+        step=f"cargo clippy kernel ({cfg.arch})",
+    )
+
+
+def cmd_fmt(cfg: Config, *, check: bool) -> None:
+    argv = ["cargo", "fmt", "--all"]
+    if check:
+        argv += ["--", "--check"]
+    run(
+        cfg,
+        argv,
+        cwd=KERNEL_DIR,
+        step="check Rust formatting" if check else "format Rust sources",
+    )
+
+
 def cmd_rustdoc(cfg: Config) -> None:
     run(cfg, ["cargo", "doc", "--no-deps"], cwd=KERNEL_DIR, step="build rustdoc")
     run(
@@ -694,6 +724,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("gen-hdd", help="Build HDD image (default).")
     subparsers.add_parser("gen-iso", help="Build ISO image.")
     subparsers.add_parser("build", help="Build kernel only.")
+    subparsers.add_parser("check", help="Type-check the kernel.")
+    subparsers.add_parser("clippy", help="Lint the kernel with Clippy.")
+    subparsers.add_parser("fmt", help="Format Rust sources.")
+    subparsers.add_parser("fmt-check", help="Check Rust source formatting.")
     subparsers.add_parser("rustdoc", help="Build and serve kernel rustdoc on :8080.")
     subparsers.add_parser("book", help="Run mdBook preview server.")
     subparsers.add_parser("clean", help="Remove build outputs.")
@@ -795,6 +829,8 @@ def estimate_steps(cfg: Config, command: Optional[str]) -> int:
         return _iso_steps(cfg, cfg.arch)
     if cmd == "build":
         return 1
+    if cmd in {"check", "clippy", "fmt", "fmt-check"}:
+        return 1
     if cmd == "rustdoc":
         return 2
     if cmd == "book":
@@ -839,6 +875,14 @@ def dispatch(cfg: Config, command: Optional[str]) -> None:
         build_iso(cfg)
     elif cmd == "build":
         cmd_kernel(cfg)
+    elif cmd == "check":
+        cmd_check(cfg)
+    elif cmd == "clippy":
+        cmd_clippy(cfg)
+    elif cmd == "fmt":
+        cmd_fmt(cfg, check=False)
+    elif cmd == "fmt-check":
+        cmd_fmt(cfg, check=True)
     elif cmd == "rustdoc":
         cmd_rustdoc(cfg)
     elif cmd == "book":

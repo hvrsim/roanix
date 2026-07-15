@@ -12,7 +12,7 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink, UnsafeRef};
+use intrusive_collections::{LinkedList, LinkedListLink, UnsafeRef, intrusive_adapter};
 
 use crate::{
     arch,
@@ -92,14 +92,12 @@ impl WaitQueue {
     }
 
     fn state_bits(&self) -> u8 {
-        if self.is_empty() {
-            0
-        } else {
-            STATE_QUEUED
-        }
+        if self.is_empty() { 0 } else { STATE_QUEUED }
     }
 
     fn push(&mut self, waiter: &MutexWaiter) {
+        // SAFETY: the waiter is pinned on the sleeping thread's stack until it
+        // is removed, and the wait-queue lock is held.
         self.list
             .push_back(unsafe { UnsafeRef::from_raw(waiter as *const MutexWaiter) });
     }
@@ -109,10 +107,13 @@ impl WaitQueue {
     }
 
     fn remove(&mut self, waiter: *const MutexWaiter) -> bool {
+        // SAFETY: callers pass the pinned waiter associated with this queue
+        // while holding its lock.
         if unsafe { !(*waiter).link.is_linked() } {
             return false;
         }
 
+        // SAFETY: a linked waiter belongs to this list and cannot move.
         unsafe {
             self.list.cursor_mut_from_ptr(waiter).remove();
         }
@@ -233,20 +234,23 @@ impl<T: ?Sized> Mutex<T> {
                 backoff.spin();
                 continue;
             };
+            // SAFETY: the scheduler keeps the current thread allocation live
+            // while it is executing.
             let seq = unsafe { (&*current).prepare_park() };
             let waiter = core::pin::pin!(MutexWaiter::new(current, seq));
             waiters.push(waiter.as_ref().get_ref());
             self.state.fetch_or(STATE_QUEUED, Ordering::Release);
-            drop(waiters_guard);
+            waiters_guard.unlock_keep_irqs_disabled();
 
-            sched::park_current(seq);
+            sched::park_current(current, seq);
 
             let mut waiters_guard = self.waiters.lock();
             let waiter_ptr = waiter.as_ref().get_ref() as *const MutexWaiter;
-            if let Some(waiters) = waiters_guard.as_mut() {
-                if waiters.remove(waiter_ptr) && waiters.is_empty() {
-                    self.state.fetch_and(!STATE_QUEUED, Ordering::AcqRel);
-                }
+            if let Some(waiters) = waiters_guard.as_mut()
+                && waiters.remove(waiter_ptr)
+                && waiters.is_empty()
+            {
+                self.state.fetch_and(!STATE_QUEUED, Ordering::AcqRel);
             }
         }
     }
@@ -324,12 +328,14 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: holding the mutex guard guarantees shared access to `value`.
         unsafe { &*self.mutex.value.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the unique guard guarantees exclusive access to `value`.
         unsafe { &mut *self.mutex.value.get() }
     }
 }

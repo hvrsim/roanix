@@ -8,16 +8,26 @@ use core::slice;
 
 use limine::request::DeviceTreeBlobRequest;
 
+const FDT_MAGIC: u32 = 0xD00D_FEED;
+const FDT_HEADER_LEN: usize = 40;
+
 #[used]
 #[doc(hidden)]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static DEVICE_TREE_BLOB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::new();
 
 /// Returns the raw DTB bytes provided by Limine.
+///
+/// Limine owns the blob for the kernel's lifetime. The header is checked before
+/// the firmware-provided total size is used to construct the slice.
 pub fn blob() -> Option<&'static [u8]> {
     let response = DEVICE_TREE_BLOB_REQUEST.get_response()?;
     let ptr = response.dtb_ptr() as *const u8;
-    let len = dtb_len(ptr)?;
+    // SAFETY: the Limine response guarantees that `dtb_ptr` addresses a
+    // persistent flattened-device-tree header.
+    let len = unsafe { dtb_len(ptr)? };
+    // SAFETY: Limine guarantees the complete DTB remains mapped, and `dtb_len`
+    // rejected invalid magic and undersized headers.
     Some(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
@@ -67,11 +77,28 @@ fn cpu_supports_sstc(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
         .unwrap_or(false)
 }
 
-fn dtb_len(ptr: *const u8) -> Option<usize> {
+/// Reads and validates the fixed portion of a flattened-device-tree header.
+///
+/// # Safety
+///
+/// `ptr` must be readable for at least eight bytes.
+unsafe fn dtb_len(ptr: *const u8) -> Option<usize> {
     if ptr.is_null() {
         return None;
     }
 
-    let raw_len = unsafe { ptr.add(4).cast::<u32>().read_unaligned() };
-    Some(u32::from_be(raw_len) as usize)
+    // SAFETY: guaranteed by the caller; unaligned reads avoid imposing extra
+    // alignment requirements on the firmware blob.
+    let (raw_magic, raw_len) = unsafe {
+        (
+            ptr.cast::<u32>().read_unaligned(),
+            ptr.add(4).cast::<u32>().read_unaligned(),
+        )
+    };
+    if u32::from_be(raw_magic) != FDT_MAGIC {
+        return None;
+    }
+
+    let len = u32::from_be(raw_len) as usize;
+    (len >= FDT_HEADER_LEN).then_some(len)
 }

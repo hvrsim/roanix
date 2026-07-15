@@ -55,6 +55,8 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     let mut com1: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
 
     for &byte in line {
+        // SAFETY: these fixed ports are the QEMU debug console and COM1 UART,
+        // initialized for exclusive kernel use.
         unsafe {
             dbgcon_e9.write(byte);
 
@@ -67,6 +69,7 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
         }
     }
 
+    // SAFETY: the same fixed debug/UART ports remain exclusively owned here.
     unsafe {
         dbgcon_e9.write(b'\n');
 
@@ -89,6 +92,8 @@ fn dbgcon_init() {
     let mut fcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FA);
     let mut mcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FC);
 
+    // SAFETY: COM1 initialization uses the standard 16550 register layout and
+    // runs once during early x86 bring-up.
     unsafe {
         // Disable interrupts.
         ier.write(0x00);
@@ -115,7 +120,9 @@ pub fn early() {
 
     set_core_local(&raw const BSP_CORE_LOCAL);
     let feats = cpu::enable_features();
-    thiscpu().platform.feats = feats;
+    // SAFETY: early boot is single-threaded on this CPU and no shared
+    // references to its `CoreLocal` remain live across this assignment.
+    unsafe { thiscpu_mut() }.platform.feats = feats;
 }
 
 /// Performs post-memory architecture initialization.
@@ -127,7 +134,8 @@ pub fn init() {
 pub fn init_secondary(core_local: *const CoreLocal) {
     set_core_local(core_local);
     let feats = cpu::enable_features();
-    thiscpu().platform.feats = feats;
+    // SAFETY: this secondary CPU is not online until initialization completes.
+    unsafe { thiscpu_mut() }.platform.feats = feats;
     timer::init_secondary();
 }
 
@@ -136,21 +144,39 @@ pub fn init_secondary(core_local: *const CoreLocal) {
 /// On x86_64, kernel core-local data is addressed through the GS base
 /// registers.
 ///
-/// ## Safety
-///
 /// The kernel thread-local context isn't valid until [`set_core_local`] is
-/// called, which
-/// happens very early in boot. If you find yourself requiring
-/// thread-local context super early in boot, consider moving
-/// your init stage into a later part of the boot pipeline.
+/// called, which happens very early in boot.
 #[inline(always)]
-pub fn thiscpu() -> &'static mut CoreLocal {
+pub fn thiscpu() -> &'static CoreLocal {
     thiscpu_opt().expect("x86: thiscpu called before GS base was initialized")
 }
 
 /// Returns core local context if it is initialized.
 #[inline(always)]
-pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
+pub fn thiscpu_opt() -> Option<&'static CoreLocal> {
+    let ptr = thiscpu_ptr()?;
+
+    // SAFETY: GS base is only initialized from stable `CoreLocal` allocations.
+    Some(unsafe { &*ptr })
+}
+
+/// Returns mutable core-local context for the current CPU.
+///
+/// # Safety
+///
+/// The caller must have exclusive access to the current CPU's `CoreLocal` for
+/// the duration of the returned borrow. In practice this requires early boot
+/// or local interrupts to be disabled.
+#[inline(always)]
+pub unsafe fn thiscpu_mut() -> &'static mut CoreLocal {
+    let ptr = thiscpu_ptr().expect("x86: thiscpu called before GS base was initialized");
+
+    // SAFETY: the caller guarantees exclusive access to this CPU's state.
+    unsafe { &mut *ptr }
+}
+
+#[inline(always)]
+fn thiscpu_ptr() -> Option<*mut CoreLocal> {
     let mut base = GsBase::read();
     if base.is_null() {
         // AP entry may arrive with the kernel value still parked in
@@ -162,8 +188,7 @@ pub fn thiscpu_opt() -> Option<&'static mut CoreLocal> {
         return None;
     }
 
-    // SAFETY: GS base is only initialized from stable `CoreLocal` allocations.
-    Some(unsafe { &mut *base.as_mut_ptr::<CoreLocal>() })
+    Some(base.as_mut_ptr::<CoreLocal>())
 }
 
 /// Sets the core local pointer.
@@ -196,9 +221,7 @@ pub fn irqset(enable: bool) {
     }
 }
 
-///
 /// Pauses CPU execution and waits for interrupts.
-///
 #[inline(always)]
 pub fn wfi() {
     hlt();
@@ -212,6 +235,7 @@ pub fn send_ipi(cpu_id: usize) {
 
 /// Forces the current CPU through the scheduler trap path.
 pub fn reschedule() {
+    // SAFETY: the vector is installed as the kernel's local reschedule trap.
     unsafe {
         asm!("int {vector}", vector = const lapic::SELF_RESCHEDULE_VECTOR);
     }
