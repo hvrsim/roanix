@@ -104,6 +104,9 @@ pub(crate) struct Thread {
     /// Baseline priority before temporary adjustments.
     pub(crate) base_priority: u8,
 
+    /// Nominal interrupt-thread priority restored after voluntary sleep.
+    pub(crate) ithread_base_priority: u8,
+
     /// User-visible priority computed from interactivity and nice value.
     pub(crate) user_priority: u8,
 
@@ -125,8 +128,11 @@ pub(crate) struct Thread {
     /// Last point where CPU usage accounting was refreshed.
     pub(crate) cpu_last_update_ns: u64,
 
-    /// Last point where the thread executed.
+    /// Last point where running-time and slice accounting was refreshed.
     pub(crate) last_run_ns: u64,
+
+    /// Start of the current voluntary sleep, or `0` while not blocked.
+    pub(crate) sleep_start_ns: u64,
 
     /// Accumulated sleep time used by interactivity heuristics.
     pub(crate) slptime_ns: u64,
@@ -258,7 +264,8 @@ impl Thread {
     }
 
     /// Marks the thread blocked until a wake event arrives.
-    pub(crate) fn mark_blocked(&mut self) {
+    pub(crate) fn mark_blocked(&mut self, now_ns: u64) {
+        self.sleep_start_ns = now_ns;
         self.publish_state(ThreadState::Blocked);
     }
 
@@ -438,6 +445,7 @@ where
         flags,
         priority,
         base_priority: priority,
+        ithread_base_priority: priority,
         user_priority: priority,
         nice: 0,
         cpu,
@@ -446,6 +454,7 @@ where
         cpu_window_start_ns: now_ns,
         cpu_last_update_ns: now_ns,
         last_run_ns: now_ns,
+        sleep_start_ns: 0,
         slptime_ns: 0,
         runtime_ns: 0,
         cpu_estimate: 0,

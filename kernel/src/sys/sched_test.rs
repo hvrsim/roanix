@@ -30,6 +30,7 @@ const ITHREAD_THREADS_PER_TWO_CPUS: usize = 1;
 const MAX_HOG_WORKERS: usize = 32;
 const MAX_INTERACTIVE_WORKERS: usize = 20;
 const MAX_ITHREAD_WORKERS: usize = 2;
+const STRESS_ITHREAD_PRIORITY: u8 = 2;
 
 const STRESS_DURATION_SECS: u64 = 12;
 const ITHREAD_PHASE_SECS: u64 = 2;
@@ -310,9 +311,10 @@ fn spawn_timeshare_workers(state: &'static SchedulerStressState, stop_ns: u64) -
 fn spawn_ithread_workers(state: &'static SchedulerStressState, stop_ns: u64, start_id: usize) {
     for offset in 0..state.cfg.ithread_workers {
         let id = start_id + offset;
-        let tid = sched::create_ithread(
+        let tid = sched::create_ithread_with_priority(
             move |arg| run_worker(state, arg as usize, WorkerKind::Ithread, stop_ns),
             id as u64,
+            STRESS_ITHREAD_PRIORITY,
         );
         info!("sched_test: spawn worker#{id} kind=ithread tid={tid}");
     }

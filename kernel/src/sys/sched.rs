@@ -1,9 +1,14 @@
 //!
 //! # Scheduler
 //!
-//! ULE-inspired kernel scheduler with per-CPU run queues, wake affinity,
-//! switch-path stealing, idle pulling, background reaping, and one-shot
-//! deadline-driven preemption.
+//! ULE-derived kernel scheduler with FreeBSD-compatible priority bands,
+//! interactivity scoring, CPU decay, timeshare queue rotation, load-scaled
+//! slices, preemption rules, wake affinity, and load balancing.
+//!
+//! The scheduler preserves Roanix-specific mechanisms where FreeBSD
+//! infrastructure does not map directly: flat CPU topology, Rust-owned thread
+//! records, intrusive per-CPU queues, and one-shot deadline multiplexing for
+//! the 127 Hz scheduler statclock and sleep timers.
 //!
 
 use alloc::boxed::Box;
@@ -35,16 +40,20 @@ type ThreadPtr = NonNull<Thread>;
 const PRIO_MIN: i32 = -20;
 const PRIO_MAX: i32 = 20;
 
-const MAX_ITHD: u8 = 15;
-const MIN_KERN: u8 = 48;
-const MIN_TIMESHARE: u8 = 88;
-const MIN_INTERACT: u8 = MIN_TIMESHARE;
-const MIN_BATCH: u8 = MIN_TIMESHARE + 48;
+const MAX_ITHD: u8 = 7;
+const MIN_KERN: u8 = 40;
+const MIN_TIMESHARE: u8 = 56;
+const MAX_TIMESHARE: u8 = 223;
 const MIN_IDLE: u8 = 224;
-
-const MAX_INTERACT: u8 = MIN_INTERACT + 48 - 1;
-const MAX_BATCH: u8 = MIN_IDLE - 1;
 const MAX_IDLE: u8 = 255;
+
+const PRI_TIMESHARE_RANGE: u32 = (MAX_TIMESHARE - MIN_TIMESHARE + 1) as u32;
+const SCHED_PRI_NRESV: u32 = (((PRIO_MAX - PRIO_MIN) as u32) * 5) / 4;
+const PRI_INTERACT_RANGE: u8 = ((PRI_TIMESHARE_RANGE - SCHED_PRI_NRESV) / 2) as u8;
+const MIN_INTERACT: u8 = MIN_TIMESHARE;
+const MAX_INTERACT: u8 = MIN_INTERACT + PRI_INTERACT_RANGE - 1;
+const MIN_BATCH: u8 = MAX_INTERACT + 1;
+const MAX_BATCH: u8 = MAX_TIMESHARE;
 
 const SCHED_INTERACT_HALF: u32 = 50;
 const SCHED_INTERACT_THRESH: u32 = 30;
@@ -53,16 +62,24 @@ const SCHED_CPU_DECAY_NUMER: u64 = 10;
 const SCHED_CPU_DECAY_DENOM: u64 = 11;
 const SCHED_CPU_DECAY_WINDOW_NS: u64 = 11_000_000_000;
 const SCHED_SLP_RUN_MAX_NS: u64 = 5_000_000_000;
+const SCHED_SLEEP_TICK_NS: u64 = 1_000_000;
 
-const SCHED_SLICE_DEFAULT_NS: u64 = 100_000_000;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+const SCHED_STAT_HZ: u64 = 127;
+const SCHED_STAT_INTERVAL_NS: u64 = NSEC_PER_SEC / SCHED_STAT_HZ;
+const SCHED_SLICE_TICKS: u64 = SCHED_STAT_HZ / 10;
+const SCHED_SLICE_DEFAULT_NS: u64 = SCHED_STAT_INTERVAL_NS * SCHED_SLICE_TICKS;
 const SCHED_SLICE_MIN_DIVISOR: u32 = 6;
-const SCHED_REBALANCE_INTERVAL_NS: u64 = 80_000_000;
-const SCHED_WAKE_AFFINITY_SLICES: u64 = 2;
+const SCHED_BALANCE_INTERVAL_NS: u64 = NSEC_PER_SEC;
+const SCHED_WAKE_AFFINITY_NS: u64 = 2_000_000;
 const SCHED_STEAL_THRESHOLD: usize = 2;
 
 const PRI_BATCH_RANGE: usize = (MAX_BATCH - MIN_BATCH + 1) as usize;
-const SCHED_PRI_NRESV: u32 = (((PRIO_MAX - PRIO_MIN) as u32) * 5) / 4;
 const SCHED_PRI_CPU_RANGE: u32 = PRI_BATCH_RANGE as u32 - SCHED_PRI_NRESV;
+
+const _: () = assert!(MAX_INTERACT == 114);
+const _: () = assert!(MIN_BATCH == 115);
+const _: () = assert!(PRI_BATCH_RANGE == 109);
 
 static SCHEDULER: Once<&'static Scheduler> = Once::new();
 
@@ -92,7 +109,7 @@ impl EnqueueKind {
 struct SchedulerConfig {
     sched_slice_ns: u64,
     sched_slice_min_ns: u64,
-    wake_affinity: u64,
+    wake_affinity_ns: u64,
 }
 
 impl SchedulerConfig {
@@ -103,7 +120,7 @@ impl SchedulerConfig {
         Self {
             sched_slice_ns,
             sched_slice_min_ns,
-            wake_affinity: sched_slice_ns.saturating_mul(SCHED_WAKE_AFFINITY_SLICES),
+            wake_affinity_ns: SCHED_WAKE_AFFINITY_NS,
         }
     }
 }
@@ -291,7 +308,8 @@ struct CpuState {
     sysload: usize,
     ts_insert_cursor: u8,
     ts_pick_cursor: u8,
-    ts_ticks: u8,
+    ts_ticks: u64,
+    next_statclock_ns: u64,
     // Prevent remote steals while this CPU is still unwinding off the old
     // thread's kernel stack after selecting a replacement.
     switching: bool,
@@ -315,6 +333,7 @@ impl CpuState {
             ts_insert_cursor: 0,
             ts_pick_cursor: 0,
             ts_ticks: 0,
+            next_statclock_ns: 0,
             switching: false,
             need_resched: false,
         }
@@ -367,6 +386,12 @@ impl CpuState {
         }
 
         thread_mut(next).mark_running(cpu_id, now_ns);
+        let previous_was_idle = previous.map(thread_ref).is_none_or(Thread::is_idle);
+        if thread_ref(next).is_idle() {
+            self.next_statclock_ns = 0;
+        } else if previous_was_idle || self.next_statclock_ns == 0 {
+            self.next_statclock_ns = now_ns.saturating_add(SCHED_STAT_INTERVAL_NS);
+        }
         self.current = Some(next);
         self.switching = previous.is_some() && previous != Some(next);
         next
@@ -415,12 +440,17 @@ impl CpuState {
         }
     }
 
-    fn consider_preemption(&mut self, priority: u8) {
-        if let Some(current) = self.current
-            && should_preempt(priority, thread_ref(current).priority)
-        {
-            self.need_resched = true;
+    fn consider_preemption(&mut self, priority: u8, remote: bool) -> bool {
+        let Some(current) = self.current else {
+            return false;
+        };
+        let current_priority = thread_ref(current).priority;
+        if priority >= current_priority {
+            return false;
         }
+
+        self.need_resched = true;
+        should_preempt(priority, current_priority, remote)
     }
 
     fn queue_bucket(&self, priority: u8, kind: EnqueueKind) -> u8 {
@@ -461,17 +491,33 @@ impl CpuState {
         }
     }
 
-    fn advance_timeshare_epoch(&mut self) {
-        if self.ts_insert_cursor != self.ts_pick_cursor {
+    fn advance_timeshare_epoch(&mut self, ticks: u64) {
+        if ticks == 0 || self.ts_insert_cursor != self.ts_pick_cursor {
             return;
         }
 
-        self.ts_ticks = self.ts_ticks.wrapping_add(1);
-        let advance = 2u16 - u16::from(self.ts_ticks / 4);
-        self.ts_insert_cursor =
-            ((u16::from(self.ts_insert_cursor) + advance) % PRI_BATCH_RANGE as u16) as u8;
-        self.ts_ticks %= 4;
+        let total_ticks = self.ts_ticks.saturating_add(ticks);
+        let advance = ticks.saturating_mul(2).saturating_sub(total_ticks / 4);
+        self.ts_insert_cursor = ((usize::from(self.ts_insert_cursor)
+            + (advance as usize % PRI_BATCH_RANGE))
+            % PRI_BATCH_RANGE) as u8;
+        self.ts_ticks = total_ticks % 4;
         self.advance_pick_cursor(false);
+    }
+
+    fn advance_statclock(&mut self, now_ns: u64) -> u64 {
+        if self.next_statclock_ns == 0 || now_ns < self.next_statclock_ns {
+            return 0;
+        }
+
+        let ticks = now_ns
+            .saturating_sub(self.next_statclock_ns)
+            .saturating_div(SCHED_STAT_INTERVAL_NS)
+            .saturating_add(1);
+        self.next_statclock_ns = self
+            .next_statclock_ns
+            .saturating_add(ticks.saturating_mul(SCHED_STAT_INTERVAL_NS));
+        ticks
     }
 
     fn quantum_for(&self, thread: &Thread, config: &SchedulerConfig) -> u64 {
@@ -638,14 +684,18 @@ impl Scheduler {
         )
     }
 
-    fn spawn_ithread<F, R>(&self, task: F, arg: u64) -> usize
+    fn spawn_ithread<F, R>(&self, task: F, arg: u64, priority: u8) -> usize
     where
         F: FnOnce(u64) -> R + Send + 'static,
     {
+        assert!(
+            priority <= MAX_ITHD,
+            "sched: ithread priority {priority} exceeds {MAX_ITHD}"
+        );
         self.spawn_on(
             self.pick_spawn_cpu(),
             ThreadClass::Ithread,
-            MAX_ITHD,
+            priority,
             move || task(arg),
         )
     }
@@ -681,10 +731,10 @@ impl Scheduler {
             let thread = thread_mut(thread);
             thread.cpu = target_cpu;
             cpu.adopt_thread(thread, EnqueueKind::Normal);
-            cpu.consider_preemption(priority);
+            let should_kick = cpu.consider_preemption(priority, current_cpu != Some(target_cpu));
             if !cpu.online {
                 None
-            } else if cpu.need_resched {
+            } else if should_kick {
                 Some((target_cpu, CpuKick::Resched))
             } else if cpu.needs_deadline_refresh(had_runnable) {
                 Some((target_cpu, CpuKick::Deadline))
@@ -743,8 +793,8 @@ impl Scheduler {
         let owner_cpu = thread.cpu;
         let mut best_id = owner_cpu;
         let mut best_load = usize::MAX;
-        let mut owner_load = usize::MAX;
         let mut wake_load = usize::MAX;
+        let mut owner_idle = false;
 
         for cpu_id in 0..self.cpu_count {
             let Some(cpu) = self.cpu(cpu_id).try_lock() else {
@@ -753,9 +803,8 @@ impl Scheduler {
             if !cpu.online {
                 continue;
             }
-
             if cpu_id == owner_cpu {
-                owner_load = cpu.load;
+                owner_idle = cpu.is_immediately_available();
             }
             if Some(cpu_id) == wake_cpu {
                 wake_load = cpu.load;
@@ -767,15 +816,16 @@ impl Scheduler {
         }
 
         if smp::is_online(owner_cpu)
-            && now_ns.saturating_sub(thread.last_run_ns) <= self.config.wake_affinity
-            && owner_load <= best_load.saturating_add(1)
+            && owner_idle
+            && now_ns.saturating_sub(thread.last_run_ns) <= self.config.wake_affinity_ns
         {
             return owner_cpu;
         }
 
         if let Some(cpu_id) = wake_cpu
             && smp::is_online(cpu_id)
-            && wake_load <= best_load
+            && wake_load != usize::MAX
+            && wake_load <= best_load.saturating_add(1)
         {
             return cpu_id;
         }
@@ -787,6 +837,9 @@ impl Scheduler {
         let Some(current_ptr) = cpu.current_thread() else {
             return;
         };
+        let stat_ticks = cpu.advance_statclock(now_ns);
+        cpu.advance_timeshare_epoch(stat_ticks);
+
         let current = thread_mut(current_ptr);
         let elapsed_ns = now_ns.saturating_sub(current.last_run_ns);
 
@@ -795,12 +848,16 @@ impl Scheduler {
             current.slice_ns = current.slice_ns.saturating_add(elapsed_ns);
 
             if current.class == ThreadClass::Timeshare {
-                current.runtime_ns = current.runtime_ns.saturating_add(elapsed_ns);
                 self.pctcpu_update(current, now_ns, true);
 
-                if current.state == ThreadState::Running {
-                    self.interact_update(current);
-                    self.priority_update(current);
+                if stat_ticks != 0 {
+                    current.runtime_ns = current
+                        .runtime_ns
+                        .saturating_add(stat_ticks.saturating_mul(SCHED_STAT_INTERVAL_NS));
+                    if current.state == ThreadState::Running {
+                        self.interact_update(current);
+                        self.priority_update(current);
+                    }
                 }
             }
         }
@@ -819,17 +876,19 @@ impl Scheduler {
         if current.slice_ns >= cpu.quantum_for(current, &self.config) {
             current.slice_ns = 0;
             current.flags.insert(ThreadFlags::SLICEEND);
-            if current.class == ThreadClass::Timeshare {
-                cpu.advance_timeshare_epoch();
-            } else if current.class == ThreadClass::Ithread && current.priority < MAX_ITHD {
-                current.priority = current.priority.saturating_add(1);
+            if current.class == ThreadClass::Ithread {
+                let demoted = current.base_priority.saturating_add(1);
+                if demoted < MAX_ITHD {
+                    current.base_priority = demoted;
+                    current.priority = demoted;
+                }
             }
             cpu.need_resched = true;
             return;
         }
 
         if let Some(best) = cpu.best_runnable()
-            && should_preempt(thread_ref(best).priority, current.priority)
+            && should_preempt(thread_ref(best).priority, current.priority, false)
         {
             cpu.need_resched = true;
         }
@@ -845,12 +904,16 @@ impl Scheduler {
         if cpu.need_resched || current.state != ThreadState::Running || current.is_idle() {
             return 0;
         }
-        if !cpu.runq.has_runnable() {
-            return 0;
-        }
 
         let quantum_ns = cpu.quantum_for(current, &self.config);
-        now_ns.saturating_add(quantum_ns.saturating_sub(current.slice_ns).max(1))
+        let slice_deadline =
+            now_ns.saturating_add(quantum_ns.saturating_sub(current.slice_ns).max(1));
+        let statclock_deadline = if cpu.next_statclock_ns == 0 {
+            now_ns.saturating_add(SCHED_STAT_INTERVAL_NS)
+        } else {
+            cpu.next_statclock_ns
+        };
+        statclock_deadline.min(slice_deadline)
     }
 
     fn trap_return(&self, cpu_id: usize, frame: &mut TrapFrame) -> *mut TrapFrame {
@@ -1013,7 +1076,7 @@ impl Scheduler {
                 return;
             }
 
-            current_thread.mark_blocked();
+            current_thread.mark_blocked(clock::monotonic_ns());
             cpu.need_resched = true;
             thread_ptr
         };
@@ -1097,12 +1160,17 @@ impl Scheduler {
                 let priority = thread.priority;
                 if waking_current {
                     thread.mark_running(target_cpu, now_ns);
-                    if let Some(best) = cpu.best_runnable() {
-                        cpu.need_resched = should_preempt(thread_ref(best).priority, priority);
-                    } else {
-                        cpu.need_resched = false;
-                    }
-                    if cpu.need_resched {
+                    cpu.need_resched = false;
+                    let should_kick = cpu
+                        .best_runnable()
+                        .map(|best| {
+                            cpu.consider_preemption(
+                                thread_ref(best).priority,
+                                wake_cpu != Some(target_cpu),
+                            )
+                        })
+                        .unwrap_or(false);
+                    if should_kick {
                         Some((target_cpu, CpuKick::Resched))
                     } else if wake_cpu != Some(target_cpu) {
                         // A remote wake may need to break the owner CPU out of
@@ -1115,8 +1183,9 @@ impl Scheduler {
                     }
                 } else {
                     cpu.adopt_thread(thread, EnqueueKind::Normal);
-                    cpu.consider_preemption(priority);
-                    if cpu.need_resched {
+                    let should_kick =
+                        cpu.consider_preemption(priority, wake_cpu != Some(target_cpu));
+                    if should_kick {
                         Some((target_cpu, CpuKick::Resched))
                     } else if cpu.needs_deadline_refresh(had_runnable) {
                         Some((target_cpu, CpuKick::Deadline))
@@ -1151,14 +1220,18 @@ impl Scheduler {
             // so we never run the same kernel stack on two CPUs at once.
             if owner.current_thread() == Some(thread_ptr) {
                 self.finish_wakeup(thread, now_ns);
-                let priority = thread.priority;
                 thread.mark_running(owner_cpu, now_ns);
-                if let Some(best) = owner.best_runnable() {
-                    owner.need_resched = should_preempt(thread_ref(best).priority, priority);
-                } else {
-                    owner.need_resched = false;
-                }
-                kick = if owner.need_resched || current_cpu != Some(owner_cpu) {
+                owner.need_resched = false;
+                let should_kick = owner
+                    .best_runnable()
+                    .map(|best| {
+                        owner.consider_preemption(
+                            thread_ref(best).priority,
+                            current_cpu != Some(owner_cpu),
+                        )
+                    })
+                    .unwrap_or(false);
+                kick = if should_kick || current_cpu != Some(owner_cpu) {
                     Some((owner_cpu, CpuKick::Resched))
                 } else if owner.needs_deadline_refresh(false) {
                     Some((owner_cpu, CpuKick::Deadline))
@@ -1172,8 +1245,8 @@ impl Scheduler {
             thread.cpu = target_cpu;
             let priority = thread.priority;
             target.adopt_thread(thread, EnqueueKind::Normal);
-            target.consider_preemption(priority);
-            kick = if target.need_resched {
+            let should_kick = target.consider_preemption(priority, current_cpu != Some(target_cpu));
+            kick = if should_kick {
                 Some((target_cpu, CpuKick::Resched))
             } else if target.needs_deadline_refresh(had_runnable) {
                 Some((target_cpu, CpuKick::Deadline))
@@ -1262,8 +1335,9 @@ impl Scheduler {
             let thread = thread_mut(candidate);
             thread.cpu = dst_cpu;
             dst.adopt_thread(thread, EnqueueKind::Normal);
-            dst.consider_preemption(thread.priority);
-            kick = if dst.need_resched {
+            let should_kick =
+                dst.consider_preemption(thread.priority, current_cpu != Some(dst_cpu));
+            kick = if should_kick {
                 Some((dst_cpu, CpuKick::Resched))
             } else if dst.needs_deadline_refresh(had_runnable) {
                 Some((dst_cpu, CpuKick::Deadline))
@@ -1316,20 +1390,24 @@ impl Scheduler {
     fn finish_wakeup(&self, thread: &mut Thread, now_ns: u64) {
         thread.slice_ns = 0;
         thread.flags.remove(ThreadFlags::SLICEEND);
+        let sleep_start_ns = core::mem::replace(&mut thread.sleep_start_ns, 0);
 
         if thread.class == ThreadClass::Ithread {
-            thread.priority = thread.base_priority;
+            thread.base_priority = thread.ithread_base_priority;
+            thread.priority = thread.ithread_base_priority;
             return;
         }
         if thread.class != ThreadClass::Timeshare {
             return;
         }
 
-        self.pctcpu_update(thread, now_ns, false);
-        let slept_ns = now_ns.saturating_sub(thread.last_run_ns);
-        thread.slptime_ns = thread.slptime_ns.saturating_add(slept_ns);
-        self.interact_update(thread);
-        self.priority_update(thread);
+        let slept_ns = now_ns.saturating_sub(sleep_start_ns);
+        if sleep_start_ns != 0 && slept_ns >= SCHED_SLEEP_TICK_NS {
+            thread.slptime_ns = thread.slptime_ns.saturating_add(slept_ns);
+            self.interact_update(thread);
+            self.pctcpu_update(thread, now_ns, false);
+            self.priority_update(thread);
+        }
     }
 
     fn activate_current(&self, thread: ThreadPtr) {
@@ -1385,9 +1463,7 @@ impl Scheduler {
             return;
         }
 
-        let score = self
-            .interact_score(thread)
-            .saturating_add((thread.nice as i32).max(0) as u64);
+        let score = (self.interact_score(thread) as i64 + i64::from(thread.nice)).max(0) as u64;
         let priority = if score < u64::from(SCHED_INTERACT_THRESH) {
             MIN_INTERACT
                 + (((MAX_INTERACT - MIN_INTERACT + 1) as u64 * score)
@@ -1511,7 +1587,7 @@ fn window_length_ns(thread: &Thread) -> u64 {
         .max(1)
 }
 
-fn should_preempt(priority: u8, current: u8) -> bool {
+fn should_preempt(priority: u8, current: u8, remote: bool) -> bool {
     if priority >= current {
         return false;
     }
@@ -1520,11 +1596,11 @@ fn should_preempt(priority: u8, current: u8) -> bool {
         return true;
     }
 
-    if priority <= MIN_KERN {
+    if priority < MIN_KERN {
         return true;
     }
 
-    priority <= MAX_INTERACT && current > MAX_INTERACT
+    remote && priority <= MAX_INTERACT && current > MAX_INTERACT
 }
 
 fn scheduler() -> &'static Scheduler {
@@ -1545,13 +1621,25 @@ pub(crate) fn request_reschedule_ipi() {
 // Keep long-term load distribution and thread reaping out of the trap-return
 // hot path and in ordinary thread context.
 fn maintenance_thread() {
+    let mut random = clock::monotonic_ns() ^ 0x9E37_79B9_7F4A_7C15;
     loop {
         scheduler().reap_all_exited();
-        clock::sleep(Duration::from_nanos(SCHED_REBALANCE_INTERVAL_NS));
+        clock::sleep(Duration::from_nanos(balance_delay_ns(&mut random)));
         if scheduler().cpu_count > 1 {
             let _ = scheduler().rebalance_once();
         }
     }
+}
+
+fn balance_delay_ns(random: &mut u64) -> u64 {
+    if *random == 0 {
+        *random = 0xA076_1D64_78BD_642F;
+    }
+    *random ^= *random << 13;
+    *random ^= *random >> 7;
+    *random ^= *random << 17;
+
+    (SCHED_BALANCE_INTERVAL_NS / 2).saturating_add(*random % SCHED_BALANCE_INTERVAL_NS)
 }
 
 /// Initializes the scheduler and per-CPU idle threads.
@@ -1588,7 +1676,15 @@ pub fn create_ithread<F, R>(task: F, arg: u64) -> usize
 where
     F: FnOnce(u64) -> R + Send + 'static,
 {
-    scheduler().spawn_ithread(task, arg)
+    scheduler().spawn_ithread(task, arg, MAX_ITHD)
+}
+
+/// Spawns an interrupt-thread style task at a ULE ithread priority in `0..=7`.
+pub fn create_ithread_with_priority<F, R>(task: F, arg: u64, priority: u8) -> usize
+where
+    F: FnOnce(u64) -> R + Send + 'static,
+{
+    scheduler().spawn_ithread(task, arg, priority)
 }
 
 /// Returns the thread currently executing on this CPU.
