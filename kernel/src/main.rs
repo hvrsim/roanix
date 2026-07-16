@@ -13,6 +13,7 @@ use log::info;
 
 pub mod arch;
 pub mod dev;
+pub mod fs;
 pub mod mem;
 pub mod sys;
 
@@ -51,6 +52,7 @@ unsafe extern "C" fn rmain() -> ! {
 
     sys::smp::init();
     sys::sched::init();
+    fs::init();
     sys::clock::start();
     sys::smp::start();
     sys::sched_test::schedule();
