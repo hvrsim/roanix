@@ -55,6 +55,5 @@ unsafe extern "C" fn rmain() -> ! {
     fs::init();
     sys::clock::start();
     sys::smp::start();
-    sys::sched_test::schedule();
     sys::sched::start();
 }

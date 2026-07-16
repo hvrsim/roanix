@@ -11,7 +11,6 @@ pub mod debug;
 pub mod fbcon;
 pub mod panic;
 pub mod sched;
-pub mod sched_test;
 pub mod smp;
 pub mod sync;
 pub mod thread;
