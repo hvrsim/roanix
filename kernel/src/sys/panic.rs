@@ -13,7 +13,7 @@ use xmas_elf::{ElfFile, sections::*, symbol_table::*};
 
 use crate::{
     arch,
-    sys::{debug, fbcon, smp},
+    sys::{debug, smp},
 };
 
 #[used]
@@ -274,7 +274,6 @@ fn prepare_panic_output() {
     // owners cannot resume after panic recovery force-unlocks them.
     unsafe {
         debug::force_unlock_for_panic();
-        fbcon::force_unlock_for_panic();
     }
 }
 

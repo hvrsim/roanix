@@ -9,7 +9,6 @@
 pub mod clock;
 pub mod debug;
 pub mod event;
-pub mod fbcon;
 pub mod panic;
 pub mod sched;
 pub mod smp;

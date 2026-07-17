@@ -41,9 +41,8 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
-
     sys::debug::register();
-    let _ = sys::fbcon::register();
+    sys::debug::register();
     info!("welcome to roanix!");
 
     arch::early();
