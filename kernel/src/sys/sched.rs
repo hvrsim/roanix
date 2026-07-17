@@ -565,10 +565,6 @@ impl PerCpuScheduler {
             state: IrqSpinLock::new(CpuState::new(cpu_id)),
         }
     }
-
-    pub(crate) fn is_online(&self) -> bool {
-        self.state.lock().online
-    }
 }
 
 struct Scheduler {
@@ -586,7 +582,10 @@ impl Scheduler {
         }
     }
 
-    fn bootstrap(&self) {
+    fn bootstrap<F, R>(&self, init_task: F)
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
         for cpu_id in 0..self.cpu_count {
             smp::core_local(cpu_id)
                 .unwrap_or_else(|| panic!("sched: missing core-local record for cpu{cpu_id}"))
@@ -605,6 +604,15 @@ impl Scheduler {
             let mut cpu = self.cpu(cpu_id).lock();
             cpu.set_idle(idle);
         }
+
+        let init = self.alloc_thread(
+            0,
+            ThreadClass::Timeshare,
+            MIN_INTERACT,
+            ThreadFlags::NOLOAD | ThreadFlags::NO_MIGRATE,
+            init_task,
+        );
+        self.cpu(0).lock().adopt_thread(init, EnqueueKind::Normal);
 
         let maint = self.alloc_thread(
             0,
@@ -990,8 +998,11 @@ impl Scheduler {
         next_frame
     }
 
-    fn start_cpu(&self, cpu_id: usize) -> ! {
+    fn start_current_cpu(&self) -> ! {
         arch::irqset(false);
+        clock::start_cpu();
+
+        let cpu_id = arch::thiscpu().id;
         self.cpu(cpu_id).lock().online = true;
 
         let _ = self.try_idle_pull(cpu_id);
@@ -999,6 +1010,7 @@ impl Scheduler {
         let next = self.schedule_next(cpu_id, now_ns);
         self.activate_current(next);
         clock::set_scheduler_deadline(self.current_deadline(cpu_id, now_ns));
+        smp::mark_current_online();
 
         // SAFETY: `next` is a live scheduler-owned thread with a validated
         // frame and this path never returns after transferring control.
@@ -1657,25 +1669,23 @@ fn balance_delay_ns(random: &mut u64) -> u64 {
     (SCHED_BALANCE_INTERVAL_NS / 2).saturating_add(*random % SCHED_BALANCE_INTERVAL_NS)
 }
 
-/// Initializes the scheduler and per-CPU idle threads.
-pub fn init() {
+/// Builds scheduler state and queues the first CPU0 kernel task.
+pub fn bootstrap<F, R>(init_task: F)
+where
+    F: FnOnce() -> R + Send + 'static,
+{
     if SCHEDULER.get().is_some() {
         return;
     }
 
     let scheduler = Box::leak(Box::new(Scheduler::new(smp::cpu_count())));
-    scheduler.bootstrap();
+    scheduler.bootstrap(init_task);
     SCHEDULER.call_once(|| scheduler);
 }
 
-/// Starts scheduling on the bootstrap CPU and never returns.
+/// Starts scheduling on the current CPU and never returns.
 pub fn start() -> ! {
-    scheduler().start_cpu(0)
-}
-
-/// Starts scheduling on the current secondary CPU and never returns.
-pub fn start_secondary() -> ! {
-    scheduler().start_cpu(arch::thiscpu().id)
+    scheduler().start_current_cpu()
 }
 
 /// Spawns a regular timeshare kernel thread and returns its thread ID.

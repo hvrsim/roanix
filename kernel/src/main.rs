@@ -34,26 +34,30 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Kernel entrypoint.
 ///
-/// Ensures that the limine protocol matches the requested version (5), then
-/// calls initializers for the various kernel subsystems. Finishes with a
-/// polling loop, waiting for the scheduler to activate and switch to the
-/// init thread.
+/// Validates the boot protocol and enters early kernel initialization.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rmain() -> ! {
     assert!(BASE_REVISION.is_supported());
+    early_init()
+}
+
+/// Initializes the facilities required to start the first kernel thread.
+fn early_init() -> ! {
     sys::debug::register();
-    sys::debug::register();
+    arch::init_boot_cpu();
     info!("welcome to roanix!");
 
-    arch::early();
-    mem::early();
-    arch::init();
+    mem::init();
+    arch::init_platform();
+    sys::smp::discover();
+    sys::sched::bootstrap(init_thread);
+    sys::sched::start()
+}
 
-    sys::smp::init();
-    sys::sched::init();
-    mem::start();
+/// Completes kernel initialization in scheduled CPU0 thread context.
+fn init_thread() {
+    sys::smp::start_secondary_cpus();
+    mem::start_page_daemon();
     fs::init();
-    sys::clock::start();
-    sys::smp::start();
-    sys::sched::start();
+    info!("boot: initialization complete");
 }

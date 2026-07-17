@@ -628,9 +628,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
 pub fn init() {
     let mut heap = heap_lock();
     heap.init();
-    if let Some(cpu) = arch::thiscpu_opt() {
-        register_tlb_cpu(cpu.id);
-    }
 
     info!(
         "mem/alloc: heap window active: virt=[0x{:x}-0x{:x}] size={} MiB",
@@ -728,7 +725,7 @@ pub(crate) fn flush_remote_tlb_shootdown() {
 }
 
 /// Marks `cpu_id` online for allocator shootdown tracking.
-pub fn register_tlb_cpu(cpu_id: usize) {
+pub(super) fn register_tlb_cpu(cpu_id: usize) {
     if cpu_id >= MAX_TLB_CPUS {
         panic!(
             "mem/alloc: cpu {} exceeds heap TLB tracking capacity {}",

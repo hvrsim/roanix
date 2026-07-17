@@ -241,7 +241,7 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 }
 
 /// Starts local timer delivery on the current CPU.
-pub fn start() {
+pub(crate) fn start_cpu() {
     CLOCK_SETUP.call_once(bootstrap_clocks);
 
     let now_ns = monotonic_ns();

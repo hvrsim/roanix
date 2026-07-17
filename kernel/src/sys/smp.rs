@@ -519,7 +519,7 @@ impl Drop for InterruptContextGuard {
 }
 
 /// Discovers CPUs exposed by the bootloader and prepares their core-local state.
-pub fn init() {
+pub fn discover() {
     if SMP_STATE.get().is_some() {
         return;
     }
@@ -542,8 +542,8 @@ pub fn init() {
     }
 }
 
-/// Starts every application processor discovered during [`init`].
-pub fn start() {
+/// Starts every application processor found by [`discover`].
+pub(crate) fn start_secondary_cpus() {
     let response = match SMP_REQUEST.get_response() {
         Some(response) => response,
         None => return,
@@ -578,17 +578,6 @@ pub fn start() {
         spin_loop();
     }
 
-    while scheduler_online_aps() + 1 < state.cpu_count() {
-        if crate::sys::clock::monotonic_ns() >= deadline {
-            panic!(
-                "smp: timed out waiting for AP schedulers ({}/{})",
-                scheduler_online_aps() + 1,
-                state.cpu_count()
-            );
-        }
-        spin_loop();
-    }
-
     info!("smp: all {} CPU(s) online", state.cpu_count());
 }
 
@@ -600,6 +589,19 @@ pub fn cpu_count() -> usize {
 /// Returns the number of CPUs that have completed bring-up.
 pub fn online_cpus() -> usize {
     ONLINE_CPUS.load(Ordering::Acquire)
+}
+
+/// Publishes the current secondary CPU after scheduler setup is complete.
+pub(crate) fn mark_current_online() {
+    let cpu_id = arch::thiscpu().id;
+    if cpu_id == 0 {
+        return;
+    }
+
+    let record = smp_state()
+        .by_logical_id(cpu_id)
+        .unwrap_or_else(|| panic!("smp: missing record for cpu{cpu_id}"));
+    let _ = record.mark_online();
 }
 
 /// Returns the architecture-specific platform identifier for `cpu_id`.
@@ -751,20 +753,6 @@ fn kick_cpu(cpu_id: usize, this_cpu: Option<usize>) {
     arch::send_ipi(cpu_id);
 }
 
-fn scheduler_online_aps() -> usize {
-    let mut ready = 0usize;
-
-    for cpu_id in 1..cpu_count() {
-        let Some(scheduler) = core_local(cpu_id).and_then(|core| core.scheduler.get()) else {
-            continue;
-        };
-
-        ready += usize::from(scheduler.is_online());
-    }
-
-    ready
-}
-
 fn discover_cpus(response: &limine::response::MpResponse) -> Box<[CpuRecord]> {
     let bsp_platform_id = bsp_platform_id(response);
     let mut cpus = Vec::with_capacity(response.cpus().len().max(1));
@@ -792,12 +780,9 @@ unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
         .by_platform_id(cpu_platform_id(cpu))
         .expect("smp: missing AP record");
 
-    arch::init_secondary(record.core_local_ptr());
-    crate::mem::alloc::register_tlb_cpu(record.logical_id);
-    crate::mem::register_tlb_cpu(record.logical_id);
-    crate::sys::clock::start();
-    let _ = record.mark_online();
-    crate::sys::sched::start_secondary();
+    arch::init_secondary_cpu(record.core_local_ptr());
+    crate::mem::register_cpu();
+    crate::sys::sched::start();
 }
 
 #[cfg(target_arch = "x86_64")]

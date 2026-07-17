@@ -175,26 +175,26 @@ pub fn irqset(enable: bool) {
     }
 }
 
-/// Performs early CPU initialization.
-///
-/// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
-pub fn early() {
-    set_core_local(&raw const BSP_CORE_LOCAL);
-    cpu::enable_features();
-
+/// Initializes the bootstrap hart and early debug output.
+pub fn init_boot_cpu() {
+    init_cpu(&raw const BSP_CORE_LOCAL);
     debug::register_sink(dbgcon_write);
 }
 
-/// Performs post-memory architecture initialization.
-pub fn init() {
+/// Initializes global RISC-V platform facilities that require memory services.
+pub fn init_platform() {
     timer::init();
 }
 
 /// Performs per-hart initialization for a secondary core.
-pub fn init_secondary(core_local: *const CoreLocal) {
+pub fn init_secondary_cpu(core_local: *const CoreLocal) {
+    init_cpu(core_local);
+    timer::init_secondary();
+}
+
+fn init_cpu(core_local: *const CoreLocal) {
     set_core_local(core_local);
     cpu::enable_features();
-    timer::init_secondary();
 }
 
 /// Pauses CPU execution and waits for interrupts.

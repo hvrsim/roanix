@@ -111,32 +111,30 @@ fn dbgcon_init() {
     }
 }
 
-/// Performs early CPU initialization.
-///
-/// Enumerates and enables CPU features, also sets trap handlers for early panic handling.
-pub fn early() {
+/// Initializes the bootstrap processor and early debug output.
+pub fn init_boot_cpu() {
     dbgcon_init();
+    init_cpu(&raw const BSP_CORE_LOCAL);
     debug::register_sink(dbgcon_write);
-
-    set_core_local(&raw const BSP_CORE_LOCAL);
-    let feats = cpu::enable_features();
-    // SAFETY: early boot is single-threaded on this CPU and no shared
-    // references to its `CoreLocal` remain live across this assignment.
-    unsafe { thiscpu_mut() }.platform.feats = feats;
 }
 
-/// Performs post-memory architecture initialization.
-pub fn init() {
+/// Initializes global x86 platform facilities that require memory services.
+pub fn init_platform() {
     timer::init();
 }
 
 /// Performs per-CPU initialization for a secondary core.
-pub fn init_secondary(core_local: *const CoreLocal) {
+pub fn init_secondary_cpu(core_local: *const CoreLocal) {
+    init_cpu(core_local);
+    timer::init_secondary();
+}
+
+fn init_cpu(core_local: *const CoreLocal) {
     set_core_local(core_local);
     let feats = cpu::enable_features();
-    // SAFETY: this secondary CPU is not online until initialization completes.
+    // SAFETY: the current CPU is not shared until its local initialization
+    // completes.
     unsafe { thiscpu_mut() }.platform.feats = feats;
-    timer::init_secondary();
 }
 
 /// Returns core local context.

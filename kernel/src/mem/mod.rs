@@ -143,16 +143,15 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[unsafe(link_section = ".requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
-/// Performs early memory subsystem initialization.
-pub fn early() {
+/// Initializes physical memory, the heap, and pageable virtual memory.
+pub fn init() {
     info!("mem: hhdm=0x{:x}", hhdm_offset());
     phys::init();
     alloc::init();
-    init();
+    init_state();
 }
 
-/// Initializes pageable memory, compressed swap, and the shared zero page.
-pub fn init() {
+fn init_state() {
     if MEMORY.get().is_some() {
         return;
     }
@@ -185,9 +184,7 @@ pub fn init() {
     swap::init(compressed_limit, physical.total_pages / 4);
     let zero = VmPage::new_shared_zero().expect("mem: failed to allocate shared zero page");
     state().zero_page.call_once(|| zero);
-    if let Some(cpu) = arch::thiscpu_opt() {
-        register_tlb_cpu(cpu.id);
-    }
+    register_cpu();
 
     info!(
         "mem: initialized (free low={} high={} compressed_swap={} MiB)",
@@ -197,8 +194,8 @@ pub fn init() {
     );
 }
 
-/// Starts the page daemon after the scheduler is initialized.
-pub fn start() {
+/// Starts the page daemon after the scheduler is running.
+pub(crate) fn start_page_daemon() {
     let state = state();
     if state
         .daemon_started
@@ -238,8 +235,14 @@ pub fn reclaim_now(target: usize) -> usize {
     reclaimed
 }
 
-/// Registers a newly online CPU for pmap TLB retirement.
-pub fn register_tlb_cpu(cpu_id: usize) {
+/// Registers the current CPU with allocator and pmap TLB tracking.
+pub(crate) fn register_cpu() {
+    let cpu_id = arch::thiscpu().id;
+    alloc::register_tlb_cpu(cpu_id);
+    register_tlb_cpu(cpu_id);
+}
+
+fn register_tlb_cpu(cpu_id: usize) {
     assert!(
         cpu_id < MAX_TLB_CPUS,
         "mem: cpu {cpu_id} exceeds TLB tracking capacity"
