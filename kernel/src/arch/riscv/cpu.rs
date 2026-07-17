@@ -21,6 +21,9 @@ const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
+const SCAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
+const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
+const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
 pub(crate) const SSTATUS_SIE: u64 = 1 << 1;
 const SSTATUS_SPIE: u64 = 1 << 5;
 const SSTATUS_SPP: u64 = 1 << 8;
@@ -290,6 +293,24 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 return crate::sys::sched::trap_return(frame);
             }
             _ => {}
+        }
+    }
+
+    if frame.sstatus & SSTATUS_SPP == 0 {
+        let access = match frame.scause {
+            SCAUSE_INSTRUCTION_PAGE_FAULT => Some(crate::mem::FaultAccess::Execute),
+            SCAUSE_LOAD_PAGE_FAULT => Some(crate::mem::FaultAccess::Read),
+            SCAUSE_STORE_PAGE_FAULT => Some(crate::mem::FaultAccess::Write),
+            _ => None,
+        };
+        if let Some(access) = access {
+            crate::arch::irqset(true);
+            let result =
+                crate::mem::handle_current_fault(crate::mem::VirtAddr::new(frame.stval), access);
+            crate::arch::irqset(false);
+            if result.is_ok() {
+                return frame;
+            }
         }
     }
 

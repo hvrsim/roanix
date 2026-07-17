@@ -241,7 +241,7 @@ impl HeapState {
         let page_idx = self.reserve_run(1, 1)?;
         let page_va = heap_page_virt(page_idx);
         let root = arch::paging::active_root();
-        let phys_page = phys::alloc_zeroed_page()?;
+        let phys_page = phys::alloc_zeroed_page(phys::PageUse::KernelHeap)?;
 
         // SAFETY: the reserved heap virtual page is currently unmapped and the
         // new physical page is exclusively owned by the allocator.
@@ -275,7 +275,7 @@ impl HeapState {
         let mut mapped = 0usize;
 
         while mapped < pages {
-            let phys_page = match phys::alloc_zeroed_page() {
+            let phys_page = match phys::alloc_zeroed_page(phys::PageUse::KernelHeap) {
                 Some(page) => page,
                 None => {
                     self.rollback_large(root, start, mapped);

@@ -11,6 +11,7 @@ rustc-demangle = "0.1"
 bitflags = "2.8.0"
 intrusive-collections = { version = "0.9", default-features = false }
 limine = { git = "https://github.com/jasondyoungberg/limine-rs", rev = "99cb96b" }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15.5"

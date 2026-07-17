@@ -11,6 +11,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::mem::VmObject;
+
 use super::error::{Error, Result};
 
 static NEXT_FILESYSTEM_ID: AtomicU64 = AtomicU64::new(1);
@@ -246,6 +248,11 @@ pub trait VnodeOps: Any + Send + Sync {
         Err(Error::IsDirectory)
     }
 
+    /// Returns the unified page-cache object used for memory mappings.
+    fn memory_object(&self, _vnode: &Vnode) -> Result<Arc<VmObject>> {
+        Err(Error::Unsupported)
+    }
+
     /// Reads a symbolic-link target.
     fn readlink(&self, _vnode: &Vnode) -> Result<Box<[u8]>> {
         Err(Error::InvalidArgument)
@@ -381,6 +388,11 @@ impl Vnode {
     /// Changes file size.
     pub fn truncate(&self, size: u64) -> Result<()> {
         self.inner.operations.truncate(self, size)
+    }
+
+    /// Returns this vnode's unified page-cache object.
+    pub fn memory_object(&self) -> Result<Arc<VmObject>> {
+        self.inner.operations.memory_object(self)
     }
 
     /// Reads a symbolic-link target.

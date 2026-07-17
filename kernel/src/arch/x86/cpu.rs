@@ -433,6 +433,22 @@ pub fn enable_features() -> CpuFeatures {
 #[unsafe(no_mangle)]
 extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     crate::sys::panic::halt_if_panicking();
+    if frame.vec == 14 && frame.cs & 3 == 3 {
+        let access = if frame.ec & (1 << 4) != 0 {
+            crate::mem::FaultAccess::Execute
+        } else if frame.ec & (1 << 1) != 0 {
+            crate::mem::FaultAccess::Write
+        } else {
+            crate::mem::FaultAccess::Read
+        };
+        let address = crate::mem::VirtAddr::new(Cr2::read_raw());
+        crate::arch::irqset(true);
+        let result = crate::mem::handle_current_fault(address, access);
+        crate::arch::irqset(false);
+        if result.is_ok() {
+            return frame;
+        }
+    }
     if frame.vec < 32 {
         let (cpu_id, tid) = crate::arch::thiscpu_opt()
             .map(|cpu| (cpu.id, cpu.current_thread))

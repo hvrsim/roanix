@@ -700,6 +700,7 @@ unsafe extern "C" fn ap_entry(cpu: &mp::Cpu) -> ! {
 
     arch::init_secondary(record.core_local_ptr());
     crate::mem::alloc::register_tlb_cpu(record.logical_id);
+    crate::mem::register_tlb_cpu(record.logical_id);
     crate::sys::clock::start();
     let _ = record.mark_online();
     crate::sys::sched::start_secondary();

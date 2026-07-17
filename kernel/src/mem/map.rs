@@ -1,0 +1,618 @@
+//! Virtual address maps, anonymous overlays, and copy-on-write resolution.
+
+use alloc::{collections::BTreeMap, sync::Arc};
+use bitflags::bitflags;
+
+use crate::mem::{PAGE_SIZE, VirtAddr, align_up};
+
+use super::{Error, Result, VmObject, VmPage};
+
+#[cfg(target_arch = "x86_64")]
+const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
+#[cfg(target_arch = "riscv64")]
+const USER_ADDRESS_MAX: u64 = 0x0000_0040_0000_0000;
+const USER_ADDRESS_MIN: u64 = 0x1_0000;
+
+bitflags! {
+    /// Access permissions attached to a VM map entry.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct VmProtection: u8 {
+        /// Permit loads.
+        const READ = 1 << 0;
+        /// Permit stores.
+        const WRITE = 1 << 1;
+        /// Permit instruction fetch.
+        const EXECUTE = 1 << 2;
+    }
+}
+
+/// Access that triggered a page fault.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FaultAccess {
+    /// Data load.
+    Read,
+    /// Data store.
+    Write,
+    /// Instruction fetch.
+    Execute,
+}
+
+/// Mapping inheritance applied during address-space fork.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VmInheritance {
+    /// Child and parent share modifications.
+    Share,
+    /// Child and parent receive copy-on-write views.
+    Copy,
+    /// Mapping is omitted from the child.
+    None,
+}
+
+/// Access-pattern hint associated with a mapping.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VmAdvice {
+    /// No special access pattern.
+    Normal,
+    /// Accesses are expected to be random.
+    Random,
+    /// Accesses are expected to be sequential.
+    Sequential,
+    /// Pages are likely to be reused.
+    WillNeed,
+    /// Pages are unlikely to be reused.
+    DontNeed,
+}
+
+struct VmAnon {
+    page: Arc<VmPage>,
+}
+
+struct AnonMap {
+    pages: crate::sys::sync::Mutex<BTreeMap<u64, Arc<VmAnon>>>,
+}
+
+impl AnonMap {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pages: crate::sys::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn private_copy(&self) -> Arc<Self> {
+        Arc::new(Self {
+            pages: crate::sys::sync::Mutex::new(self.pages.lock().clone()),
+        })
+    }
+
+    fn slice(&self, start: u64, pages: u64) -> Arc<Self> {
+        let end = start.saturating_add(pages);
+        let sliced = self
+            .pages
+            .lock()
+            .range(start..end)
+            .map(|(index, anon)| (*index, anon.clone()))
+            .collect();
+        Arc::new(Self {
+            pages: crate::sys::sync::Mutex::new(sliced),
+        })
+    }
+
+    fn lookup(&self, index: u64) -> Option<(Arc<VmPage>, bool)> {
+        let pages = self.pages.lock();
+        let anon = pages.get(&index)?;
+        Some((anon.page.clone(), Arc::strong_count(anon) == 1))
+    }
+
+    fn cow_page(&self, index: u64, source: &Arc<VmPage>) -> Result<Arc<VmPage>> {
+        let mut pages = self.pages.lock();
+        if let Some(anon) = pages.get(&index) {
+            if Arc::strong_count(anon) == 1 {
+                return Ok(anon.page.clone());
+            }
+            let page = anon.page.copy_to(index)?;
+            pages.insert(index, Arc::new(VmAnon { page: page.clone() }));
+            return Ok(page);
+        }
+
+        let page = if Arc::ptr_eq(source, &super::shared_zero_page()) {
+            VmPage::new_zero(index, super::phys::PageOwnerKind::Anonymous)
+        } else {
+            source.copy_to(index)?
+        };
+        pages.insert(index, Arc::new(VmAnon { page: page.clone() }));
+        Ok(page)
+    }
+}
+
+/// One contiguous virtual address mapping.
+#[derive(Clone)]
+pub struct VmMapEntry {
+    start: u64,
+    end: u64,
+    object: Option<Arc<VmObject>>,
+    object_offset: u64,
+    amap: Option<Arc<AnonMap>>,
+    amap_offset: u64,
+    protection: VmProtection,
+    maximum_protection: VmProtection,
+    inheritance: VmInheritance,
+    advice: VmAdvice,
+    private: bool,
+    needs_copy: bool,
+    wired_count: u32,
+}
+
+impl VmMapEntry {
+    /// Returns the entry's inclusive start address.
+    pub fn start(&self) -> VirtAddr {
+        VirtAddr::new(self.start)
+    }
+
+    /// Returns the entry's exclusive end address.
+    pub fn end(&self) -> VirtAddr {
+        VirtAddr::new(self.end)
+    }
+
+    /// Returns current access permissions.
+    pub fn protection(&self) -> VmProtection {
+        self.protection
+    }
+
+    /// Returns the inheritance policy.
+    pub fn inheritance(&self) -> VmInheritance {
+        self.inheritance
+    }
+
+    /// Returns the access-pattern hint.
+    pub fn advice(&self) -> VmAdvice {
+        self.advice
+    }
+
+    /// Returns whether the entry is wired against reclamation.
+    pub fn is_wired(&self) -> bool {
+        self.wired_count != 0
+    }
+
+    fn contains(&self, address: u64) -> bool {
+        address >= self.start && address < self.end
+    }
+
+    fn page_offset(&self, address: u64) -> u64 {
+        (address - self.start) / PAGE_SIZE
+    }
+
+    fn clipped(&self, start: u64, end: u64) -> Self {
+        let page_delta = (start - self.start) / PAGE_SIZE;
+        let mut clipped = self.clone();
+        clipped.start = start;
+        clipped.end = end;
+        clipped.object_offset = clipped.object_offset.saturating_add(page_delta);
+        clipped.amap_offset = clipped.amap_offset.saturating_add(page_delta);
+        if self.inheritance != VmInheritance::Share
+            && let Some(amap) = &self.amap
+        {
+            clipped.amap = Some(amap.slice(clipped.amap_offset, (end - start) / PAGE_SIZE));
+        }
+        clipped
+    }
+}
+
+/// Page and permissions produced by map fault classification.
+pub struct ResolvedPage {
+    /// Page that should be entered into the pmap.
+    pub page: Arc<VmPage>,
+    /// Effective mapping permissions.
+    pub protection: VmProtection,
+    /// Whether this resolution completed a copy-on-write promotion.
+    pub promoted: bool,
+}
+
+/// Ordered set of virtual mappings for one address space.
+pub struct VmMap {
+    entries: BTreeMap<u64, VmMapEntry>,
+    size: u64,
+    timestamp: u64,
+}
+
+impl VmMap {
+    /// Creates an empty user address map.
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            size: 0,
+            timestamp: 1,
+        }
+    }
+
+    /// Returns bytes covered by entries.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the map version incremented by every structural change.
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Finds a page-aligned free range using first fit.
+    pub fn find_space(&self, hint: VirtAddr, length: u64) -> Result<VirtAddr> {
+        let length = checked_page_length(length)?;
+        let mut candidate = align_up(hint.as_u64().max(USER_ADDRESS_MIN), PAGE_SIZE);
+        for entry in self.entries.values() {
+            if candidate
+                .checked_add(length)
+                .is_some_and(|end| end <= entry.start)
+            {
+                return Ok(VirtAddr::new(candidate));
+            }
+            candidate = candidate.max(entry.end);
+        }
+        if candidate
+            .checked_add(length)
+            .is_some_and(|end| end <= USER_ADDRESS_MAX)
+        {
+            Ok(VirtAddr::new(candidate))
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// Inserts a private zero-fill anonymous mapping.
+    pub fn map_anonymous(
+        &mut self,
+        start: VirtAddr,
+        length: u64,
+        protection: VmProtection,
+        maximum_protection: VmProtection,
+        inheritance: VmInheritance,
+    ) -> Result<()> {
+        self.insert(VmMapEntry {
+            start: start.as_u64(),
+            end: checked_end(start.as_u64(), length)?,
+            object: None,
+            object_offset: 0,
+            amap: Some(AnonMap::new()),
+            amap_offset: 0,
+            protection,
+            maximum_protection,
+            inheritance,
+            advice: VmAdvice::Normal,
+            private: true,
+            needs_copy: false,
+            wired_count: 0,
+        })
+    }
+
+    /// Inserts an object mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_object(
+        &mut self,
+        start: VirtAddr,
+        length: u64,
+        object: Arc<VmObject>,
+        object_offset: u64,
+        protection: VmProtection,
+        maximum_protection: VmProtection,
+        inheritance: VmInheritance,
+        private: bool,
+    ) -> Result<()> {
+        if !object_offset.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::InvalidAddress);
+        }
+        self.insert(VmMapEntry {
+            start: start.as_u64(),
+            end: checked_end(start.as_u64(), length)?,
+            object: Some(object),
+            object_offset: object_offset / PAGE_SIZE,
+            amap: private.then(AnonMap::new),
+            amap_offset: 0,
+            protection,
+            maximum_protection,
+            inheritance,
+            advice: VmAdvice::Normal,
+            private,
+            needs_copy: false,
+            wired_count: 0,
+        })
+    }
+
+    /// Removes all mappings intersecting a range, clipping partial entries.
+    pub fn unmap(&mut self, start: VirtAddr, length: u64) -> Result<()> {
+        let start = start.as_u64();
+        let end = checked_end(start, length)?;
+        let keys = self.overlapping_keys(start, end);
+        if keys.is_empty() {
+            return Err(Error::NotMapped);
+        }
+
+        for key in keys {
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("mem/map: overlapping entry vanished");
+            self.size -= entry.end - entry.start;
+            if entry.start < start {
+                let left = entry.clipped(entry.start, start);
+                self.size += left.end - left.start;
+                self.entries.insert(left.start, left);
+            }
+            if entry.end > end {
+                let right = entry.clipped(end, entry.end);
+                self.size += right.end - right.start;
+                self.entries.insert(right.start, right);
+            }
+        }
+        self.bump_timestamp();
+        Ok(())
+    }
+
+    /// Changes protection on a range after clipping entries.
+    pub fn protect(
+        &mut self,
+        start: VirtAddr,
+        length: u64,
+        protection: VmProtection,
+    ) -> Result<()> {
+        let start = start.as_u64();
+        let end = checked_end(start, length)?;
+        let keys = self.overlapping_keys(start, end);
+        if keys.is_empty() {
+            return Err(Error::NotMapped);
+        }
+        let mut covered = start;
+        for key in &keys {
+            let entry = self
+                .entries
+                .get(key)
+                .expect("mem/map: protected entry vanished during validation");
+            if entry.start > covered {
+                return Err(Error::NotMapped);
+            }
+            if !entry.maximum_protection.contains(protection) {
+                return Err(Error::Protection);
+            }
+            covered = covered.max(entry.end);
+        }
+        if covered < end {
+            return Err(Error::NotMapped);
+        }
+
+        for key in keys {
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("mem/map: overlapping entry vanished");
+            if entry.start < start {
+                let left = entry.clipped(entry.start, start);
+                self.entries.insert(left.start, left);
+            }
+            let middle_start = entry.start.max(start);
+            let middle_end = entry.end.min(end);
+            let mut middle = entry.clipped(middle_start, middle_end);
+            middle.protection = protection;
+            self.entries.insert(middle.start, middle);
+            if entry.end > end {
+                let right = entry.clipped(end, entry.end);
+                self.entries.insert(right.start, right);
+            }
+        }
+        self.bump_timestamp();
+        Ok(())
+    }
+
+    /// Updates the access-pattern hint for a range.
+    pub fn advise(&mut self, start: VirtAddr, length: u64, advice: VmAdvice) -> Result<()> {
+        let start = start.as_u64();
+        let end = checked_end(start, length)?;
+        let keys = self.overlapping_keys(start, end);
+        if keys.is_empty() {
+            return Err(Error::NotMapped);
+        }
+        for key in keys {
+            let entry = self
+                .entries
+                .get_mut(&key)
+                .expect("mem/map: advised entry vanished");
+            entry.advice = advice;
+        }
+        self.bump_timestamp();
+        Ok(())
+    }
+
+    /// Resolves a fault using the flat anonymous-overlay/object model.
+    pub fn resolve_fault(
+        &mut self,
+        address: VirtAddr,
+        access: FaultAccess,
+    ) -> Result<ResolvedPage> {
+        let address = address.align_down().as_u64();
+        let key = self
+            .entries
+            .range(..=address)
+            .next_back()
+            .and_then(|(key, entry)| entry.contains(address).then_some(*key))
+            .ok_or(Error::NotMapped)?;
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .expect("mem/map: fault entry vanished");
+
+        let required = match access {
+            FaultAccess::Read => VmProtection::READ,
+            FaultAccess::Write => VmProtection::WRITE,
+            FaultAccess::Execute => VmProtection::EXECUTE,
+        };
+        if !entry.protection.contains(required) {
+            return Err(Error::Protection);
+        }
+
+        let relative = entry.page_offset(address);
+        let anon_index = entry.amap_offset + relative;
+        let object_index = entry.object_offset + relative;
+        let write = access == FaultAccess::Write;
+
+        if write && entry.private {
+            if entry.needs_copy {
+                let amap = entry.amap.get_or_insert_with(AnonMap::new);
+                if Arc::strong_count(amap) > 1 {
+                    entry.amap = Some(amap.private_copy());
+                }
+                entry.needs_copy = false;
+            }
+            let source = if let Some(amap) = &entry.amap
+                && let Some((page, _)) = amap.lookup(anon_index)
+            {
+                page
+            } else if let Some(object) = &entry.object {
+                object.fault_page(object_index, false)?
+            } else {
+                super::shared_zero_page()
+            };
+            let amap = entry.amap.get_or_insert_with(AnonMap::new);
+            let page = amap.cow_page(anon_index, &source)?;
+            return Ok(ResolvedPage {
+                page,
+                protection: entry.protection,
+                promoted: true,
+            });
+        }
+
+        if let Some(amap) = &entry.amap
+            && let Some((page, exclusive)) = amap.lookup(anon_index)
+        {
+            let mut protection = entry.protection;
+            if entry.private && (entry.needs_copy || !exclusive) {
+                protection.remove(VmProtection::WRITE);
+            }
+            return Ok(ResolvedPage {
+                page,
+                protection,
+                promoted: false,
+            });
+        }
+
+        let page = if let Some(object) = &entry.object {
+            object.fault_page(object_index, write && !entry.private)?
+        } else {
+            super::shared_zero_page()
+        };
+        let mut protection = entry.protection;
+        if entry.private || Arc::ptr_eq(&page, &super::shared_zero_page()) {
+            protection.remove(VmProtection::WRITE);
+        }
+        Ok(ResolvedPage {
+            page,
+            protection,
+            promoted: false,
+        })
+    }
+
+    /// Creates a child map and installs lazy COW state in copy-inherited entries.
+    pub fn fork(&mut self) -> Self {
+        let mut child = Self::new();
+        for entry in self.entries.values_mut() {
+            match entry.inheritance {
+                VmInheritance::None => continue,
+                VmInheritance::Share => {}
+                VmInheritance::Copy => {
+                    if entry.private {
+                        entry.needs_copy = true;
+                    }
+                }
+            }
+            let mut child_entry = entry.clone();
+            if child_entry.inheritance == VmInheritance::Copy && child_entry.private {
+                child_entry.needs_copy = true;
+            }
+            child.size += child_entry.end - child_entry.start;
+            child.entries.insert(child_entry.start, child_entry);
+        }
+        self.bump_timestamp();
+        child.timestamp = self.timestamp;
+        child
+    }
+
+    /// Returns a cloned entry containing `address`.
+    pub fn lookup(&self, address: VirtAddr) -> Option<VmMapEntry> {
+        self.entries
+            .range(..=address.as_u64())
+            .next_back()
+            .and_then(|(_, entry)| entry.contains(address.as_u64()).then(|| entry.clone()))
+    }
+
+    fn insert(&mut self, entry: VmMapEntry) -> Result<()> {
+        validate_range(entry.start, entry.end)?;
+        if !entry.maximum_protection.contains(entry.protection) {
+            return Err(Error::Protection);
+        }
+        if self
+            .entries
+            .range(..entry.end)
+            .next_back()
+            .is_some_and(|(_, previous)| previous.end > entry.start)
+        {
+            return Err(Error::AlreadyMapped);
+        }
+        self.size = self
+            .size
+            .checked_add(entry.end - entry.start)
+            .ok_or(Error::InvalidAddress)?;
+        self.entries.insert(entry.start, entry);
+        self.bump_timestamp();
+        Ok(())
+    }
+
+    fn overlapping_keys(&self, start: u64, end: u64) -> alloc::vec::Vec<u64> {
+        self.entries
+            .range(..end)
+            .filter_map(|(key, entry)| (entry.end > start).then_some(*key))
+            .collect()
+    }
+
+    fn bump_timestamp(&mut self) {
+        self.timestamp = self.timestamp.wrapping_add(1);
+        if self.timestamp == 0 {
+            self.timestamp = 1;
+        }
+    }
+}
+
+impl Default for VmMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn checked_page_length(length: u64) -> Result<u64> {
+    if length == 0 {
+        return Err(Error::InvalidAddress);
+    }
+    let mask = PAGE_SIZE - 1;
+    length
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or(Error::InvalidAddress)
+}
+
+fn checked_end(start: u64, length: u64) -> Result<u64> {
+    if !start.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::InvalidAddress);
+    }
+    let end = start
+        .checked_add(checked_page_length(length)?)
+        .ok_or(Error::InvalidAddress)?;
+    validate_range(start, end)?;
+    Ok(end)
+}
+
+fn validate_range(start: u64, end: u64) -> Result<()> {
+    if start < USER_ADDRESS_MIN
+        || !start.is_multiple_of(PAGE_SIZE)
+        || !end.is_multiple_of(PAGE_SIZE)
+        || start >= end
+        || end > USER_ADDRESS_MAX
+    {
+        return Err(Error::InvalidAddress);
+    }
+    Ok(())
+}

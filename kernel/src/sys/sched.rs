@@ -303,6 +303,7 @@ struct CpuState {
     current: Option<ThreadPtr>,
     idle: Option<ThreadPtr>,
     exited: ExitedThreads,
+    deferred_exit: Option<ThreadPtr>,
     online: bool,
     load: usize,
     sysload: usize,
@@ -327,6 +328,7 @@ impl CpuState {
             current: None,
             idle: None,
             exited: ExitedThreads::new(),
+            deferred_exit: None,
             online: cpu_id == 0,
             load: 0,
             sysload: 0,
@@ -917,6 +919,7 @@ impl Scheduler {
     }
 
     fn trap_return(&self, cpu_id: usize, frame: &mut TrapFrame) -> *mut TrapFrame {
+        self.publish_deferred_exit(cpu_id);
         smp::drain_ipi_queue();
         let now_ns = clock::monotonic_ns();
 
@@ -1006,6 +1009,7 @@ impl Scheduler {
 
     fn exit_current(&self, cpu_id: usize) -> ! {
         arch::irqset(false);
+        self.publish_deferred_exit(cpu_id);
 
         {
             let mut cpu = self.cpu(cpu_id).lock();
@@ -1017,7 +1021,10 @@ impl Scheduler {
 
             current_thread.mark_exited();
             cpu.release_thread(current_thread);
-            cpu.exited.push(current);
+            assert!(
+                cpu.deferred_exit.replace(current).is_none(),
+                "sched: deferred exit slot already occupied"
+            );
             cpu.current = None;
             cpu.need_resched = false;
         }
@@ -1431,6 +1438,7 @@ impl Scheduler {
         cpu.kernel_stack = thread.stack_top.as_u64();
         cpu.user_stack = 0;
         cpu.current_thread = thread.id;
+        crate::mem::activate_thread_space(thread.address_space());
         // SAFETY: the frame belongs to `thread`, was validated above, and is
         // exclusively prepared on the local scheduler path.
         unsafe {
@@ -1562,6 +1570,13 @@ impl Scheduler {
     fn reap_all_exited(&self) {
         for cpu_id in 0..self.cpu_count {
             self.reap_exited(cpu_id);
+        }
+    }
+
+    fn publish_deferred_exit(&self, cpu_id: usize) {
+        let mut cpu = self.cpu(cpu_id).lock();
+        if let Some(thread) = cpu.deferred_exit.take() {
+            cpu.exited.push(thread);
         }
     }
 }
@@ -1700,6 +1715,11 @@ pub(crate) fn current_thread_opt() -> Option<*mut Thread> {
         .copied()?
         .current_thread_opt(cpu_id)
         .map(ThreadPtr::as_ptr)
+}
+
+/// Publishes a thread whose final stack switch has completed.
+pub(crate) fn publish_deferred_exit() {
+    scheduler().publish_deferred_exit(arch::thiscpu().id);
 }
 
 /// Parks the current thread until a matching wake event occurs.

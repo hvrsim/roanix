@@ -52,6 +52,7 @@ unsafe extern "C" fn rmain() -> ! {
 
     sys::smp::init();
     sys::sched::init();
+    mem::start();
     fs::init();
     sys::clock::start();
     sys::smp::start();

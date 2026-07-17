@@ -7,6 +7,7 @@
 use alloc::{
     alloc::{Layout, alloc_zeroed, handle_alloc_error},
     boxed::Box,
+    sync::Arc,
 };
 use core::{
     mem::size_of,
@@ -15,7 +16,8 @@ use core::{
 
 use crate::{
     arch,
-    mem::{PAGE_SIZE, VirtAddr},
+    mem::{PAGE_SIZE, VirtAddr, VmSpace},
+    sys::smp::IrqSpinLock,
 };
 use bitflags::bitflags;
 use intrusive_collections::{LinkedListLink, intrusive_adapter};
@@ -166,6 +168,9 @@ pub(crate) struct Thread {
 
     /// Heap-allocated entry closure that runs when the thread starts.
     task: Option<Box<dyn KernelTask>>,
+
+    /// User address space activated while this thread runs.
+    address_space: IrqSpinLock<Option<Arc<VmSpace>>>,
 }
 
 // SAFETY: `Thread` instances are scheduler-owned, live for the lifetime of the
@@ -243,6 +248,19 @@ impl Thread {
     pub(crate) fn can_migrate(&self) -> bool {
         !self.flags.contains(ThreadFlags::NO_MIGRATE)
             && self.migration_pins.load(Ordering::Acquire) == 0
+    }
+
+    /// Returns the thread's current user address space.
+    pub(crate) fn address_space(&self) -> Option<Arc<VmSpace>> {
+        self.address_space.lock().clone()
+    }
+
+    /// Replaces the thread's user address space and returns the previous one.
+    pub(crate) fn replace_address_space(
+        &self,
+        space: Option<Arc<VmSpace>>,
+    ) -> Option<Arc<VmSpace>> {
+        core::mem::replace(&mut *self.address_space.lock(), space)
     }
 
     /// Prevents the scheduler from migrating this thread until the matching
@@ -383,6 +401,7 @@ impl Thread {
 }
 
 extern "C" fn thread_entry(thread_ptr: usize) -> ! {
+    crate::sys::sched::publish_deferred_exit();
     // SAFETY: the scheduler passes the leaked `Thread` pointer used to create
     // this initial frame and starts it exactly once.
     let thread = unsafe { &mut *(thread_ptr as *mut Thread) };
@@ -466,6 +485,7 @@ where
         migration_pins: AtomicUsize::new(0),
         park_seq: AtomicU64::new(0),
         task: Some(Box::new(task)),
+        address_space: IrqSpinLock::new(None),
     }));
     // SAFETY: `frame` points inside the exclusively owned stack allocation and
     // is properly aligned for the architecture trap frame.

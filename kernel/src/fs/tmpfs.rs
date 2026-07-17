@@ -1,4 +1,4 @@
-//! Sparse, page-backed temporary filesystem.
+//! Sparse temporary filesystem backed by unified page-cache objects.
 
 use alloc::{
     boxed::Box,
@@ -8,14 +8,14 @@ use alloc::{
 };
 use core::{
     any::Any,
-    cmp, ptr,
+    cmp,
     sync::atomic::{AtomicU16, AtomicU64, Ordering},
 };
 
 use spin::Once;
 
 use crate::{
-    mem::{self, PAGE_SIZE},
+    mem::{self, ObjectKind, PAGE_SIZE, PageAccount, VmObject},
     sys::{clock, smp::IrqSpinLock, sync::Mutex},
 };
 
@@ -30,22 +30,11 @@ use super::{
 
 const TMPFS_NAME: &str = "tmpfs";
 
-/// Capacity limits for one tmpfs filesystem.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct TmpfsOptions {
-    /// Maximum physical bytes that file pages may consume.
-    pub maximum_bytes: u64,
-    /// Maximum number of allocated tmpfs nodes.
-    pub maximum_nodes: u64,
-}
-
 /// Memory-backed filesystem instance.
 pub struct Tmpfs {
     id: FilesystemId,
     next_node: AtomicU64,
-    maximum_pages: u64,
-    maximum_nodes: u64,
-    used_pages: AtomicU64,
+    page_account: Arc<PageAccount>,
     used_nodes: AtomicU64,
     rename_lock: Mutex<()>,
     root: Once<Vnode>,
@@ -66,11 +55,11 @@ struct TmpfsNode {
 enum TmpfsData {
     File(Mutex<TmpfsFile>),
     Directory(TmpfsDirectory),
-    Symlink(Box<[u8]>),
+    Symlink(Arc<VmObject>),
 }
 
 struct TmpfsFile {
-    pages: BTreeMap<u64, Arc<TmpfsPage>>,
+    object: Arc<VmObject>,
 }
 
 struct TmpfsDirectory {
@@ -87,12 +76,6 @@ struct TmpfsDirectoryData {
 struct TmpfsDirEntry {
     vnode: Vnode,
     cookie: u64,
-}
-
-struct TmpfsPage {
-    filesystem: Weak<Tmpfs>,
-    page: &'static mem::phys::Page,
-    lock: IrqSpinLock<()>,
 }
 
 impl TmpfsDirectoryData {
@@ -145,18 +128,11 @@ impl TmpfsDirectoryData {
 
 impl Tmpfs {
     /// Creates an empty tmpfs filesystem.
-    pub fn new(options: TmpfsOptions) -> Result<Arc<Self>> {
-        let maximum_pages = options.maximum_bytes / PAGE_SIZE;
-        if maximum_pages == 0 || options.maximum_nodes == 0 {
-            return Err(Error::InvalidArgument);
-        }
-
+    pub fn new() -> Result<Arc<Self>> {
         let filesystem = Arc::new(Self {
             id: FilesystemId::allocate(),
             next_node: AtomicU64::new(1),
-            maximum_pages,
-            maximum_nodes: options.maximum_nodes,
-            used_pages: AtomicU64::new(0),
+            page_account: PageAccount::unlimited(),
             used_nodes: AtomicU64::new(0),
             rename_lock: Mutex::new(()),
             root: Once::new(),
@@ -172,7 +148,6 @@ impl Tmpfs {
         mode: u16,
         parent: VnodeWeak,
     ) -> Result<Vnode> {
-        reserve(&self.used_nodes, self.maximum_nodes, 1)?;
         let id = NodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
         let now_ns = clock::monotonic_ns();
         let (vnode_kind, size, links, data) = match kind {
@@ -181,7 +156,10 @@ impl Tmpfs {
                 0,
                 1,
                 TmpfsData::File(Mutex::new(TmpfsFile {
-                    pages: BTreeMap::new(),
+                    object: VmObject::with_page_account(
+                        ObjectKind::Vnode,
+                        self.page_account.clone(),
+                    ),
                 })),
             ),
             CreateKind::Directory => (
@@ -199,7 +177,16 @@ impl Tmpfs {
             ),
             CreateKind::Symlink(target) => {
                 let size = target.len() as u64;
-                (VnodeKind::Symlink, size, 1, TmpfsData::Symlink(target))
+                let object =
+                    VmObject::with_page_account(ObjectKind::Vnode, self.page_account.clone());
+                let written = match object.write_at(0, &target) {
+                    Ok(written) => written,
+                    Err(error) => return Err(mem_error(error)),
+                };
+                if written != target.len() {
+                    return Err(Error::NoSpace);
+                }
+                (VnodeKind::Symlink, size, 1, TmpfsData::Symlink(object))
             }
         };
         let node = TmpfsNode {
@@ -213,27 +200,16 @@ impl Tmpfs {
             changed_ns: AtomicU64::new(now_ns),
             data,
         };
-        Ok(Vnode::new(
+        let vnode = Vnode::new(
             VnodeKey {
                 filesystem: self.id,
                 node: id,
             },
             vnode_kind,
             Box::new(node),
-        ))
-    }
-
-    fn allocate_page(self: &Arc<Self>) -> Result<Arc<TmpfsPage>> {
-        reserve(&self.used_pages, self.maximum_pages, 1)?;
-        let Some(page) = mem::phys::alloc_zeroed_page() else {
-            self.used_pages.fetch_sub(1, Ordering::AcqRel);
-            return Err(Error::OutOfMemory);
-        };
-        Ok(Arc::new(TmpfsPage {
-            filesystem: Arc::downgrade(self),
-            page,
-            lock: IrqSpinLock::new(()),
-        }))
+        );
+        self.used_nodes.fetch_add(1, Ordering::AcqRel);
+        Ok(vnode)
     }
 }
 
@@ -255,12 +231,9 @@ impl FileSystem for Tmpfs {
 
     fn statfs(&self) -> StatFs {
         StatFs {
-            total_bytes: self.maximum_pages.saturating_mul(PAGE_SIZE),
-            used_bytes: self
-                .used_pages
-                .load(Ordering::Acquire)
-                .saturating_mul(PAGE_SIZE),
-            total_nodes: self.maximum_nodes,
+            total_bytes: u64::MAX,
+            used_bytes: self.page_account.used().saturating_mul(PAGE_SIZE),
+            total_nodes: u64::MAX,
             used_nodes: self.used_nodes.load(Ordering::Acquire),
         }
     }
@@ -302,13 +275,7 @@ impl TmpfsNode {
             .store(clock::monotonic_ns(), Ordering::Release);
     }
 
-    fn write_locked(
-        &self,
-        filesystem: &Arc<Tmpfs>,
-        file: &mut TmpfsFile,
-        offset: u64,
-        buffer: &[u8],
-    ) -> Result<usize> {
+    fn write_locked(&self, file: &mut TmpfsFile, offset: u64, buffer: &[u8]) -> Result<usize> {
         let end = offset
             .checked_add(buffer.len() as u64)
             .ok_or(Error::FileTooLarge)?;
@@ -316,29 +283,21 @@ impl TmpfsNode {
 
         while written < buffer.len() {
             let position = offset + written as u64;
-            let page_index = position / PAGE_SIZE;
             let page_offset = (position % PAGE_SIZE) as usize;
             let count = cmp::min(PAGE_SIZE as usize - page_offset, buffer.len() - written);
-
-            let page = if let Some(page) = file.pages.get(&page_index) {
-                page.clone()
-            } else {
-                match filesystem.allocate_page() {
-                    Ok(page) => {
-                        file.pages.insert(page_index, page.clone());
-                        page
-                    }
-                    Err(_) if written != 0 => {
-                        self.size
-                            .fetch_max(offset + written as u64, Ordering::AcqRel);
-                        self.touch_modified();
-                        return Ok(written);
-                    }
-                    Err(error) => return Err(error),
+            match file
+                .object
+                .write_at(position, &buffer[written..written + count])
+            {
+                Ok(count) => written += count,
+                Err(_) if written != 0 => {
+                    self.size
+                        .fetch_max(offset + written as u64, Ordering::AcqRel);
+                    self.touch_modified();
+                    return Ok(written);
                 }
-            };
-            page.write(page_offset, &buffer[written..written + count]);
-            written += count;
+                Err(error) => return Err(mem_error(error)),
+            }
         }
 
         self.size.fetch_max(end, Ordering::AcqRel);
@@ -346,22 +305,14 @@ impl TmpfsNode {
         Ok(written)
     }
 
-    fn truncate_locked(&self, file: &mut TmpfsFile, size: u64) {
+    fn truncate_locked(&self, file: &mut TmpfsFile, size: u64) -> Result<()> {
         let old_size = self.size.load(Ordering::Acquire);
         if size < old_size {
-            let first_removed_page = size.div_ceil(PAGE_SIZE);
-            let removed = file.pages.split_off(&first_removed_page);
-            drop(removed);
-
-            let tail = (size % PAGE_SIZE) as usize;
-            if tail != 0
-                && let Some(page) = file.pages.get(&(size / PAGE_SIZE))
-            {
-                page.zero(tail, PAGE_SIZE as usize - tail);
-            }
+            file.object.truncate(size).map_err(mem_error)?;
         }
         self.size.store(size, Ordering::Release);
         self.touch_modified();
+        Ok(())
     }
 
     fn child_node(vnode: &Vnode) -> Result<&TmpfsNode> {
@@ -711,20 +662,10 @@ impl VnodeOps for TmpfsNode {
             return Ok(0);
         }
         let count = cmp::min(buffer.len() as u64, size - offset) as usize;
-        let mut read = 0usize;
-
-        while read < count {
-            let position = offset + read as u64;
-            let page_index = position / PAGE_SIZE;
-            let page_offset = (position % PAGE_SIZE) as usize;
-            let chunk = cmp::min(PAGE_SIZE as usize - page_offset, count - read);
-            if let Some(page) = file.pages.get(&page_index) {
-                page.read(page_offset, &mut buffer[read..read + chunk]);
-            } else {
-                buffer[read..read + chunk].fill(0);
-            }
-            read += chunk;
-        }
+        let read = file
+            .object
+            .read_at(offset, &mut buffer[..count])
+            .map_err(mem_error)?;
         drop(file);
         self.touch_accessed();
         Ok(read)
@@ -734,9 +675,8 @@ impl VnodeOps for TmpfsNode {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let filesystem = self.filesystem()?;
         let mut file = self.file()?.lock();
-        self.write_locked(&filesystem, &mut file, offset, buffer)
+        self.write_locked(&mut file, offset, buffer)
     }
 
     fn append(&self, _vnode: &Vnode, buffer: &[u8]) -> Result<(usize, u64)> {
@@ -744,23 +684,32 @@ impl VnodeOps for TmpfsNode {
         if buffer.is_empty() {
             return Ok((0, self.size.load(Ordering::Acquire)));
         }
-        let filesystem = self.filesystem()?;
         let offset = self.size.load(Ordering::Acquire);
-        let written = self.write_locked(&filesystem, &mut file, offset, buffer)?;
+        let written = self.write_locked(&mut file, offset, buffer)?;
         Ok((written, offset.saturating_add(written as u64)))
     }
 
     fn truncate(&self, _vnode: &Vnode, size: u64) -> Result<()> {
         let mut file = self.file()?.lock();
-        self.truncate_locked(&mut file, size);
-        Ok(())
+        self.truncate_locked(&mut file, size)
+    }
+
+    fn memory_object(&self, _vnode: &Vnode) -> Result<Arc<VmObject>> {
+        Ok(self.file()?.lock().object.clone())
     }
 
     fn readlink(&self, _vnode: &Vnode) -> Result<Box<[u8]>> {
         match &self.data {
-            TmpfsData::Symlink(target) => {
+            TmpfsData::Symlink(object) => {
+                let size = usize::try_from(self.size.load(Ordering::Acquire))
+                    .map_err(|_| Error::FileTooLarge)?;
+                let mut target = alloc::vec![0; size];
+                let read = object.read_at(0, &mut target).map_err(mem_error)?;
+                if read != size {
+                    return Err(Error::Io);
+                }
                 self.touch_accessed();
-                Ok(target.clone())
+                Ok(target.into_boxed_slice())
             }
             _ => Err(Error::InvalidArgument),
         }
@@ -818,67 +767,6 @@ impl VnodeOps for TmpfsNode {
     }
 }
 
-impl TmpfsPage {
-    fn read(&self, offset: usize, buffer: &mut [u8]) {
-        assert!(offset + buffer.len() <= PAGE_SIZE as usize);
-        let _guard = self.lock.lock();
-        // SAFETY: this page is exclusively managed by tmpfs, the HHDM mapping
-        // remains valid, and the bounds assertion keeps the copy in one page.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                mem::phys_to_virt(self.page.paddr())
-                    .as_ptr::<u8>()
-                    .add(offset),
-                buffer.as_mut_ptr(),
-                buffer.len(),
-            );
-        }
-    }
-
-    fn write(&self, offset: usize, buffer: &[u8]) {
-        assert!(offset + buffer.len() <= PAGE_SIZE as usize);
-        let _guard = self.lock.lock();
-        // SAFETY: this page is exclusively managed by tmpfs, the HHDM mapping
-        // remains valid, and the bounds assertion keeps the copy in one page.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                mem::phys_to_virt(self.page.paddr())
-                    .as_mut_ptr::<u8>()
-                    .add(offset),
-                buffer.len(),
-            );
-        }
-    }
-
-    fn zero(&self, offset: usize, length: usize) {
-        assert!(offset + length <= PAGE_SIZE as usize);
-        let _guard = self.lock.lock();
-        // SAFETY: this page is exclusively managed by tmpfs, the HHDM mapping
-        // remains valid, and the bounds assertion keeps the write in one page.
-        unsafe {
-            ptr::write_bytes(
-                mem::phys_to_virt(self.page.paddr())
-                    .as_mut_ptr::<u8>()
-                    .add(offset),
-                0,
-                length,
-            );
-        }
-    }
-}
-
-impl Drop for TmpfsPage {
-    fn drop(&mut self) {
-        // SAFETY: the final `Arc` owns the only tmpfs reference to this
-        // unmapped physical page; HHDM access is no longer in progress.
-        unsafe { mem::phys::free_page(self.page) };
-        if let Some(filesystem) = self.filesystem.upgrade() {
-            filesystem.used_pages.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
 impl Drop for TmpfsNode {
     fn drop(&mut self) {
         if let Some(filesystem) = self.filesystem.upgrade() {
@@ -887,16 +775,14 @@ impl Drop for TmpfsNode {
     }
 }
 
-fn reserve(counter: &AtomicU64, limit: u64, amount: u64) -> Result<()> {
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        let next = current.checked_add(amount).ok_or(Error::NoSpace)?;
-        if next > limit {
-            return Err(Error::NoSpace);
-        }
-        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Ok(()),
-            Err(observed) => current = observed,
+fn mem_error(error: mem::Error) -> Error {
+    match error {
+        mem::Error::OutOfMemory => Error::OutOfMemory,
+        mem::Error::LimitExceeded | mem::Error::SwapUnavailable => Error::NoSpace,
+        mem::Error::InvalidAddress => Error::FileTooLarge,
+        mem::Error::CorruptSwap | mem::Error::Pmap => Error::Io,
+        mem::Error::AlreadyMapped | mem::Error::NotMapped | mem::Error::Protection => {
+            Error::InvalidArgument
         }
     }
 }

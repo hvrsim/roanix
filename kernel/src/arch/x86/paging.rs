@@ -4,6 +4,8 @@
 //! x86_64 paging backend for the [`mem`] subsystem.
 //!
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use x86_64::{
     PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr, instructions::tlb, registers::control::Cr3,
     structures::paging::PhysFrame,
@@ -24,6 +26,10 @@ const PTE_USER: u64 = 1 << 2;
 const PTE_PWT: u64 = 1 << 3;
 /// Cache-disable policy.
 const PTE_PCD: u64 = 1 << 4;
+/// Hardware accessed bit.
+const PTE_ACCESSED: u64 = 1 << 5;
+/// Hardware dirty bit.
+const PTE_DIRTY: u64 = 1 << 6;
 /// Entry maps a huge page.
 const PTE_HUGE: u64 = 1 << 7;
 /// Global TLB entry.
@@ -113,7 +119,8 @@ pub unsafe fn map_page(
                 continue;
             }
 
-            let frame = phys::alloc_zeroed_phys().ok_or(PagingError::OutOfMemory)?;
+            let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
+                .ok_or(PagingError::OutOfMemory)?;
             let mut bits = PTE_PRESENT | PTE_WRITE;
             if user {
                 bits |= PTE_USER;
@@ -147,6 +154,89 @@ pub unsafe fn map_page(
         leaf_ptr.write_volatile((phys.as_u64() & ENTRY_ADDR_MASK) | bits);
         tlb::flush(X86VirtAddr::new(v));
         Ok(())
+    }
+}
+
+/// Replaces one existing 4 KiB mapping.
+///
+/// # Safety
+///
+/// The caller must own and synchronize the page-table hierarchy and guarantee
+/// that `phys` remains valid for the resulting mapping.
+pub unsafe fn remap_page(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: VmFlags,
+) -> Result<()> {
+    if !root.is_page_aligned() || !virt.is_page_aligned() || !phys.is_page_aligned() {
+        return Err(PagingError::UnalignedAddress);
+    }
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
+    let mut table = root;
+    // SAFETY: the caller guarantees exclusive page-table mutation.
+    unsafe {
+        for idx in [idx_l4, idx_l3, idx_l2] {
+            let entry = entry_ptr(table, idx).read_volatile();
+            if entry & PTE_PRESENT == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if entry & PTE_HUGE != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
+        }
+        let leaf_ptr = entry_ptr(table, idx_l1);
+        if leaf_ptr.read_volatile() & PTE_PRESENT == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        leaf_ptr.write_volatile((phys.as_u64() & ENTRY_ADDR_MASK) | leaf_bits(flags));
+        tlb::flush(X86VirtAddr::new(virt.as_u64()));
+    }
+    Ok(())
+}
+
+/// Reads and clears the hardware accessed and dirty bits for one mapping.
+///
+/// # Safety
+///
+/// `root` must remain a valid page-table hierarchy and the caller must
+/// serialize leaf updates.
+pub unsafe fn take_accessed_dirty(root: PhysAddr, virt: VirtAddr) -> Result<(bool, bool)> {
+    if !root.is_page_aligned() || !virt.is_page_aligned() {
+        return Err(PagingError::UnalignedAddress);
+    }
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
+    let mut table = root;
+    // SAFETY: the caller guarantees a stable, writable hierarchy.
+    unsafe {
+        for idx in [idx_l4, idx_l3, idx_l2] {
+            let entry = entry_ptr(table, idx).read_volatile();
+            if entry & PTE_PRESENT == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if entry & PTE_HUGE != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
+        }
+        let leaf_ptr = entry_ptr(table, idx_l1);
+        let leaf = &*leaf_ptr.cast::<AtomicU64>();
+        let value = leaf.load(Ordering::Acquire);
+        if value & PTE_PRESENT == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        let previous = if value & (PTE_ACCESSED | PTE_DIRTY) != 0 {
+            leaf.fetch_and(!(PTE_ACCESSED | PTE_DIRTY), Ordering::AcqRel)
+        } else {
+            value
+        };
+        let accessed = previous & PTE_ACCESSED != 0;
+        let dirty = previous & PTE_DIRTY != 0;
+        if accessed || dirty {
+            tlb::flush(X86VirtAddr::new(virt.as_u64()));
+        }
+        Ok((accessed, dirty))
     }
 }
 
@@ -192,6 +282,51 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
 /// Flushes the current CPU's TLB entry for `virt`.
 pub fn flush_page(virt: VirtAddr) {
     tlb::flush(X86VirtAddr::new(virt.as_u64()));
+}
+
+/// Flushes every non-global translation on the current CPU.
+pub fn flush_all() {
+    tlb::flush_all();
+}
+
+/// Creates an empty user root sharing the kernel half of `kernel_root`.
+///
+/// # Safety
+///
+/// `kernel_root` must remain a valid top-level table for the kernel lifetime.
+pub unsafe fn create_user_root(kernel_root: PhysAddr) -> Result<PhysAddr> {
+    let root = phys::alloc_zeroed_phys(phys::PageUse::PageTable).ok_or(PagingError::OutOfMemory)?;
+    // SAFETY: both roots are valid, page-aligned top-level tables and the new
+    // root is exclusively owned.
+    unsafe {
+        for index in 256..512 {
+            let entry = entry_ptr(kernel_root, index).read_volatile();
+            entry_ptr(root, index).write_volatile(entry);
+        }
+    }
+    Ok(root)
+}
+
+/// Destroys a user root while preserving shared kernel-half tables.
+///
+/// # Safety
+///
+/// `root` must be inactive and exclusively owned by the caller.
+pub unsafe fn destroy_user_root(root: PhysAddr) {
+    // SAFETY: the caller guarantees this hierarchy is inactive and exclusive.
+    unsafe {
+        for index in 0..256 {
+            let entry = entry_ptr(root, index).read_volatile();
+            if entry & PTE_PRESENT == 0 {
+                continue;
+            }
+            if entry & PTE_HUGE == 0 {
+                destroy_table(PhysAddr::new(entry & ENTRY_ADDR_MASK), 3);
+            }
+            entry_ptr(root, index).write_volatile(0);
+        }
+        free_table_page(root);
+    }
 }
 
 /// Translates a virtual address to physical using `root`.
@@ -258,4 +393,47 @@ unsafe fn entry_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
     // SAFETY: callers guarantee `table` is a mapped page table and `idx` is a
     // valid page-table index.
     unsafe { mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx) }
+}
+
+fn leaf_bits(flags: VmFlags) -> u64 {
+    let mut bits = PTE_PRESENT;
+    if flags.contains(VmFlags::WRITE) {
+        bits |= PTE_WRITE;
+    }
+    if flags.contains(VmFlags::USER) {
+        bits |= PTE_USER;
+    }
+    if flags.contains(VmFlags::GLOBAL) {
+        bits |= PTE_GLOBAL;
+    }
+    if flags.contains(VmFlags::DEVICE) {
+        bits |= PTE_PWT | PTE_PCD;
+    }
+    if !flags.contains(VmFlags::EXECUTE) {
+        bits |= PTE_NX;
+    }
+    bits
+}
+
+unsafe fn destroy_table(table: PhysAddr, level: usize) {
+    // SAFETY: the caller owns the inactive user hierarchy.
+    unsafe {
+        for index in 0..512 {
+            let entry = entry_ptr(table, index).read_volatile();
+            if entry & PTE_PRESENT == 0 {
+                continue;
+            }
+            if level > 1 && entry & PTE_HUGE == 0 {
+                destroy_table(PhysAddr::new(entry & ENTRY_ADDR_MASK), level - 1);
+            }
+            entry_ptr(table, index).write_volatile(0);
+        }
+        free_table_page(table);
+    }
+}
+
+unsafe fn free_table_page(table: PhysAddr) {
+    let page = phys::phys_to_page(table).expect("x86/paging: table page missing PFN metadata");
+    // SAFETY: the inactive hierarchy no longer references this table.
+    unsafe { phys::free_page(page) };
 }
