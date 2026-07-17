@@ -55,9 +55,10 @@ use core::{mem::size_of, ptr};
 use bitflags::bitflags;
 use log::{info, warn};
 use raw_cpuid::CpuId;
-use spin::Once;
 use x86_64::registers::control::*;
 use x86_64::registers::model_specific::{Efer, EferFlags};
+
+use crate::sys::sync::Once;
 
 core::arch::global_asm!(include_str!("trap.S"), options(att_syntax));
 

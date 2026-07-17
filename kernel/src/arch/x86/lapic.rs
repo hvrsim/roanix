@@ -9,12 +9,12 @@ use core::ptr::{read_volatile, write_volatile};
 
 use log::info;
 use raw_cpuid::CpuId;
-use spin::Once;
 use x86_64::registers::model_specific::Msr;
 
 use crate::{
     arch,
     mem::{self, PhysAddr, VirtAddr, VmFlags},
+    sys::sync::Once,
 };
 
 /// Timer interrupt vector used by the local APIC.

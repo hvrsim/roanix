@@ -20,13 +20,13 @@ use core::{
 };
 
 use intrusive_collections::LinkedList;
-use spin::Once;
 
 use crate::{
     arch,
     sys::{
         clock,
         smp::{self, IrqSpinLock},
+        sync::Once,
         thread::{
             ExitedThreadAdapter, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState,
             WakeResult, allocate_thread, free_thread, idle_task,

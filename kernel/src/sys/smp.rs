@@ -19,20 +19,23 @@
 //!
 
 use alloc::{boxed::Box, vec::Vec};
-use core::hint::spin_loop;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    hint::spin_loop,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use limine::{mp, request::MpRequest};
 use log::info;
-use spin::{Mutex, MutexGuard, Once};
 
 #[cfg(target_arch = "x86_64")]
 use limine::mp::RequestFlags;
 
 use crate::{
     arch,
-    sys::{clock::PerCpuClock, sched::PerCpuScheduler},
+    sys::{clock::PerCpuClock, sched::PerCpuScheduler, sync::Once},
 };
 
 #[used]
@@ -148,6 +151,7 @@ struct SmpState {
 }
 
 const IPI_QUEUE_CAPACITY: usize = 32;
+const IRQ_SPIN_BACKOFF_MAX: u32 = 64;
 
 struct IpiJob {
     callback: fn(),
@@ -305,62 +309,90 @@ fn smp_state() -> &'static SmpState {
     SMP_STATE.get().expect("smp: init required before use")
 }
 
-/// `spin::Mutex` wrapper that masks interrupts while holding the lock.
+/// Compact spinlock that masks local interrupts while held.
 ///
 /// Unlike [`crate::sys::sync::Mutex`], this lock is valid in interrupt
 /// context. It is the kernel's primitive for data that must be reachable from
 /// trap handlers while still preventing local IRQ re-entry deadlocks.
-pub struct IrqSpinLock<T> {
-    inner: Mutex<T>,
+///
+/// Contended CPUs use test-and-test-and-set with bounded exponential backoff,
+/// reducing cache-line writes while preserving a one-byte lock state for the
+/// many fine-grained instances embedded in kernel objects.
+pub struct IrqSpinLock<T: ?Sized> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
 }
 
 /// Guard for [`IrqSpinLock`].
-pub struct IrqSpinLockGuard<'a, T> {
-    guard: Option<MutexGuard<'a, T>>,
-    irq_enabled: bool,
+#[must_use = "if unused the spinlock will immediately unlock"]
+pub struct IrqSpinLockGuard<'a, T: ?Sized> {
+    lock: &'a IrqSpinLock<T>,
+    restore_irqs: bool,
+    held: bool,
+    _nosend: PhantomData<*mut ()>,
 }
 
 impl<T> IrqSpinLock<T> {
     /// Creates an IRQ-safe mutex with initial payload `value`.
     pub const fn new(value: T) -> Self {
         Self {
-            inner: Mutex::new(value),
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
         }
     }
+}
 
+// SAFETY: ownership of the protected value can move with the lock.
+unsafe impl<T: ?Sized + Send> Send for IrqSpinLock<T> {}
+// SAFETY: shared access to the value is serialized by the atomic lock state.
+unsafe impl<T: ?Sized + Send> Sync for IrqSpinLock<T> {}
+
+impl<T: ?Sized> IrqSpinLock<T> {
     /// Locks the mutex while interrupts are masked.
+    #[inline]
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
-        let irq_enabled = arch::irqstate();
+        let restore_irqs = arch::irqstate();
         arch::irqset(false);
+        self.acquire();
 
         IrqSpinLockGuard {
-            guard: Some(self.inner.lock()),
-            irq_enabled,
+            lock: self,
+            restore_irqs,
+            held: true,
+            _nosend: PhantomData,
         }
     }
 
     /// Attempts to lock the mutex while interrupts are masked.
+    #[inline]
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
-        let irq_enabled = arch::irqstate();
+        let restore_irqs = arch::irqstate();
         arch::irqset(false);
 
-        let guard = self.inner.try_lock();
-        if guard.is_none() && irq_enabled {
-            arch::irqset(true);
+        if self.try_acquire() {
+            return Some(IrqSpinLockGuard {
+                lock: self,
+                restore_irqs,
+                held: true,
+                _nosend: PhantomData,
+            });
         }
 
-        guard.map(|guard| IrqSpinLockGuard {
-            guard: Some(guard),
-            irq_enabled,
-        })
+        if restore_irqs {
+            arch::irqset(true);
+        }
+        None
     }
 
-    /// Returns whether the underlying spin mutex is currently held.
+    /// Returns whether the spinlock is currently held.
+    ///
+    /// This is only a momentary observation and provides no synchronization.
+    #[inline]
     pub fn is_locked(&self) -> bool {
-        self.inner.is_locked()
+        self.locked.load(Ordering::Relaxed)
     }
 
-    /// Forcibly releases the underlying spin mutex without restoring the
+    /// Forcibly releases the spinlock without restoring the
     /// interrupted CPU's prior interrupt state.
     ///
     /// # Safety
@@ -368,39 +400,101 @@ impl<T> IrqSpinLock<T> {
     /// This is only sound in fatal recovery paths where the lock owner will
     /// never resume normal execution, such as global panic shutdown.
     pub unsafe fn force_unlock(&self) {
-        // SAFETY: upheld by this method's caller contract.
-        unsafe { self.inner.force_unlock() };
+        self.release();
+    }
+
+    #[inline]
+    fn try_acquire(&self) -> bool {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    fn acquire(&self) {
+        if !self.try_acquire() {
+            self.acquire_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn acquire_slow(&self) {
+        let mut backoff = 1u32;
+
+        loop {
+            while self.locked.load(Ordering::Relaxed) {
+                for _ in 0..backoff {
+                    spin_loop();
+                }
+                backoff = (backoff << 1).min(IRQ_SPIN_BACKOFF_MAX);
+            }
+
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    fn release(&self) {
+        self.locked.store(false, Ordering::Release);
     }
 }
 
-impl<T> Deref for IrqSpinLockGuard<'_, T> {
+impl<T: ?Sized> Deref for IrqSpinLockGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.guard.as_ref().unwrap()
+        // SAFETY: this guard owns the lock and only exposes shared access.
+        unsafe { &*self.lock.value.get() }
     }
 }
 
-impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
+impl<T: ?Sized> DerefMut for IrqSpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard.as_mut().unwrap()
+        // SAFETY: this unique guard owns the lock and serializes mutation.
+        unsafe { &mut *self.lock.value.get() }
     }
 }
 
-impl<T> IrqSpinLockGuard<'_, T> {
-    /// Releases the lock but keeps local IRQs masked for a following
-    /// sleep/reschedule handoff.
-    pub fn unlock_keep_irqs_disabled(&mut self) {
-        drop(self.guard.take());
-        self.irq_enabled = false;
+impl<T: ?Sized> IrqSpinLockGuard<'_, T> {
+    /// Returns whether local interrupts were enabled before this lock attempt.
+    #[inline]
+    pub fn irqs_were_enabled(&self) -> bool {
+        self.restore_irqs
+    }
+
+    /// Releases the lock while keeping local IRQs masked.
+    ///
+    /// The returned value reports whether the caller must eventually restore
+    /// interrupts. The guard is consumed so protected data cannot be accessed
+    /// after the raw lock has been released.
+    pub fn unlock_keep_irqs_disabled(mut self) -> bool {
+        self.release();
+        let restore_irqs = self.restore_irqs;
+        self.restore_irqs = false;
+        restore_irqs
+    }
+
+    #[inline]
+    fn release(&mut self) {
+        if self.held {
+            self.lock.release();
+            self.held = false;
+        }
     }
 }
 
-impl<T> Drop for IrqSpinLockGuard<'_, T> {
+impl<T: ?Sized> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        drop(self.guard.take());
+        self.release();
 
-        if self.irq_enabled {
+        if self.restore_irqs {
             arch::irqset(true);
         }
     }

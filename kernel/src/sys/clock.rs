@@ -9,13 +9,13 @@ use core::{hint::spin_loop, time::Duration};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::info;
-use spin::Once;
 
 use crate::{
     arch,
     sys::{
         event::Event,
         smp::{self, IrqSpinLock},
+        sync::Once,
     },
 };
 

@@ -4,9 +4,11 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use lz4_flex::block::{compress_into, decompress_into};
-use spin::Once;
 
-use crate::{mem::PAGE_SIZE, sys::sync::Mutex};
+use crate::{
+    mem::PAGE_SIZE,
+    sys::sync::{Mutex, Once},
+};
 
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 const MAX_COMPRESSED_PAGE_BYTES: usize = PAGE_BYTES + PAGE_BYTES / 255 + 16;

@@ -12,11 +12,13 @@ use core::{
     sync::atomic::{AtomicU16, AtomicU64, Ordering},
 };
 
-use spin::Once;
-
 use crate::{
     mem::{self, ObjectKind, PAGE_SIZE, PageAccount, VmObject},
-    sys::{clock, smp::IrqSpinLock, sync::Mutex},
+    sys::{
+        clock,
+        smp::IrqSpinLock,
+        sync::{Mutex, Once},
+    },
 };
 
 use super::{

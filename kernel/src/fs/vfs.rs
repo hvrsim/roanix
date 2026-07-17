@@ -6,9 +6,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::Once;
-
-use crate::sys::sync::Mutex;
+use crate::sys::sync::{Mutex, Once};
 
 use super::{
     error::{Error, Result},

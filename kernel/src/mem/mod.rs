@@ -18,11 +18,13 @@ use limine::{
     request::{HhdmRequest, MemoryMapRequest},
 };
 use log::info;
-use spin::Once;
 
 use crate::{
     arch,
-    sys::{clock, sched, smp, sync::Mutex},
+    sys::{
+        clock, sched, smp,
+        sync::{Mutex, Once},
+    },
 };
 
 pub mod addr;
