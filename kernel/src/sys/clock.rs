@@ -5,9 +5,7 @@
 //! sleep queues.
 //!
 
-use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::time::Duration;
+use core::{hint::spin_loop, time::Duration};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::info;
@@ -16,9 +14,8 @@ use spin::Once;
 use crate::{
     arch,
     sys::{
-        sched,
+        event::Event,
         smp::{self, IrqSpinLock},
-        thread::Thread,
     },
 };
 
@@ -77,21 +74,19 @@ struct Timer {
     link: RBTreeLink,
     deadline_ns: u64,
     order: u64,
-    thread: *mut Thread,
-    park_seq: u64,
-    fired: AtomicBool,
+    event: Event,
 }
 
 #[derive(Copy, Clone)]
 struct ExpiredTimer {
-    thread: *mut Thread,
-    park_seq: u64,
+    event: *const Event,
 }
 
 // SAFETY: timers are only linked/unlinked while protected by the local timer
-// lock for their owning CPU.
+// lock for their owning CPU, and the embedded event synchronizes its waiters.
 unsafe impl Send for Timer {}
-// SAFETY: shared access is read-only and coordinated by the local timer lock.
+// SAFETY: timer fields are immutable while linked except under the local clock
+// lock, and the embedded event provides its own synchronization.
 unsafe impl Sync for Timer {}
 
 intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });
@@ -113,14 +108,12 @@ struct LocalClockState {
 }
 
 impl Timer {
-    const fn new(thread: *mut Thread, deadline_ns: u64, park_seq: u64) -> Self {
+    const fn new(deadline_ns: u64) -> Self {
         Self {
             link: RBTreeLink::new(),
             deadline_ns,
             order: 0,
-            thread,
-            park_seq,
-            fired: AtomicBool::new(false),
+            event: Event::new(),
         }
     }
 }
@@ -156,31 +149,14 @@ impl LocalClockState {
         self.refresh_programmed_deadline()
     }
 
-    fn cancel_timer(&mut self, timer: *const Timer) -> (bool, Option<u64>) {
-        // SAFETY: callers pass the pinned timer associated with this local
-        // queue and hold the queue lock.
-        if unsafe { !(*timer).link.is_linked() } {
-            return (false, None);
-        }
-
-        // SAFETY: the linked timer belongs to this tree and the lock is held.
-        unsafe {
-            self.timers.cursor_mut_from_ptr(timer).remove();
-        }
-        self.refresh_timer_deadline();
-        (true, self.refresh_programmed_deadline())
-    }
-
     fn take_expired(&mut self, now_ns: u64) -> Option<ExpiredTimer> {
         let expired = self.expired_front(now_ns)?;
         // SAFETY: `expired_front` returned the currently linked front element
         // while this tree is exclusively borrowed.
         let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
             .expect("clock: timer tree lost armed timer");
-        timer.fired.store(true, Ordering::Release);
         Some(ExpiredTimer {
-            thread: timer.thread,
-            park_seq: timer.park_seq,
+            event: &timer.event,
         })
     }
 
@@ -322,7 +298,9 @@ pub fn handle_local_timer_interrupt() {
         let mut local = local_clock().lock();
         local.take_expired(now_ns)
     } {
-        let _ = sched::wake(expired.thread, expired.park_seq);
+        // SAFETY: the timer remains pinned on the sleeping thread's stack
+        // until this signal completes and allows that thread to return.
+        unsafe { &*expired.event }.signal();
     }
 
     let arm = {
@@ -359,18 +337,11 @@ fn sleep_ns(ns: u64) {
     // and programmed local deadline always match.
     arch::irqset(false);
 
-    let current = sched::current_thread();
-    let timer_cpu = arch::thiscpu().id;
-    // SAFETY: the scheduler guarantees the current-thread pointer remains live
-    // while that thread is executing.
-    let thread = unsafe { &*current };
-    thread.pin_migration();
-    let seq = thread.prepare_park();
     let now_ns = monotonic_ns();
-    let mut timer = core::pin::pin!(Timer::new(current, now_ns.saturating_add(ns), seq));
+    let mut timer = core::pin::pin!(Timer::new(now_ns.saturating_add(ns)));
 
     let arm = {
-        let mut local = clock_for_cpu(timer_cpu).lock();
+        let mut local = local_clock().lock();
         local.insert_timer(timer.as_mut().get_mut())
     };
 
@@ -378,24 +349,9 @@ fn sleep_ns(ns: u64) {
         apply_deadline(deadline, now_ns);
     }
 
-    sched::park_current(current, seq);
-    let now_ns = monotonic_ns();
-
-    if !timer.as_ref().get_ref().fired.load(Ordering::Acquire) {
-        let (removed, arm) = {
-            // The scheduler may resume this thread on a different CPU, but the
-            // timer remains linked in the source CPU's timer tree until it fires or
-            // gets canceled.
-            let mut local = clock_for_cpu(timer_cpu).lock();
-            local.cancel_timer(timer.as_ref().get_ref() as *const Timer)
-        };
-
-        if removed && let Some(deadline) = arm {
-            apply_deadline_for_cpu(timer_cpu, deadline, now_ns);
-        }
-    }
-
-    thread.unpin_migration();
+    // The persistent event signal handles expiry racing with entry into wait.
+    arch::irqset(true);
+    timer.as_ref().get_ref().event.wait();
 }
 
 fn bootstrap_clocks() {
@@ -442,24 +398,6 @@ fn apply_deadline(deadline_ns: u64, now_ns: u64) {
     let delay_ns = deadline_ns.saturating_sub(now_ns).clamp(min_ns, max_ns);
 
     timer.set_oneshot(delay_ns);
-}
-
-fn apply_deadline_for_cpu(cpu_id: usize, deadline_ns: u64, now_ns_hint: u64) {
-    let this_cpu = arch::thiscpu().id;
-    if this_cpu == cpu_id {
-        apply_deadline(deadline_ns, now_ns_hint);
-        return;
-    }
-
-    let _ = smp::send_ipi(reapply_local_deadline_ipi, smp::IpiTarget::Single(cpu_id));
-}
-
-fn reapply_local_deadline_ipi() {
-    let deadline_ns = {
-        let local = local_clock().lock();
-        local.armed_deadline_ns
-    };
-    apply_deadline(deadline_ns, monotonic_ns());
 }
 
 fn format_frequency(freq_hz: u64) -> (u64, u64, &'static str) {
