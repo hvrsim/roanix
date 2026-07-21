@@ -1,0 +1,717 @@
+diff --git a/meson.build b/meson.build
+index 9b7d774..2bc5079 100644
+--- a/meson.build
++++ b/meson.build
+@@ -258,6 +258,12 @@ elif host_machine.system() == 'managarm'
+ 	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
+ 	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
+ 	subdir('sysdeps/managarm')
++elif host_machine.system() == 'roanix'
++	rtld_include_dirs += include_directories('sysdeps/roanix/include')
++	libc_include_dirs += include_directories('sysdeps/roanix/include')
++	internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', true)
++	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
++	subdir('sysdeps/roanix')
+ elif host_machine.system() == 'ironclad'
+ 	rtld_include_dirs += include_directories('sysdeps/ironclad/include')
+ 	libc_include_dirs += include_directories('sysdeps/ironclad/include')
+diff --git a/sysdeps/roanix/generic/entry.cpp b/sysdeps/roanix/generic/entry.cpp
+new file mode 100644
+index 0000000..9e8955e
+--- /dev/null
++++ b/sysdeps/roanix/generic/entry.cpp
+@@ -0,0 +1,19 @@
++#include <stdint.h>
++#include <stdlib.h>
++#include <mlibc/elf/startup.h>
++
++extern "C" void __dlapi_enter(uintptr_t *);
++
++extern char **environ;
++
++extern "C" void __mlibc_entry(
++        uintptr_t *entry_stack,
++        int (*main_fn)(int argc, char *argv[], char *env[])) {
++    __dlapi_enter(entry_stack);
++    int result = main_fn(
++        mlibc::entry_stack.argc,
++        mlibc::entry_stack.argv,
++        environ
++    );
++    exit(result);
++}
+diff --git a/sysdeps/roanix/generic/sysdeps.cpp b/sysdeps/roanix/generic/sysdeps.cpp
+new file mode 100644
+index 0000000..9f79836
+--- /dev/null
++++ b/sysdeps/roanix/generic/sysdeps.cpp
+@@ -0,0 +1,198 @@
++#include <errno.h>
++#include <limits.h>
++#include <string.h>
++#include <sys/mman.h>
++
++#include <mlibc/all-sysdeps.hpp>
++#include <mlibc/tcb.hpp>
++#include <roanix/syscall.h>
++
++namespace {
++
++constexpr bool syscall_failed(long result) {
++    return result < 0 && result >= -4095;
++}
++
++int syscall_error(long result) {
++    return syscall_failed(result) ? static_cast<int>(-result) : 0;
++}
++
++long as_word(const void *pointer) {
++    return static_cast<long>(reinterpret_cast<uintptr_t>(pointer));
++}
++
++} // namespace
++
++namespace mlibc {
++
++void Sysdeps<LibcLog>::operator()(const char *message) {
++    ssize_t ignored;
++    sysdep<Write>(2, message, strlen(message), &ignored);
++}
++
++[[noreturn]] void Sysdeps<LibcPanic>::operator()() {
++    sysdep<LibcLog>("mlibc: unrecoverable error\n");
++    sysdep<Exit>(127);
++}
++
++[[noreturn]] void Sysdeps<Exit>::operator()(int status) {
++    roanix_syscall1(ROANIX_SYS_PROCESS_EXIT, status);
++    __builtin_unreachable();
++}
++
++int Sysdeps<TcbSet>::operator()(void *pointer) {
++    uintptr_t thread_pointer = reinterpret_cast<uintptr_t>(pointer);
++#if defined(__riscv) && __riscv_xlen == 64
++    thread_pointer += sizeof(Tcb);
++#endif
++    long result = roanix_syscall1(
++        ROANIX_SYS_THREAD_SET_POINTER,
++        static_cast<long>(thread_pointer)
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<FutexWait>::operator()(
++        int *pointer, int expected, const struct timespec *timeout) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FUTEX_WAIT,
++        as_word(pointer),
++        expected,
++        as_word(timeout)
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<FutexWake>::operator()(int *pointer, bool all) {
++    long result = roanix_syscall2(
++        ROANIX_SYS_FUTEX_WAKE,
++        as_word(pointer),
++        all ? INT_MAX : 1
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<AnonAllocate>::operator()(size_t size, void **pointer) {
++    return sysdep<VmMap>(
++        nullptr,
++        size,
++        PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS,
++        -1,
++        0,
++        pointer
++    );
++}
++
++int Sysdeps<AnonFree>::operator()(void *pointer, size_t size) {
++    return sysdep<VmUnmap>(pointer, size);
++}
++
++int Sysdeps<Open>::operator()(
++        const char *path, int flags, mode_t mode, int *fd) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_OPEN,
++        as_word(path),
++        flags,
++        mode
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Close>::operator()(int fd) {
++    return syscall_error(roanix_syscall1(ROANIX_SYS_FILE_CLOSE, fd));
++}
++
++int Sysdeps<Isatty>::operator()(int) {
++    return ENOTTY;
++}
++
++int Sysdeps<Read>::operator()(
++        int fd, void *buffer, size_t size, ssize_t *bytes_read) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_READ,
++        fd,
++        as_word(buffer),
++        size
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *bytes_read = result;
++    return error;
++}
++
++int Sysdeps<Write>::operator()(
++        int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_WRITE,
++        fd,
++        as_word(buffer),
++        size
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *bytes_written = result;
++    return error;
++}
++
++int Sysdeps<Seek>::operator()(
++        int fd, off_t offset, int whence, off_t *new_offset) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_SEEK,
++        fd,
++        offset,
++        whence
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *new_offset = result;
++    return error;
++}
++
++int Sysdeps<ClockGet>::operator()(
++        int clock, time_t *seconds, long *nanoseconds) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_CLOCK_GET,
++        clock,
++        as_word(seconds),
++        as_word(nanoseconds)
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<VmMap>::operator()(
++        void *hint,
++        size_t size,
++        int protection,
++        int flags,
++        int fd,
++        off_t offset,
++        void **window) {
++    long result = roanix_syscall6(
++        ROANIX_SYS_MEMORY_MAP,
++        as_word(hint),
++        size,
++        protection,
++        flags,
++        fd,
++        offset
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *window = reinterpret_cast<void *>(result);
++    return error;
++}
++
++int Sysdeps<VmUnmap>::operator()(void *pointer, size_t size) {
++    long result = roanix_syscall2(
++        ROANIX_SYS_MEMORY_UNMAP,
++        as_word(pointer),
++        size
++    );
++    return syscall_error(result);
++}
++
++} // namespace mlibc
+diff --git a/sysdeps/roanix/include/abi-bits b/sysdeps/roanix/include/abi-bits
+new file mode 120000
+index 0000000..375b4f1
+--- /dev/null
++++ b/sysdeps/roanix/include/abi-bits
+@@ -0,0 +1 @@
++../../../abis/linux
+\ No newline at end of file
+diff --git a/sysdeps/roanix/include/mlibc/sysdeps.hpp b/sysdeps/roanix/include/mlibc/sysdeps.hpp
+new file mode 100644
+index 0000000..96f01c7
+--- /dev/null
++++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <mlibc/sysdep-signatures.hpp>
++
++namespace mlibc {
++
++struct RoanixSysdepTags :
++    LibcLog,
++    LibcPanic,
++    Exit,
++    TcbSet,
++    FutexWait,
++    FutexWake,
++    AnonAllocate,
++    AnonFree,
++    Open,
++    Read,
++    Write,
++    Seek,
++    Close,
++    Isatty,
++    ClockGet,
++    VmMap,
++    VmUnmap
++{};
++
++template<typename Tag>
++using Sysdeps = SysdepOf<RoanixSysdepTags, Tag>;
++
++struct SysdepTraits {
++    static constexpr bool usesRtNetlink = false;
++};
++
++} // namespace mlibc
+diff --git a/sysdeps/roanix/include/roanix/syscall.h b/sysdeps/roanix/include/roanix/syscall.h
+new file mode 100644
+index 0000000..48048ef
+--- /dev/null
++++ b/sysdeps/roanix/include/roanix/syscall.h
+@@ -0,0 +1,147 @@
++#ifndef ROANIX_SYSCALL_H
++#define ROANIX_SYSCALL_H
++
++#include <stdint.h>
++
++enum roanix_syscall_number {
++    ROANIX_SYS_PROCESS_EXIT = 0,
++    ROANIX_SYS_THREAD_SET_POINTER,
++    ROANIX_SYS_FUTEX_WAIT,
++    ROANIX_SYS_FUTEX_WAKE,
++    ROANIX_SYS_FILE_OPEN,
++    ROANIX_SYS_FILE_CLOSE,
++    ROANIX_SYS_FILE_READ,
++    ROANIX_SYS_FILE_WRITE,
++    ROANIX_SYS_FILE_SEEK,
++    ROANIX_SYS_CLOCK_GET,
++    ROANIX_SYS_MEMORY_MAP,
++    ROANIX_SYS_MEMORY_UNMAP
++};
++
++typedef long roanix_syscall_word_t;
++
++#if defined(__x86_64__)
++
++static inline roanix_syscall_word_t roanix_syscall0(long number) {
++    register long result __asm__("rax") = number;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        :
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall1(long number, long a0) {
++    register long result __asm__("rax") = number;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall2(long number, long a0, long a1) {
++    register long result __asm__("rax") = number;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0), "S"(a1)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall3(
++        long number, long a0, long a1, long a2) {
++    register long result __asm__("rax") = number;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0), "S"(a1), "d"(a2)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall4(
++        long number, long a0, long a1, long a2, long a3) {
++    register long result __asm__("rax") = number;
++    register long arg3 __asm__("r10") = a3;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0), "S"(a1), "d"(a2), "r"(arg3)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall5(
++        long number, long a0, long a1, long a2, long a3, long a4) {
++    register long result __asm__("rax") = number;
++    register long arg3 __asm__("r10") = a3;
++    register long arg4 __asm__("r8") = a4;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0), "S"(a1), "d"(a2), "r"(arg3), "r"(arg4)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++static inline roanix_syscall_word_t roanix_syscall6(
++        long number, long a0, long a1, long a2, long a3, long a4, long a5) {
++    register long result __asm__("rax") = number;
++    register long arg3 __asm__("r10") = a3;
++    register long arg4 __asm__("r8") = a4;
++    register long arg5 __asm__("r9") = a5;
++    __asm__ volatile("syscall"
++        : "+a"(result)
++        : "D"(a0), "S"(a1), "d"(a2), "r"(arg3), "r"(arg4), "r"(arg5)
++        : "rcx", "r11", "memory");
++    return result;
++}
++
++#elif defined(__riscv) && __riscv_xlen == 64
++
++static inline roanix_syscall_word_t roanix_syscall6(
++        long number, long a0, long a1, long a2, long a3, long a4, long a5) {
++    register long x10 __asm__("a0") = a0;
++    register long x11 __asm__("a1") = a1;
++    register long x12 __asm__("a2") = a2;
++    register long x13 __asm__("a3") = a3;
++    register long x14 __asm__("a4") = a4;
++    register long x15 __asm__("a5") = a5;
++    register long x17 __asm__("a7") = number;
++    __asm__ volatile("ecall"
++        : "+r"(x10)
++        : "r"(x11), "r"(x12), "r"(x13), "r"(x14), "r"(x15), "r"(x17)
++        : "memory");
++    return x10;
++}
++
++static inline roanix_syscall_word_t roanix_syscall5(
++        long number, long a0, long a1, long a2, long a3, long a4) {
++    return roanix_syscall6(number, a0, a1, a2, a3, a4, 0);
++}
++
++static inline roanix_syscall_word_t roanix_syscall4(
++        long number, long a0, long a1, long a2, long a3) {
++    return roanix_syscall6(number, a0, a1, a2, a3, 0, 0);
++}
++
++static inline roanix_syscall_word_t roanix_syscall3(
++        long number, long a0, long a1, long a2) {
++    return roanix_syscall6(number, a0, a1, a2, 0, 0, 0);
++}
++
++static inline roanix_syscall_word_t roanix_syscall2(long number, long a0, long a1) {
++    return roanix_syscall6(number, a0, a1, 0, 0, 0, 0);
++}
++
++static inline roanix_syscall_word_t roanix_syscall1(long number, long a0) {
++    return roanix_syscall6(number, a0, 0, 0, 0, 0, 0);
++}
++
++static inline roanix_syscall_word_t roanix_syscall0(long number) {
++    return roanix_syscall6(number, 0, 0, 0, 0, 0, 0);
++}
++
++#else
++#error "Roanix supports only x86_64 and riscv64"
++#endif
++
++#endif
+diff --git a/sysdeps/roanix/meson.build b/sysdeps/roanix/meson.build
+new file mode 100644
+index 0000000..b3a9c7e
+--- /dev/null
++++ b/sysdeps/roanix/meson.build
+@@ -0,0 +1,128 @@
++sysdep_supported_options = {
++    'posix': true,
++    'glibc': true,
++}
++
++rtld_sources += files(
++    'generic/sysdeps.cpp',
++)
++
++libc_sources += files(
++    'generic/entry.cpp',
++    'generic/sysdeps.cpp',
++)
++
++if not no_headers
++    install_headers(
++        'include/abi-bits/access.h',
++        'include/abi-bits/aio.h',
++        'include/abi-bits/auxv.h',
++        'include/abi-bits/blkcnt_t.h',
++        'include/abi-bits/blksize_t.h',
++        'include/abi-bits/clockid_t.h',
++        'include/abi-bits/dev_t.h',
++        'include/abi-bits/epoll.h',
++        'include/abi-bits/errno.h',
++        'include/abi-bits/fcntl.h',
++        'include/abi-bits/fd_set.h',
++        'include/abi-bits/fsblkcnt_t.h',
++        'include/abi-bits/fsfilcnt_t.h',
++        'include/abi-bits/gid_t.h',
++        'include/abi-bits/in.h',
++        'include/abi-bits/ino_t.h',
++        'include/abi-bits/inotify.h',
++        'include/abi-bits/ioctls.h',
++        'include/abi-bits/ipc.h',
++        'include/abi-bits/limits.h',
++        'include/abi-bits/mode_t.h',
++        'include/abi-bits/mqueue.h',
++        'include/abi-bits/msg.h',
++        'include/abi-bits/nlink_t.h',
++        'include/abi-bits/packet.h',
++        'include/abi-bits/pid_t.h',
++        'include/abi-bits/poll.h',
++        'include/abi-bits/ptrace.h',
++        'include/abi-bits/random.h',
++        'include/abi-bits/reboot.h',
++        'include/abi-bits/resource.h',
++        'include/abi-bits/riscv-hwprobe.h',
++        'include/abi-bits/rlim_t.h',
++        'include/abi-bits/route.h',
++        'include/abi-bits/sa_family_t.h',
++        'include/abi-bits/seek-whence.h',
++        'include/abi-bits/sem.h',
++        'include/abi-bits/shm.h',
++        'include/abi-bits/sig-limits.h',
++        'include/abi-bits/sigevent.h',
++        'include/abi-bits/signal.h',
++        'include/abi-bits/sigset_t.h',
++        'include/abi-bits/sigval.h',
++        'include/abi-bits/sockaddr_storage.h',
++        'include/abi-bits/socket.h',
++        'include/abi-bits/socklen_t.h',
++        'include/abi-bits/stat.h',
++        'include/abi-bits/statfs.h',
++        'include/abi-bits/statvfs.h',
++        'include/abi-bits/statx.h',
++        'include/abi-bits/suseconds_t.h',
++        'include/abi-bits/termios.h',
++        'include/abi-bits/time.h',
++        'include/abi-bits/uid_t.h',
++        'include/abi-bits/utmp-defines.h',
++        'include/abi-bits/utmpx.h',
++        'include/abi-bits/utsname.h',
++        'include/abi-bits/vm-flags.h',
++        'include/abi-bits/vt.h',
++        'include/abi-bits/wait.h',
++        'include/abi-bits/xattr.h',
++        subdir: 'abi-bits',
++        follow_symlinks: true,
++    )
++
++    install_headers(
++        'include/roanix/syscall.h',
++        subdir: 'roanix',
++    )
++endif
++
++if not headers_only
++    crt = custom_target(
++        'crt1',
++        build_by_default: true,
++        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
++        input: host_machine.cpu_family() / 'crt-src/crt1.S',
++        output: 'crt1.o',
++        install: true,
++        install_dir: get_option('libdir'),
++    )
++
++    crt_pie = custom_target(
++        'Scrt1',
++        build_by_default: true,
++        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
++        input: host_machine.cpu_family() / 'crt-src/Scrt1.S',
++        output: 'Scrt1.o',
++        install: true,
++        install_dir: get_option('libdir'),
++    )
++
++    custom_target(
++        'crti',
++        build_by_default: true,
++        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
++        input: host_machine.cpu_family() / 'crt-src/crti.S',
++        output: 'crti.o',
++        install: true,
++        install_dir: get_option('libdir'),
++    )
++
++    custom_target(
++        'crtn',
++        build_by_default: true,
++        command: c_compiler.cmd_array() + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
++        input: host_machine.cpu_family() / 'crt-src/crtn.S',
++        output: 'crtn.o',
++        install: true,
++        install_dir: get_option('libdir'),
++    )
++endif
+diff --git a/sysdeps/roanix/riscv64/crt-src/Scrt1.S b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
+new file mode 100644
+index 0000000..4e61d62
+--- /dev/null
++++ b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
+@@ -0,0 +1,17 @@
++.weak __global_pointer$
++.hidden __global_pointer$
++
++.section .text
++.global _start
++_start:
++    .option push
++    .option norelax
++    lla gp, __global_pointer$
++    .option pop
++
++    mv a0, sp
++    la a1, main
++    call __mlibc_entry@plt
++    unimp
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/riscv64/crt-src/crt1.S b/sysdeps/roanix/riscv64/crt-src/crt1.S
+new file mode 100644
+index 0000000..d7ccfd4
+--- /dev/null
++++ b/sysdeps/roanix/riscv64/crt-src/crt1.S
+@@ -0,0 +1,17 @@
++.weak __global_pointer$
++.hidden __global_pointer$
++
++.section .text
++.global _start
++_start:
++    .option push
++    .option norelax
++    lla gp, __global_pointer$
++    .option pop
++
++    mv a0, sp
++    la a1, main
++    call __mlibc_entry
++    unimp
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/riscv64/crt-src/crti.S b/sysdeps/roanix/riscv64/crt-src/crti.S
+new file mode 100644
+index 0000000..1baada4
+--- /dev/null
++++ b/sysdeps/roanix/riscv64/crt-src/crti.S
+@@ -0,0 +1,11 @@
++.section .init
++.global _init
++_init:
++    nop
++
++.section .fini
++.global _fini
++_fini:
++    nop
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/riscv64/crt-src/crtn.S b/sysdeps/roanix/riscv64/crt-src/crtn.S
+new file mode 100644
+index 0000000..76a4b87
+--- /dev/null
++++ b/sysdeps/roanix/riscv64/crt-src/crtn.S
+@@ -0,0 +1,7 @@
++.section .init
++    nop
++
++.section .fini
++    nop
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/x86_64/crt-src/Scrt1.S b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
+new file mode 100644
+index 0000000..2715c9b
+--- /dev/null
++++ b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
+@@ -0,0 +1,8 @@
++.section .text
++.global _start
++_start:
++    mov %rsp, %rdi
++    lea main(%rip), %rsi
++    call __mlibc_entry
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/x86_64/crt-src/crt1.S b/sysdeps/roanix/x86_64/crt-src/crt1.S
+new file mode 100644
+index 0000000..e39014c
+--- /dev/null
++++ b/sysdeps/roanix/x86_64/crt-src/crt1.S
+@@ -0,0 +1,8 @@
++.section .text
++.global _start
++_start:
++    mov %rsp, %rdi
++    mov $main, %rsi
++    call __mlibc_entry
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/x86_64/crt-src/crti.S b/sysdeps/roanix/x86_64/crt-src/crti.S
+new file mode 100644
+index 0000000..6fd3c22
+--- /dev/null
++++ b/sysdeps/roanix/x86_64/crt-src/crti.S
+@@ -0,0 +1,11 @@
++.section .init
++.global _init
++_init:
++    push %rax
++
++.section .fini
++.global _fini
++_fini:
++    push %rax
++
++.section .note.GNU-stack,"",%progbits
+diff --git a/sysdeps/roanix/x86_64/crt-src/crtn.S b/sysdeps/roanix/x86_64/crt-src/crtn.S
+new file mode 100644
+index 0000000..89d1536
+--- /dev/null
++++ b/sysdeps/roanix/x86_64/crt-src/crtn.S
+@@ -0,0 +1,9 @@
++.section .init
++    pop %rax
++    ret
++
++.section .fini
++    pop %rax
++    ret
++
++.section .note.GNU-stack,"",%progbits

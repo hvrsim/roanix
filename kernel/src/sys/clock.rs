@@ -160,6 +160,22 @@ impl LocalClockState {
         })
     }
 
+    fn remove_timer(&mut self, timer: &Timer) -> Option<u64> {
+        if !timer.link.is_linked() {
+            return None;
+        }
+        // SAFETY: the timer is linked in this exclusively borrowed tree and
+        // remains pinned for the duration of this operation.
+        unsafe {
+            self.timers
+                .cursor_mut_from_ptr(timer as *const Timer)
+                .remove()
+        }
+        .expect("clock: linked timer vanished");
+        self.refresh_timer_deadline();
+        self.refresh_programmed_deadline()
+    }
+
     fn finish_interrupt(&mut self, now_ns: u64) -> Option<u64> {
         self.refresh_timer_deadline();
         if self.next_scheduler_deadline_ns != 0 && self.next_scheduler_deadline_ns <= now_ns {
@@ -268,6 +284,44 @@ pub fn delay(duration: Duration) {
 /// Puts the current thread to sleep for at least the requested duration.
 pub fn sleep(duration: Duration) {
     sleep_ns(duration_to_ns(duration));
+}
+
+/// Waits until `event` is notified or `duration` expires.
+///
+/// Returns `true` when the event won and `false` on timeout.
+pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
+    let duration_ns = duration_to_ns(duration);
+    if duration_ns == 0 {
+        return event.is_signaled();
+    }
+
+    assert!(arch::irqstate() && !smp::in_interrupt_context());
+    arch::irqset(false);
+
+    let now_ns = monotonic_ns();
+    let mut timer = core::pin::pin!(Timer::new(now_ns.saturating_add(duration_ns)));
+    let arm = {
+        let mut local = local_clock().lock();
+        local.insert_timer(timer.as_mut().get_mut())
+    };
+    if let Some(deadline) = arm {
+        apply_deadline(deadline, now_ns);
+    }
+
+    arch::irqset(true);
+    let winner = Event::wait_any(&[event, &timer.as_ref().get_ref().event]);
+    if winner == 1 {
+        return false;
+    }
+
+    arch::irqset(false);
+    let now_ns = monotonic_ns();
+    let arm = local_clock().lock().remove_timer(timer.as_ref().get_ref());
+    if let Some(deadline) = arm {
+        apply_deadline(deadline, now_ns);
+    }
+    arch::irqset(true);
+    true
 }
 
 /// Returns monotonic nanoseconds derived from the active local counter.

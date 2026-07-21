@@ -5,6 +5,10 @@ iso_root
 store/
 kernel/roanix-*
 kernel/target/
+userland/.jinx-cache/
+userland/host-sources/
+userland/sources/
+__pycache__/
 
 # editor artifacts
 *.swp

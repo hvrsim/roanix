@@ -1,0 +1,43 @@
+#! /bin/sh
+
+version=5.3
+revision=9
+tarball_url="https://ftpmirror.gnu.org/gnu/bash/bash-${version}.tar.gz"
+tarball_sha512="426702c8b0fb9e0c9956259973ce5b657890fd47f4f807a64febf20077bb48d0b91474ed6e843d2ef277186b46c5fffa79b808da9b48d4ec027d5e2de1b28ed8"
+imagedeps="build-essential bison"
+hostdeps="bootstrap-gcc binutils"
+deps="base ncurses readline"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    bash_cv_func_sigsetjmp=missing \
+    bash_cv_must_reinstall_sighandlers=no \
+    ac_cv_func_mmap_fixed_mapped=yes \
+    ac_cv_func_setvbuf_reversed=no \
+    CC_FOR_BUILD=gcc \
+    CFLAGS_FOR_BUILD="-std=gnu17 -g" \
+    CFLAGS="${TARGET_CFLAGS} \
+        -DDEFAULT_PATH_VALUE='\"/usr/bin:/bin\"' \
+        -DSTANDARD_UTILS_PATH='\"/usr/bin:/bin\"'" \
+        autotools_configure \
+            --disable-nls \
+            --enable-readline \
+            --with-curses \
+            --with-installed-readline \
+            --without-bash-malloc
+}
+
+build() {
+    make -j"${parallelism}"
+}
+
+package() {
+    make install DESTDIR="${dest_dir}"
+
+    mkdir -p "${dest_dir}/bin"
+    ln -s ../usr/bin/bash "${dest_dir}/bin/bash"
+    ln -s bash "${dest_dir}/bin/sh"
+}

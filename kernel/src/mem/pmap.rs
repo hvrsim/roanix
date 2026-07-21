@@ -1,6 +1,7 @@
 //! Machine-independent pmap ownership and address-space integration.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::ptr;
 
 use crate::{
     arch,
@@ -9,7 +10,8 @@ use crate::{
 };
 
 use super::{
-    Error, FaultAccess, ObjectKind, Result, VmInheritance, VmMap, VmObject, VmPage, VmProtection,
+    Error, FaultAccess, ObjectKind, Result, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmInheritance,
+    VmMap, VmObject, VmPage, VmProtection,
 };
 
 struct Mapping {
@@ -337,6 +339,11 @@ impl VmSpace {
         &self.pmap
     }
 
+    /// Finds a free page-aligned user range using first fit.
+    pub fn find_space(&self, hint: VirtAddr, length: u64) -> Result<VirtAddr> {
+        self.map.lock().find_space(hint, length)
+    }
+
     /// Maps private anonymous zero-fill memory.
     pub fn map_anonymous(
         &self,
@@ -400,6 +407,56 @@ impl VmSpace {
         Ok(())
     }
 
+    /// Copies bytes from this address space into a kernel buffer.
+    pub fn read_user(&self, address: VirtAddr, output: &mut [u8]) -> Result<()> {
+        validate_user_range(address, output.len())?;
+        let mut copied = 0usize;
+        while copied < output.len() {
+            let current = address
+                .checked_add(copied as u64)
+                .ok_or(Error::InvalidAddress)?;
+            self.fault(current, FaultAccess::Read)?;
+            let physical = self.pmap.extract(current).ok_or(Error::NotMapped)?;
+            let count =
+                ((PAGE_SIZE - (current.as_u64() % PAGE_SIZE)) as usize).min(output.len() - copied);
+            let source = super::phys_to_virt(physical).as_ptr::<u8>();
+
+            // SAFETY: the fault above established a readable resident mapping,
+            // the HHDM aliases that physical range, and `count` stays within
+            // the current page and the live output slice.
+            unsafe {
+                ptr::copy_nonoverlapping(source, output.as_mut_ptr().add(copied), count);
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
+    /// Copies bytes from a kernel buffer into this address space.
+    pub fn write_user(&self, address: VirtAddr, input: &[u8]) -> Result<()> {
+        validate_user_range(address, input.len())?;
+        let mut copied = 0usize;
+        while copied < input.len() {
+            let current = address
+                .checked_add(copied as u64)
+                .ok_or(Error::InvalidAddress)?;
+            self.fault(current, FaultAccess::Write)?;
+            let physical = self.pmap.extract(current).ok_or(Error::NotMapped)?;
+            let count =
+                ((PAGE_SIZE - (current.as_u64() % PAGE_SIZE)) as usize).min(input.len() - copied);
+            let destination = super::phys_to_virt(physical).as_mut_ptr::<u8>();
+
+            // SAFETY: the write fault above established an exclusively
+            // writable resident page for this mapping. The HHDM aliases that
+            // physical range and `count` remains within both source and page.
+            unsafe {
+                ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, count);
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
     /// Forks the map with lazy anonymous-overlay COW.
     pub fn fork(&self) -> Result<Arc<Self>> {
         let mut map = self.map.lock();
@@ -416,6 +473,20 @@ impl VmSpace {
     pub fn anonymous_object() -> Arc<VmObject> {
         VmObject::new(ObjectKind::Anonymous)
     }
+}
+
+fn validate_user_range(address: VirtAddr, length: usize) -> Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let start = address.as_u64();
+    let end = start
+        .checked_add(length as u64)
+        .ok_or(Error::InvalidAddress)?;
+    if start < USER_ADDRESS_MIN || end > USER_ADDRESS_MAX || start >= end {
+        return Err(Error::InvalidAddress);
+    }
+    Ok(())
 }
 
 fn pmap_flags(protection: VmProtection) -> VmFlags {

@@ -17,6 +17,7 @@ use core::{
 use crate::{
     arch,
     mem::{PAGE_SIZE, VirtAddr, VmSpace},
+    proc::Process,
     sys::smp::IrqSpinLock,
 };
 use bitflags::bitflags;
@@ -169,8 +170,14 @@ pub(crate) struct Thread {
     /// Heap-allocated entry closure that runs when the thread starts.
     task: Option<Box<dyn KernelTask>>,
 
+    /// Process state shared by user threads.
+    process: Option<Arc<Process>>,
+
     /// User address space activated while this thread runs.
     address_space: IrqSpinLock<Option<Arc<VmSpace>>>,
+
+    /// Architecture user thread pointer or TLS base.
+    thread_pointer: AtomicU64,
 }
 
 // SAFETY: `Thread` instances are scheduler-owned, live for the lifetime of the
@@ -255,12 +262,27 @@ impl Thread {
         self.address_space.lock().clone()
     }
 
+    /// Returns the process associated with this thread.
+    pub(crate) fn process(&self) -> Option<Arc<Process>> {
+        self.process.clone()
+    }
+
     /// Replaces the thread's user address space and returns the previous one.
     pub(crate) fn replace_address_space(
         &self,
         space: Option<Arc<VmSpace>>,
     ) -> Option<Arc<VmSpace>> {
         core::mem::replace(&mut *self.address_space.lock(), space)
+    }
+
+    /// Returns the userspace thread pointer restored on resume.
+    pub(crate) fn thread_pointer(&self) -> u64 {
+        self.thread_pointer.load(Ordering::Acquire)
+    }
+
+    /// Changes the userspace thread pointer restored on resume.
+    pub(crate) fn set_thread_pointer(&self, pointer: u64) {
+        self.thread_pointer.store(pointer, Ordering::Release);
     }
 
     /// Prevents the scheduler from migrating this thread until the matching
@@ -425,6 +447,73 @@ pub(crate) fn allocate_thread<F, R>(
 where
     F: FnOnce() -> R + Send + 'static,
 {
+    let thread = allocate_thread_record(
+        id,
+        cpu,
+        now_ns,
+        class,
+        priority,
+        flags,
+        Some(Box::new(task)),
+        None,
+        None,
+    );
+    // SAFETY: `frame` points inside the exclusively owned stack allocation and
+    // is properly aligned for the architecture trap frame.
+    unsafe {
+        crate::arch::cpu::init_kernel_thread_frame(
+            thread.frame,
+            thread.stack_top.as_u64(),
+            thread_entry as *const () as usize,
+            thread as *mut Thread as usize,
+            0,
+        );
+    }
+    thread
+}
+
+/// Allocates a user thread with a prepared initial userspace frame.
+pub(crate) fn allocate_user_thread(
+    id: usize,
+    cpu: usize,
+    now_ns: u64,
+    priority: u8,
+    process: Arc<Process>,
+    entry: u64,
+    stack: u64,
+) -> &'static mut Thread {
+    let address_space = process.address_space();
+    let thread = allocate_thread_record(
+        id,
+        cpu,
+        now_ns,
+        ThreadClass::Timeshare,
+        priority,
+        ThreadFlags::empty(),
+        None,
+        Some(process),
+        Some(address_space),
+    );
+    // SAFETY: `frame` points inside the exclusively owned stack allocation and
+    // is properly aligned for the architecture trap frame.
+    unsafe {
+        crate::arch::cpu::init_user_thread_frame(thread.frame, entry, stack);
+    }
+    thread
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_thread_record(
+    id: usize,
+    cpu: usize,
+    now_ns: u64,
+    class: ThreadClass,
+    priority: u8,
+    flags: ThreadFlags,
+    task: Option<Box<dyn KernelTask>>,
+    process: Option<Arc<Process>>,
+    address_space: Option<Arc<VmSpace>>,
+) -> &'static mut Thread {
     let layout = Layout::new::<KernelStack>();
     // SAFETY: `layout` describes `KernelStack`; null is handled immediately.
     let stack_ptr = unsafe { alloc_zeroed(layout) } as *mut KernelStack;
@@ -484,20 +573,11 @@ where
         state_atomic: AtomicU8::new(state as u8),
         migration_pins: AtomicUsize::new(0),
         park_seq: AtomicU64::new(0),
-        task: Some(Box::new(task)),
-        address_space: IrqSpinLock::new(None),
+        task,
+        process,
+        address_space: IrqSpinLock::new(address_space),
+        thread_pointer: AtomicU64::new(0),
     }));
-    // SAFETY: `frame` points inside the exclusively owned stack allocation and
-    // is properly aligned for the architecture trap frame.
-    unsafe {
-        crate::arch::cpu::init_kernel_thread_frame(
-            frame,
-            stack_top.as_u64(),
-            thread_entry as *const () as usize,
-            thread as *mut Thread as usize,
-            0,
-        );
-    }
     thread
 }
 

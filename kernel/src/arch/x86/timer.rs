@@ -6,6 +6,7 @@
 
 use core::arch::asm;
 
+use log::warn;
 use raw_cpuid::{CpuId, CpuIdReader};
 use x86_64::instructions::port::{
     PortGeneric, PortReadOnly, PortWriteOnly, ReadOnlyAccess, WriteOnlyAccess,
@@ -89,7 +90,9 @@ pub fn init() {
         .get_advanced_power_mgmt_info()
         .map(|info| info.has_invariant_tsc())
         .unwrap_or(false);
-    assert!(invariant_tsc, "x86/timer: invariant TSC required");
+    if !invariant_tsc {
+        warn!("x86/timer: TSC is not invariant; clock stability is not guaranteed");
+    }
 
     let tsc_hz = calibrate_tsc(&cpuid);
     lapic::init(tsc_hz);

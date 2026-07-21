@@ -49,7 +49,12 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     // SAFETY: the debug subsystem only calls sinks with a live buffer for the
     // duration of the callback.
     let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
+    console_write(line);
+    console_write(b"\n");
+}
 
+/// Writes bytes directly to the architecture debug console.
+pub(crate) fn console_write(line: &[u8]) {
     let mut dbgcon_e9: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0xE9);
     let mut status: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(0x3FD);
     let mut com1: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
@@ -67,16 +72,6 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
             while status.read() & 0x20 == 0 {}
             com1.write(byte);
         }
-    }
-
-    // SAFETY: the same fixed debug/UART ports remain exclusively owned here.
-    unsafe {
-        dbgcon_e9.write(b'\n');
-
-        while status.read() & 0x20 == 0 {}
-        com1.write(b'\r');
-        while status.read() & 0x20 == 0 {}
-        com1.write(b'\n');
     }
 }
 
@@ -131,7 +126,10 @@ pub fn init_secondary_cpu(core_local: *const CoreLocal) {
 
 fn init_cpu(core_local: *const CoreLocal) {
     set_core_local(core_local);
-    let feats = cpu::enable_features();
+    let feats = cpu::enable_features(core_local);
+    // Loading the GDT refreshes the hidden GS base from its zero-base segment
+    // descriptor, so restore both SWAPGS slots afterwards.
+    set_core_local(core_local);
     // SAFETY: the current CPU is not shared until its local initialization
     // completes.
     unsafe { thiscpu_mut() }.platform.feats = feats;

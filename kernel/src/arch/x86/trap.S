@@ -12,13 +12,12 @@ rsyscall_entry:
     swapgs
     movq %rsp, %gs:8
     movq %gs:0, %rsp
-    sti
 
-    /* Create a fake trap frame header. */
-    pushq $0x38
-    pushq %gs:16
+    /* Create an iret-compatible user trap frame header. */
+    pushq $0x43
+    pushq %gs:8
     pushq %r11
-    pushq $0x40
+    pushq $0x3b
     pushq %rcx
     pushq $0
     pushq $0
@@ -40,6 +39,7 @@ rsyscall_entry:
     push %rbx
     push %rax
     cld
+    sti
 
     /* Trigger the syscall handler. */
     mov %rsp, %rdi
@@ -66,15 +66,17 @@ rsyscall_entry:
     pop %r15
     add $16, %rsp
 
-    /* Restore the remaining context and off we go! */
+    /* Restore the remaining context and return through the full user frame. */
     cli
-    mov %rsp, %gs:8
+    cmpq $0x3b, 8(%rsp)
+    jne 1f
     swapgs
-    sysretq
+1:
+    iretq
 
 rtrap_entry:
     /* Perform a swapgs (if we came from usermode). */
-    cmpq $0x3b, 16(%rsp)
+    cmpq $0x3b, 24(%rsp)
     jne 1f
     swapgs
 

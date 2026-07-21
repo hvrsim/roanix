@@ -107,11 +107,16 @@ rtrap_entry:
      *  disable interrupts and set the kernel thread-local
      *  info in sscratch if returning to umode
      */
+.prepare_return:
     csrci sstatus, 0x2
     ld a1, 272(sp)
     andi  a1, a1, 0x100
-    bnez  a1, .restore_context
+    bnez  a1, .return_to_kernel
     csrw sscratch, tp
+    j .restore_context
+
+.return_to_kernel:
+    csrw sscratch, zero
 
 .restore_context:
     /* restore the general purpose registers */
@@ -165,4 +170,4 @@ rtrap_entry:
 
 rthread_resume:
     mv sp, a0
-    j .restore_context
+    j .prepare_return

@@ -1,0 +1,27 @@
+#! /bin/sh
+
+version=0.1
+revision=1
+source_dir="init"
+hostdeps="bootstrap-gcc binutils"
+deps="base"
+
+configure() {
+    cp -a "${source_dir}"/. .
+}
+
+build() {
+    make \
+        CC="${OS_TRIPLET}-gcc" \
+        CFLAGS="${TARGET_CFLAGS}" \
+        LDFLAGS="${TARGET_LDFLAGS}" \
+        -j"${parallelism}"
+}
+
+package() {
+    install -Dm755 init "${dest_dir}/usr/bin/init"
+
+    mkdir -p "${dest_dir}/sbin"
+    ln -s usr/bin/init "${dest_dir}/init"
+    ln -s ../usr/bin/init "${dest_dir}/sbin/init"
+}

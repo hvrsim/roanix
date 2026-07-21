@@ -23,10 +23,8 @@
 //! Reference: *Intel SDM Volume 3A, Section 5.6*
 //!
 //! ## SMAP
-//! When SMAP is enabled, any attempt to access user-space memory while running in
-//! a privileged mode will lead to a page fault. If you are wondering how user IO
-//! is done with SMAP active, it isn't. SMAP is disabled while user IO is in progress,
-//! then enabled once again. State changes here happen through the AC bit in RFLAGS.
+//! SMAP remains disabled until every kernel user-memory access uses an explicit
+//! guarded copy path.
 //!
 //! Reference: *Intel SDM Volume 3A, Section 5.6*
 //!
@@ -55,35 +53,37 @@ use core::{mem::size_of, ptr};
 use bitflags::bitflags;
 use log::{info, warn};
 use raw_cpuid::CpuId;
+use x86_64::VirtAddr as X86VirtAddr;
 use x86_64::registers::control::*;
-use x86_64::registers::model_specific::{Efer, EferFlags};
+use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
+use x86_64::registers::rflags::RFlags;
 
-use crate::sys::sync::Once;
+use crate::sys::{smp::CoreLocal, sync::Once};
 
 core::arch::global_asm!(include_str!("trap.S"), options(att_syntax));
 
 unsafe extern "C" {
+    fn rsyscall_entry();
     fn vstub0();
     fn rthread_resume(frame: *const TrapFrame) -> !;
 }
 
-static KERNEL_GDT: Gdt = Gdt::new();
 // SAFETY: descriptor tables are initialized during per-CPU early boot before
 // concurrent Rust code starts executing on that CPU.
 static mut KERNEL_IDT: [Idt; 256] = [Idt::new(); 256];
 static BSP_STARTUP: Once<()> = Once::new();
+const TSS_SELECTOR: u16 = 9 * 8;
+const TSS_SIZE: usize = 104;
 
 bitflags! {
     /// Bitmap of supported x86 extensions.
     pub struct CpuFeatures: u32 {
         /// Supervisor-mode execution prevention.
         const SMEP = 0b0001;
-        /// Supervisor-mode access prevention.
-        const SMAP = 0b0010;
         /// Process-context identifiers.
-        const PCID = 0b0100;
+        const PCID = 0b0010;
         /// Control-flow enforcement shadow stacks.
-        const CET_SS = 0b1000;
+        const CET_SS = 0b0100;
     }
 }
 
@@ -98,9 +98,15 @@ struct Descriptor {
 
 /// Representation of the x86_64 Global Descriptor Table.
 #[repr(C, packed(1))]
-struct Gdt {
+pub(crate) struct Gdt {
     /// GDT entries as raw u64s.
-    entries: [u64; 9],
+    entries: [u64; 11],
+}
+
+/// Hardware task-state segment used for privilege-level stack switches.
+#[repr(C, align(16))]
+pub(crate) struct TaskStateSegment {
+    bytes: [u8; TSS_SIZE],
 }
 
 /// Representation of the x86_64 Interrupt Descriptor Table.
@@ -207,6 +213,46 @@ pub unsafe fn init_kernel_thread_frame(
     }
 }
 
+/// Initializes a trap frame for a brand-new user thread.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes, properly aligned for [`TrapFrame`], and
+/// point at memory reserved for the new thread's initial register state.
+pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64) {
+    // SAFETY: the caller guarantees that `frame` is valid and exclusively
+    // writable for a complete `TrapFrame`.
+    unsafe {
+        ptr::write(
+            frame,
+            TrapFrame {
+                rax: 0,
+                rbx: 0,
+                rcx: 0,
+                rdx: 0,
+                rsi: 0,
+                rdi: 0,
+                rbp: 0,
+                r8: 0,
+                r9: 0,
+                r10: 0,
+                r11: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+                vec: 0,
+                ec: 0,
+                ip,
+                cs: 0x3B,
+                rflags: (1 << 9) | (1 << 1),
+                sp: stack,
+                ss: 0x43,
+            },
+        );
+    }
+}
+
 /// Restores `frame` and enters the first scheduled kernel thread.
 ///
 /// # Safety
@@ -222,9 +268,12 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 ///
 /// # Safety
 ///
-/// `frame` must point to the current thread's saved trap frame. x86_64 does
-/// not currently need to mutate it before resume.
-pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame) {}
+/// `frame` must point to the current thread's saved trap frame.
+pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame, thread_pointer: u64) {
+    // SAFETY: the caller guarantees `frame` is valid for the selected thread.
+    let user = unsafe { (*frame).cs & 3 == 3 };
+    FsBase::write(X86VirtAddr::new(if user { thread_pointer } else { 0 }));
+}
 
 /// Returns the saved instruction pointer from a trap frame.
 pub fn trap_frame_ip(frame: &TrapFrame) -> u64 {
@@ -233,7 +282,7 @@ pub fn trap_frame_ip(frame: &TrapFrame) -> u64 {
 
 impl Gdt {
     /// Creates a new GDT structure.
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             entries: [
                 0x0000_0000_0000_0000,
@@ -243,10 +292,24 @@ impl Gdt {
                 0x00cf_9300_0000_ffff,
                 0x00af_9b00_0000_ffff,
                 0x00af_9300_0000_ffff,
-                0x00af_fa00_0000_ffff,
-                0x008f_f200_0000_ffff,
+                // Pre-set accessed bits because the GDT lives in read-only memory.
+                0x00af_fb00_0000_ffff,
+                0x008f_f300_0000_ffff,
+                0,
+                0,
             ],
         }
+    }
+
+    fn install_tss(&mut self, tss: &TaskStateSegment) {
+        let base = tss as *const TaskStateSegment as u64;
+        let limit = (TSS_SIZE - 1) as u64;
+        self.entries[9] = (limit & 0xffff)
+            | ((base & 0x00ff_ffff) << 16)
+            | (0x89 << 40)
+            | (((limit >> 16) & 0xf) << 48)
+            | (((base >> 24) & 0xff) << 56);
+        self.entries[10] = base >> 32;
     }
 
     /// Loads the GDT structure into the CPU registers.
@@ -286,6 +349,20 @@ impl Gdt {
     }
 }
 
+impl TaskStateSegment {
+    /// Creates an empty TSS with the I/O bitmap disabled.
+    pub(crate) const fn new() -> Self {
+        let mut bytes = [0; TSS_SIZE];
+        bytes[102] = TSS_SIZE as u8;
+        bytes[103] = (TSS_SIZE >> 8) as u8;
+        Self { bytes }
+    }
+
+    fn set_rsp0(&mut self, stack: u64) {
+        self.bytes[4..12].copy_from_slice(&stack.to_le_bytes());
+    }
+}
+
 impl Idt {
     /// Creates a new IDT entry.
     const fn new() -> Self {
@@ -315,7 +392,7 @@ impl Idt {
 }
 
 /// Checks for and enables the x86 CPU features required by the kernel.
-pub fn enable_features() -> CpuFeatures {
+pub fn enable_features(core_local: *const CoreLocal) -> CpuFeatures {
     let cpuid = CpuId::new();
     let mut cpufeats = CpuFeatures::empty();
 
@@ -326,7 +403,10 @@ pub fn enable_features() -> CpuFeatures {
         Efer::write(
             Efer::read() | EferFlags::SYSTEM_CALL_EXTENSIONS | EferFlags::NO_EXECUTE_ENABLE,
         );
+        Star::write_raw(0, 0x28);
     }
+    LStar::write(X86VirtAddr::new(rsyscall_entry as *const () as u64));
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG);
 
     // Set the groundwork for SIMD/FP instructions by disabling
     // emulation and activating CR0.MP. Also enable Write Protect
@@ -363,10 +443,6 @@ pub fn enable_features() -> CpuFeatures {
             warn!("cpu: SMEP not supported!");
         }
 
-        if !ext_feats.has_smap() {
-            warn!("cpu: SMAP not supported!");
-        }
-
         // SAFETY: BSP startup is serialized by `BSP_STARTUP`, so the static
         // IDT is initialized exactly once before it is loaded.
         unsafe { init_idt_entries() };
@@ -385,15 +461,10 @@ pub fn enable_features() -> CpuFeatures {
         bits |= Cr4Flags::FSGSBASE;
     }
 
-    // Enable SMEP/SMAP (if supported)
+    // Enable SMEP while leaving SMAP disabled.
     if ext_feats.has_smep() {
         bits |= Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION;
         cpufeats |= CpuFeatures::SMEP;
-    }
-
-    if ext_feats.has_smap() {
-        bits |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;
-        cpufeats |= CpuFeatures::SMAP;
     }
 
     // Only activate PCIDs if the `invpcid` instruction is supported.
@@ -418,14 +489,22 @@ pub fn enable_features() -> CpuFeatures {
     unsafe {
         Cr4::write(Cr4::read() | bits);
     }
-    // SAFETY: both descriptor tables are fully initialized and remain static
-    // for the lifetime of the kernel.
+    // SAFETY: this CPU exclusively owns its core-local GDT and TSS during
+    // bring-up, and the shared IDT has completed one-time initialization.
     unsafe {
-        KERNEL_GDT.load();
-        load_idt();
+        load_descriptor_tables(core_local.cast_mut());
     }
 
     cpufeats
+}
+
+/// Updates the ring-0 exception stack for the current CPU.
+pub fn set_kernel_stack(stack: u64) {
+    // SAFETY: scheduler activation runs locally with interrupts disabled.
+    unsafe { crate::arch::thiscpu_mut() }
+        .platform
+        .tss
+        .set_rsp0(stack);
 }
 
 /// Kernel trap handler.
@@ -586,7 +665,17 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
 /// Kernel syscall handler.
 #[unsafe(no_mangle)]
 extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
-    panic!("SYSCALL triggered at IP=0x{:X}", frame.ip);
+    frame.rax = crate::sys::syscall::dispatch(
+        frame.rax,
+        [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ],
+    ) as u64;
+    // SAFETY: `frame` is the current thread's live syscall frame.
+    unsafe {
+        prepare_thread_frame(frame, crate::proc::current_thread_pointer());
+    }
+    crate::sys::sched::trap_return(frame)
 }
 
 unsafe fn init_idt_entries() {
@@ -596,6 +685,24 @@ unsafe fn init_idt_entries() {
         // SAFETY: `idt` points to the 256-element static IDT and each index is
         // initialized exactly once during single-threaded CPU setup.
         unsafe { idt.add(idx).write(Idt::from_address(addr as u64, 0)) };
+    }
+}
+
+unsafe fn load_descriptor_tables(core_local: *mut CoreLocal) {
+    // SAFETY: the caller provides this CPU's exclusively owned stable
+    // core-local allocation during bring-up.
+    let platform = unsafe { &mut (*core_local).platform };
+    platform.gdt.install_tss(&platform.tss);
+    // SAFETY: the GDT and TSS remain embedded in the permanent core-local
+    // allocation, and the IDT is a permanent kernel table.
+    unsafe {
+        platform.gdt.load();
+        core::arch::asm!(
+            "ltr ax",
+            in("ax") TSS_SELECTOR,
+            options(nostack, preserves_flags)
+        );
+        load_idt();
     }
 }
 

@@ -8,7 +8,7 @@ This chapter serves as a quick guide on how to Roanix from source and run it in 
 
 Due to the use of `rust-toolchain.toml` for selecting rust toolchains, an installation of `rustup` is required. For instructions on how to install rustup, see [here](https://rustup.rs/).
 
-Packages such as `xorriso`, `mtools` and `sgdisk` are also required for disk image creation. Additionally, `python3` is required to run xtool, and QEMU is preferred for testing Roanix. Commands to install these packages have been provided below for multiple linux distros.
+Packages such as `xorriso`, `mtools` and `sgdisk` are also required for disk image creation. Additionally, `python3` is required to run xtool, and QEMU is preferred for testing Roanix. Building the userspace sysroot requires the Jinx host dependencies: Bash, awk, findutils, Git, GNU Make, grep, gzip, sed, tar, zstd, coreutils, procps, and util-linux. Jinx normally uses wget; xtool also supports curl as a fallback. Commands to install the core packages have been provided below for multiple Linux distros.
 
 **Ubuntu:**
 
@@ -60,12 +60,26 @@ $ python3 x.py gen-iso
 # Build kernel only
 $ python3 x.py build
 
+# Build mlibc, ncurses, readline, Bash, init, and os-test, then install them into
+# store/sysroots/<architecture>.
+$ python3 x.py --arch x86_64 sysroot
+
+# Pack that sysroot as store/initramfs/roanix-<architecture>.tar.gz.
+$ python3 x.py --arch x86_64 initramfs
+
 # Clean up build directories
 $ python3 x.py clean
 
 # Clean up build directories and cached files.
 $ python3 x.py distclean
 ```
+
+The userspace sysroot is dynamically linked with `/usr/lib/ld.so`. Its mlibc
+port uses the minimal Roanix syscall ABI needed by the loader and a hello-world
+program; the kernel imports the initramfs and starts `/sbin/init` through that
+ABI.
+When an architecture's sysroot already exists, `gen-hdd` and `gen-iso`
+automatically repack it and attach it as the Limine initramfs module.
 
 ## Running Roanix
 

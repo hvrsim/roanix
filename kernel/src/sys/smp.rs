@@ -61,6 +61,12 @@ pub struct PlatformFields {
     /// Calibrated local APIC timer frequency in Hz, or `0` when unused.
     #[cfg(target_arch = "x86_64")]
     pub lapic_timer_hz: u64,
+    /// Per-CPU global descriptor table.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) gdt: arch::cpu::Gdt,
+    /// Per-CPU task-state segment.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) tss: arch::cpu::TaskStateSegment,
 }
 
 /// Kernel context unique to each CPU core.
@@ -107,6 +113,10 @@ impl PlatformFields {
             tsc_hz: 0,
             #[cfg(target_arch = "x86_64")]
             lapic_timer_hz: 0,
+            #[cfg(target_arch = "x86_64")]
+            gdt: arch::cpu::Gdt::new(),
+            #[cfg(target_arch = "x86_64")]
+            tss: arch::cpu::TaskStateSegment::new(),
         }
     }
 }

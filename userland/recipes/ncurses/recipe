@@ -1,0 +1,54 @@
+#! /bin/sh
+
+version=6.6
+revision=10
+tarball_url="https://github.com/ThomasDickey/ncurses-snapshots/archive/refs/tags/v6_6.tar.gz"
+tarball_blake2b="736b7b46f5f9e16f983ba7d0e5073c84c22db23984eeaf90905ad952c6720726832606c2c39cf64ed6ddbd3744979f245f1ed797c11f1e48e2218077eec96f11"
+imagedeps="build-essential"
+hostdeps="bootstrap-gcc binutils"
+deps="base"
+
+prepare() {
+    autotools_recursive_regen no-autoreconf
+}
+
+configure() {
+    CC_FOR_BUILD=gcc \
+    cf_cv_func_nanosleep=yes \
+    cf_cv_working_poll=yes \
+    CC="${OS_TRIPLET}-gcc" \
+    CXX="${OS_TRIPLET}-g++" \
+    AR="${OS_TRIPLET}-ar" \
+    RANLIB="${OS_TRIPLET}-ranlib" \
+    CFLAGS="${TARGET_CFLAGS}" \
+    CXXFLAGS="${TARGET_CXXFLAGS}" \
+    CPPFLAGS="${TARGET_CPPFLAGS}" \
+    LDFLAGS="${TARGET_LDFLAGS}" \
+        "${source_dir}"/configure \
+            --host="${OS_TRIPLET}" \
+            --prefix="${prefix}" \
+            --libdir="${prefix}/lib" \
+            --enable-widec \
+            --enable-pc-files \
+            --with-shared \
+            --with-termlib \
+            --without-ada \
+            --without-cxx-binding \
+            --without-debug \
+            --without-manpages \
+            --without-progs \
+            --without-normal \
+            --without-tests
+}
+
+build() {
+    make -j"${parallelism}" libs
+}
+
+package() {
+    make install.includes install.libs DESTDIR="${dest_dir}"
+
+    printf 'INPUT(-lncursesw)\n' >"${dest_dir}${prefix}/lib/libncurses.so"
+    printf 'INPUT(-lncursesw)\n' >"${dest_dir}${prefix}/lib/libcurses.so"
+    printf 'INPUT(-ltinfow)\n' >"${dest_dir}${prefix}/lib/libtinfo.so"
+}

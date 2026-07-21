@@ -6,6 +6,8 @@ Lightweight all-in-one script for developers working on Roanix.
 """
 
 import argparse
+import gzip
+import hashlib
 import os
 import shlex
 import shutil
@@ -23,11 +25,23 @@ from typing import List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parent
 KERNEL_DIR = ROOT / "kernel"
 STORE_DIR = ROOT / "store"
+USERLAND_DIR = ROOT / "userland"
 ISO_ROOT = ROOT / "iso_root"
 LIMINE_DIR = STORE_DIR / "limine"
 OVMF_DIR = STORE_DIR / "edk2-ovmf"
+JINX_DIR = STORE_DIR / "jinx"
+JINX_HOST_TOOLS_DIR = STORE_DIR / "jinx-host-tools"
+JINX_COMMIT = "287ceaf9a2c08b43dbc56d38d8b815fd990a2192"
+LIMINE_VERSION = "12.5.0"
+LIMINE_RELEASE_URL = (
+    "https://github.com/limine-bootloader/limine/releases/download/"
+    f"v{LIMINE_VERSION}/limine-binary.tar.gz"
+)
+LIMINE_RELEASE_SHA256 = "8bc0d0f2a2cd0e212f529c57d8a2033a25996dcdd9f58c916b7bf5594a0282eb"
 
 SUPPORTED_ARCHES = ("x86_64", "riscv64")
+USERLAND_PACKAGES = ("bash", "init", "os-test")
+USERLAND_BUILD_PACKAGES = ("mlibc-headers", "mlibc", *USERLAND_PACKAGES)
 OVMF_RELEASE_URL = (
     "https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/"
     "edk2-ovmf.tar.gz"
@@ -154,6 +168,14 @@ class Config:
     def image_hdd(self) -> Path:
         return ROOT / f"roanix-{self.arch}.hdd"
 
+    @property
+    def sysroot(self) -> Path:
+        return STORE_DIR / "sysroots" / self.arch
+
+    @property
+    def initramfs(self) -> Path:
+        return STORE_DIR / "initramfs" / f"roanix-{self.arch}.tar.gz"
+
 
 def default_rust_target(arch: str) -> str:
     if arch == "riscv64":
@@ -178,6 +200,13 @@ def kvm_available() -> bool:
         return False
 
     return stat.S_ISCHR(mode)
+
+
+def qemu_accel_overridden(cfg: Config) -> bool:
+    return any(
+        argument == "-accel" or argument.startswith("-accel=")
+        for argument in (*cfg.qemu_flags, *cfg.qemu_passthrough)
+    )
 
 
 def run(
@@ -258,6 +287,62 @@ def safe_extract_tar(archive: Path, destination: Path) -> None:
         tf.extractall(destination)
 
 
+def create_initramfs(cfg: Config) -> None:
+    if not cfg.sysroot.is_dir():
+        raise BuildError(
+            f"Userspace sysroot is missing for {cfg.arch}: {cfg.sysroot}"
+        )
+
+    cfg.ui.step(f"create gzipped initramfs ({cfg.arch})")
+    ensure_dir(cfg.initramfs.parent)
+    remove_path(cfg.initramfs)
+
+    def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.uid = 0
+        info.gid = 0
+        info.uname = "root"
+        info.gname = "root"
+        info.mtime = 0
+        return info
+
+    with cfg.initramfs.open("wb") as output:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=output, mtime=0
+        ) as compressed:
+            with tarfile.open(
+                fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
+            ) as archive:
+                for path in sorted(
+                    cfg.sysroot.rglob("*"),
+                    key=lambda item: item.relative_to(cfg.sysroot).as_posix(),
+                ):
+                    archive.add(
+                        path,
+                        arcname=path.relative_to(cfg.sysroot).as_posix(),
+                        recursive=False,
+                        filter=normalize,
+                    )
+
+
+def create_optional_initramfs(cfg: Config) -> bool:
+    if not cfg.sysroot.is_dir():
+        remove_path(cfg.initramfs)
+        return False
+
+    create_initramfs(cfg)
+    return True
+
+
+def limine_config_text(*, with_initramfs: bool) -> str:
+    config = (USERLAND_DIR / "distro-files/limine.conf").read_text(encoding="ascii")
+    if with_initramfs:
+        config += (
+            "    module_path: $boot():/boot/roanix-root.tar.gz\n"
+            "    module_string: initramfs\n"
+        )
+    return config
+
+
 def ensure_ovmf(cfg: Config) -> None:
     if OVMF_DIR.exists():
         return
@@ -282,25 +367,135 @@ def ensure_ovmf(cfg: Config) -> None:
         raise BuildError("OVMF archive did not produce 'store/edk2-ovmf'.")
 
 
+def limine_ready() -> bool:
+    version_file = LIMINE_DIR / ".roanix-version"
+    if not (LIMINE_DIR / "limine").exists() or not version_file.is_file():
+        return False
+    return version_file.read_text(encoding="ascii").strip() == LIMINE_VERSION
+
+
 def ensure_limine(cfg: Config) -> None:
-    limine_binary = LIMINE_DIR / "limine"
-    if limine_binary.exists():
+    if limine_ready():
         return
+
+    cfg.ui.step(f"fetch Limine {LIMINE_VERSION} binary release")
     ensure_dir(STORE_DIR)
-    remove_path(LIMINE_DIR)
+    extracted = STORE_DIR / "limine-binary"
+    remove_path(extracted)
+    with tempfile.NamedTemporaryFile(
+        prefix="limine-", suffix=".tar.gz", delete=False
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        with (
+            urllib.request.urlopen(LIMINE_RELEASE_URL) as response,
+            tmp_path.open("wb") as output,
+        ):
+            shutil.copyfileobj(response, output)
+        digest = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
+        if digest != LIMINE_RELEASE_SHA256:
+            raise BuildError(
+                f"Limine archive checksum mismatch: expected "
+                f"{LIMINE_RELEASE_SHA256}, got {digest}"
+            )
+        safe_extract_tar(tmp_path, STORE_DIR)
+        if not extracted.is_dir():
+            raise BuildError("Limine archive did not produce 'store/limine-binary'.")
+        remove_path(LIMINE_DIR)
+        extracted.rename(LIMINE_DIR)
+        (LIMINE_DIR / ".roanix-version").write_text(
+            LIMINE_VERSION + "\n", encoding="ascii"
+        )
+    except BuildError:
+        remove_path(extracted)
+        raise
+    except Exception as exc:
+        remove_path(extracted)
+        raise BuildError(f"Failed to download/extract Limine: {exc}") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    run(cfg, ["make", "-C", str(LIMINE_DIR)], step="build limine host tools")
+
+
+def ensure_jinx(cfg: Config) -> None:
+    jinx = JINX_DIR / "jinx"
+    if jinx.exists():
+        return
+
+    ensure_dir(JINX_DIR)
+    run(cfg, ["git", "init", str(JINX_DIR)], step="initialize Jinx checkout")
     run(
         cfg,
         [
             "git",
-            "clone",
-            "https://github.com/limine-bootloader/limine.git",
-            "--branch=v10.x-binary",
+            "-C",
+            str(JINX_DIR),
+            "fetch",
             "--depth=1",
-            str(LIMINE_DIR),
+            "https://github.com/Mintsuki/Jinx.git",
+            JINX_COMMIT,
         ],
-        step="clone limine bootloader",
+        step="fetch pinned Jinx revision",
     )
-    run(cfg, ["make", "-C", str(LIMINE_DIR)], step="build limine host tools")
+    run(
+        cfg,
+        ["git", "-C", str(JINX_DIR), "checkout", "--detach", "FETCH_HEAD"],
+        step="check out Jinx build system",
+    )
+
+
+def jinx_env() -> Mapping[str, str]:
+    path = os.environ.get("PATH", "")
+    if shutil.which("wget") is not None:
+        return {"PATH": path}
+
+    curl = shutil.which("curl")
+    if curl is None:
+        raise BuildError("Jinx requires wget, or curl for the built-in wget fallback.")
+
+    ensure_dir(JINX_HOST_TOOLS_DIR)
+    wget = JINX_HOST_TOOLS_DIR / "wget"
+    wget.write_text(
+        "#!/bin/sh\n"
+        'output=""\n'
+        'user_agent=""\n'
+        'insecure=""\n'
+        'url=""\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '    case "$1" in\n'
+        '        -O) output="$2"; shift 2 ;;\n'
+        '        -qO-) output="-"; shift ;;\n'
+        '        -U) user_agent="$2"; shift 2 ;;\n'
+        '        -nv|-q) shift ;;\n'
+        '        --no-check-certificate) insecure="-k"; shift ;;\n'
+        '        --ca-certificate=*) ca_file="${1#*=}"; shift ;;\n'
+        '        --certificate=*) certificate="${1#*=}"; shift ;;\n'
+        '        --private-key=*) private_key="${1#*=}"; shift ;;\n'
+        '        --) shift; break ;;\n'
+        '        -*) echo "unsupported wget option: $1" >&2; exit 2 ;;\n'
+        '        *) url="$1"; shift ;;\n'
+        "    esac\n"
+        "done\n"
+        'if [ -z "$url" ]; then\n'
+        '    echo "wget fallback requires a URL" >&2\n'
+        "    exit 2\n"
+        "fi\n"
+        f"set -- {shlex.quote(curl)} -fL\n"
+        '[ -n "$output" ] && set -- "$@" -o "$output"\n'
+        '[ -n "$user_agent" ] && set -- "$@" -A "$user_agent"\n'
+        '[ -n "$insecure" ] && set -- "$@" "$insecure"\n'
+        '[ -n "${ca_file-}" ] && set -- "$@" --cacert "$ca_file"\n'
+        '[ -n "${certificate-}" ] && set -- "$@" --cert "$certificate"\n'
+        '[ -n "${private_key-}" ] && set -- "$@" --key "$private_key"\n'
+        'exec "$@" "$url"\n',
+        encoding="ascii",
+    )
+    wget.chmod(0o755)
+    combined_path = f"{JINX_HOST_TOOLS_DIR}:{path}" if path else str(
+        JINX_HOST_TOOLS_DIR
+    )
+    return {"PATH": combined_path}
 
 
 def build_kernel(cfg: Config) -> None:
@@ -329,6 +524,7 @@ def build_iso(cfg: Config) -> None:
     if not cfg.no_bootstrap:
         ensure_limine(cfg)
     build_kernel(cfg)
+    with_initramfs = create_optional_initramfs(cfg)
 
     remove_path(ISO_ROOT)
     ensure_dir(ISO_ROOT / "boot" / "limine")
@@ -336,9 +532,12 @@ def build_iso(cfg: Config) -> None:
     cfg.ui.step(f"copy boot files for ISO ({cfg.arch})")
 
     copy_file(cfg.kernel_artifact, ISO_ROOT / "boot" / "roanix")
+    if with_initramfs:
+        copy_file(cfg.initramfs, ISO_ROOT / "boot" / "roanix-root.tar.gz")
     copy_file(ROOT / "userland/distro-files/splash.jpg", ISO_ROOT / "boot/splash.jpg")
-    copy_file(
-        ROOT / "userland/distro-files/limine.conf", ISO_ROOT / "boot/limine/limine.conf"
+    (ISO_ROOT / "boot/limine/limine.conf").write_text(
+        limine_config_text(with_initramfs=with_initramfs),
+        encoding="ascii",
     )
 
     if cfg.arch == "x86_64":
@@ -428,6 +627,7 @@ def build_hdd(cfg: Config) -> None:
     if not cfg.no_bootstrap:
         ensure_limine(cfg)
     build_kernel(cfg)
+    with_initramfs = create_optional_initramfs(cfg)
 
     remove_path(cfg.image_hdd)
     with cfg.image_hdd.open("wb") as disk:
@@ -466,6 +666,17 @@ def build_hdd(cfg: Config) -> None:
     )
     cfg.ui.step(f"copy boot files into HDD image ({cfg.arch})")
     run(cfg, ["mcopy", "-i", mtools, str(cfg.kernel_artifact), "::/boot/roanix"])
+    if with_initramfs:
+        run(
+            cfg,
+            [
+                "mcopy",
+                "-i",
+                mtools,
+                str(cfg.initramfs),
+                "::/boot/roanix-root.tar.gz",
+            ],
+        )
     run(
         cfg,
         [
@@ -476,16 +687,21 @@ def build_hdd(cfg: Config) -> None:
             "::/boot/",
         ],
     )
-    run(
-        cfg,
-        [
-            "mcopy",
-            "-i",
-            mtools,
-            str(ROOT / "userland/distro-files/limine.conf"),
-            "::/boot/limine",
-        ],
-    )
+    with tempfile.NamedTemporaryFile(
+        prefix="roanix-limine-", suffix=".conf", mode="w", encoding="ascii"
+    ) as config_file:
+        config_file.write(limine_config_text(with_initramfs=with_initramfs))
+        config_file.flush()
+        run(
+            cfg,
+            [
+                "mcopy",
+                "-i",
+                mtools,
+                config_file.name,
+                "::/boot/limine/limine.conf",
+            ],
+        )
     if cfg.arch == "x86_64":
         run(
             cfg,
@@ -549,7 +765,7 @@ def run_qemu(
 
     if bios:
         argv += ["-M", "q35,smm=off"]
-        if kvm_available():
+        if kvm_available() and not qemu_accel_overridden(script_cfg):
             argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
         else:
             argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
@@ -563,7 +779,7 @@ def run_qemu(
 
         if arch == "x86_64":
             argv += ["-M", "q35"]
-            if kvm_available():
+            if kvm_available() and not qemu_accel_overridden(script_cfg):
                 argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
             else:
                 argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
@@ -659,12 +875,63 @@ def cmd_book(cfg: Config) -> None:
     run(cfg, ["mdbook", "serve"], cwd=ROOT / "book", step="serve mdBook", capture=False)
 
 
+def cmd_sysroot(cfg: Config) -> None:
+    ensure_jinx(cfg)
+    env = jinx_env()
+
+    build_dir = STORE_DIR / f"jinx-build-{cfg.arch}"
+    ensure_dir(build_dir)
+    if not (build_dir / ".jinx-parameters").exists():
+        run(
+            cfg,
+            [
+                str(JINX_DIR / "jinx"),
+                "init",
+                str(USERLAND_DIR),
+                f"ARCH={cfg.arch}",
+            ],
+            cwd=build_dir,
+            env_updates=env,
+            step=f"initialize Jinx build ({cfg.arch})",
+        )
+
+    run(
+        cfg,
+        [str(JINX_DIR / "jinx"), "update", "-b", *USERLAND_BUILD_PACKAGES],
+        cwd=build_dir,
+        env_updates=env,
+        step=f"update userspace package closure ({cfg.arch})",
+        capture=False,
+    )
+    remove_path(cfg.sysroot)
+    ensure_dir(cfg.sysroot)
+    run(
+        cfg,
+        [
+            str(JINX_DIR / "jinx"),
+            "install",
+            str(cfg.sysroot),
+            *USERLAND_PACKAGES,
+        ],
+        cwd=build_dir,
+        env_updates=env,
+        step=f"install userspace sysroot ({cfg.arch})",
+        capture=False,
+    )
+
+
+def cmd_initramfs(cfg: Config) -> None:
+    cmd_sysroot(cfg)
+    create_initramfs(cfg)
+
+
 def cmd_clean(cfg: Config) -> None:
     run(cfg, ["cargo", "clean"], cwd=KERNEL_DIR, step="cargo clean kernel")
     for pattern in ("roanix-*.iso", "roanix-*.hdd"):
         for path in ROOT.glob(pattern):
             remove_path(path)
     remove_path(ISO_ROOT)
+    remove_path(cfg.initramfs)
     for path in KERNEL_DIR.glob("roanix-*"):
         remove_path(path)
 
@@ -685,7 +952,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arch",
         choices=SUPPORTED_ARCHES,
-        default="x86_64",
+        default=None,
         help="Kernel/image architecture.",
     )
     parser.add_argument(
@@ -730,6 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("fmt-check", help="Check Rust source formatting.")
     subparsers.add_parser("rustdoc", help="Build and serve kernel rustdoc on :8080.")
     subparsers.add_parser("book", help="Run mdBook preview server.")
+    subparsers.add_parser(
+        "sysroot", help="Build and install the Jinx Bash userspace sysroot."
+    )
+    subparsers.add_parser(
+        "initramfs", help="Build the userspace sysroot and pack its Limine module."
+    )
     subparsers.add_parser("clean", help="Remove build outputs.")
     subparsers.add_parser("distclean", help="Remove build outputs and caches.")
     run_parser = subparsers.add_parser("run", help="Build HDD and run on QEMU (UEFI).")
@@ -778,7 +1051,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def make_config(args: argparse.Namespace) -> Config:
-    arch = args.arch
+    command = args.command or "gen-hdd"
+    if args.arch is None and command in {"sysroot", "initramfs"}:
+        raise BuildError(f"{command} requires an explicit --arch")
+    arch = args.arch or "x86_64"
     if arch not in SUPPORTED_ARCHES:
         raise BuildError(f"Unsupported architecture: {arch}")
 
@@ -802,7 +1078,7 @@ def make_config(args: argparse.Namespace) -> Config:
 
 
 def _limine_bootstrap_steps(cfg: Config) -> int:
-    if cfg.no_bootstrap or (LIMINE_DIR / "limine").exists():
+    if cfg.no_bootstrap or limine_ready():
         return 0
     return 2
 
@@ -811,14 +1087,38 @@ def _ovmf_bootstrap_steps() -> int:
     return 0 if OVMF_DIR.exists() else 1
 
 
+def _jinx_bootstrap_steps(cfg: Config) -> int:
+    steps = 0 if (JINX_DIR / "jinx").exists() else 3
+    build_dir = STORE_DIR / f"jinx-build-{cfg.arch}"
+    if not (build_dir / ".jinx-parameters").exists():
+        steps += 1
+    return steps
+
+
+def _sysroot_steps(cfg: Config) -> int:
+    return _jinx_bootstrap_steps(cfg) + 2
+
+
+def _initramfs_steps(cfg: Config) -> int:
+    return _sysroot_steps(cfg) + 1
+
+
+def _optional_initramfs_steps(cfg: Config) -> int:
+    return 1 if cfg.sysroot.is_dir() else 0
+
+
 def _iso_steps(cfg: Config, arch: str) -> int:
-    return _limine_bootstrap_steps(cfg) + (4 if arch == "x86_64" else 3)
+    return (
+        _limine_bootstrap_steps(cfg)
+        + _optional_initramfs_steps(cfg)
+        + (4 if arch == "x86_64" else 3)
+    )
 
 
 def _hdd_steps(cfg: Config, arch: str) -> int:
     if arch == "x86_64":
-        return _limine_bootstrap_steps(cfg) + 6
-    return _limine_bootstrap_steps(cfg) + 5
+        return _limine_bootstrap_steps(cfg) + _optional_initramfs_steps(cfg) + 6
+    return _limine_bootstrap_steps(cfg) + _optional_initramfs_steps(cfg) + 5
 
 
 def estimate_steps(cfg: Config, command: Optional[str]) -> int:
@@ -835,6 +1135,10 @@ def estimate_steps(cfg: Config, command: Optional[str]) -> int:
         return 2
     if cmd == "book":
         return 1
+    if cmd == "sysroot":
+        return _sysroot_steps(cfg)
+    if cmd == "initramfs":
+        return _initramfs_steps(cfg)
     if cmd == "clean":
         return 1
     if cmd == "distclean":
@@ -887,6 +1191,10 @@ def dispatch(cfg: Config, command: Optional[str]) -> None:
         cmd_rustdoc(cfg)
     elif cmd == "book":
         cmd_book(cfg)
+    elif cmd == "sysroot":
+        cmd_sysroot(cfg)
+    elif cmd == "initramfs":
+        cmd_initramfs(cfg)
     elif cmd == "clean":
         cmd_clean(cfg)
     elif cmd == "distclean":

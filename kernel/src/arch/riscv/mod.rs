@@ -43,7 +43,12 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     // SAFETY: the debug subsystem only calls sinks with a live buffer for the
     // duration of the callback.
     let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
+    console_write(line);
+    console_write(b"\n");
+}
 
+/// Writes bytes directly to the architecture debug console.
+pub(crate) fn console_write(line: &[u8]) {
     let putc = |byte: u8| {
         let ret = sbi_call1(byte as usize, DEBUG_EXT_ID, 2);
 
@@ -57,8 +62,6 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
     for &byte in line {
         putc(byte);
     }
-
-    putc(b'\n');
 }
 
 /// Returns core local context.

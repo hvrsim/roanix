@@ -21,6 +21,7 @@ const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
+const SCAUSE_USER_ECALL: u64 = 8;
 const SCAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
 const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
 const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
@@ -136,6 +137,57 @@ pub unsafe fn init_kernel_thread_frame(
     }
 }
 
+/// Initializes a trap frame for a brand-new user thread.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes, properly aligned for [`TrapFrame`], and
+/// point at memory reserved for the new thread's initial register state.
+pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64) {
+    // SAFETY: the caller guarantees that `frame` is valid and exclusively
+    // writable for a complete `TrapFrame`.
+    unsafe {
+        *frame = TrapFrame {
+            a0: 0,
+            a1: 0,
+            a2: 0,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+            a6: 0,
+            a7: 0,
+            t0: 0,
+            t1: 0,
+            t2: 0,
+            t3: 0,
+            t4: 0,
+            t5: 0,
+            t6: 0,
+            s0: 0,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
+            ra: 0,
+            gp: 0,
+            prev_sp: stack,
+            prev_sscratch: 0,
+            scause: 0,
+            stval: 0,
+            ip,
+            sstatus: SSTATUS_SPIE,
+            reserved: 0,
+        };
+    }
+}
+
 /// Restores `frame` and enters the first scheduled kernel thread.
 ///
 /// # Safety
@@ -153,15 +205,24 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 ///
 /// `frame` must be the saved context for the thread about to resume on the
 /// current hart.
-pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame) {
+pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame, thread_pointer: u64) {
     // SAFETY: the caller guarantees `frame` is valid and exclusively owned.
     unsafe {
-        (*frame).prev_sscratch = crate::arch::thiscpu() as *const crate::sys::smp::CoreLocal as u64;
-        (*frame).gp = read_gp();
-        (*frame).sstatus |= SSTATUS_SPP | SSTATUS_SPIE;
+        if (*frame).sstatus & SSTATUS_SPP == 0 {
+            (*frame).prev_sscratch = thread_pointer;
+        } else {
+            (*frame).prev_sscratch =
+                crate::arch::thiscpu() as *const crate::sys::smp::CoreLocal as u64;
+            (*frame).gp = read_gp();
+            (*frame).sstatus |= SSTATUS_SPP;
+        }
+        (*frame).sstatus |= SSTATUS_SPIE;
         (*frame).sstatus &= !SSTATUS_SIE;
     }
 }
+
+/// Updates the ring-0 exception stack for the current hart.
+pub fn set_kernel_stack(_stack: u64) {}
 
 /// Returns the saved instruction pointer from a trap frame.
 pub fn trap_frame_ip(frame: &TrapFrame) -> u64 {
@@ -297,6 +358,21 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     }
 
     if frame.sstatus & SSTATUS_SPP == 0 {
+        if frame.scause == SCAUSE_USER_ECALL {
+            crate::arch::irqset(true);
+            frame.a0 = crate::sys::syscall::dispatch(
+                frame.a7,
+                [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5],
+            ) as u64;
+            crate::arch::irqset(false);
+            frame.ip = frame.ip.wrapping_add(4);
+            // SAFETY: `frame` is the current thread's live user trap frame.
+            unsafe {
+                prepare_thread_frame(frame, crate::proc::current_thread_pointer());
+            }
+            return crate::sys::sched::trap_return(frame);
+        }
+
         let access = match frame.scause {
             SCAUSE_INSTRUCTION_PAGE_FAULT => Some(crate::mem::FaultAccess::Execute),
             SCAUSE_LOAD_PAGE_FAULT => Some(crate::mem::FaultAccess::Read),

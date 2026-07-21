@@ -40,7 +40,8 @@ pub mod swap;
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 pub use error::{Error, Result};
 pub use map::{
-    FaultAccess, ResolvedPage, VmAdvice, VmInheritance, VmMap, VmMapEntry, VmProtection,
+    FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmInheritance, VmMap,
+    VmMapEntry, VmProtection,
 };
 pub use object::{ObjectKind, PageAccount, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};

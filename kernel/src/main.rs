@@ -15,6 +15,7 @@ pub mod arch;
 pub mod dev;
 pub mod fs;
 pub mod mem;
+pub mod proc;
 pub mod sys;
 
 #[used]
@@ -46,6 +47,7 @@ fn early_init() -> ! {
     sys::debug::register();
     arch::init_boot_cpu();
     info!("welcome to roanix!");
+    sys::initramfs::init();
 
     mem::init();
     arch::init_platform();
@@ -59,5 +61,7 @@ fn init_thread() {
     sys::smp::start_secondary_cpus();
     mem::start_page_daemon();
     fs::init();
+    sys::initramfs::populate().expect("boot: failed to import initramfs");
+    proc::spawn_init().expect("boot: failed to start /sbin/init");
     info!("boot: initialization complete");
 }

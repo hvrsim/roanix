@@ -1,0 +1,12 @@
+[binaries]
+c = 'riscv64-roanix-gcc'
+cpp = 'riscv64-roanix-g++'
+ar = 'riscv64-roanix-ar'
+nm = 'riscv64-roanix-nm'
+strip = 'riscv64-roanix-strip'
+
+[host_machine]
+system = 'roanix'
+cpu_family = 'riscv64'
+cpu = 'riscv64'
+endian = 'little'

@@ -1,0 +1,60 @@
+#! /bin/sh
+
+version=14.3.0
+revision=6
+tarball_url="https://ftpmirror.gnu.org/gnu/gcc/gcc-${version}/gcc-${version}.tar.xz"
+tarball_sha512="cb4e3259640721bbd275c723fe4df53d12f9b1673afb3db274c22c6aa457865dccf2d6ea20b4fd4c591f6152e6d4b87516c402015900f06ce9d43af66d3b7a93"
+imagedeps="build-essential texinfo"
+hostrundeps="binutils"
+source_imagedeps="ca-certificates curl"
+source_hostdeps=""
+source_deps=""
+source_allow_network=yes
+
+early_prepare() {
+    ./contrib/download_prerequisites
+}
+
+configure() {
+    target_options=""
+    if [ "${JINX_ARCH}" = riscv64 ]; then
+        target_options="--with-arch=rv64gc --with-abi=lp64d"
+    fi
+
+    mkdir build
+    cd build
+    # shellcheck disable=SC2086
+    CFLAGS_FOR_TARGET="${TARGET_CFLAGS} -fPIC" \
+    CXXFLAGS_FOR_TARGET="${TARGET_CXXFLAGS} -fPIC" \
+    "${source_dir}"/configure \
+        --prefix="${prefix}" \
+        --target="${OS_TRIPLET}" \
+        --with-sysroot="${sysroot}" \
+        --with-pic \
+        --with-newlib \
+        --without-headers \
+        --enable-languages=c,c++ \
+        --disable-bootstrap \
+        --disable-multilib \
+        --disable-nls \
+        --disable-shared \
+        --disable-threads \
+        --disable-libatomic \
+        --disable-libgomp \
+        --disable-libquadmath \
+        --disable-libssp \
+        --disable-libstdcxx \
+        --disable-libvtv \
+        --disable-werror \
+        ${target_options}
+}
+
+build() {
+    cd build
+    make -j"${parallelism}" all-gcc all-target-libgcc
+}
+
+package() {
+    cd build
+    make install-gcc install-target-libgcc DESTDIR="${dest_dir}"
+}

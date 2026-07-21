@@ -1,0 +1,54 @@
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 0c1b883..20b9599 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -705,6 +705,11 @@ case "${targ}" in
+     targ_selvecs="i386_elf32_vec"
+     want64=true
+     ;;
++  x86_64-*-roanix*)
++    targ_defvec=x86_64_elf64_vec
++    targ_selvecs="i386_elf32_vec"
++    want64=true
++    ;;
+   x86_64-*-netbsd* | x86_64-*-openbsd*)
+     targ_defvec=x86_64_elf64_vec
+     targ_selvecs="i386_elf32_vec iamcu_elf32_vec i386_coff_vec i386_pei_vec x86_64_pe_vec x86_64_pei_vec"
+diff --git a/config.sub b/config.sub
+index 4aaae46..285f759 100755
+--- a/config.sub
++++ b/config.sub
+@@ -2108,6 +2108,7 @@ case $os in
+ 	| skyos* \
+ 	| solaris* \
+ 	| solidbsd* \
++	| roanix* \
+ 	| sortix* \
+ 	| storm-chaos* \
+ 	| sunos \
+diff --git a/gas/configure.tgt b/gas/configure.tgt
+index 7c81bff..a82ed92 100644
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -225,6 +225,7 @@ case ${generic_target} in
+   h8300-*-elf)				fmt=elf ;;
+   h8300-*-linux*)			fmt=elf em=linux ;;
+ 
++  i386-*-roanix*)			fmt=elf ;;
+   i386-*-beospe*)			fmt=coff em=pe ;;
+   i386-*-beos*)				fmt=elf ;;
+   i386-*-elfiamcu)			fmt=elf arch=iamcu ;;
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index ea01ccf..e85a2e4 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -998,6 +998,9 @@ vax-*-linux-*)		targ_emul=elf32vax
+ 			;;
+ visium-*-elf)		targ_emul=elf32visium
+ 			;;
++x86_64-*-roanix*)	targ_emul=elf_x86_64
++			targ_extra_emuls="elf_i386"
++			;;
+ x86_64-*-rdos*)		targ_emul=elf64rdos
+ 			;;
+ x86_64-*-cloudabi*)	targ_emul=elf_x86_64_cloudabi

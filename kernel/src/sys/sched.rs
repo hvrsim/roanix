@@ -11,7 +11,7 @@
 //! the 127 Hz scheduler statclock and sleep timers.
 //!
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::{
     array,
     ptr::NonNull,
@@ -23,13 +23,14 @@ use intrusive_collections::LinkedList;
 
 use crate::{
     arch,
+    proc::Process,
     sys::{
         clock,
         smp::{self, IrqSpinLock},
         sync::Once,
         thread::{
             ExitedThreadAdapter, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState,
-            WakeResult, allocate_thread, free_thread, idle_task,
+            WakeResult, allocate_thread, allocate_user_thread, free_thread, idle_task,
         },
     },
 };
@@ -716,8 +717,28 @@ impl Scheduler {
     {
         let thread =
             NonNull::from(self.alloc_thread(cpu_id, class, priority, ThreadFlags::empty(), task));
+        self.enqueue_new_thread(thread)
+    }
+
+    fn spawn_user(&self, process: Arc<Process>, entry: u64, stack: u64) -> usize {
+        let cpu_id = self.pick_spawn_cpu();
+        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        let thread = allocate_user_thread(
+            tid,
+            cpu_id,
+            clock::monotonic_ns(),
+            MIN_INTERACT,
+            process,
+            entry,
+            stack,
+        );
+        self.enqueue_new_thread(NonNull::from(thread))
+    }
+
+    fn enqueue_new_thread(&self, thread: ThreadPtr) -> usize {
         let tid = thread_ref(thread).id;
         let priority = thread_ref(thread).priority;
+        let cpu_id = thread_ref(thread).cpu;
         let current_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
         let initial_target = self
             .cpu(cpu_id)
@@ -1450,11 +1471,12 @@ impl Scheduler {
         cpu.kernel_stack = thread.stack_top.as_u64();
         cpu.user_stack = 0;
         cpu.current_thread = thread.id;
+        crate::arch::cpu::set_kernel_stack(thread.stack_top.as_u64());
         crate::mem::activate_thread_space(thread.address_space());
         // SAFETY: the frame belongs to `thread`, was validated above, and is
         // exclusively prepared on the local scheduler path.
         unsafe {
-            crate::arch::cpu::prepare_thread_frame(thread.frame);
+            crate::arch::cpu::prepare_thread_frame(thread.frame, thread.thread_pointer());
         }
     }
 
@@ -1694,6 +1716,11 @@ where
     F: FnOnce() -> R + Send + 'static,
 {
     scheduler().spawn(task)
+}
+
+/// Spawns the initial thread of a userspace process.
+pub(crate) fn run_user(process: Arc<Process>, entry: u64, stack: u64) -> usize {
+    scheduler().spawn_user(process, entry, stack)
 }
 
 /// Spawns an interrupt-thread style task with the supplied argument.

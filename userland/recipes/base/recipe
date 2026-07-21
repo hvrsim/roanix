@@ -1,0 +1,5 @@
+#! /bin/sh
+
+version=0.1
+revision=2
+deps="mlibc"

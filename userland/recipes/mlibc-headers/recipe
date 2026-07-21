@@ -1,0 +1,26 @@
+#! /bin/sh
+
+from_source=mlibc-source
+revision=1
+imagedeps="meson ninja-build"
+hostdeps="bootstrap-gcc binutils"
+
+configure() {
+    meson setup build "${source_dir}" \
+        --cross-file="${CROSS_FILE}" \
+        --prefix="${prefix}" \
+        --libdir=lib \
+        -Dheaders_only=true \
+        -Dposix_option=enabled \
+        -Dlinux_option=disabled \
+        -Dglibc_option=enabled \
+        -Dbsd_option=disabled
+}
+
+build() {
+    ninja -C build
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja -C build install
+}

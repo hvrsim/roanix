@@ -1,0 +1,63 @@
+#! /bin/sh
+
+JINX_MAJOR_VER=0.10
+JINX_DEBIAN_SNAPSHOT=20260601T202527Z
+JINX_BASE_PACKAGES="autoconf automake bison file flex gawk make meson ninja-build patch perl pkg-config texinfo"
+
+case "${JINX_ARCH}" in
+    x86_64)
+        TARGET_CFLAGS="-O2 -pipe -march=x86-64 -mtune=generic"
+        ;;
+    riscv64)
+        TARGET_CFLAGS="-O2 -pipe -march=rv64gc -mabi=lp64d"
+        ;;
+    *)
+        echo "Unsupported Roanix architecture: ${JINX_ARCH}" >&2
+        return 1
+        ;;
+esac
+
+TARGET_CXXFLAGS="${TARGET_CFLAGS}"
+TARGET_CPPFLAGS="-D_GNU_SOURCE"
+TARGET_LDFLAGS=""
+OS_TRIPLET="${JINX_ARCH}-roanix"
+CROSS_FILE="${base_dir}/build-support/cross_file-${JINX_ARCH}.txt"
+
+copy_gnu_config_files() {
+    for config_name in config.sub config.guess; do
+        find . -type f -name "${config_name}" -print0 |
+            while IFS= read -r -d '' config_path; do
+                cp "${base_dir}/build-support/${config_name}" "${config_path}"
+                chmod +x "${config_path}"
+            done
+    done
+}
+
+autotools_recursive_regen() {
+    copy_gnu_config_files
+    if [ "${1-}" != "no-autoreconf" ]; then
+        autoreconf -fiv
+    fi
+    copy_gnu_config_files
+}
+
+autotools_configure() {
+    configure_script="${configure_script_path-${source_dir}/configure}"
+
+    CC="${OS_TRIPLET}-gcc" \
+    CXX="${OS_TRIPLET}-g++" \
+    AR="${OS_TRIPLET}-ar" \
+    NM="${OS_TRIPLET}-nm" \
+    RANLIB="${OS_TRIPLET}-ranlib" \
+    STRIP="${OS_TRIPLET}-strip" \
+    CFLAGS="${TARGET_CFLAGS}" \
+    CXXFLAGS="${TARGET_CXXFLAGS}" \
+    CPPFLAGS="${TARGET_CPPFLAGS}" \
+    LDFLAGS="${TARGET_LDFLAGS}" \
+        "${configure_script}" \
+            --host="${OS_TRIPLET}" \
+            --prefix="${prefix}" \
+            --enable-shared \
+            --disable-static \
+            "$@"
+}

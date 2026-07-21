@@ -1,0 +1,33 @@
+#! /bin/sh
+
+version=1764d1493063388df9ab42544cb5da371b44fd58
+revision=1
+git_url="https://gitlab.com/sortix/os-test.git"
+commit="1764d1493063388df9ab42544cb5da371b44fd58"
+imagedeps="build-essential"
+hostdeps="bootstrap-gcc binutils"
+deps="base"
+
+configure() {
+    cp -a "${source_dir}"/. .
+    rm -rf .git
+}
+
+build() {
+    make \
+        OS=Roanix \
+        CC="${OS_TRIPLET}-gcc" \
+        CC_FOR_BUILD=gcc \
+        CFLAGS="${TARGET_CFLAGS}" \
+        CPPFLAGS="${TARGET_CPPFLAGS}" \
+        LDFLAGS="${TARGET_LDFLAGS}" \
+        CFLAGS_FOR_BUILD="-O2 -pipe" \
+        CPPFLAGS_FOR_BUILD="" \
+        LDFLAGS_FOR_BUILD="" \
+        -j"${parallelism}"
+}
+
+package() {
+    mkdir -p "${dest_dir}/usr/share/os-test"
+    cp -a ./* "${dest_dir}/usr/share/os-test/"
+}

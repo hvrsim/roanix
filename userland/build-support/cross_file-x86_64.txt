@@ -1,0 +1,12 @@
+[binaries]
+c = 'x86_64-roanix-gcc'
+cpp = 'x86_64-roanix-g++'
+ar = 'x86_64-roanix-ar'
+nm = 'x86_64-roanix-nm'
+strip = 'x86_64-roanix-strip'
+
+[host_machine]
+system = 'roanix'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

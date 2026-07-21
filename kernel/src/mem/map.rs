@@ -8,10 +8,13 @@ use crate::mem::{PAGE_SIZE, VirtAddr, align_up};
 use super::{Error, Result, VmObject, VmPage};
 
 #[cfg(target_arch = "x86_64")]
-const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
+/// Exclusive upper bound of the architecture user virtual address range.
+pub const USER_ADDRESS_MAX: u64 = 0x0000_8000_0000_0000;
 #[cfg(target_arch = "riscv64")]
-const USER_ADDRESS_MAX: u64 = 0x0000_0040_0000_0000;
-const USER_ADDRESS_MIN: u64 = 0x1_0000;
+/// Exclusive upper bound of the architecture user virtual address range.
+pub const USER_ADDRESS_MAX: u64 = 0x0000_0040_0000_0000;
+/// Lowest virtual address accepted for userspace mappings.
+pub const USER_ADDRESS_MIN: u64 = 0x1_0000;
 
 bitflags! {
     /// Access permissions attached to a VM map entry.

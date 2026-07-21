@@ -9,8 +9,10 @@
 pub mod clock;
 pub mod debug;
 pub mod event;
+pub mod initramfs;
 pub mod panic;
 pub mod sched;
 pub mod smp;
 pub mod sync;
+pub mod syscall;
 pub mod thread;
