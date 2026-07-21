@@ -34,6 +34,11 @@ SECTIONS
 
     .rodata : {
         *(.rodata .rodata.*)
+
+        . = ALIGN(8);
+        PROVIDE_HIDDEN (__roanix_drivers_start = .);
+        KEEP(*(.roanix_drivers))
+        PROVIDE_HIDDEN (__roanix_drivers_end = .);
     } :rodata
 
     /* init array section for C++ global constructors */

@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod devtempfs;
 pub mod error;
 pub mod file;
 pub mod path;
@@ -24,10 +25,12 @@ pub use vnode::{
     VnodeAttr, VnodeKey, VnodeKind,
 };
 
-/// Initializes the VFS and mounts tmpfs as the initial root filesystem.
+/// Initializes the VFS, mounts tmpfs as root, and mounts devtempfs at `/dev`.
 pub fn init() {
     let filesystem = tmpfs::Tmpfs::new().expect("fs: failed to create root tmpfs");
     let filesystem: Arc<dyn FileSystem> = filesystem;
     vfs::init_root(filesystem).expect("fs: failed to mount root filesystem");
+    devtempfs::mount_global().expect("fs: failed to mount devtempfs");
     info!("fs: mounted tmpfs root");
+    info!("fs: mounted devtempfs at /dev");
 }
