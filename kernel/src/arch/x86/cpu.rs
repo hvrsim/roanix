@@ -269,10 +269,11 @@ pub unsafe fn start_first_thread(frame: *mut TrapFrame) -> ! {
 /// # Safety
 ///
 /// `frame` must point to the current thread's saved trap frame.
-pub unsafe fn prepare_thread_frame(frame: *mut TrapFrame, thread_pointer: u64) {
-    // SAFETY: the caller guarantees `frame` is valid for the selected thread.
-    let user = unsafe { (*frame).cs & 3 == 3 };
-    FsBase::write(X86VirtAddr::new(if user { thread_pointer } else { 0 }));
+pub unsafe fn prepare_thread_frame(_frame: *mut TrapFrame, thread_pointer: u64) {
+    // FS belongs to the selected thread even while it resumes an interrupted
+    // kernel continuation. The x86 kernel uses GS for core-local state, and
+    // kernel threads carry a zero thread pointer.
+    FsBase::write(X86VirtAddr::new(thread_pointer));
 }
 
 /// Returns the saved instruction pointer from a trap frame.
@@ -671,6 +672,9 @@ extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
     ) as u64;
+    // Syscalls run with IRQs enabled, but final frame preparation and
+    // scheduling must be atomic with respect to interrupt-driven switches.
+    crate::arch::irqset(false);
     // SAFETY: `frame` is the current thread's live syscall frame.
     unsafe {
         prepare_thread_frame(frame, crate::proc::current_thread_pointer());
