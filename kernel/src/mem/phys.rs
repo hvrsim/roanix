@@ -28,7 +28,7 @@ use crate::{
         page::VmPage,
         pmap::PmapInner,
     },
-    sys::smp::IrqSpinLock,
+    sys::{smp::IrqSpinLock, sync::Mutex},
 };
 
 /// Virtual base address where the PFN database is mapped.
@@ -146,7 +146,8 @@ pub struct Page {
     owner_id: AtomicU64,
     offset: AtomicU64,
     owner: IrqSpinLock<Option<Weak<VmPage>>>,
-    reverse_mappings: IrqSpinLock<Vec<ReverseMapping>>,
+    // Growing this vector can allocate, so its lock must not mask interrupts.
+    reverse_mappings: Mutex<Vec<ReverseMapping>>,
 }
 
 pub(super) struct ReverseMapping {
@@ -171,7 +172,7 @@ impl Page {
             owner_id: AtomicU64::new(0),
             offset: AtomicU64::new(0),
             owner: IrqSpinLock::new(None),
-            reverse_mappings: IrqSpinLock::new(Vec::new()),
+            reverse_mappings: Mutex::new(Vec::new()),
         }
     }
 
@@ -439,7 +440,7 @@ impl Page {
 }
 
 // SAFETY: PFN entries have stable addresses and all interior mutation is
-// atomic or protected by IRQ-safe locks and allocator queue locks.
+// atomic or protected by locks and allocator queue locks.
 unsafe impl Send for Page {}
 // SAFETY: shared access observes atomic fields or lock-protected owner state.
 unsafe impl Sync for Page {}

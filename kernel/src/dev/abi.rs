@@ -8,14 +8,20 @@ use core::{alloc::Layout, mem, ptr, slice, str};
 
 use log::Level;
 
-use crate::fs::{
-    self, IoctlContext,
-    devtempfs::{self, DevNodeId, DeviceNodeKind, DeviceNodeOps},
+use crate::{
+    fs::{
+        self, IoctlContext,
+        devtempfs::{self, DevNodeId, DeviceNodeKind, DeviceNodeOps},
+    },
+    sys::sync::Mutex,
 };
 
 use super::{
     BusId, DeviceNodeId, DriverId, Error, ResourceCallback, ResourceFlags, ResourceKey,
     ResourceMethod, ResourceValue, driver,
+    interrupt::{
+        self, InterruptControllerId, InterruptControllerV1, InterruptHandlerFn, InterruptId,
+    },
     tree::{self, NodeKind},
 };
 
@@ -46,6 +52,8 @@ pub const STATUS_NO_SPACE: i32 = -9;
 pub const STATUS_IO: i32 = -10;
 /// Kernel allocation failure.
 pub const STATUS_OUT_OF_MEMORY: i32 = -11;
+
+static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
 /// ABI byte slice. The pointed-to memory remains owned by the caller.
 #[repr(C)]
@@ -265,6 +273,42 @@ pub struct DriverHostApiV1 {
     pub deallocate: unsafe extern "C" fn(data: *mut u8, size: usize, align: usize) -> i32,
     /// Writes a driver message to the kernel log.
     pub log: unsafe extern "C" fn(level: u32, message: AbiSlice) -> i32,
+    /// Registers an interrupt controller on an owned bus.
+    pub register_interrupt_controller: unsafe extern "C" fn(
+        driver: u64,
+        bus: u64,
+        controller: *const InterruptControllerV1,
+        out_controller: *mut u64,
+    ) -> i32,
+    /// Removes an idle interrupt controller.
+    pub unregister_interrupt_controller: unsafe extern "C" fn(driver: u64, controller: u64) -> i32,
+    /// Routes an interrupt for an owned device node.
+    pub request_interrupt: unsafe extern "C" fn(
+        driver: u64,
+        node: u64,
+        specifier: AbiSlice,
+        flags: u64,
+        target_cpu: u32,
+        handler: Option<InterruptHandlerFn>,
+        context: usize,
+        out_interrupt: *mut u64,
+    ) -> i32,
+    /// Releases an owned interrupt route.
+    pub release_interrupt: unsafe extern "C" fn(driver: u64, interrupt: u64) -> i32,
+    /// Masks an owned interrupt route.
+    pub mask_interrupt: unsafe extern "C" fn(driver: u64, interrupt: u64) -> i32,
+    /// Unmasks an owned interrupt route.
+    pub unmask_interrupt: unsafe extern "C" fn(driver: u64, interrupt: u64) -> i32,
+    /// Retargets an owned interrupt route.
+    pub set_interrupt_affinity:
+        unsafe extern "C" fn(driver: u64, interrupt: u64, target_cpu: u32) -> i32,
+    /// Establishes a persistent device mapping in the kernel direct map.
+    pub map_mmio: unsafe extern "C" fn(
+        driver: u64,
+        physical: u64,
+        size: usize,
+        out_address: *mut usize,
+    ) -> i32,
 }
 
 /// Static version-1 host service table.
@@ -287,6 +331,14 @@ pub static HOST_API_V1: DriverHostApiV1 = DriverHostApiV1 {
     allocate_zeroed: host_allocate_zeroed,
     deallocate: host_deallocate,
     log: host_log,
+    register_interrupt_controller: host_register_interrupt_controller,
+    unregister_interrupt_controller: host_unregister_interrupt_controller,
+    request_interrupt: host_request_interrupt,
+    release_interrupt: host_release_interrupt,
+    mask_interrupt: host_mask_interrupt,
+    unmask_interrupt: host_unmask_interrupt,
+    set_interrupt_affinity: host_set_interrupt_affinity,
+    map_mmio: host_map_mmio,
 };
 
 struct ForeignDeviceOps {
@@ -742,6 +794,150 @@ unsafe extern "C" fn host_log(level: u32, message: AbiSlice) -> i32 {
     STATUS_OK
 }
 
+unsafe extern "C" fn host_register_interrupt_controller(
+    driver_id: u64,
+    bus: u64,
+    controller: *const InterruptControllerV1,
+    out_controller: *mut u64,
+) -> i32 {
+    let result = (|| {
+        let owner = DriverId::new(driver_id);
+        driver::authorize(owner)?;
+        let bus = BusId::from_node(DeviceNodeId::from_raw(bus))?;
+        // SAFETY: required by the host function ABI.
+        let controller = unsafe { read_interrupt_controller(controller)? };
+        // SAFETY: the foreign driver guarantees the copied callback table
+        // follows the interrupt-controller ABI for its registered lifetime.
+        let id = unsafe { interrupt::register_controller(owner, bus, controller)? };
+        // SAFETY: required by the host function ABI.
+        unsafe { write_out(out_controller, id.get()) }
+    })();
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_unregister_interrupt_controller(driver_id: u64, controller: u64) -> i32 {
+    let owner = DriverId::new(driver_id);
+    let result = driver::authorize(owner).and_then(|()| {
+        interrupt::unregister_controller(owner, InterruptControllerId::from_raw(controller))
+    });
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_request_interrupt(
+    driver_id: u64,
+    node: u64,
+    specifier: AbiSlice,
+    flags: u64,
+    target_cpu: u32,
+    handler: Option<InterruptHandlerFn>,
+    context: usize,
+    out_interrupt: *mut u64,
+) -> i32 {
+    let result = (|| {
+        let owner = DriverId::new(driver_id);
+        driver::authorize(owner)?;
+        let handler = handler.ok_or(Error::InvalidArgument)?;
+        // SAFETY: required by the host function ABI.
+        let specifier = unsafe { specifier.as_slice()? };
+        let id = interrupt::request_interrupt(
+            owner,
+            DeviceNodeId::from_raw(node),
+            specifier,
+            flags,
+            target_cpu,
+            handler,
+            context,
+        )?;
+        // SAFETY: required by the host function ABI.
+        unsafe { write_out(out_interrupt, id.get()) }
+    })();
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_release_interrupt(driver_id: u64, interrupt_id: u64) -> i32 {
+    let owner = DriverId::new(driver_id);
+    let result = driver::authorize(owner)
+        .and_then(|()| interrupt::release_interrupt(owner, InterruptId::from_raw(interrupt_id)));
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_mask_interrupt(driver_id: u64, interrupt_id: u64) -> i32 {
+    let owner = DriverId::new(driver_id);
+    let result = driver::authorize(owner)
+        .and_then(|()| interrupt::mask_interrupt(owner, InterruptId::from_raw(interrupt_id)));
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_unmask_interrupt(driver_id: u64, interrupt_id: u64) -> i32 {
+    let owner = DriverId::new(driver_id);
+    let result = driver::authorize(owner)
+        .and_then(|()| interrupt::unmask_interrupt(owner, InterruptId::from_raw(interrupt_id)));
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_set_interrupt_affinity(
+    driver_id: u64,
+    interrupt_id: u64,
+    target_cpu: u32,
+) -> i32 {
+    let owner = DriverId::new(driver_id);
+    let result = driver::authorize(owner).and_then(|()| {
+        interrupt::set_interrupt_affinity(owner, InterruptId::from_raw(interrupt_id), target_cpu)
+    });
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
+unsafe extern "C" fn host_map_mmio(
+    driver_id: u64,
+    physical: u64,
+    size: usize,
+    out_address: *mut usize,
+) -> i32 {
+    let result = (|| {
+        let owner = DriverId::new(driver_id);
+        let _owner = driver::mutation_guard(owner)?;
+        if size == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let size = u64::try_from(size).map_err(|_| Error::InvalidArgument)?;
+        let end = physical.checked_add(size).ok_or(Error::InvalidArgument)?;
+        let _mapping = MMIO_MAP_LOCK.lock();
+        let start_page = crate::mem::PhysAddr::new(physical).align_down();
+        let end_page = crate::mem::PhysAddr::new(end).align_up();
+        let root = crate::arch::paging::active_root();
+        let flags = crate::mem::VmFlags::READ
+            | crate::mem::VmFlags::WRITE
+            | crate::mem::VmFlags::GLOBAL
+            | crate::mem::VmFlags::DEVICE;
+        let mut page = start_page;
+        while page < end_page {
+            let virtual_page = crate::mem::phys_to_virt(page);
+            // SAFETY: the caller identifies this physical range as device
+            // MMIO; this only inspects the active kernel page tables.
+            let mapped = unsafe { crate::arch::paging::translate(root, virtual_page) };
+            if let Some(mapped) = mapped {
+                if mapped != page {
+                    return Err(Error::AlreadyExists);
+                }
+            } else {
+                // SAFETY: the driver requested a global device mapping and
+                // the device subsystem serializes this mutation through its
+                // driver callback guard during initialization/control calls.
+                unsafe { crate::arch::paging::map_page(root, virtual_page, page, flags) }
+                    .map_err(|_| Error::OutOfMemory)?;
+            }
+            page = page
+                .checked_add(crate::mem::PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+        }
+        let address = crate::mem::phys_to_virt(crate::mem::PhysAddr::new(physical)).as_u64();
+        let address = usize::try_from(address).map_err(|_| Error::InvalidArgument)?;
+        // SAFETY: required by the host function ABI.
+        unsafe { write_out(out_address, address) }
+    })();
+    result.map_or_else(status, |_| STATUS_OK)
+}
+
 unsafe fn abi_name<'a>(name: AbiSlice) -> super::Result<&'a str> {
     // SAFETY: forwarded from this function's caller.
     let name = unsafe { name.as_slice()? };
@@ -804,6 +1000,23 @@ unsafe fn read_operations(
         sync: prefix.sync,
         ioctl,
     })
+}
+
+unsafe fn read_interrupt_controller(
+    controller: *const InterruptControllerV1,
+) -> super::Result<InterruptControllerV1> {
+    if !is_aligned(controller) {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: the versioned ABI guarantees the size/version prefix is readable.
+    let size = unsafe { core::ptr::addr_of!((*controller).size).read() } as usize;
+    // SAFETY: the same prefix contract covers this field.
+    let version = unsafe { core::ptr::addr_of!((*controller).abi_version).read() };
+    if version != interrupt::INTERRUPT_ABI_V1 || size < mem::size_of::<InterruptControllerV1>() {
+        return Err(Error::AbiMismatch);
+    }
+    // SAFETY: the validated record size covers the complete version-1 table.
+    Ok(unsafe { controller.read() })
 }
 
 fn is_aligned<T>(pointer: *const T) -> bool {

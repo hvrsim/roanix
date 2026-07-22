@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=6.6
-revision=10
+revision=11
 tarball_url="https://github.com/ThomasDickey/ncurses-snapshots/archive/refs/tags/v6_6.tar.gz"
 tarball_blake2b="736b7b46f5f9e16f983ba7d0e5073c84c22db23984eeaf90905ad952c6720726832606c2c39cf64ed6ddbd3744979f245f1ed797c11f1e48e2218077eec96f11"
 imagedeps="build-essential"
@@ -36,19 +36,24 @@ configure() {
             --without-cxx-binding \
             --without-debug \
             --without-manpages \
-            --without-progs \
             --without-normal \
             --without-tests
 }
 
 build() {
-    make -j"${parallelism}" libs
+    make -j"${parallelism}"
 }
 
 package() {
-    make install.includes install.libs DESTDIR="${dest_dir}"
+    make install \
+        DESTDIR="${dest_dir}" \
+        INSTALL_PROG="/usr/bin/install -c -s --strip-program=${OS_TRIPLET}-strip"
 
     printf 'INPUT(-lncursesw)\n' >"${dest_dir}${prefix}/lib/libncurses.so"
     printf 'INPUT(-lncursesw)\n' >"${dest_dir}${prefix}/lib/libcurses.so"
+    printf 'INPUT(-lncursesw)\n' >"${dest_dir}${prefix}/lib/libcursesw.so"
     printf 'INPUT(-ltinfow)\n' >"${dest_dir}${prefix}/lib/libtinfo.so"
+    printf 'INPUT(-lmenuw)\n' >"${dest_dir}${prefix}/lib/libmenu.so"
+    printf 'INPUT(-lformw)\n' >"${dest_dir}${prefix}/lib/libform.so"
+    printf 'INPUT(-lpanelw)\n' >"${dest_dir}${prefix}/lib/libpanel.so"
 }

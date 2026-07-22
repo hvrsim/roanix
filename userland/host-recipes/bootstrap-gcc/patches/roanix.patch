@@ -52,7 +52,7 @@ index a3566f5c7..5265af4d1 100644
  
  case ${target} in
 +x86_64-*-roanix*)
-+	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h gnu-user.h glibc-stdint.h i386/i386elf.h i386/x86-64.h roanix.h"
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h i386/i386elf.h i386/x86-64.h gnu-user.h roanix.h"
 +	;;
  aarch64*-*-elf | aarch64*-*-fuchsia* | aarch64*-*-rtems*)
  	tm_file="${tm_file} elfos.h newlib-stdint.h"

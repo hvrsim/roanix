@@ -23,8 +23,8 @@ use super::{
     error::{Error, Result},
     path,
     vnode::{
-        DirEntry, FileSystem, FilesystemId, IoctlContext, NodeId, SetAttr, StatFs, Vnode,
-        VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
+        DirEntry, FileSystem, FilesystemId, IoctlContext, NodeId, PollEvents, SetAttr, StatFs,
+        Vnode, VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
     },
 };
 
@@ -107,6 +107,11 @@ pub trait DeviceNodeOps: Send + Sync {
     /// Writes bytes while observing the originating open flags.
     fn write_at_with_flags(&self, offset: u64, buffer: &[u8], _flags: u32) -> Result<usize> {
         self.write_at(offset, buffer)
+    }
+
+    /// Returns requested events that are immediately ready.
+    fn poll(&self, _offset: u64, _events: PollEvents, _flags: u32) -> Result<PollEvents> {
+        Ok(PollEvents::empty())
     }
 
     /// Returns the current logical size.
@@ -731,6 +736,31 @@ impl VnodeOps for DevtempfsNode {
         }
         self.touch_modified();
         Ok(written)
+    }
+
+    fn poll(
+        &self,
+        _vnode: &Vnode,
+        offset: u64,
+        events: PollEvents,
+        flags: u32,
+    ) -> Result<PollEvents> {
+        match &self.data {
+            DevtempfsData::Directory => {
+                self.ensure_live()?;
+                let flags = crate::fs::OpenFlags::from_bits_retain(flags);
+                Ok(if flags.contains(crate::fs::OpenFlags::READ) {
+                    events & (PollEvents::IN | PollEvents::RDNORM)
+                } else {
+                    PollEvents::empty()
+                })
+            }
+            DevtempfsData::Device(operations) => {
+                let _activity = self.begin_activity()?;
+                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
+                operations.poll(offset, events, flags)
+            }
+        }
     }
 
     fn readdir(

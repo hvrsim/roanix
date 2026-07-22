@@ -36,7 +36,12 @@ copy_gnu_config_files() {
 autotools_recursive_regen() {
     copy_gnu_config_files
     if [ "${1-}" != "no-autoreconf" ]; then
-        autoreconf -fiv
+        if [ -d /usr/local/share/aclocal ]; then
+            ACLOCAL_PATH="/usr/local/share/aclocal${ACLOCAL_PATH:+:${ACLOCAL_PATH}}" \
+                autoreconf -fiv
+        else
+            autoreconf -fiv
+        fi
     fi
     copy_gnu_config_files
 }

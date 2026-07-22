@@ -15,6 +15,8 @@ pub enum Error {
     AlreadyExists,
     /// An operation required a directory.
     NotDirectory,
+    /// The open object does not support seeking.
+    IllegalSeek,
     /// An operation is invalid for a directory.
     IsDirectory,
     /// The target is not a terminal device.
@@ -59,6 +61,7 @@ impl fmt::Display for Error {
             Self::NotFound => "not found",
             Self::AlreadyExists => "already exists",
             Self::NotDirectory => "not a directory",
+            Self::IllegalSeek => "illegal seek",
             Self::IsDirectory => "is a directory",
             Self::NotTty => "not a terminal",
             Self::Interrupted => "operation interrupted",

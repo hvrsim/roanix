@@ -1302,6 +1302,27 @@ impl Scheduler {
                 return;
             }
 
+            // `take_next_thread` publishes the replacement in `current`
+            // before the owner CPU has switched RSP away from the outgoing
+            // thread's kernel stack. A remote wake during that interval must
+            // remain on the owner CPU or two CPUs can execute the same stack.
+            if owner.switching {
+                let had_owner_runnable = owner.runq.has_runnable();
+                self.finish_wakeup(thread, now_ns);
+                let priority = thread.priority;
+                owner.adopt_thread(thread, EnqueueKind::Normal);
+                let should_kick =
+                    owner.consider_preemption(priority, current_cpu != Some(owner_cpu));
+                kick = if should_kick || current_cpu != Some(owner_cpu) {
+                    Some((owner_cpu, CpuKick::Resched))
+                } else if owner.needs_deadline_refresh(had_owner_runnable) {
+                    Some((owner_cpu, CpuKick::Deadline))
+                } else {
+                    None
+                };
+                return;
+            }
+
             self.finish_wakeup(thread, now_ns);
             thread.cpu = target_cpu;
             let priority = thread.priority;

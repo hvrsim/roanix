@@ -57,6 +57,12 @@ pub(crate) struct CallbackGuard {
     record: Option<Arc<DriverRecord>>,
 }
 
+/// Lock-free callback owner captured while the driver registry is accessible.
+#[derive(Clone)]
+pub(crate) struct CallbackOwner {
+    record: Option<Arc<DriverRecord>>,
+}
+
 static DRIVERS: Once<DriverRegistry> = Once::new();
 
 impl DriverRegistry {
@@ -82,6 +88,58 @@ impl Drop for CallbackGuard {
             let previous = record.active_callbacks.fetch_sub(1, Ordering::Release);
             assert!(previous != 0, "dev: driver callback count underflow");
         }
+    }
+}
+
+impl CallbackOwner {
+    /// Pins an interrupt-context callback owned by a loading or loaded driver.
+    pub(crate) fn acquire_irq(&self) -> Result<CallbackGuard> {
+        self.acquire(true, false)
+    }
+
+    /// Pins a control-plane callback while a driver is loading or loaded.
+    pub(crate) fn acquire_control(&self) -> Result<CallbackGuard> {
+        self.acquire(true, false)
+    }
+
+    /// Pins cleanup code while a driver is loading, loaded, or unloading.
+    pub(crate) fn acquire_cleanup(&self) -> Result<CallbackGuard> {
+        self.acquire(true, true)
+    }
+
+    /// Returns whether interrupt callbacks may currently enter this driver.
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.record
+            .as_ref()
+            .is_none_or(|record| record.state.load(Ordering::Acquire) == STATE_LOADED)
+    }
+
+    fn acquire(&self, allow_loading: bool, allow_unloading: bool) -> Result<CallbackGuard> {
+        let Some(record) = self.record.as_ref() else {
+            return Ok(CallbackGuard { record: None });
+        };
+        if !state_allowed(
+            record.state.load(Ordering::Acquire),
+            allow_loading,
+            allow_unloading,
+        ) {
+            return Err(Error::Busy);
+        }
+
+        record.active_callbacks.fetch_add(1, Ordering::AcqRel);
+        if !state_allowed(
+            record.state.load(Ordering::Acquire),
+            allow_loading,
+            allow_unloading,
+        ) {
+            let previous = record.active_callbacks.fetch_sub(1, Ordering::Release);
+            assert!(previous != 0, "dev: driver callback count underflow");
+            return Err(Error::Busy);
+        }
+
+        Ok(CallbackGuard {
+            record: Some(record.clone()),
+        })
     }
 }
 
@@ -132,6 +190,7 @@ pub unsafe fn load(module: &DriverModuleV1) -> Result<DriverId> {
     // remains executable. The host table is static and immutable.
     let status = unsafe { init(&HOST_API_V1, id.get(), module.context) };
     if status != 0 {
+        super::interrupt::cleanup_failed_load(id);
         record.state.store(STATE_UNLOADING, Ordering::Release);
         cleanup_failed_load(id);
         return Err(Error::CallbackFailed(status));
@@ -154,11 +213,32 @@ pub fn unload(id: DriverId) -> Result<()> {
         {
             return Err(Error::Busy);
         }
-        record.state.store(STATE_UNLOADING, Ordering::Release);
         record
     };
+
+    super::interrupt::prepare_remove_driver(id)?;
+    let transitioned = {
+        let _state = registry.state.lock();
+        if record.state.load(Ordering::Acquire) != STATE_LOADED {
+            false
+        } else {
+            record.state.store(STATE_UNLOADING, Ordering::Release);
+            if record.active_callbacks.load(Ordering::Acquire) == 0 {
+                true
+            } else {
+                record.state.store(STATE_LOADED, Ordering::Release);
+                false
+            }
+        }
+    };
+    if !transitioned {
+        let _ = super::interrupt::restore_driver(id);
+        return Err(Error::Busy);
+    }
+
     if let Err(error) = tree::prepare_remove_driver(id) {
         record.state.store(STATE_LOADED, Ordering::Release);
+        let _ = super::interrupt::restore_driver(id);
         return Err(error);
     }
     if let Ok(filesystem) = devtempfs::global()
@@ -166,20 +246,25 @@ pub fn unload(id: DriverId) -> Result<()> {
     {
         let _ = tree::restore_driver_resources(id);
         record.state.store(STATE_LOADED, Ordering::Release);
+        let _ = super::interrupt::restore_driver(id);
         return Err(map_filesystem_error(error));
     }
 
     if let Ok(filesystem) = devtempfs::global() {
-        filesystem
-            .remove_owner(id)
-            .map_err(map_filesystem_error)
-            .inspect_err(|_| {
-                let _ = tree::restore_driver_resources(id);
-                record.state.store(STATE_LOADED, Ordering::Release);
-            })?;
+        if let Err(error) = filesystem.remove_owner(id).map_err(map_filesystem_error) {
+            let _ = tree::restore_driver_resources(id);
+            record.state.store(STATE_LOADED, Ordering::Release);
+            let _ = super::interrupt::restore_driver(id);
+            return Err(error);
+        }
     }
-    tree::remove_driver(id).inspect_err(|_| record.state.store(STATE_LOADED, Ordering::Release))?;
+    if let Err(error) = tree::remove_driver(id) {
+        record.state.store(STATE_LOADED, Ordering::Release);
+        let _ = super::interrupt::restore_driver(id);
+        return Err(error);
+    }
 
+    super::interrupt::remove_driver(id);
     if let Some(fini) = record.callbacks.fini {
         // SAFETY: the descriptor contract keeps this callback executable until
         // unload completes, and all externally reachable callback objects have
@@ -249,13 +334,17 @@ pub(crate) fn parent_guard(caller: DriverId, parent_owner: DriverId) -> Result<C
     callback_guard(parent_owner)
 }
 
-fn callback_guard_with_states(
+pub(crate) fn callback_owner(id: DriverId) -> Result<CallbackOwner> {
+    callback_owner_with_states(id, true, false)
+}
+
+fn callback_owner_with_states(
     id: DriverId,
     allow_loading: bool,
     allow_unloading: bool,
-) -> Result<CallbackGuard> {
+) -> Result<CallbackOwner> {
     if id == KERNEL_DRIVER {
-        return Ok(CallbackGuard { record: None });
+        return Ok(CallbackOwner { record: None });
     }
     let state = registry()?.state.lock();
     let record = state
@@ -263,17 +352,31 @@ fn callback_guard_with_states(
         .get(&id)
         .cloned()
         .ok_or(Error::PermissionDenied)?;
-    let current = record.state.load(Ordering::Acquire);
-    if current != STATE_LOADED
-        && !(allow_loading && current == STATE_LOADING)
-        && !(allow_unloading && current == STATE_UNLOADING)
-    {
+    if !state_allowed(
+        record.state.load(Ordering::Acquire),
+        allow_loading,
+        allow_unloading,
+    ) {
         return Err(Error::Busy);
     }
-    record.active_callbacks.fetch_add(1, Ordering::Acquire);
-    Ok(CallbackGuard {
+    Ok(CallbackOwner {
         record: Some(record),
     })
+}
+
+fn callback_guard_with_states(
+    id: DriverId,
+    allow_loading: bool,
+    allow_unloading: bool,
+) -> Result<CallbackGuard> {
+    callback_owner_with_states(id, allow_loading, allow_unloading)?
+        .acquire(allow_loading, allow_unloading)
+}
+
+fn state_allowed(current: u8, allow_loading: bool, allow_unloading: bool) -> bool {
+    current == STATE_LOADED
+        || (allow_loading && current == STATE_LOADING)
+        || (allow_unloading && current == STATE_UNLOADING)
 }
 
 /// Loads every statically linked driver descriptor.

@@ -1,0 +1,57 @@
+#! /bin/sh
+
+version=3.13.14
+revision=7
+tarball_url="https://www.python.org/ftp/python/${version}/Python-${version}.tar.xz"
+tarball_blake2b="8f60f704c06fbfc2ee8ae3b2aa5c74cb5941f609baf74b3625eb37929933d2a3c806e9257c7d7f860d775a94454ed3ad90f50402ddd110b8bb32c40879bf66ec"
+imagedeps="build-essential python3"
+hostdeps="bootstrap-gcc binutils"
+deps="base ncurses readline"
+source_imagedeps=""
+source_hostdeps="autoconf-archive"
+source_deps=""
+source_allow_network=no
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    cat >config.site <<EOF
+ac_cv_file__dev_ptmx=no
+ac_cv_file__dev_ptc=no
+EOF
+
+    CONFIG_SITE="${PWD}/config.site" \
+    CC="${OS_TRIPLET}-gcc" \
+    CXX="${OS_TRIPLET}-g++" \
+    AR="${OS_TRIPLET}-ar" \
+    NM="${OS_TRIPLET}-nm" \
+    RANLIB="${OS_TRIPLET}-ranlib" \
+    READELF="${OS_TRIPLET}-readelf" \
+    STRIP="${OS_TRIPLET}-strip" \
+    CFLAGS="${TARGET_CFLAGS}" \
+    CXXFLAGS="${TARGET_CXXFLAGS}" \
+    CPPFLAGS="${TARGET_CPPFLAGS}" \
+    LDFLAGS="${TARGET_LDFLAGS}" \
+        "${source_dir}"/configure \
+            --build=x86_64-linux-gnu \
+            --host="${OS_TRIPLET}" \
+            --prefix="${prefix}" \
+            --enable-shared \
+            --disable-ipv6 \
+            --disable-test-modules \
+            --with-build-python=python3 \
+            --with-readline=readline \
+            --without-ensurepip \
+            --without-mimalloc \
+            --without-static-libpython
+}
+
+build() {
+    make -j"${parallelism}"
+}
+
+package() {
+    make install DESTDIR="${dest_dir}"
+}

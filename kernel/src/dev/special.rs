@@ -4,7 +4,7 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     fs::{
-        Error as FsError, OpenFlags, Result as FsResult,
+        Error as FsError, PollEvents, Result as FsResult,
         devtempfs::{self, DevNodeId, DeviceNodeKind, DeviceNodeOps},
     },
     sys::{debug, random},
@@ -113,12 +113,12 @@ impl DeviceNodeOps for KmsgDevice {
         Ok(debug::log_start_offset())
     }
 
-    fn read_at_with_flags(&self, offset: u64, buffer: &mut [u8], flags: u32) -> FsResult<usize> {
-        let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
-        debug::read_log(offset, buffer, nonblocking).map_err(|error| match error {
-            debug::LogReadError::Overrun => FsError::Io,
-            debug::LogReadError::WouldBlock => FsError::WouldBlock,
-        })
+    fn read_at_with_flags(&self, offset: u64, buffer: &mut [u8], _flags: u32) -> FsResult<usize> {
+        match debug::read_log(offset, buffer, true) {
+            Ok(read) => Ok(read),
+            Err(debug::LogReadError::Overrun) => Err(FsError::Io),
+            Err(debug::LogReadError::WouldBlock) => Ok(0),
+        }
     }
 
     fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
@@ -129,6 +129,16 @@ impl DeviceNodeOps for KmsgDevice {
     fn size(&self) -> u64 {
         debug::log_end_offset()
     }
+
+    fn poll(&self, offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
+        let mut ready = events & (PollEvents::OUT | PollEvents::WRNORM);
+        if offset < debug::log_start_offset() {
+            ready |= PollEvents::ERR;
+        } else if offset < debug::log_end_offset() {
+            ready |= events & (PollEvents::IN | PollEvents::RDNORM);
+        }
+        Ok(ready)
+    }
 }
 
 impl DeviceNodeOps for NullDevice {
@@ -138,6 +148,10 @@ impl DeviceNodeOps for NullDevice {
 
     fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
         Ok(buffer.len())
+    }
+
+    fn poll(&self, _offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
+        Ok(events & (PollEvents::IN | PollEvents::RDNORM | PollEvents::OUT | PollEvents::WRNORM))
     }
 }
 
@@ -150,6 +164,10 @@ impl DeviceNodeOps for ZeroDevice {
     fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
         Ok(buffer.len())
     }
+
+    fn poll(&self, _offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
+        Ok(events & (PollEvents::IN | PollEvents::RDNORM | PollEvents::OUT | PollEvents::WRNORM))
+    }
 }
 
 impl DeviceNodeOps for RandomDevice {
@@ -161,6 +179,10 @@ impl DeviceNodeOps for RandomDevice {
     fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
         random::mix_bytes(buffer);
         Ok(buffer.len())
+    }
+
+    fn poll(&self, _offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
+        Ok(events & (PollEvents::IN | PollEvents::RDNORM | PollEvents::OUT | PollEvents::WRNORM))
     }
 }
 

@@ -22,7 +22,7 @@ pub use vfs::{
 };
 pub use vnode::{
     CreateKind, DirEntry, FileSystem, FileSystemRef, FilesystemId, IoctlContext, NodeId, SetAttr,
-    StatFs, Vnode, VnodeAttr, VnodeKey, VnodeKind,
+    PollEvents, StatFs, Vnode, VnodeAttr, VnodeKey, VnodeKind,
 };
 
 /// Initializes the VFS, mounts tmpfs as root, and mounts devtempfs at `/dev`.

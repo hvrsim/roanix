@@ -11,6 +11,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use bitflags::bitflags;
+
 use crate::mem::VmObject;
 
 use super::error::{Error, Result};
@@ -75,6 +77,33 @@ pub enum VnodeKind {
     Fifo,
     /// Local socket endpoint.
     Socket,
+}
+
+bitflags! {
+    /// Readiness events used by descriptor polling.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct PollEvents: u16 {
+        /// Data can be read without blocking.
+        const IN = 0x0001;
+        /// Exceptional data is available.
+        const PRI = 0x0002;
+        /// Data can be written without blocking.
+        const OUT = 0x0004;
+        /// An asynchronous error is pending.
+        const ERR = 0x0008;
+        /// The peer has closed its endpoint.
+        const HUP = 0x0010;
+        /// The descriptor is invalid.
+        const NVAL = 0x0020;
+        /// Normal data can be read without blocking.
+        const RDNORM = 0x0040;
+        /// Priority data can be read without blocking.
+        const RDBAND = 0x0080;
+        /// Normal data can be written without blocking.
+        const WRNORM = 0x0100;
+        /// Priority data can be written without blocking.
+        const WRBAND = 0x0200;
+    }
 }
 
 /// Metadata returned for a vnode.
@@ -278,6 +307,29 @@ pub trait VnodeOps: Any + Send + Sync {
         self.write_at(vnode, offset, buffer)
     }
 
+    /// Returns events that are immediately ready for this open file.
+    fn poll(
+        &self,
+        vnode: &Vnode,
+        _offset: u64,
+        events: PollEvents,
+        flags: u32,
+    ) -> Result<PollEvents> {
+        let flags = super::file::OpenFlags::from_bits_retain(flags);
+        let mut supported = PollEvents::empty();
+        if flags.contains(super::file::OpenFlags::READ)
+            && matches!(vnode.kind(), VnodeKind::Regular | VnodeKind::Directory)
+        {
+            supported |= PollEvents::IN | PollEvents::RDNORM;
+        }
+        if flags.contains(super::file::OpenFlags::WRITE)
+            && vnode.kind() == VnodeKind::Regular
+        {
+            supported |= PollEvents::OUT | PollEvents::WRNORM;
+        }
+        Ok(events & supported)
+    }
+
     /// Appends bytes atomically and returns `(written, new_offset)`.
     fn append(&self, _vnode: &Vnode, _buffer: &[u8]) -> Result<(usize, u64)> {
         Err(Error::Unsupported)
@@ -456,6 +508,15 @@ impl Vnode {
         self.inner
             .operations
             .write_at_with_flags(self, offset, buffer, flags)
+    }
+
+    pub(crate) fn poll_with_flags(
+        &self,
+        offset: u64,
+        events: PollEvents,
+        flags: u32,
+    ) -> Result<PollEvents> {
+        self.inner.operations.poll(self, offset, events, flags)
     }
 
     /// Atomically appends bytes.

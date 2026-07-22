@@ -12,12 +12,15 @@ mod driver;
 #[cfg(target_arch = "riscv64")]
 pub mod dtb;
 pub mod error;
+pub mod interrupt;
 mod platform;
 pub mod resource;
 mod serial;
 mod special;
 mod tree;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) use acpi::rsdp_address as acpi_rsdp_address;
 pub use driver::{
     DriverInfo, info as driver_info, load as load_driver, loaded as loaded_drivers,
     unload as unload_driver,
@@ -39,6 +42,7 @@ pub use tree::{
 pub fn init() {
     tree::init();
     driver::init();
+    interrupt::init();
     platform::init().expect("dev: failed to register platform buses");
     serial::discover().expect("dev: failed to discover platform UARTs");
 }

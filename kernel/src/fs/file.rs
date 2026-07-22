@@ -9,7 +9,7 @@ use crate::sys::sync::Mutex;
 
 use super::{
     error::{Error, Result},
-    vnode::{DirEntry, IoctlContext, Vnode, VnodeAttr, VnodeKind},
+    vnode::{DirEntry, IoctlContext, PollEvents, Vnode, VnodeAttr, VnodeKind},
 };
 
 bitflags! {
@@ -140,6 +140,12 @@ impl OpenFile {
 
     /// Changes and returns the shared offset.
     pub fn seek(&self, from: SeekFrom) -> Result<u64> {
+        if matches!(
+            self.vnode.kind(),
+            VnodeKind::CharacterDevice | VnodeKind::Fifo | VnodeKind::Socket
+        ) {
+            return Err(Error::IllegalSeek);
+        }
         let mut offset = self.offset.lock();
         let base = match from {
             SeekFrom::Start(value) => {
@@ -174,6 +180,13 @@ impl OpenFile {
             size: None,
             mode: Some(mode),
         })
+    }
+
+    /// Returns requested events that are immediately ready.
+    pub fn poll(&self, events: PollEvents) -> Result<PollEvents> {
+        let offset = *self.offset.lock();
+        self.vnode
+            .poll_with_flags(offset, events, self.flags().bits())
     }
 
     /// Performs a device- or filesystem-specific control operation.

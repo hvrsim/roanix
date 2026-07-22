@@ -7,7 +7,10 @@ use core::{
 };
 
 use crate::{
-    fs::{Error as FsError, IoctlContext, OpenFlags, Result as FsResult, devtempfs::DeviceNodeOps},
+    fs::{
+        Error as FsError, IoctlContext, OpenFlags, PollEvents, Result as FsResult,
+        devtempfs::DeviceNodeOps,
+    },
     sys::{clock, sync::Mutex},
 };
 
@@ -668,6 +671,28 @@ impl DeviceNodeOps for Tty {
     fn write_at_with_flags(&self, _offset: u64, buffer: &[u8], flags: u32) -> FsResult<usize> {
         let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
         self.write_transformed(buffer, nonblocking)
+    }
+
+    fn poll(&self, _offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
+        self.pump_input();
+        let state = self.state.lock();
+        let mut ready = PollEvents::empty();
+        let read_events = events & (PollEvents::IN | PollEvents::RDNORM);
+        let readable = if state.termios.local_flags & ICANON != 0 {
+            canonical_ready(&state.input, &state.termios)
+        } else {
+            state
+                .input
+                .iter()
+                .any(|item| matches!(item, InputItem::Byte(_)))
+        };
+        if state.interrupted || readable {
+            ready |= read_events;
+        }
+        if !state.output_stopped {
+            ready |= events & (PollEvents::OUT | PollEvents::WRNORM);
+        }
+        Ok(ready)
     }
 
     fn sync(&self) -> FsResult<()> {

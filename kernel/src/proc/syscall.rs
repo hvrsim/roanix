@@ -9,7 +9,7 @@ use core::{
 
 use crate::{
     arch::cpu::TrapFrame,
-    fs::{self, IoctlContext, OpenFlags, SeekFrom, VnodeAttr, VnodeKind},
+    fs::{self, IoctlContext, OpenFlags, PollEvents, SeekFrom, VnodeAttr, VnodeKind},
     mem::{self, PAGE_SIZE, USER_ADDRESS_MIN, VirtAddr, VmInheritance, VmProtection},
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
     sys::{
@@ -58,10 +58,15 @@ const SYS_CLOCK_SLEEP: u64 = 35;
 const SYS_FILE_MKDIR: u64 = 36;
 const SYS_PROCESS_GETTID: u64 = 37;
 const SYS_FILE_FCHMOD: u64 = 38;
+const SYS_FILE_RENAME: u64 = 39;
+const SYS_FILE_POLL: u64 = 40;
+const SYS_SYSTEM_UNAME: u64 = 41;
 
 const MAX_IO_SIZE: usize = 16 * 1024 * 1024;
 const MAX_IOCTL_SIZE: usize = 4096;
 const MMAP_BASE: u64 = 0x1000_0000;
+const UTSNAME_FIELD_SIZE: usize = 65;
+const UTSNAME_FIELD_COUNT: usize = 6;
 
 const O_ACCMODE: u64 = 0o3;
 const O_WRONLY: u64 = 0o1;
@@ -128,6 +133,13 @@ struct FutexKey {
 struct Futex {
     generation: AtomicU64,
     event: Event,
+}
+
+#[derive(Clone, Copy)]
+struct UserPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 impl Futex {
@@ -228,6 +240,9 @@ pub(crate) fn dispatch(frame: &mut TrapFrame, number: u64, arguments: [u64; 6]) 
         SYS_FILE_MKDIR => sys_file_mkdir(arguments[0], arguments[1]),
         SYS_PROCESS_GETTID => Ok(crate::arch::thiscpu().current_thread as u64),
         SYS_FILE_FCHMOD => sys_file_fchmod(arguments[0] as i32, arguments[1]),
+        SYS_FILE_RENAME => sys_file_rename(arguments[0], arguments[1]),
+        SYS_FILE_POLL => sys_file_poll(arguments[0], arguments[1], arguments[2] as i32),
+        SYS_SYSTEM_UNAME => sys_system_uname(arguments[0]),
         _ => Err(Errno::NotImplemented),
     };
     let value = match result {
@@ -287,6 +302,9 @@ fn syscall_name(number: u64) -> &'static str {
         SYS_FILE_MKDIR => "mkdir",
         SYS_PROCESS_GETTID => "gettid",
         SYS_FILE_FCHMOD => "fchmod",
+        SYS_FILE_RENAME => "rename",
+        SYS_FILE_POLL => "poll",
+        SYS_SYSTEM_UNAME => "uname",
         _ => "unknown",
     }
 }
@@ -1001,6 +1019,115 @@ fn sys_file_fchmod(fd: i32, mode: u64) -> Result<u64> {
     Ok(0)
 }
 
+fn sys_file_rename(source: u64, target: u64) -> Result<u64> {
+    let process = current_process()?;
+    let source = process.resolve_path(&read_user_string(&process, source)?);
+    let target = process.resolve_path(&read_user_string(&process, target)?);
+    fs::rename(&source, &target).map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn sys_file_poll(poll_fds: u64, count: u64, timeout_ms: i32) -> Result<u64> {
+    const POLL_FD_SIZE: usize = size_of::<i32>() + size_of::<i16>() * 2;
+    const POLL_INTERVAL_NS: u64 = 1_000_000;
+
+    let count = usize::try_from(count).map_err(|_| Errno::Invalid)?;
+    let byte_len = count
+        .checked_mul(POLL_FD_SIZE)
+        .filter(|length| *length <= MAX_IO_SIZE)
+        .ok_or(Errno::Invalid)?;
+    let process = current_process()?;
+    let mut bytes = vec![0u8; byte_len];
+    if byte_len != 0 {
+        process
+            .address_space()
+            .read_user(VirtAddr::new(poll_fds), &mut bytes)
+            .map_err(map_memory_error)?;
+    }
+    let mut entries = bytes
+        .chunks_exact(POLL_FD_SIZE)
+        .map(|record| UserPollFd {
+            fd: i32::from_ne_bytes(record[..4].try_into().expect("poll fd width")),
+            events: i16::from_ne_bytes(record[4..6].try_into().expect("poll events width")),
+            revents: 0,
+        })
+        .collect::<Vec<_>>();
+    let deadline = (timeout_ms >= 0).then(|| {
+        clock::monotonic_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
+    });
+
+    loop {
+        let mut ready = 0usize;
+        for entry in &mut entries {
+            entry.revents = 0;
+            if entry.fd < 0 {
+                continue;
+            }
+            let requested = PollEvents::from_bits_retain(entry.events as u16);
+            let events = match process.descriptor(entry.fd) {
+                Some(Descriptor::File(file)) => file.poll(requested).unwrap_or(PollEvents::ERR),
+                Some(Descriptor::Pipe(pipe)) => pipe.poll(requested),
+                None => PollEvents::NVAL,
+            };
+            entry.revents = events.bits() as i16;
+            if !events.is_empty() {
+                ready += 1;
+            }
+        }
+
+        let now = clock::monotonic_ns();
+        if ready != 0 || timeout_ms == 0 || deadline.is_some_and(|value| now >= value) {
+            for (entry, record) in entries.iter().zip(bytes.chunks_exact_mut(POLL_FD_SIZE)) {
+                record[..4].copy_from_slice(&entry.fd.to_ne_bytes());
+                record[4..6].copy_from_slice(&entry.events.to_ne_bytes());
+                record[6..8].copy_from_slice(&entry.revents.to_ne_bytes());
+            }
+            if byte_len != 0 {
+                process
+                    .address_space()
+                    .write_user(VirtAddr::new(poll_fds), &bytes)
+                    .map_err(map_memory_error)?;
+            }
+            return Ok(ready as u64);
+        }
+
+        let sleep_ns = deadline
+            .map(|value| value.saturating_sub(now).min(POLL_INTERVAL_NS))
+            .unwrap_or(POLL_INTERVAL_NS);
+        clock::sleep(Duration::from_nanos(sleep_ns));
+    }
+}
+
+fn sys_system_uname(output: u64) -> Result<u64> {
+    #[cfg(target_arch = "x86_64")]
+    const MACHINE: &[u8] = b"x86_64";
+    #[cfg(target_arch = "riscv64")]
+    const MACHINE: &[u8] = b"riscv64";
+
+    let mut record = [0u8; UTSNAME_FIELD_SIZE * UTSNAME_FIELD_COUNT];
+    write_utsname_field(&mut record, 0, b"Roanix");
+    write_utsname_field(&mut record, 1, b"local");
+    write_utsname_field(&mut record, 2, env!("CARGO_PKG_VERSION").as_bytes());
+    write_utsname_field(&mut record, 3, concat!("#1 ", env!("ROANIX_GIT_HASH")).as_bytes());
+    write_utsname_field(&mut record, 4, MACHINE);
+    write_utsname_field(&mut record, 5, b"(none)");
+
+    current_process()?
+        .address_space()
+        .write_user(VirtAddr::new(output), &record)
+        .map_err(map_memory_error)?;
+    Ok(0)
+}
+
+fn write_utsname_field(record: &mut [u8], index: usize, value: &[u8]) {
+    assert!(
+        index < UTSNAME_FIELD_COUNT && value.len() < UTSNAME_FIELD_SIZE,
+        "uname: invalid field"
+    );
+    let start = index * UTSNAME_FIELD_SIZE;
+    record[start..start + value.len()].copy_from_slice(value);
+}
+
 fn current_process() -> Result<Arc<Process>> {
     proc::current().ok_or(Errno::Invalid)
 }
@@ -1236,6 +1363,7 @@ fn map_fs_error(error: fs::Error) -> Errno {
         fs::Error::NotFound => Errno::NoEntry,
         fs::Error::AlreadyExists => Errno::Exists,
         fs::Error::NotDirectory => Errno::NotDirectory,
+        fs::Error::IllegalSeek => Errno::IllegalSeek,
         fs::Error::IsDirectory => Errno::IsDirectory,
         fs::Error::NotTty => Errno::NotTty,
         fs::Error::Interrupted => Errno::Interrupted,

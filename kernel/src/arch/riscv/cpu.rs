@@ -21,6 +21,7 @@ const CSR_STVEC: u16 = 0x0105;
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
+const SCAUSE_SUPERVISOR_EXTERNAL: u64 = 9;
 const SCAUSE_USER_ECALL: u64 = 8;
 const SCAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
 const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
@@ -323,7 +324,8 @@ pub fn enable_features() {
     //
     // We accomplish this by doing the following:
     //   - Set the trap vector address, and the interrupt mode to direct.
-    //   - Enable supervisor software and external interrupts in the 'sie' CSR.
+    //   - Enable supervisor software interrupts in the 'sie' CSR. External
+    //     delivery is enabled after a root interrupt controller registers.
     //   - Disable MXR (Make eXecutable Readable).
     //   - Keep SIE masked so bootstrap does not take interrupts until the
     //     scheduler hands control to the first thread context.
@@ -333,7 +335,20 @@ pub fn enable_features() {
     unsafe {
         wrcsr::<CSR_STVEC>((&rtrap_entry as *const u8 as u64) & !0b11);
         clear_csr_bits::<CSR_SSTATUS>(SSTATUS_SIE | (1 << 19));
-        wrcsr::<CSR_SIE>(SIE_SSIE | SIE_SEIE);
+        wrcsr::<CSR_SIE>(SIE_SSIE);
+    }
+}
+
+/// Enables or disables supervisor external interrupts on the current hart.
+pub(crate) fn set_external_interrupts(enable: bool) {
+    // SAFETY: SIE.SEIE is the hart-local supervisor external interrupt enable
+    // bit and this operation preserves all other interrupt classes.
+    unsafe {
+        if enable {
+            set_csr_bits::<CSR_SIE>(SIE_SEIE);
+        } else {
+            clear_csr_bits::<CSR_SIE>(SIE_SEIE);
+        }
     }
 }
 
@@ -367,6 +382,21 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                     clear_csr_bits::<CSR_SIP>(SIE_SSIE);
                 }
                 return crate::sys::sched::trap_return(frame);
+            }
+            SCAUSE_SUPERVISOR_EXTERNAL => {
+                let cpu = crate::arch::thiscpu();
+                let platform_id = crate::sys::smp::platform_id(cpu.id)
+                    .expect("riscv: current hart is absent from SMP topology");
+                let outcome = crate::dev::interrupt::dispatch_external(cpu.id as u32, platform_id);
+                if outcome.handled {
+                    return if outcome.reschedule {
+                        crate::sys::sched::trap_return(frame)
+                    } else {
+                        frame
+                    };
+                }
+                set_external_interrupts(false);
+                return frame;
             }
             _ => {}
         }

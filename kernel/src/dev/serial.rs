@@ -23,6 +23,8 @@ struct DiscoveredUart {
     backend: Arc<dyn ConsoleBackend>,
     description: Box<str>,
     baud: u32,
+    #[cfg(target_arch = "x86_64")]
+    interrupt_uart: crate::arch::serial::LegacyUart,
 }
 
 static DISCOVERED: Once<Vec<DiscoveredUart>> = Once::new();
@@ -47,7 +49,7 @@ pub(super) fn start() -> Result<usize> {
     let discovered = DISCOVERED.get().ok_or(Error::NotInitialized)?;
     let console = super::platform_buses()?.console;
     for (index, uart) in discovered.iter().enumerate() {
-        publish_uart(console, index, uart.backend.clone(), uart.baud)?;
+        publish_uart(console, index, uart)?;
         info!("dev: serial{index} {}", uart.description);
     }
     let count = discovered.len();
@@ -68,6 +70,7 @@ fn discover_inner() -> Result<Vec<DiscoveredUart>> {
             description: format!("COM{} at I/O port 0x{:x}", com_index + 1, uart.base())
                 .into_boxed_str(),
             baud: 9600,
+            interrupt_uart: uart,
         });
     }
     Ok(discovered)
@@ -121,18 +124,18 @@ fn discover_inner() -> Result<Vec<DiscoveredUart>> {
     Ok(discovered)
 }
 
-fn publish_uart(
-    console: super::BusId,
-    index: usize,
-    backend: Arc<dyn ConsoleBackend>,
-    baud: u32,
-) -> Result<()> {
+fn publish_uart(console: super::BusId, index: usize, uart: &DiscoveredUart) -> Result<()> {
     let device = super::register_device(KERNEL_DRIVER, console, &format!("serial{index}"))?;
     validate_console_capability(device.node())?;
+    #[cfg(target_arch = "x86_64")]
+    if let Err(error) = uart.interrupt_uart.enable_interrupts(device.node()) {
+        let _ = super::remove_node(KERNEL_DRIVER, device.node());
+        return Err(error);
+    }
 
-    let tty: Arc<dyn DeviceNodeOps> = Tty::new(backend, index, baud)?;
+    let tty: Arc<dyn DeviceNodeOps> = Tty::new(uart.backend.clone(), index, uart.baud)?;
     let filesystem = devtempfs::global().map_err(|_| Error::Filesystem)?;
-    let name = format!("ttys{index}");
+    let name = format!("ttyS{index}");
     filesystem
         .create_device(
             KERNEL_DRIVER,

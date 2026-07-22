@@ -20,6 +20,7 @@ use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use crate::sys::{debug, smp::CoreLocal};
 
 pub mod cpu;
+pub mod ioapic;
 pub mod lapic;
 pub mod paging;
 pub mod serial;
@@ -109,6 +110,7 @@ pub fn init_boot_cpu() {
 /// Initializes global x86 platform facilities that require memory services.
 pub fn init_platform() {
     timer::init();
+    ioapic::init().expect("x86: failed to initialize IOAPIC interrupt domain");
 }
 
 /// Performs per-CPU initialization for a secondary core.

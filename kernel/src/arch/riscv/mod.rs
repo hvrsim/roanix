@@ -9,7 +9,12 @@
 //!
 
 use crate::sys::{debug, smp::CoreLocal};
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use crate::sys::smp::{self, IpiTarget};
 
 pub mod cpu;
 pub mod paging;
@@ -22,6 +27,7 @@ pub mod timer;
 /// This bootstrap instance is only referenced through a raw pointer
 /// during early bring-up before hart-local state becomes shared.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
+static EXTERNAL_INTERRUPTS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// SBI extension ID for the debug console.
 const DEBUG_EXT_ID: usize = 0x4442434E;
@@ -203,6 +209,17 @@ pub fn init_secondary_cpu(core_local: *const CoreLocal) {
 fn init_cpu(core_local: *const CoreLocal) {
     set_core_local(core_local);
     cpu::enable_features();
+    refresh_external_interrupts();
+}
+
+pub(crate) fn set_external_interrupts(enable: bool) {
+    EXTERNAL_INTERRUPTS_ENABLED.store(enable, Ordering::Release);
+    refresh_external_interrupts();
+    let _ = smp::send_ipi(refresh_external_interrupts, IpiTarget::All);
+}
+
+fn refresh_external_interrupts() {
+    cpu::set_external_interrupts(EXTERNAL_INTERRUPTS_ENABLED.load(Ordering::Acquire));
 }
 
 /// Pauses CPU execution and waits for interrupts.

@@ -561,12 +561,41 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             cpu_id,
             tid,
         );
-        panic!("x86/trap: exception while returning from kernel trap");
+        panic!(
+            "x86/trap: kernel exception ip=0x{:X} vec=0x{:X} ec=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
+            frame.ip,
+            frame.vec,
+            frame.ec,
+            Cr2::read_raw(),
+            frame.cs,
+            frame.ss,
+            frame.sp,
+            frame.rflags,
+            cpu_id,
+            tid,
+        );
     }
 
     let _interrupt = crate::sys::smp::enter_interrupt_context();
 
-    let next = match crate::arch::timer::handle_interrupt(frame.vec) {
+    let action = match crate::arch::timer::handle_interrupt(frame.vec) {
+        crate::arch::timer::InterruptAction::Unhandled => {
+            let outcome = crate::dev::interrupt::dispatch_vector(frame.vec as u8);
+            if outcome.handled {
+                crate::arch::lapic::eoi();
+                if outcome.reschedule {
+                    crate::arch::timer::InterruptAction::Reschedule
+                } else {
+                    crate::arch::timer::InterruptAction::Handled
+                }
+            } else {
+                crate::arch::timer::InterruptAction::Unhandled
+            }
+        }
+        action => action,
+    };
+
+    let next = match action {
         crate::arch::timer::InterruptAction::Reschedule => crate::sys::sched::trap_return(frame),
         crate::arch::timer::InterruptAction::Handled => frame,
         crate::arch::timer::InterruptAction::Unhandled => {

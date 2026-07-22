@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 #define ROANIX_DRIVER_ABI_V1 1u
+#define ROANIX_INTERRUPT_ABI_V1 1u
 
 #define ROANIX_OK 0
 #define ROANIX_EINVAL (-1)
@@ -38,6 +39,19 @@ extern "C" {
 /* Reserved until resource lookup is interrupt-safe; publication returns ENOTSUP. */
 #define ROANIX_RESOURCE_IRQ_SAFE (UINT64_C(1) << 3)
 
+#define ROANIX_INTERRUPT_CONTROLLER_ROOT (UINT64_C(1) << 0)
+
+#define ROANIX_INTERRUPT_EDGE (UINT64_C(1) << 0)
+#define ROANIX_INTERRUPT_LEVEL (UINT64_C(1) << 1)
+#define ROANIX_INTERRUPT_ACTIVE_HIGH (UINT64_C(1) << 2)
+#define ROANIX_INTERRUPT_ACTIVE_LOW (UINT64_C(1) << 3)
+#define ROANIX_INTERRUPT_START_MASKED (UINT64_C(1) << 4)
+
+#define ROANIX_INTERRUPT_RESCHEDULE (UINT32_C(1) << 0)
+
+#define ROANIX_INTERRUPT_DOMAIN_NAMESPACE UINT64_C(0x524F414E49584952)
+#define ROANIX_INTERRUPT_DOMAIN_RESOURCE UINT64_C(1)
+
 struct roanix_driver_host_v1;
 
 struct roanix_slice {
@@ -48,6 +62,64 @@ struct roanix_slice {
 struct roanix_resource_key {
     uint64_t namespace_id;
     uint64_t resource_id;
+};
+
+struct roanix_interrupt_route_v1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t interrupt;
+    uint32_t vector;
+    uint32_t target_cpu;
+    uint64_t target_platform_id;
+    uint64_t flags;
+    struct roanix_slice specifier;
+};
+
+typedef int32_t (*roanix_interrupt_connect_fn)(
+    uintptr_t context,
+    const struct roanix_interrupt_route_v1 *route,
+    uint64_t *out_cookie);
+typedef int32_t (*roanix_interrupt_disconnect_fn)(
+    uintptr_t context,
+    uint64_t cookie);
+typedef int32_t (*roanix_interrupt_line_fn)(
+    uintptr_t context,
+    uint64_t cookie);
+typedef int32_t (*roanix_interrupt_set_affinity_fn)(
+    uintptr_t context,
+    uint64_t cookie,
+    const struct roanix_interrupt_route_v1 *route);
+/* IRQ-safe: must not block, allocate, or call thread-context host services. */
+typedef int32_t (*roanix_interrupt_claim_fn)(
+    uintptr_t context,
+    uint32_t cpu,
+    uint64_t platform_id,
+    uint64_t *out_interrupt,
+    uint64_t *out_cookie);
+/* IRQ-safe: completes one value returned by the matching claim callback. */
+typedef void (*roanix_interrupt_complete_fn)(
+    uintptr_t context,
+    uint32_t cpu,
+    uint64_t platform_id,
+    uint64_t interrupt,
+    uint64_t cookie);
+/* IRQ-safe: return ROANIX_INTERRUPT_RESCHEDULE when trap return must schedule. */
+typedef uint32_t (*roanix_interrupt_handler_fn)(
+    uintptr_t context,
+    uint64_t interrupt);
+
+struct roanix_interrupt_controller_v1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t flags;
+    uintptr_t context;
+    roanix_interrupt_connect_fn connect;
+    roanix_interrupt_disconnect_fn disconnect;
+    roanix_interrupt_line_fn mask;
+    roanix_interrupt_line_fn unmask;
+    roanix_interrupt_set_affinity_fn set_affinity;
+    roanix_interrupt_claim_fn claim;
+    roanix_interrupt_complete_fn complete;
 };
 
 typedef int32_t (*roanix_resource_fn)(
@@ -177,7 +249,45 @@ struct roanix_driver_host_v1 {
     uint8_t *(*allocate_zeroed)(size_t size, size_t align);
     int32_t (*deallocate)(uint8_t *data, size_t size, size_t align);
     int32_t (*log)(uint32_t level, struct roanix_slice message);
+    int32_t (*register_interrupt_controller)(
+        uint64_t driver,
+        uint64_t bus,
+        const struct roanix_interrupt_controller_v1 *controller,
+        uint64_t *out_controller);
+    int32_t (*unregister_interrupt_controller)(
+        uint64_t driver,
+        uint64_t controller);
+    int32_t (*request_interrupt)(
+        uint64_t driver,
+        uint64_t node,
+        struct roanix_slice specifier,
+        uint64_t flags,
+        uint32_t target_cpu,
+        roanix_interrupt_handler_fn handler,
+        uintptr_t context,
+        uint64_t *out_interrupt);
+    int32_t (*release_interrupt)(uint64_t driver, uint64_t interrupt);
+    int32_t (*mask_interrupt)(uint64_t driver, uint64_t interrupt);
+    int32_t (*unmask_interrupt)(uint64_t driver, uint64_t interrupt);
+    int32_t (*set_interrupt_affinity)(
+        uint64_t driver,
+        uint64_t interrupt,
+        uint32_t target_cpu);
+    /*
+     * Establishes a persistent uncached/device mapping in the kernel direct
+     * map. The returned address remains valid after driver unload.
+     */
+    int32_t (*map_mmio)(
+        uint64_t driver,
+        uint64_t physical,
+        size_t size,
+        uintptr_t *out_address);
 };
+
+#define ROANIX_HOST_HAS(host, field)                                         \
+    ((host) != NULL &&                                                       \
+     (host)->size >= offsetof(struct roanix_driver_host_v1, field) +         \
+                         sizeof((host)->field))
 
 int32_t roanix_driver_load_v1(
     const struct roanix_driver_module_v1 *module,

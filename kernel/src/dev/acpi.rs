@@ -5,6 +5,8 @@ use core::slice;
 
 use limine::request::RsdpRequest;
 
+use crate::sys::sync::Once;
+
 use super::{
     BusId, Error, KERNEL_DRIVER, Result,
     resource::{ResourceFlags, ResourceKey, ResourceValue},
@@ -21,6 +23,7 @@ pub const RSDP_RESOURCE: ResourceKey = ResourceKey::new(0x524F_414E_4958_4657, 1
 #[doc(hidden)]
 #[unsafe(link_section = ".requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+static RSDP_ADDRESS: Once<usize> = Once::new();
 
 /// Publishes the bootloader-provided RSDP on the ACPI bus.
 pub(super) fn publish_rsdp(bus: BusId) -> Result<()> {
@@ -30,6 +33,7 @@ pub(super) fn publish_rsdp(bus: BusId) -> Result<()> {
     // for the kernel lifetime. `rsdp_length` validates the fixed header before
     // the computed length is used.
     let length = unsafe { rsdp_length(pointer)? };
+    RSDP_ADDRESS.call_once(|| pointer as usize);
     // SAFETY: the validated RSDP length is contained in the persistent ACPI
     // root structure supplied by Limine.
     let bytes: Arc<[u8]> = Arc::from(unsafe { slice::from_raw_parts(pointer, length) });
@@ -41,6 +45,10 @@ pub(super) fn publish_rsdp(bus: BusId) -> Result<()> {
         ResourceValue::Data(bytes),
     )?;
     Ok(())
+}
+
+pub(crate) fn rsdp_address() -> Option<usize> {
+    RSDP_ADDRESS.get().copied()
 }
 
 /// Validates the RSDP signature and checksums and returns its complete length.

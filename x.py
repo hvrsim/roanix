@@ -210,8 +210,14 @@ ARCHITECTURES: Mapping[str, Architecture] = {
     ),
 }
 
-USERSPACE_PACKAGES = ("bash", "coreutils", "init", "os-test")
-USERSPACE_BUILD_PACKAGES = ("mlibc-headers", "mlibc", *USERSPACE_PACKAGES)
+USERSPACE_PACKAGES = ("bash", "coreutils", "python", "init", "os-test")
+USERSPACE_BUILD_PACKAGES = (
+    "mlibc-headers",
+    "mlibc",
+    "ncurses",
+    "readline",
+    *USERSPACE_PACKAGES,
+)
 
 DOWNLOADS: Mapping[str, DownloadPin] = {
     "limine": DownloadPin(
@@ -1593,7 +1599,7 @@ def build_hdd(ctx: Context) -> Path:
     ensure_dir(ctx.image_hdd.parent)
     remove_path(ctx.image_hdd)
     with ctx.image_hdd.open("wb") as disk:
-        disk.truncate(64 * 1024 * 1024)
+        disk.truncate(128 * 1024 * 1024)
 
     path = os.environ.get("PATH", "")
     tool_path = f"{path}:/usr/sbin:/sbin" if path else "/usr/sbin:/sbin"

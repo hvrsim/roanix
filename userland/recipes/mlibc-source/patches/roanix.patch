@@ -45,7 +45,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
 --- /dev/null
 +++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,815 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -249,6 +249,10 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    return error;
 +}
 +
++int Sysdeps<Fadvise>::operator()(int, off_t, off_t, int) {
++    return 0;
++}
++
 +int Sysdeps<Fork>::operator()(pid_t *child) {
 +    long result = roanix_syscall0(ROANIX_SYS_PROCESS_FORK);
 +    int error = syscall_error(result);
@@ -434,9 +438,24 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +        ROANIX_SYS_FILE_MKDIR, as_word(path), mode));
 +}
 +
++int Sysdeps<Rename>::operator()(const char *path, const char *new_path) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_RENAME, as_word(path), as_word(new_path)));
++}
++
 +int Sysdeps<Pipe>::operator()(int *fds, int flags) {
 +    return syscall_error(roanix_syscall2(
 +        ROANIX_SYS_FILE_PIPE, as_word(fds), flags));
++}
++
++int Sysdeps<Poll>::operator()(
++        struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_POLL, as_word(fds), count, timeout);
++    int error = syscall_error(result);
++    if (!error)
++        *num_events = static_cast<int>(result);
++    return error;
 +}
 +
 +int Sysdeps<Sleep>::operator()(time_t *seconds, long *nanoseconds) {
@@ -488,7 +507,7 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<GetHostname>::operator()(char *buffer, size_t size) {
-+    const char hostname[] = "roanix";
++    const char hostname[] = "local";
 +    if (size < sizeof(hostname))
 +        return ENAMETOOLONG;
 +    memcpy(buffer, hostname, sizeof(hostname));
@@ -496,22 +515,9 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<Uname>::operator()(struct utsname *name) {
-+    auto copy = [](char *destination, const char *source) {
-+        do {
-+            *destination++ = *source;
-+        } while (*source++);
-+    };
-+    memset(name, 0, sizeof(*name));
-+    copy(name->sysname, "Roanix");
-+    copy(name->nodename, "roanix");
-+    copy(name->release, "0.1");
-+    copy(name->version, "0.1");
-+#if defined(__x86_64__)
-+    copy(name->machine, "x86_64");
-+#else
-+    copy(name->machine, "riscv64");
-+#endif
-+    return 0;
++    static_assert(sizeof(*name) == sizeof(struct roanix_utsname));
++    return syscall_error(roanix_syscall1(
++        ROANIX_SYS_SYSTEM_UNAME, as_word(name)));
 +}
 +
 +int Sysdeps<Sysconf>::operator()(int number, long *result) {
@@ -527,21 +533,27 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<GetEntropy>::operator()(void *buffer, size_t length) {
-+    time_t seconds;
-+    long nanoseconds;
-+    int error = sysdep<ClockGet>(CLOCK_MONOTONIC, &seconds, &nanoseconds);
++    int fd;
++    int error = sysdep<Open>("/dev/urandom", O_RDONLY, 0, &fd);
 +    if (error)
 +        return error;
-+    uint64_t state = static_cast<uint64_t>(nanoseconds)
-+        ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer));
++
 +    auto output = static_cast<unsigned char *>(buffer);
-+    for (size_t i = 0; i < length; i++) {
-+        state ^= state << 13;
-+        state ^= state >> 7;
-+        state ^= state << 17;
-+        output[i] = static_cast<unsigned char>(state);
++    size_t offset = 0;
++    while (offset < length) {
++        ssize_t bytes_read;
++        error = sysdep<Read>(fd, output + offset, length - offset, &bytes_read);
++        if (error)
++            break;
++        if (!bytes_read) {
++            error = EIO;
++            break;
++        }
++        offset += static_cast<size_t>(bytes_read);
 +    }
-+    return 0;
++
++    int close_error = sysdep<Close>(fd);
++    return error ? error : close_error;
 +}
 +
 +int Sysdeps<Umask>::operator()(mode_t, mode_t *old) {
@@ -564,27 +576,95 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +        const struct timespec *timeout,
 +        const sigset_t *,
 +        int *num_events) {
-+    if (except_set) {
-+        auto bytes = reinterpret_cast<unsigned char *>(except_set);
-+        for (size_t i = 0; i < sizeof(*except_set); i++)
-+            bytes[i] = 0;
++    if (num_fds < 0 || num_fds > FD_SETSIZE)
++        return EINVAL;
++    int timeout_ms = -1;
++    if (timeout) {
++        if (timeout->tv_sec < 0
++                || timeout->tv_nsec < 0
++                || timeout->tv_nsec >= 1000000000)
++            return EINVAL;
++        if (timeout->tv_sec > INT_MAX / 1000) {
++            timeout_ms = INT_MAX;
++        } else {
++            unsigned long long milliseconds =
++                static_cast<unsigned long long>(timeout->tv_sec) * 1000
++                + (static_cast<unsigned long long>(timeout->tv_nsec) + 999999) / 1000000;
++            timeout_ms = milliseconds > INT_MAX
++                ? INT_MAX
++                : static_cast<int>(milliseconds);
++        }
 +    }
-+    int ready = 0;
++
++    struct pollfd poll_fds[FD_SETSIZE];
++    int poll_count = 0;
 +    for (int fd = 0; fd < num_fds; fd++) {
 +        unsigned char mask = 1u << (fd % 8);
 +        bool readable = read_set
 +            && (read_set->fds_bits[fd / 8] & mask);
 +        bool writable = write_set
 +            && (write_set->fds_bits[fd / 8] & mask);
-+        if (readable || writable)
-+            ready++;
++        bool exceptional = except_set
++            && (except_set->fds_bits[fd / 8] & mask);
++        short events = 0;
++        if (readable)
++            events |= POLLIN;
++        if (writable)
++            events |= POLLOUT;
++        if (exceptional)
++            events |= POLLPRI;
++        if (!events)
++            continue;
++        poll_fds[poll_count].fd = fd;
++        poll_fds[poll_count].events = events;
++        poll_fds[poll_count].revents = 0;
++        poll_count++;
 +    }
-+    if (!ready && timeout) {
-+        time_t seconds = timeout->tv_sec;
-+        long nanoseconds = timeout->tv_nsec;
-+        int error = sysdep<Sleep>(&seconds, &nanoseconds);
-+        if (error)
-+            return error;
++
++    int polled;
++    int error = sysdep<Poll>(
++        poll_fds,
++        static_cast<nfds_t>(poll_count),
++        timeout_ms,
++        &polled
++    );
++    if (error)
++        return error;
++
++    if (read_set)
++        memset(read_set, 0, sizeof(*read_set));
++    if (write_set)
++        memset(write_set, 0, sizeof(*write_set));
++    if (except_set)
++        memset(except_set, 0, sizeof(*except_set));
++
++    int ready = 0;
++    for (int index = 0; index < poll_count; index++) {
++        const auto &entry = poll_fds[index];
++        if (entry.revents & POLLNVAL)
++            return EBADF;
++        unsigned char mask = 1u << (entry.fd % 8);
++        bool descriptor_ready = false;
++        if (read_set
++                && entry.events & POLLIN
++                && entry.revents & (POLLIN | POLLHUP | POLLERR)) {
++            read_set->fds_bits[entry.fd / 8] |= mask;
++            descriptor_ready = true;
++        }
++        if (write_set
++                && entry.events & POLLOUT
++                && entry.revents & (POLLOUT | POLLERR)) {
++            write_set->fds_bits[entry.fd / 8] |= mask;
++            descriptor_ready = true;
++        }
++        if (except_set
++                && entry.events & POLLPRI
++                && entry.revents & POLLPRI) {
++            except_set->fds_bits[entry.fd / 8] |= mask;
++            descriptor_ready = true;
++        }
++        if (descriptor_ready)
++            ready++;
 +    }
 +    *num_events = ready;
 +    return 0;
@@ -794,7 +874,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
 --- /dev/null
 +++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,97 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -821,6 +901,7 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Dup,
 +    Dup2,
 +    Fcntl,
++    Fadvise,
 +    Fork,
 +    Execve,
 +    Waitpid,
@@ -842,7 +923,9 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Readlink,
 +    Unlinkat,
 +    Mkdir,
++    Rename,
 +    Pipe,
++    Poll,
 +    Sleep,
 +    GetGid,
 +    GetEgid,
@@ -894,7 +977,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
 --- /dev/null
 +++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,200 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -939,7 +1022,21 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +    ROANIX_SYS_CLOCK_SLEEP,
 +    ROANIX_SYS_FILE_MKDIR,
 +    ROANIX_SYS_PROCESS_GETTID,
-+    ROANIX_SYS_FILE_FCHMOD
++    ROANIX_SYS_FILE_FCHMOD,
++    ROANIX_SYS_FILE_RENAME,
++    ROANIX_SYS_FILE_POLL,
++    ROANIX_SYS_SYSTEM_UNAME
++};
++
++#define ROANIX_UTSNAME_FIELD_SIZE 65
++
++struct roanix_utsname {
++    char sysname[ROANIX_UTSNAME_FIELD_SIZE];
++    char nodename[ROANIX_UTSNAME_FIELD_SIZE];
++    char release[ROANIX_UTSNAME_FIELD_SIZE];
++    char version[ROANIX_UTSNAME_FIELD_SIZE];
++    char machine[ROANIX_UTSNAME_FIELD_SIZE];
++    char domainname[ROANIX_UTSNAME_FIELD_SIZE];
 +};
 +
 +struct roanix_stat {

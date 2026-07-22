@@ -3,7 +3,10 @@
 use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sys::{event::Event, sync::Mutex};
+use crate::{
+    fs::PollEvents,
+    sys::{event::Event, sync::Mutex},
+};
 
 const PIPE_CAPACITY: usize = 64 * 1024;
 
@@ -144,6 +147,32 @@ impl PipeEnd {
     /// Returns whether operations avoid sleeping.
     pub(crate) fn is_nonblocking(&self) -> bool {
         self.nonblocking.load(Ordering::Acquire)
+    }
+
+    /// Returns requested events that are immediately ready.
+    pub(crate) fn poll(&self, events: PollEvents) -> PollEvents {
+        let state = self.pipe.state.lock();
+        match self.direction {
+            Direction::Read => {
+                let mut ready = PollEvents::empty();
+                if !state.buffer.is_empty() {
+                    ready |= events & (PollEvents::IN | PollEvents::RDNORM);
+                }
+                if !state.writer_open {
+                    ready |= PollEvents::HUP;
+                }
+                ready
+            }
+            Direction::Write => {
+                if !state.reader_open {
+                    PollEvents::ERR
+                } else if state.buffer.len() < PIPE_CAPACITY {
+                    events & (PollEvents::OUT | PollEvents::WRNORM)
+                } else {
+                    PollEvents::empty()
+                }
+            }
+        }
     }
 }
 
