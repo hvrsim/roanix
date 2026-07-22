@@ -15,7 +15,6 @@ use crate::{
         ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmInheritance, VmObject, VmProtection,
         VmSpace, align_down,
     },
-    sys::clock,
 };
 
 use super::{Error, Result};
@@ -381,13 +380,7 @@ fn build_stack(
     let executable_pointer = push_string(&mut bytes, &mut cursor, stack_base, executable)?;
 
     let mut random = [0u8; 16];
-    let mut seed = clock::monotonic_ns() ^ main.entry ^ main.program_headers;
-    for chunk in random.chunks_mut(8) {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        chunk.copy_from_slice(&seed.to_ne_bytes());
-    }
+    crate::sys::random::fill_bytes(&mut random);
     let random_pointer = push_bytes(&mut bytes, &mut cursor, stack_base, &random, 16)?;
 
     let mut words = Vec::new();

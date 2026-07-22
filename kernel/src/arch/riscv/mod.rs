@@ -64,6 +64,11 @@ pub(crate) fn console_write(line: &[u8]) {
     }
 }
 
+/// Returns platform-provided hardware entropy when available.
+pub(crate) fn entropy_word() -> Option<u64> {
+    None
+}
+
 /// Returns core local context.
 ///
 /// On riscv64, kernel core-local data is stored in the TP register.

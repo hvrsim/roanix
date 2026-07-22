@@ -11,6 +11,7 @@ pub mod debug;
 pub mod event;
 pub mod initramfs;
 pub mod panic;
+pub mod random;
 pub mod sched;
 pub mod smp;
 pub mod sync;

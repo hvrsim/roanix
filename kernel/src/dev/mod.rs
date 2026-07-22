@@ -15,6 +15,7 @@ pub mod error;
 mod platform;
 pub mod resource;
 mod serial;
+mod special;
 mod tree;
 
 pub use driver::{
@@ -50,4 +51,9 @@ pub fn start_linked_drivers() -> Result<()> {
 /// Probes built-in platform drivers and publishes their device nodes.
 pub fn start_platform_drivers() -> Result<usize> {
     serial::start()
+}
+
+/// Publishes kernel-native special devices in devtempfs.
+pub fn start_special_devices() -> Result<()> {
+    special::start()
 }

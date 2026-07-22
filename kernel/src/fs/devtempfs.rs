@@ -76,6 +76,11 @@ impl DeviceNodeKind {
 
 /// File operations implemented by a driver-owned device node.
 pub trait DeviceNodeOps: Send + Sync {
+    /// Returns the initial byte offset for a new open file description.
+    fn initial_offset(&self, _flags: u32) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Opens a new file description.
     fn open(&self, _flags: u32) -> Result<()> {
         Ok(())
@@ -555,6 +560,20 @@ impl DevtempfsNode {
 impl VnodeOps for DevtempfsNode {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn initial_offset(&self, _vnode: &Vnode, flags: u32) -> Result<u64> {
+        match &self.data {
+            DevtempfsData::Directory => {
+                self.ensure_live()?;
+                Ok(0)
+            }
+            DevtempfsData::Device(operations) => {
+                let _activity = self.begin_activity()?;
+                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
+                operations.initial_offset(flags)
+            }
+        }
     }
 
     fn open(&self, _vnode: &Vnode, flags: u32) -> Result<()> {

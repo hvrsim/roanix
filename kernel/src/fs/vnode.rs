@@ -183,6 +183,11 @@ pub trait VnodeOps: Any + Send + Sync {
     /// Supports checked downcasting by the owning filesystem.
     fn as_any(&self) -> &dyn Any;
 
+    /// Returns the initial byte offset for a new open file description.
+    fn initial_offset(&self, _vnode: &Vnode, _flags: u32) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Notifies the filesystem that an open file description was created.
     fn open(&self, _vnode: &Vnode, _flags: u32) -> Result<()> {
         Ok(())
@@ -373,6 +378,10 @@ impl Vnode {
     /// Returns current vnode metadata.
     pub fn getattr(&self) -> Result<VnodeAttr> {
         self.inner.operations.getattr(self)
+    }
+
+    pub(crate) fn initial_offset(&self, flags: u32) -> Result<u64> {
+        self.inner.operations.initial_offset(self, flags)
     }
 
     /// Applies supported metadata changes.

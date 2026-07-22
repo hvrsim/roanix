@@ -71,6 +71,26 @@ pub(crate) fn console_write(line: &[u8]) {
     }
 }
 
+/// Returns one word from the CPU hardware random generator when available.
+pub(crate) fn entropy_word() -> Option<u64> {
+    if !raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|features| features.has_rdrand())
+    {
+        return None;
+    }
+
+    for _ in 0..10 {
+        let mut value = 0;
+        // SAFETY: CPUID confirmed RDRAND support before executing the
+        // target-feature intrinsic.
+        if unsafe { core::arch::x86_64::_rdrand64_step(&mut value) } == 1 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Initializes the debug console for printing.
 ///
 /// On x86_64, QEMU's debugcon is pre-configured, so we simply

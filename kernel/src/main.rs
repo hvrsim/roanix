@@ -62,6 +62,7 @@ fn init_thread() {
     sys::smp::start_secondary_cpus();
     mem::start_page_daemon();
     fs::init();
+    dev::start_special_devices().expect("boot: failed to publish special devices");
     dev::start_platform_drivers().expect("boot: failed to start platform drivers");
     dev::start_linked_drivers().expect("boot: failed to load linked drivers");
     sys::initramfs::populate().expect("boot: failed to import initramfs");

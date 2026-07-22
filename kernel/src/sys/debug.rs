@@ -12,13 +12,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use log::Level;
 
-use crate::sys::smp::IrqSpinLock;
+use crate::sys::{event::Event, smp::IrqSpinLock};
 
 /// Connector between [`log`] crate and the kernel logging backend.
 struct KLog;
 
 /// Number of entries stored in the global log ring.
 pub const RING_CAPACITY: usize = 512;
+
+const RECORD_CAPACITY: usize = 256;
 
 /// Maximum number of registered sinks.
 pub const MAX_SINKS: usize = 8;
@@ -31,7 +33,7 @@ pub type LogSink = fn(*const u8, usize);
 #[allow(dead_code)]
 struct Record {
     /// Buffer to store the formatted log message.
-    buf: [u8; 256],
+    buf: [u8; RECORD_CAPACITY],
 
     /// Length of formatted log message in bytes.
     buflen: usize,
@@ -41,6 +43,9 @@ struct Record {
 
     /// CPU responsible for the message.
     cpu: usize,
+
+    /// Absolute byte offset of this record in the kmsg stream.
+    stream_offset: u64,
 }
 
 /// Fixed-size ring buffer containing the latest kernel logs.
@@ -49,6 +54,7 @@ struct LogRing {
     read: usize,
     write: usize,
     len: usize,
+    next_offset: u64,
 }
 
 /// Shared debug subsystem state.
@@ -63,15 +69,26 @@ static LOGGER: KLog = KLog;
 /// Global debug state protected by an IRQ-safe spinlock.
 static DEBUG_STATE: IrqSpinLock<DebugState> = IrqSpinLock::new(DebugState::new());
 static PANIC_MODE: AtomicBool = AtomicBool::new(false);
+static REGULAR_SINK_OUTPUT: AtomicBool = AtomicBool::new(true);
+static LOG_EVENT: Event = Event::new();
+
+/// Failure returned while reading the kernel log stream.
+pub(crate) enum LogReadError {
+    /// The requested data has already been overwritten.
+    Overrun,
+    /// A nonblocking read found no new data.
+    WouldBlock,
+}
 
 impl Record {
     /// Creates an empty log record.
     const fn empty() -> Self {
         Self {
-            buf: [0; 256],
+            buf: [0; RECORD_CAPACITY],
             buflen: 0,
             level: 0,
             cpu: 0,
+            stream_offset: 0,
         }
     }
 
@@ -106,6 +123,23 @@ impl Record {
 
         rec
     }
+
+    /// Creates a record from bytes written through `/dev/kmsg`.
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut rec = Self {
+            level: 3,
+            cpu: crate::arch::thiscpu_opt().map_or(0, |cpu| cpu.id),
+            ..Self::empty()
+        };
+        let count = bytes.len().min(rec.buf.len());
+        rec.buf[..count].copy_from_slice(&bytes[..count]);
+        rec.buflen = count;
+        rec
+    }
+
+    fn stream_len(self) -> u64 {
+        self.buflen as u64 + 1
+    }
 }
 
 impl Write for Record {
@@ -130,11 +164,17 @@ impl LogRing {
             read: 0,
             write: 0,
             len: 0,
+            next_offset: 0,
         }
     }
 
     /// Pushes a record into the ring, overwriting oldest entries when full.
-    fn push(&mut self, rec: Record) {
+    fn push(&mut self, mut rec: Record) {
+        rec.stream_offset = self.next_offset;
+        self.next_offset = self
+            .next_offset
+            .checked_add(rec.stream_len())
+            .expect("debug: kernel log offset overflow");
         self.records[self.write] = rec;
 
         if self.len == RING_CAPACITY {
@@ -144,6 +184,54 @@ impl LogRing {
         }
 
         self.write = (self.write + 1) % RING_CAPACITY;
+    }
+
+    fn oldest_offset(&self) -> u64 {
+        if self.len == 0 {
+            self.next_offset
+        } else {
+            self.records[self.read].stream_offset
+        }
+    }
+
+    fn read_into(&self, offset: u64, output: &mut [u8]) -> usize {
+        let mut cursor = offset;
+        let mut written = 0;
+        let mut index = self.read;
+
+        for _ in 0..self.len {
+            let rec = self.records[index];
+            let body_end = rec.stream_offset + rec.buflen as u64;
+            let record_end = body_end + 1;
+            index = (index + 1) % RING_CAPACITY;
+
+            if cursor >= record_end {
+                continue;
+            }
+
+            if cursor < body_end {
+                let source = (cursor - rec.stream_offset) as usize;
+                let count = (rec.buflen - source).min(output.len() - written);
+                output[written..written + count]
+                    .copy_from_slice(&rec.buf[source..source + count]);
+                cursor += count as u64;
+                written += count;
+            }
+
+            if written == output.len() {
+                break;
+            }
+            if cursor == body_end {
+                output[written] = b'\n';
+                written += 1;
+                cursor += 1;
+            }
+            if written == output.len() {
+                break;
+            }
+        }
+
+        written
     }
 }
 
@@ -171,8 +259,9 @@ impl log::Log for KLog {
 
         let rec = Record::from_log_record(record);
         let mut state = DEBUG_STATE.lock();
-        state.ring.push(rec);
-        dispatch_sinks_locked(rec.buf.as_ptr(), rec.buflen, &state.sinks);
+        append_record_locked(&mut state, rec);
+        drop(state);
+        LOG_EVENT.signal();
     }
 
     fn flush(&self) {}
@@ -193,6 +282,13 @@ fn dispatch_sinks_locked(buf: *const u8, buflen: usize, sinks: &[Option<LogSink>
     }
 }
 
+fn append_record_locked(state: &mut DebugState, rec: Record) {
+    state.ring.push(rec);
+    if REGULAR_SINK_OUTPUT.load(Ordering::Acquire) {
+        dispatch_sinks_locked(rec.buf.as_ptr(), rec.buflen, &state.sinks);
+    }
+}
+
 /// Registers a log sink callback.
 ///
 /// Fails silently if a sink is unable to be registered.
@@ -202,6 +298,9 @@ pub fn register_sink(sink: LogSink) {
     for slot in &mut state.sinks {
         if slot.is_none() {
             *slot = Some(sink);
+            if !REGULAR_SINK_OUTPUT.load(Ordering::Acquire) {
+                return;
+            }
             let mut idx = state.ring.read;
             for _ in 0..state.ring.len {
                 let rec = state.ring.records[idx];
@@ -236,6 +335,82 @@ pub fn unregister_sink(sink: LogSink) -> bool {
 pub fn clear_sinks() {
     let mut state = DEBUG_STATE.lock();
     state.sinks.fill(None);
+}
+
+/// Stops ordinary log records from being mirrored to registered debug sinks.
+///
+/// Panic-time output still writes directly to the registered sinks.
+pub(crate) fn disable_regular_sink_output() {
+    let _state = DEBUG_STATE.lock();
+    REGULAR_SINK_OUTPUT.store(false, Ordering::Release);
+}
+
+/// Returns the first readable byte offset in the kernel log stream.
+pub(crate) fn log_start_offset() -> u64 {
+    DEBUG_STATE.lock().ring.oldest_offset()
+}
+
+/// Returns the byte offset immediately following the current kernel log.
+pub(crate) fn log_end_offset() -> u64 {
+    DEBUG_STATE.lock().ring.next_offset
+}
+
+/// Reads bytes from the kernel log, waiting for new records when requested.
+pub(crate) fn read_log(
+    offset: u64,
+    output: &mut [u8],
+    nonblocking: bool,
+) -> Result<usize, LogReadError> {
+    if output.is_empty() {
+        return Ok(0);
+    }
+
+    loop {
+        let state = DEBUG_STATE.lock();
+        if offset < state.ring.oldest_offset() {
+            return Err(LogReadError::Overrun);
+        }
+        if offset < state.ring.next_offset {
+            return Ok(state.ring.read_into(offset, output));
+        }
+        if nonblocking {
+            return Err(LogReadError::WouldBlock);
+        }
+
+        LOG_EVENT.reset();
+        drop(state);
+        LOG_EVENT.wait();
+    }
+}
+
+/// Appends bytes written through `/dev/kmsg` as kernel log records.
+pub(crate) fn append_kernel_message(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let mut state = DEBUG_STATE.lock();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let newline = remaining.iter().position(|byte| *byte == b'\n');
+        let line_len = newline.unwrap_or(remaining.len());
+        let line = &remaining[..line_len];
+
+        if line.is_empty() {
+            append_record_locked(&mut state, Record::from_bytes(&[]));
+        } else {
+            for chunk in line.chunks(RECORD_CAPACITY) {
+                append_record_locked(&mut state, Record::from_bytes(chunk));
+            }
+        }
+
+        remaining = match newline {
+            Some(index) => &remaining[index + 1..],
+            None => &[],
+        };
+    }
+    drop(state);
+    LOG_EVENT.signal();
 }
 
 /// Prevents regular logs from competing with panic output.

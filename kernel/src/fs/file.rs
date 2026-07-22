@@ -62,11 +62,12 @@ pub struct OpenFile {
 
 impl OpenFile {
     pub(crate) fn new(vnode: Vnode, flags: OpenFlags) -> Result<FileRef> {
+        let offset = vnode.initial_offset(flags.bits())?;
         vnode.open(flags.bits())?;
         Ok(Arc::new(Self {
             vnode,
             flags: AtomicU32::new(flags.bits()),
-            offset: Mutex::new(0),
+            offset: Mutex::new(offset),
         }))
     }
 
