@@ -57,9 +57,12 @@ $ python3 x.py build iso
 # Build kernel only
 $ python3 x.py build
 
-# Build mlibc, ncurses, readline, Bash, init, and os-test, then install them into
+# Build mlibc, ncurses, readline, Bash, coreutils, init, and os-test, then install them into
 # build/runtime/sysroots/<architecture>.
 $ python3 x.py build sysroot --arch x86_64
+
+# Rebuild one package (and affected dependents) and replace the existing sysroot.
+$ python3 x.py package init --arch x86_64
 
 # Pack that sysroot as build/<architecture>/<profile>/roanix-<architecture>.initramfs.tar.gz.
 $ python3 x.py build initramfs --arch x86_64

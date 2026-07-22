@@ -107,6 +107,19 @@ pub struct SetAttr {
     pub mode: Option<u16>,
 }
 
+/// Caller metadata supplied to device-control operations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct IoctlContext {
+    /// Process issuing the operation.
+    pub process_id: usize,
+    /// Process group of the caller.
+    pub process_group: i32,
+    /// Session containing the caller.
+    pub session_id: i32,
+    /// Whether the caller is its session leader.
+    pub is_session_leader: bool,
+}
+
 /// Node type requested from a directory create operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateKind {
@@ -233,9 +246,31 @@ pub trait VnodeOps: Any + Send + Sync {
         Err(Error::IsDirectory)
     }
 
+    /// Reads file data with the originating open flags.
+    fn read_at_with_flags(
+        &self,
+        vnode: &Vnode,
+        offset: u64,
+        buffer: &mut [u8],
+        _flags: u32,
+    ) -> Result<usize> {
+        self.read_at(vnode, offset, buffer)
+    }
+
     /// Writes file data at an explicit byte offset.
     fn write_at(&self, _vnode: &Vnode, _offset: u64, _buffer: &[u8]) -> Result<usize> {
         Err(Error::IsDirectory)
+    }
+
+    /// Writes file data with the originating open flags.
+    fn write_at_with_flags(
+        &self,
+        vnode: &Vnode,
+        offset: u64,
+        buffer: &[u8],
+        _flags: u32,
+    ) -> Result<usize> {
+        self.write_at(vnode, offset, buffer)
     }
 
     /// Appends bytes atomically and returns `(written, new_offset)`.
@@ -271,6 +306,18 @@ pub trait VnodeOps: Any + Send + Sync {
     /// Flushes vnode state.
     fn fsync(&self, _vnode: &Vnode) -> Result<()> {
         Ok(())
+    }
+
+    /// Performs a filesystem- or device-specific control operation.
+    fn ioctl(
+        &self,
+        _vnode: &Vnode,
+        _context: IoctlContext,
+        _request: u64,
+        _value: u64,
+        _argument: &mut [u8],
+    ) -> Result<u64> {
+        Err(Error::NotTty)
     }
 }
 
@@ -375,9 +422,31 @@ impl Vnode {
         self.inner.operations.read_at(self, offset, buffer)
     }
 
+    pub(crate) fn read_at_with_flags(
+        &self,
+        offset: u64,
+        buffer: &mut [u8],
+        flags: u32,
+    ) -> Result<usize> {
+        self.inner
+            .operations
+            .read_at_with_flags(self, offset, buffer, flags)
+    }
+
     /// Writes bytes at an explicit offset.
     pub fn write_at(&self, offset: u64, buffer: &[u8]) -> Result<usize> {
         self.inner.operations.write_at(self, offset, buffer)
+    }
+
+    pub(crate) fn write_at_with_flags(
+        &self,
+        offset: u64,
+        buffer: &[u8],
+        flags: u32,
+    ) -> Result<usize> {
+        self.inner
+            .operations
+            .write_at_with_flags(self, offset, buffer, flags)
     }
 
     /// Atomically appends bytes.
@@ -408,6 +477,19 @@ impl Vnode {
     /// Flushes vnode state.
     pub fn fsync(&self) -> Result<()> {
         self.inner.operations.fsync(self)
+    }
+
+    /// Performs a control operation.
+    pub fn ioctl(
+        &self,
+        context: IoctlContext,
+        request: u64,
+        value: u64,
+        argument: &mut [u8],
+    ) -> Result<u64> {
+        self.inner
+            .operations
+            .ioctl(self, context, request, value, argument)
     }
 
     pub(crate) fn open(&self, flags: u32) -> Result<()> {

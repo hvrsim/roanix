@@ -9,7 +9,7 @@ use core::{alloc::Layout, mem, ptr, slice, str};
 use log::Level;
 
 use crate::fs::{
-    self,
+    self, IoctlContext,
     devtempfs::{self, DevNodeId, DeviceNodeKind, DeviceNodeOps},
 };
 
@@ -95,6 +95,18 @@ pub type DeviceWriteFn =
 pub type DeviceSizeFn = unsafe extern "C" fn(context: usize) -> u64;
 /// Device synchronization callback.
 pub type DeviceSyncFn = unsafe extern "C" fn(context: usize) -> i32;
+/// Device-control callback. Non-negative values are successful return values.
+pub type DeviceIoctlFn = unsafe extern "C" fn(
+    context: usize,
+    process_id: usize,
+    process_group: i32,
+    session_id: i32,
+    is_session_leader: u8,
+    request: u64,
+    value: u64,
+    argument: *mut u8,
+    argument_len: usize,
+) -> i64;
 
 /// Version-1 driver module descriptor.
 #[repr(C)]
@@ -151,6 +163,22 @@ pub struct DriverDeviceOpsV1 {
     pub size_bytes: Option<DeviceSizeFn>,
     /// Optional synchronization callback.
     pub sync: Option<DeviceSyncFn>,
+    /// Optional control callback.
+    pub ioctl: Option<DeviceIoctlFn>,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct DriverDeviceOpsV1Prefix {
+    size: u32,
+    abi_version: u32,
+    context: usize,
+    open: Option<DeviceOpenFn>,
+    close: Option<DeviceCloseFn>,
+    read: Option<DeviceReadFn>,
+    write: Option<DeviceWriteFn>,
+    size_bytes: Option<DeviceSizeFn>,
+    sync: Option<DeviceSyncFn>,
 }
 
 /// Stable host service table passed to every driver.
@@ -327,6 +355,40 @@ impl DeviceNodeOps for ForeignDeviceOps {
         };
         // SAFETY: devtempfs pins the owning driver around this call.
         callback_status(unsafe { callback(self.operations.context) })
+    }
+
+    fn ioctl(
+        &self,
+        context: IoctlContext,
+        request: u64,
+        value: u64,
+        argument: &mut [u8],
+    ) -> fs::Result<u64> {
+        let callback = self.operations.ioctl.ok_or(fs::Error::Unsupported)?;
+        let pointer = if argument.is_empty() {
+            ptr::null_mut()
+        } else {
+            argument.as_mut_ptr()
+        };
+        // SAFETY: devtempfs pins the owning driver and `argument` is writable
+        // for the duration of this call.
+        let result = unsafe {
+            callback(
+                self.operations.context,
+                context.process_id,
+                context.process_group,
+                context.session_id,
+                u8::from(context.is_session_leader),
+                request,
+                value,
+                pointer,
+                argument.len(),
+            )
+        };
+        if result < 0 {
+            return Err(status_to_fs(i32::try_from(result).unwrap_or(STATUS_IO)));
+        }
+        Ok(result as u64)
     }
 }
 
@@ -712,14 +774,36 @@ unsafe fn read_operations(
     if !is_aligned(operations) {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: the host ABI requires a readable, aligned operations record.
-    let operations = unsafe { *operations };
-    if operations.abi_version != DRIVER_ABI_V1
-        || (operations.size as usize) < mem::size_of::<DriverDeviceOpsV1>()
-    {
+    // SAFETY: the version-1 ABI guarantees at least the size/version prefix is
+    // readable. No reference to the potentially shorter foreign record is
+    // created.
+    let size = unsafe { core::ptr::addr_of!((*operations).size).read() } as usize;
+    // SAFETY: same prefix contract as above.
+    let version = unsafe { core::ptr::addr_of!((*operations).abi_version).read() };
+    if version != DRIVER_ABI_V1 || size < mem::size_of::<DriverDeviceOpsV1Prefix>() {
         return Err(Error::AbiMismatch);
     }
-    Ok(operations)
+    // SAFETY: the validated size covers the complete original version-1
+    // prefix, which has stable C layout.
+    let prefix = unsafe { operations.cast::<DriverDeviceOpsV1Prefix>().read() };
+    let ioctl = if size >= mem::size_of::<DriverDeviceOpsV1>() {
+        // SAFETY: the reported record size covers the optional tail field.
+        unsafe { core::ptr::addr_of!((*operations).ioctl).read() }
+    } else {
+        None
+    };
+    Ok(DriverDeviceOpsV1 {
+        size: prefix.size,
+        abi_version: prefix.abi_version,
+        context: prefix.context,
+        open: prefix.open,
+        close: prefix.close,
+        read: prefix.read,
+        write: prefix.write,
+        size_bytes: prefix.size_bytes,
+        sync: prefix.sync,
+        ioctl,
+    })
 }
 
 fn is_aligned<T>(pointer: *const T) -> bool {

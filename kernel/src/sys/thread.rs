@@ -502,6 +502,37 @@ pub(crate) fn allocate_user_thread(
     thread
 }
 
+/// Allocates a child user thread from a copied parent syscall frame.
+pub(crate) fn allocate_forked_user_thread(
+    id: usize,
+    cpu: usize,
+    now_ns: u64,
+    priority: u8,
+    process: Arc<Process>,
+    parent_frame: &TrapFrame,
+    thread_pointer: u64,
+) -> &'static mut Thread {
+    let address_space = process.address_space();
+    let thread = allocate_thread_record(
+        id,
+        cpu,
+        now_ns,
+        ThreadClass::Timeshare,
+        priority,
+        ThreadFlags::empty(),
+        None,
+        Some(process),
+        Some(address_space),
+    );
+    thread.set_thread_pointer(thread_pointer);
+    // SAFETY: `frame` points inside the exclusively owned stack allocation,
+    // while `parent_frame` remains live for the duration of this copy.
+    unsafe {
+        crate::arch::cpu::init_forked_user_thread_frame(thread.frame, parent_frame);
+    }
+    thread
+}
+
 #[allow(clippy::too_many_arguments)]
 fn allocate_thread_record(
     id: usize,

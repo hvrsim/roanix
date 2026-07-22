@@ -22,6 +22,7 @@ use crate::sys::{debug, smp::CoreLocal};
 pub mod cpu;
 pub mod lapic;
 pub mod paging;
+pub mod serial;
 pub mod timer;
 
 /// BSP's core local context.
@@ -56,22 +57,17 @@ fn dbgcon_write(buf: *const u8, buflen: usize) {
 /// Writes bytes directly to the architecture debug console.
 pub(crate) fn console_write(line: &[u8]) {
     let mut dbgcon_e9: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0xE9);
-    let mut status: PortGeneric<u8, ReadOnlyAccess> = PortReadOnly::new(0x3FD);
-    let mut com1: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
 
     for &byte in line {
-        // SAFETY: these fixed ports are the QEMU debug console and COM1 UART,
-        // initialized for exclusive kernel use.
+        // SAFETY: port 0xE9 is the QEMU/Bochs debug console.
         unsafe {
             dbgcon_e9.write(byte);
-
-            if byte == b'\n' {
-                while status.read() & 0x20 == 0 {}
-                com1.write(b'\r');
-            }
-            while status.read() & 0x20 == 0 {}
-            com1.write(byte);
         }
+        let uart = serial::LegacyUart::com1();
+        if byte == b'\n' {
+            uart.write(b"\r");
+        }
+        uart.write(core::slice::from_ref(&byte));
     }
 }
 
@@ -80,30 +76,7 @@ pub(crate) fn console_write(line: &[u8]) {
 /// On x86_64, QEMU's debugcon is pre-configured, so we simply
 /// set COM1 (16550 UART) to 9600 9600 8N1.
 fn dbgcon_init() {
-    let mut ier: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F9);
-    let mut lcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FB);
-    let mut dll: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F8);
-    let mut dlm: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3F9);
-    let mut fcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FA);
-    let mut mcr: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0x3FC);
-
-    // SAFETY: COM1 initialization uses the standard 16550 register layout and
-    // runs once during early x86 bring-up.
-    unsafe {
-        // Disable interrupts.
-        ier.write(0x00);
-        // Enable DLAB.
-        lcr.write(0x80);
-        // Divisor = 12 (9600 baud with 1.8432 MHz clock).
-        dll.write(0x0C);
-        dlm.write(0x00);
-        // 8 bits, no parity, one stop bit.
-        lcr.write(0x03);
-        // Enable FIFO, clear TX/RX queues.
-        fcr.write(0x07);
-        // DTR | RTS | OUT2.
-        mcr.write(0x0B);
-    }
+    serial::init_debug();
 }
 
 /// Initializes the bootstrap processor and early debug output.

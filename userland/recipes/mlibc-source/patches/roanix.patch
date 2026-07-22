@@ -1,5 +1,5 @@
 diff --git a/meson.build b/meson.build
-index 9b7d774..2bc5079 100644
+index 9b7d7745c2141c1b1ac46c98d205a8031734aabd..2bc507902df0b37011d3a5ac90fb59dee4d4ecd8 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -258,6 +258,12 @@ elif host_machine.system() == 'managarm'
@@ -17,7 +17,7 @@ index 9b7d774..2bc5079 100644
  	libc_include_dirs += include_directories('sysdeps/ironclad/include')
 diff --git a/sysdeps/roanix/generic/entry.cpp b/sysdeps/roanix/generic/entry.cpp
 new file mode 100644
-index 0000000..9e8955e
+index 0000000000000000000000000000000000000000..9e8955e585976b53006313c77512f52e9dd62167
 --- /dev/null
 +++ b/sysdeps/roanix/generic/entry.cpp
 @@ -0,0 +1,19 @@
@@ -42,14 +42,27 @@ index 0000000..9e8955e
 +}
 diff --git a/sysdeps/roanix/generic/sysdeps.cpp b/sysdeps/roanix/generic/sysdeps.cpp
 new file mode 100644
-index 0000000..9f79836
+index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
 --- /dev/null
 +++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,735 @@
++#include <dirent.h>
 +#include <errno.h>
++#include <fcntl.h>
 +#include <limits.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdarg.h>
 +#include <string.h>
++#include <sys/resource.h>
 +#include <sys/mman.h>
++#include <sys/select.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <sys/utsname.h>
++#include <sys/wait.h>
++#include <termios.h>
++#include <unistd.h>
 +
 +#include <mlibc/all-sysdeps.hpp>
 +#include <mlibc/tcb.hpp>
@@ -67,6 +80,52 @@ index 0000000..9f79836
 +
 +long as_word(const void *pointer) {
 +    return static_cast<long>(reinterpret_cast<uintptr_t>(pointer));
++}
++
++constexpr unsigned long kTcgets = 0x5401;
++constexpr unsigned long kTcsets = 0x5402;
++constexpr unsigned long kTcsetsw = 0x5403;
++constexpr unsigned long kTcsetsf = 0x5404;
++constexpr unsigned long kTcsbrk = 0x5409;
++constexpr unsigned long kTcxonc = 0x540A;
++constexpr unsigned long kTcflsh = 0x540B;
++constexpr unsigned long kTiocgwinsz = 0x5413;
++constexpr unsigned long kTiocswinsz = 0x5414;
++
++} // namespace
++
++namespace {
++
++mode_t file_type(unsigned kind) {
++    switch (kind) {
++        case 1: return S_IFREG;
++        case 2: return S_IFDIR;
++        case 3: return S_IFLNK;
++        case 4: return S_IFCHR;
++        case 5: return S_IFBLK;
++        case 6: return S_IFIFO;
++        case 7: return S_IFSOCK;
++        default: return 0;
++    }
++}
++
++void fill_stat(const struct roanix_stat &source, struct stat *target) {
++    memset(target, 0, sizeof(*target));
++    target->st_dev = source.device;
++    target->st_ino = source.inode;
++    target->st_mode = source.mode | file_type(source.kind);
++    target->st_nlink = source.links;
++    target->st_uid = 0;
++    target->st_gid = 0;
++    target->st_size = source.size;
++    target->st_blksize = 4096;
++    target->st_blocks = (source.size + 511) / 512;
++    target->st_atim.tv_sec = source.accessed_ns / 1000000000;
++    target->st_atim.tv_nsec = source.accessed_ns % 1000000000;
++    target->st_mtim.tv_sec = source.modified_ns / 1000000000;
++    target->st_mtim.tv_nsec = source.modified_ns % 1000000000;
++    target->st_ctim.tv_sec = source.changed_ns / 1000000000;
++    target->st_ctim.tv_nsec = source.changed_ns % 1000000000;
 +}
 +
 +} // namespace
@@ -98,6 +157,10 @@ index 0000000..9f79836
 +        static_cast<long>(thread_pointer)
 +    );
 +    return syscall_error(result);
++}
++
++pid_t Sysdeps<FutexTid>::operator()() {
++    return static_cast<pid_t>(roanix_syscall0(ROANIX_SYS_PROCESS_GETTID));
 +}
 +
 +int Sysdeps<FutexWait>::operator()(
@@ -154,8 +217,482 @@ index 0000000..9f79836
 +    return syscall_error(roanix_syscall1(ROANIX_SYS_FILE_CLOSE, fd));
 +}
 +
-+int Sysdeps<Isatty>::operator()(int) {
-+    return ENOTTY;
++int Sysdeps<Dup>::operator()(int fd, int flags, int *newfd) {
++    long result = roanix_syscall3(ROANIX_SYS_FILE_DUP, fd, 0, flags);
++    int error = syscall_error(result);
++    if (!error)
++        *newfd = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Dup2>::operator()(int fd, int flags, int newfd) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_DUP2, fd, newfd, flags));
++}
++
++int Sysdeps<Fcntl>::operator()(int fd, int request, va_list args, int *result_out) {
++    long argument = 0;
++    switch (request) {
++        case F_DUPFD:
++        case F_DUPFD_CLOEXEC:
++        case F_SETFD:
++        case F_SETFL:
++            argument = va_arg(args, int);
++            break;
++        default:
++            break;
++    }
++    long result = roanix_syscall3(ROANIX_SYS_FILE_FCNTL, fd, request, argument);
++    int error = syscall_error(result);
++    if (!error)
++        *result_out = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Fork>::operator()(pid_t *child) {
++    long result = roanix_syscall0(ROANIX_SYS_PROCESS_FORK);
++    int error = syscall_error(result);
++    if (!error)
++        *child = static_cast<pid_t>(result);
++    return error;
++}
++
++int Sysdeps<Execve>::operator()(
++        const char *path, char *const argv[], char *const envp[]) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_PROCESS_EXEC,
++        as_word(path),
++        as_word(argv),
++        as_word(envp)
++    ));
++}
++
++int Sysdeps<Waitpid>::operator()(
++        pid_t pid,
++        int *status,
++        int flags,
++        struct rusage *usage,
++        pid_t *result_out) {
++    if (usage)
++        return ENOSYS;
++    long result = roanix_syscall3(
++        ROANIX_SYS_PROCESS_WAIT,
++        pid,
++        as_word(status),
++        flags
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *result_out = static_cast<pid_t>(result);
++    return error;
++}
++
++pid_t Sysdeps<GetPid>::operator()() {
++    return static_cast<pid_t>(roanix_syscall0(ROANIX_SYS_PROCESS_GETPID));
++}
++
++pid_t Sysdeps<GetTid>::operator()() {
++    return static_cast<pid_t>(
++        roanix_syscall0(ROANIX_SYS_PROCESS_GETTID));
++}
++
++pid_t Sysdeps<GetPpid>::operator()() {
++    return static_cast<pid_t>(roanix_syscall0(ROANIX_SYS_PROCESS_GETPPID));
++}
++
++int Sysdeps<GetPgid>::operator()(pid_t pid, pid_t *group) {
++    long result = roanix_syscall1(ROANIX_SYS_PROCESS_GETPGID, pid);
++    int error = syscall_error(result);
++    if (!error)
++        *group = static_cast<pid_t>(result);
++    return error;
++}
++
++int Sysdeps<SetPgid>::operator()(pid_t pid, pid_t group) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_PROCESS_SETPGID, pid, group));
++}
++
++int Sysdeps<GetSid>::operator()(pid_t pid, pid_t *session) {
++    long result = roanix_syscall1(ROANIX_SYS_PROCESS_GETSID, pid);
++    int error = syscall_error(result);
++    if (!error)
++        *session = static_cast<pid_t>(result);
++    return error;
++}
++
++int Sysdeps<SetSid>::operator()(pid_t *session) {
++    long result = roanix_syscall0(ROANIX_SYS_PROCESS_SETSID);
++    int error = syscall_error(result);
++    if (!error)
++        *session = static_cast<pid_t>(result);
++    return error;
++}
++
++int Sysdeps<Kill>::operator()(pid_t pid, int signal) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_PROCESS_KILL, pid, signal));
++}
++
++int Sysdeps<Sigaction>::operator()(
++        int, const struct sigaction *, struct sigaction *old_action) {
++    if (old_action)
++        memset(old_action, 0, sizeof(*old_action));
++    return 0;
++}
++
++int Sysdeps<Sigprocmask>::operator()(
++        int, const sigset_t *, sigset_t *old_set) {
++    if (old_set) {
++        auto bytes = reinterpret_cast<unsigned char *>(old_set);
++        for (size_t i = 0; i < sizeof(*old_set); i++)
++            bytes[i] = 0;
++    }
++    return 0;
++}
++
++int Sysdeps<Chdir>::operator()(const char *path) {
++    return syscall_error(roanix_syscall1(
++        ROANIX_SYS_FILE_CHDIR, as_word(path)));
++}
++
++int Sysdeps<GetCwd>::operator()(char *buffer, size_t size) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_GETCWD, as_word(buffer), size));
++}
++
++int Sysdeps<Access>::operator()(const char *path, int mode) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_ACCESS, as_word(path), mode));
++}
++
++int Sysdeps<Faccessat>::operator()(
++        int dirfd, const char *path, int mode, int flags) {
++    if (dirfd != AT_FDCWD || flags)
++        return ENOSYS;
++    return Sysdeps<Access>::operator()(path, mode);
++}
++
++int Sysdeps<Stat>::operator()(
++        mlibc::fsfd_target target,
++        int fd,
++        const char *path,
++        int flags,
++        struct stat *output) {
++    struct roanix_stat source;
++    long result;
++    if (target == mlibc::fsfd_target::fd) {
++        result = roanix_syscall2(
++            ROANIX_SYS_FILE_FSTAT, fd, as_word(&source));
++    } else if (target == mlibc::fsfd_target::path
++            || (target == mlibc::fsfd_target::fd_path && fd == AT_FDCWD)) {
++        result = roanix_syscall3(
++            ROANIX_SYS_FILE_STAT, as_word(path), flags, as_word(&source));
++    } else {
++        return ENOSYS;
++    }
++    int error = syscall_error(result);
++    if (!error)
++        fill_stat(source, output);
++    return error;
++}
++
++int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {
++    return Sysdeps<Open>::operator()(
++        path, O_RDONLY | O_DIRECTORY, 0, handle);
++}
++
++int Sysdeps<ReadEntries>::operator()(
++        int handle, void *buffer, size_t size, size_t *bytes_read) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_READDIR, handle, as_word(buffer), size);
++    int error = syscall_error(result);
++    if (!error)
++        *bytes_read = static_cast<size_t>(result);
++    return error;
++}
++
++int Sysdeps<Readlink>::operator()(
++        const char *path, void *buffer, size_t size, ssize_t *length) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_READLINK, as_word(path), as_word(buffer), size);
++    int error = syscall_error(result);
++    if (!error)
++        *length = result;
++    return error;
++}
++
++int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
++    if (dirfd != AT_FDCWD)
++        return ENOSYS;
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_UNLINK, as_word(path), flags));
++}
++
++int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_MKDIR, as_word(path), mode));
++}
++
++int Sysdeps<Pipe>::operator()(int *fds, int flags) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_PIPE, as_word(fds), flags));
++}
++
++int Sysdeps<Sleep>::operator()(time_t *seconds, long *nanoseconds) {
++    int error = syscall_error(roanix_syscall2(
++        ROANIX_SYS_CLOCK_SLEEP, *seconds, *nanoseconds));
++    if (!error) {
++        *seconds = 0;
++        *nanoseconds = 0;
++    }
++    return error;
++}
++
++gid_t Sysdeps<GetGid>::operator()() { return 0; }
++gid_t Sysdeps<GetEgid>::operator()() { return 0; }
++uid_t Sysdeps<GetUid>::operator()() { return 0; }
++uid_t Sysdeps<GetEuid>::operator()() { return 0; }
++
++int Sysdeps<GetGroups>::operator()(size_t size, gid_t *list, int *result) {
++    if (size && list)
++        list[0] = 0;
++    *result = 1;
++    return 0;
++}
++
++int Sysdeps<GetResuid>::operator()(uid_t *real, uid_t *effective, uid_t *saved) {
++    *real = *effective = *saved = 0;
++    return 0;
++}
++
++int Sysdeps<GetResgid>::operator()(gid_t *real, gid_t *effective, gid_t *saved) {
++    *real = *effective = *saved = 0;
++    return 0;
++}
++
++int Sysdeps<SetResuid>::operator()(uid_t, uid_t, uid_t) { return 0; }
++int Sysdeps<SetResgid>::operator()(gid_t, gid_t, gid_t) { return 0; }
++
++int Sysdeps<GetRlimit>::operator()(int, struct rlimit *limit) {
++    limit->rlim_cur = RLIM_INFINITY;
++    limit->rlim_max = RLIM_INFINITY;
++    return 0;
++}
++
++int Sysdeps<SetRlimit>::operator()(int, const struct rlimit *) { return 0; }
++
++int Sysdeps<GetRusage>::operator()(int, struct rusage *usage) {
++    memset(usage, 0, sizeof(*usage));
++    return 0;
++}
++
++int Sysdeps<GetHostname>::operator()(char *buffer, size_t size) {
++    const char hostname[] = "roanix";
++    if (size < sizeof(hostname))
++        return ENAMETOOLONG;
++    memcpy(buffer, hostname, sizeof(hostname));
++    return 0;
++}
++
++int Sysdeps<Uname>::operator()(struct utsname *name) {
++    auto copy = [](char *destination, const char *source) {
++        do {
++            *destination++ = *source;
++        } while (*source++);
++    };
++    memset(name, 0, sizeof(*name));
++    copy(name->sysname, "Roanix");
++    copy(name->nodename, "roanix");
++    copy(name->release, "0.1");
++    copy(name->version, "0.1");
++#if defined(__x86_64__)
++    copy(name->machine, "x86_64");
++#else
++    copy(name->machine, "riscv64");
++#endif
++    return 0;
++}
++
++int Sysdeps<Sysconf>::operator()(int number, long *result) {
++    switch (number) {
++        case _SC_PAGESIZE: *result = 4096; return 0;
++        case _SC_OPEN_MAX: *result = 1024; return 0;
++        case _SC_CHILD_MAX: *result = 256; return 0;
++        case _SC_CLK_TCK: *result = 100; return 0;
++        case _SC_NPROCESSORS_CONF:
++        case _SC_NPROCESSORS_ONLN: *result = 1; return 0;
++        default: return EINVAL;
++    }
++}
++
++int Sysdeps<GetEntropy>::operator()(void *buffer, size_t length) {
++    time_t seconds;
++    long nanoseconds;
++    int error = sysdep<ClockGet>(CLOCK_MONOTONIC, &seconds, &nanoseconds);
++    if (error)
++        return error;
++    uint64_t state = static_cast<uint64_t>(nanoseconds)
++        ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer));
++    auto output = static_cast<unsigned char *>(buffer);
++    for (size_t i = 0; i < length; i++) {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        output[i] = static_cast<unsigned char>(state);
++    }
++    return 0;
++}
++
++int Sysdeps<Umask>::operator()(mode_t, mode_t *old) {
++    *old = 022;
++    return 0;
++}
++
++int Sysdeps<SetItimer>::operator()(
++        int, const struct itimerval *, struct itimerval *old_value) {
++    if (old_value)
++        memset(old_value, 0, sizeof(*old_value));
++    return 0;
++}
++
++int Sysdeps<Pselect>::operator()(
++        int num_fds,
++        fd_set *read_set,
++        fd_set *write_set,
++        fd_set *except_set,
++        const struct timespec *timeout,
++        const sigset_t *,
++        int *num_events) {
++    if (except_set) {
++        auto bytes = reinterpret_cast<unsigned char *>(except_set);
++        for (size_t i = 0; i < sizeof(*except_set); i++)
++            bytes[i] = 0;
++    }
++    int ready = 0;
++    for (int fd = 0; fd < num_fds; fd++) {
++        unsigned char mask = 1u << (fd % 8);
++        bool readable = read_set
++            && (read_set->fds_bits[fd / 8] & mask);
++        bool writable = write_set
++            && (write_set->fds_bits[fd / 8] & mask);
++        if (readable || writable)
++            ready++;
++    }
++    if (!ready && timeout) {
++        time_t seconds = timeout->tv_sec;
++        long nanoseconds = timeout->tv_nsec;
++        int error = sysdep<Sleep>(&seconds, &nanoseconds);
++        if (error)
++            return error;
++    }
++    *num_events = ready;
++    return 0;
++}
++
++int Sysdeps<Fchmod>::operator()(int fd, mode_t mode) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_FILE_FCHMOD, fd, mode));
++}
++
++int Sysdeps<Ttyname>::operator()(int fd, char *buffer, size_t size) {
++    int error = Sysdeps<Isatty>::operator()(fd);
++    if (error)
++        return error;
++    constexpr unsigned long kTiocgpath = 0x52540001;
++    char path[32];
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTiocgpath, as_word(path));
++    error = syscall_error(result);
++    if (error)
++        return error;
++    size_t length = strlen(path) + 1;
++    if (size < length)
++        return ERANGE;
++    memcpy(buffer, path, length);
++    return 0;
++}
++
++int Sysdeps<GetLoginR>::operator()(char *buffer, size_t size) {
++    const char login[] = "root";
++    if (size < sizeof(login))
++        return ERANGE;
++    memcpy(buffer, login, sizeof(login));
++    return 0;
++}
++
++int Sysdeps<Isatty>::operator()(int fd) {
++    struct termios settings;
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL,
++        fd,
++        kTcgets,
++        as_word(&settings)
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<Ioctl>::operator()(
++        int fd, unsigned long request, void *argument, int *result_out) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL,
++        fd,
++        request,
++        as_word(argument)
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *result_out = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Tcgetattr>::operator()(int fd, struct termios *settings) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTcgets, as_word(settings)));
++}
++
++int Sysdeps<Tcsetattr>::operator()(
++        int fd, int action, const struct termios *settings) {
++    unsigned long request;
++    switch (action) {
++        case TCSANOW: request = kTcsets; break;
++        case TCSADRAIN: request = kTcsetsw; break;
++        case TCSAFLUSH: request = kTcsetsf; break;
++        default: return EINVAL;
++    }
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, request, as_word(settings)));
++}
++
++int Sysdeps<Tcsendbreak>::operator()(int fd, int duration) {
++    (void)duration;
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTcsbrk, 0));
++}
++
++int Sysdeps<Tcflow>::operator()(int fd, int action) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTcxonc, action));
++}
++
++int Sysdeps<Tcflush>::operator()(int fd, int queue) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTcflsh, queue));
++}
++
++int Sysdeps<Tcdrain>::operator()(int fd) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTcsbrk, 1));
++}
++
++int Sysdeps<Tcgetwinsize>::operator()(int fd, struct winsize *size) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTiocgwinsz, as_word(size)));
++}
++
++int Sysdeps<Tcsetwinsize>::operator()(int fd, const struct winsize *size) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_IOCTL, fd, kTiocswinsz, as_word(size)));
 +}
 +
 +int Sysdeps<Read>::operator()(
@@ -246,7 +783,7 @@ index 0000000..9f79836
 +} // namespace mlibc
 diff --git a/sysdeps/roanix/include/abi-bits b/sysdeps/roanix/include/abi-bits
 new file mode 120000
-index 0000000..375b4f1
+index 0000000000000000000000000000000000000000..375b4f1a5277b64b9e9510b86e60e3815e7666be
 --- /dev/null
 +++ b/sysdeps/roanix/include/abi-bits
 @@ -0,0 +1 @@
@@ -254,10 +791,10 @@ index 0000000..375b4f1
 \ No newline at end of file
 diff --git a/sysdeps/roanix/include/mlibc/sysdeps.hpp b/sysdeps/roanix/include/mlibc/sysdeps.hpp
 new file mode 100644
-index 0000000..96f01c7
+index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
 --- /dev/null
 +++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,94 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -267,6 +804,7 @@ index 0000000..96f01c7
 +struct RoanixSysdepTags :
 +    LibcLog,
 +    LibcPanic,
++    FutexTid,
 +    Exit,
 +    TcbSet,
 +    FutexWait,
@@ -274,11 +812,70 @@ index 0000000..96f01c7
 +    AnonAllocate,
 +    AnonFree,
 +    Open,
++    OpenDir,
++    ReadEntries,
 +    Read,
 +    Write,
 +    Seek,
 +    Close,
++    Dup,
++    Dup2,
++    Fcntl,
++    Fork,
++    Execve,
++    Waitpid,
++    GetPid,
++    GetTid,
++    GetPpid,
++    GetPgid,
++    SetPgid,
++    GetSid,
++    SetSid,
++    Kill,
++    Sigaction,
++    Sigprocmask,
++    Chdir,
++    GetCwd,
++    Access,
++    Faccessat,
++    Stat,
++    Readlink,
++    Unlinkat,
++    Mkdir,
++    Pipe,
++    Sleep,
++    GetGid,
++    GetEgid,
++    GetUid,
++    GetEuid,
++    GetGroups,
++    GetResuid,
++    GetResgid,
++    SetResuid,
++    SetResgid,
++    GetRlimit,
++    SetRlimit,
++    GetRusage,
++    Fchmod,
++    Ttyname,
++    GetLoginR,
++    GetHostname,
++    Uname,
++    Sysconf,
++    GetEntropy,
++    Umask,
++    SetItimer,
++    Pselect,
 +    Isatty,
++    Ioctl,
++    Tcgetattr,
++    Tcsetattr,
++    Tcsendbreak,
++    Tcflow,
++    Tcflush,
++    Tcdrain,
++    Tcgetwinsize,
++    Tcsetwinsize,
 +    ClockGet,
 +    VmMap,
 +    VmUnmap
@@ -294,10 +891,10 @@ index 0000000..96f01c7
 +} // namespace mlibc
 diff --git a/sysdeps/roanix/include/roanix/syscall.h b/sysdeps/roanix/include/roanix/syscall.h
 new file mode 100644
-index 0000000..48048ef
+index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
 --- /dev/null
 +++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,186 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -315,7 +912,46 @@ index 0000000..48048ef
 +    ROANIX_SYS_FILE_SEEK,
 +    ROANIX_SYS_CLOCK_GET,
 +    ROANIX_SYS_MEMORY_MAP,
-+    ROANIX_SYS_MEMORY_UNMAP
++    ROANIX_SYS_MEMORY_UNMAP,
++    ROANIX_SYS_FILE_IOCTL,
++    ROANIX_SYS_FILE_DUP,
++    ROANIX_SYS_FILE_DUP2,
++    ROANIX_SYS_PROCESS_FORK,
++    ROANIX_SYS_PROCESS_EXEC,
++    ROANIX_SYS_PROCESS_WAIT,
++    ROANIX_SYS_PROCESS_GETPID,
++    ROANIX_SYS_PROCESS_GETPPID,
++    ROANIX_SYS_PROCESS_GETPGID,
++    ROANIX_SYS_PROCESS_SETPGID,
++    ROANIX_SYS_PROCESS_GETSID,
++    ROANIX_SYS_PROCESS_SETSID,
++    ROANIX_SYS_PROCESS_KILL,
++    ROANIX_SYS_FILE_CHDIR,
++    ROANIX_SYS_FILE_GETCWD,
++    ROANIX_SYS_FILE_ACCESS,
++    ROANIX_SYS_FILE_STAT,
++    ROANIX_SYS_FILE_FSTAT,
++    ROANIX_SYS_FILE_FCNTL,
++    ROANIX_SYS_FILE_PIPE,
++    ROANIX_SYS_FILE_READDIR,
++    ROANIX_SYS_FILE_READLINK,
++    ROANIX_SYS_FILE_UNLINK,
++    ROANIX_SYS_CLOCK_SLEEP,
++    ROANIX_SYS_FILE_MKDIR,
++    ROANIX_SYS_PROCESS_GETTID,
++    ROANIX_SYS_FILE_FCHMOD
++};
++
++struct roanix_stat {
++    uint64_t device;
++    uint64_t inode;
++    uint32_t mode;
++    uint32_t kind;
++    uint64_t links;
++    uint64_t size;
++    uint64_t accessed_ns;
++    uint64_t modified_ns;
++    uint64_t changed_ns;
 +};
 +
 +typedef long roanix_syscall_word_t;
@@ -447,7 +1083,7 @@ index 0000000..48048ef
 +#endif
 diff --git a/sysdeps/roanix/meson.build b/sysdeps/roanix/meson.build
 new file mode 100644
-index 0000000..b3a9c7e
+index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd084da5b780
 --- /dev/null
 +++ b/sysdeps/roanix/meson.build
 @@ -0,0 +1,128 @@
@@ -581,7 +1217,7 @@ index 0000000..b3a9c7e
 +endif
 diff --git a/sysdeps/roanix/riscv64/crt-src/Scrt1.S b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
 new file mode 100644
-index 0000000..4e61d62
+index 0000000000000000000000000000000000000000..4e61d620d34bc6d95723d084c2ab5e5c9ca8a3a3
 --- /dev/null
 +++ b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
 @@ -0,0 +1,17 @@
@@ -604,7 +1240,7 @@ index 0000000..4e61d62
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/riscv64/crt-src/crt1.S b/sysdeps/roanix/riscv64/crt-src/crt1.S
 new file mode 100644
-index 0000000..d7ccfd4
+index 0000000000000000000000000000000000000000..d7ccfd4a932d1f83f59954d62347ef98b354dacd
 --- /dev/null
 +++ b/sysdeps/roanix/riscv64/crt-src/crt1.S
 @@ -0,0 +1,17 @@
@@ -627,7 +1263,7 @@ index 0000000..d7ccfd4
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/riscv64/crt-src/crti.S b/sysdeps/roanix/riscv64/crt-src/crti.S
 new file mode 100644
-index 0000000..1baada4
+index 0000000000000000000000000000000000000000..1baada4634bea2c16adf2269a5b31377e6f7ad5a
 --- /dev/null
 +++ b/sysdeps/roanix/riscv64/crt-src/crti.S
 @@ -0,0 +1,11 @@
@@ -644,7 +1280,7 @@ index 0000000..1baada4
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/riscv64/crt-src/crtn.S b/sysdeps/roanix/riscv64/crt-src/crtn.S
 new file mode 100644
-index 0000000..76a4b87
+index 0000000000000000000000000000000000000000..76a4b873f3c701c2642b4786fae5e2d9a2c017e5
 --- /dev/null
 +++ b/sysdeps/roanix/riscv64/crt-src/crtn.S
 @@ -0,0 +1,7 @@
@@ -657,7 +1293,7 @@ index 0000000..76a4b87
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/x86_64/crt-src/Scrt1.S b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
 new file mode 100644
-index 0000000..2715c9b
+index 0000000000000000000000000000000000000000..2715c9b5088316d66eb47ba30a3816dfe64c1ec4
 --- /dev/null
 +++ b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
 @@ -0,0 +1,8 @@
@@ -671,7 +1307,7 @@ index 0000000..2715c9b
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/x86_64/crt-src/crt1.S b/sysdeps/roanix/x86_64/crt-src/crt1.S
 new file mode 100644
-index 0000000..e39014c
+index 0000000000000000000000000000000000000000..e39014c17cb3cd1c16c03db7ec1b5187cd05d2ce
 --- /dev/null
 +++ b/sysdeps/roanix/x86_64/crt-src/crt1.S
 @@ -0,0 +1,8 @@
@@ -685,7 +1321,7 @@ index 0000000..e39014c
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/x86_64/crt-src/crti.S b/sysdeps/roanix/x86_64/crt-src/crti.S
 new file mode 100644
-index 0000000..6fd3c22
+index 0000000000000000000000000000000000000000..6fd3c221794f1bf1508e1e950465f260adba46cb
 --- /dev/null
 +++ b/sysdeps/roanix/x86_64/crt-src/crti.S
 @@ -0,0 +1,11 @@
@@ -702,7 +1338,7 @@ index 0000000..6fd3c22
 +.section .note.GNU-stack,"",%progbits
 diff --git a/sysdeps/roanix/x86_64/crt-src/crtn.S b/sysdeps/roanix/x86_64/crt-src/crtn.S
 new file mode 100644
-index 0000000..89d1536
+index 0000000000000000000000000000000000000000..89d1536c0baaa5b1013636e4a5a20823a3248359
 --- /dev/null
 +++ b/sysdeps/roanix/x86_64/crt-src/crtn.S
 @@ -0,0 +1,9 @@

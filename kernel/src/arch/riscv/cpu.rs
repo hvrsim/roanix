@@ -37,6 +37,7 @@ const SIE_SEIE: u64 = 1 << 9;
 /// **NOTE:** The layout and offsets MUST exactly match the assembly
 /// routine `rtrap_entry`.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TrapFrame {
     a0: u64,
     a1: u64,
@@ -185,6 +186,20 @@ pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64)
             sstatus: SSTATUS_SPIE,
             reserved: 0,
         };
+    }
+}
+
+/// Initializes a child user frame from its parent's syscall frame.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes and `parent` must be a live user frame
+/// whose instruction pointer already advances past the `ecall`.
+pub unsafe fn init_forked_user_thread_frame(frame: *mut TrapFrame, parent: &TrapFrame) {
+    // SAFETY: the caller guarantees exclusive writable storage for `frame`.
+    unsafe {
+        *frame = *parent;
+        (*frame).a0 = 0;
     }
 }
 
@@ -360,12 +375,11 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     if frame.sstatus & SSTATUS_SPP == 0 {
         if frame.scause == SCAUSE_USER_ECALL {
             crate::arch::irqset(true);
-            frame.a0 = crate::sys::syscall::dispatch(
-                frame.a7,
-                [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5],
-            ) as u64;
-            crate::arch::irqset(false);
             frame.ip = frame.ip.wrapping_add(4);
+            let number = frame.a7;
+            let arguments = [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5];
+            frame.a0 = crate::proc::syscall::dispatch(frame, number, arguments) as u64;
+            crate::arch::irqset(false);
             // SAFETY: `frame` is the current thread's live user trap frame.
             unsafe {
                 prepare_thread_frame(frame, crate::proc::current_thread_pointer());

@@ -175,29 +175,80 @@ impl Pmap {
     /// Write-protects every writable mapping before a COW fork.
     pub fn write_protect_all(&self) -> Result<()> {
         let mut mappings = self.inner.mappings.lock();
-        for (address, mapping) in mappings.iter_mut() {
+        let mut pending: Vec<(u64, Arc<VmPage>, PhysAddr, VmProtection, VmProtection)> =
+            Vec::new();
+        for (address, mapping) in mappings.iter() {
             if !mapping.protection.contains(VmProtection::WRITE) {
                 continue;
             }
             let mut protection = mapping.protection;
             protection.remove(VmProtection::WRITE);
-            let paddr = mapping.page.acquire_mapping()?;
+            let paddr = match mapping.page.acquire_mapping() {
+                Ok(paddr) => paddr,
+                Err(error) => {
+                    for (_, page, _, _, _) in pending {
+                        page.release_mapping();
+                    }
+                    return Err(error);
+                }
+            };
+            pending.push((
+                *address,
+                mapping.page.clone(),
+                paddr,
+                mapping.protection,
+                protection,
+            ));
+        }
+
+        let mut applied = 0usize;
+        for (address, _, paddr, _, protection) in &pending {
             // SAFETY: the existing mapping pins the page and the pmap lock
             // serializes the leaf update.
             let result = unsafe {
                 arch::paging::remap_page(
                     self.inner.root,
                     VirtAddr::new(*address),
-                    paddr,
-                    pmap_flags(protection),
+                    *paddr,
+                    pmap_flags(*protection),
                 )
             };
-            mapping.page.release_mapping();
-            result.map_err(|_| Error::Pmap)?;
-            mapping.protection = protection;
+            if result.is_err() {
+                for (address, _, paddr, original, _) in &pending[..applied] {
+                    // SAFETY: these leaves were changed above while this lock
+                    // remained held and their pages are still pinned.
+                    unsafe {
+                        arch::paging::remap_page(
+                            self.inner.root,
+                            VirtAddr::new(*address),
+                            *paddr,
+                            pmap_flags(*original),
+                        )
+                    }
+                    .expect("mem/pmap: failed to roll back fork protection");
+                    mappings
+                        .get_mut(address)
+                        .expect("mem/pmap: rollback mapping vanished")
+                        .protection = *original;
+                }
+                for (_, page, _, _, _) in pending {
+                    page.release_mapping();
+                }
+                return Err(Error::Pmap);
+            }
+            mappings
+                .get_mut(address)
+                .expect("mem/pmap: fork mapping vanished")
+                .protection = *protection;
+            applied += 1;
+        }
+        for (_, page, _, _, _) in pending {
+            page.release_mapping();
         }
         drop(mappings);
-        super::publish_permission_shootdown();
+        if applied != 0 {
+            super::publish_permission_shootdown();
+        }
         Ok(())
     }
 
@@ -459,13 +510,14 @@ impl VmSpace {
 
     /// Forks the map with lazy anonymous-overlay COW.
     pub fn fork(&self) -> Result<Arc<Self>> {
+        let child_pmap = Pmap::new()?;
         let mut map = self.map.lock();
         self.pmap.write_protect_all()?;
         let child_map = map.fork();
         drop(map);
         Ok(Arc::new(Self {
             map: Mutex::new(child_map),
-            pmap: Pmap::new()?,
+            pmap: child_pmap,
         }))
     }
 

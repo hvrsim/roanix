@@ -113,6 +113,11 @@ pub fn lookup(path: &str) -> Result<Vnode> {
     lookup_bytes(path.as_bytes())
 }
 
+/// Looks up a path without following a final symbolic link.
+pub fn lookup_nofollow(path: &str) -> Result<Vnode> {
+    Ok(resolve(path.as_bytes(), false)?.vnode)
+}
+
 /// Looks up a byte path from the global root namespace.
 pub fn lookup_bytes(path: &[u8]) -> Result<Vnode> {
     Ok(resolve(path, true)?.vnode)

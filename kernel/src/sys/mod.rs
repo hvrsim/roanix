@@ -14,5 +14,4 @@ pub mod panic;
 pub mod sched;
 pub mod smp;
 pub mod sync;
-pub mod syscall;
 pub mod thread;

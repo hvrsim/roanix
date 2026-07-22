@@ -73,7 +73,11 @@ struct LoadedElf {
     program_header_count: u16,
 }
 
-pub(super) fn load(path: &str, arguments: &[&str], environment: &[&str]) -> Result<LoadedProgram> {
+pub(super) fn load<A: AsRef<str>, E: AsRef<str>>(
+    path: &str,
+    arguments: &[A],
+    environment: &[E],
+) -> Result<LoadedProgram> {
     let address_space = VmSpace::new()?;
     let main_bytes = read_file(path)?;
     let main_spec = parse_elf(&main_bytes)?;
@@ -101,11 +105,13 @@ pub(super) fn load(path: &str, arguments: &[&str], environment: &[&str]) -> Resu
         (main.entry, 0)
     };
 
+    let argument_refs: Vec<_> = arguments.iter().map(|value| value.as_ref()).collect();
+    let environment_refs: Vec<_> = environment.iter().map(|value| value.as_ref()).collect();
     let stack = build_stack(
         &address_space,
         path,
-        arguments,
-        environment,
+        &argument_refs,
+        &environment_refs,
         &main,
         interpreter_base,
     )?;

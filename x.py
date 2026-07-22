@@ -210,7 +210,7 @@ ARCHITECTURES: Mapping[str, Architecture] = {
     ),
 }
 
-USERSPACE_PACKAGES = ("bash", "init", "os-test")
+USERSPACE_PACKAGES = ("bash", "coreutils", "init", "os-test")
 USERSPACE_BUILD_PACKAGES = ("mlibc-headers", "mlibc", *USERSPACE_PACKAGES)
 
 DOWNLOADS: Mapping[str, DownloadPin] = {
@@ -1054,6 +1054,184 @@ def format_kernel(ctx: Context, *, check: bool) -> None:
     )
 
 
+def available_userland_packages() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            path.parent.name
+            for path in (USERLAND_DIR / "recipes").glob("*/recipe")
+            if path.parent.name != "mlibc-source"
+        )
+    )
+
+
+def recipe_dependencies(package: str) -> tuple[str, ...]:
+    recipe = USERLAND_DIR / "recipes" / package / "recipe"
+    dependencies: list[str] = []
+    found = False
+    for line in recipe.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("deps="):
+            continue
+        if found:
+            raise BuildError(f"Multiple deps assignments in {recipe}")
+        found = True
+        value = line.removeprefix("deps=").strip().strip("\"'")
+        if "$" in value or "`" in value:
+            raise BuildError(f"Dynamic deps assignment is unsupported in {recipe}")
+        dependencies.extend(value.split())
+    known = {
+        path.parent.name
+        for path in (USERLAND_DIR / "recipes").glob("*/recipe")
+    }
+    unknown = sorted(set(dependencies) - known)
+    if unknown:
+        raise BuildError(
+            f"Unknown dependencies in {recipe}: {', '.join(unknown)}"
+        )
+    return tuple(dependencies)
+
+
+def recipe_source(package: str) -> str | None:
+    recipe = USERLAND_DIR / "recipes" / package / "recipe"
+    for line in recipe.read_text(encoding="utf-8").splitlines():
+        if line.startswith("from_source="):
+            return line.removeprefix("from_source=").strip().strip("\"'")
+    return None
+
+
+def discard_failed_tarball(package: str, ui: UI) -> None:
+    recipe = USERLAND_DIR / "recipes" / package / "recipe"
+    assignments: dict[str, str] = {}
+    for line in recipe.read_text(encoding="utf-8").splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key in {"version", "tarball_url"}:
+            assignments[key] = value.strip().strip("\"'")
+    url = assignments.get("tarball_url")
+    if not url:
+        return
+    url = url.replace("${version}", assignments.get("version", ""))
+    cached = USERLAND_DIR / "sources" / Path(url.split("?", 1)[0]).name
+    if cached.is_file():
+        ui.detail(f"discard failed source download: {_display_path(cached)}")
+        remove_path(cached)
+
+
+def reset_patched_source(package: str, ui: UI) -> None:
+    source = recipe_source(package) or package
+    patches = USERLAND_DIR / "recipes" / source / "patches"
+    if not patches.is_dir():
+        return
+    source_root = USERLAND_DIR / "sources"
+    candidates = (
+        source_root / source,
+        source_root / f"{source}-clean",
+        source_root / f"{source}-workdir",
+        source_root / f"{source}.version",
+        source_root / f"{source}.patched",
+        source_root / f"{source}.prepared",
+        source_root / f"{source}.revision",
+        source_root / f"{source}.host-revision",
+    )
+    if any(path.exists() for path in candidates):
+        ui.detail(f"refresh patched source: {source}")
+    for path in candidates:
+        remove_path(path)
+    discard_failed_tarball(source, ui)
+
+
+def package_rebuild_order(package: str) -> tuple[str, ...]:
+    packages = available_userland_packages()
+    dependencies = {name: recipe_dependencies(name) for name in packages}
+    sources = {name: recipe_source(name) for name in packages}
+    closure = {package}
+    changed = True
+    while changed:
+        changed = False
+        selected_sources = {
+            source for name, source in sources.items() if name in closure and source
+        }
+        for name, source in sources.items():
+            if name not in closure and source in selected_sources:
+                closure.add(name)
+                changed = True
+        for name, required in dependencies.items():
+            if name not in closure and closure.intersection(required):
+                closure.add(name)
+                changed = True
+
+    ordered: list[str] = []
+    visiting: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in ordered:
+            return
+        if name in visiting:
+            raise BuildError(f"Userspace package dependency cycle at {name}")
+        visiting.add(name)
+        for dependency in dependencies.get(name, ()):
+            if dependency in closure:
+                visit(dependency)
+        visiting.remove(name)
+        ordered.append(name)
+
+    for name in sorted(closure):
+        visit(name)
+    return tuple(ordered)
+
+
+def package_dependency_closure(packages: Sequence[str]) -> tuple[str, ...]:
+    closure = set(packages)
+    pending = list(packages)
+    while pending:
+        package = pending.pop()
+        related = list(recipe_dependencies(package))
+        source = recipe_source(package)
+        if source:
+            related.append(source)
+        for dependency in related:
+            if dependency not in closure:
+                closure.add(dependency)
+                pending.append(dependency)
+    return tuple(sorted(closure))
+
+
+def replace_directory(staging: Path, destination: Path, backup_name: str) -> None:
+    if not destination.exists():
+        staging.rename(destination)
+        return
+
+    backup = destination.parent / backup_name
+    remove_path(backup)
+    destination.rename(backup)
+    installed = False
+    try:
+        staging.rename(destination)
+        installed = True
+    finally:
+        if not installed and backup.exists() and not destination.exists():
+            backup.rename(destination)
+    remove_path(backup)
+
+
+def prepare_jinx_build(ctx: Context) -> tuple[Path, Path, Mapping[str, str]]:
+    jinx = ensure_jinx(ctx)
+    build_dir = RUNTIME_ROOT / f"jinx-build-{ctx.arch.name}"
+    if build_dir.is_symlink():
+        raise BuildError(f"Refusing to use symlinked Jinx build directory: {build_dir}")
+    ensure_dir(build_dir)
+    env = jinx_environment(ctx)
+    if not (build_dir / ".jinx-parameters").is_file():
+        run(
+            ctx,
+            [str(jinx / "jinx"), "init", str(USERLAND_DIR), f"ARCH={ctx.arch.name}"],
+            cwd=build_dir,
+            env_updates=env,
+            step=f"initialize userspace build ({ctx.arch.name})",
+        )
+    return jinx, build_dir, env
+
+
 def build_sysroot(ctx: Context) -> Path:
     fingerprint = userspace_fingerprint(ctx)
     state_key = f"userspace-{ctx.arch.name}"
@@ -1071,17 +1249,10 @@ def build_sysroot(ctx: Context) -> Path:
         remove_path(build_dir)
         remove_path(ctx.sysroot)
 
-    jinx = ensure_jinx(ctx)
-    ensure_dir(build_dir)
-    env = jinx_environment(ctx)
-    if not (build_dir / ".jinx-parameters").is_file():
-        run(
-            ctx,
-            [str(jinx / "jinx"), "init", str(USERLAND_DIR), f"ARCH={ctx.arch.name}"],
-            cwd=build_dir,
-            env_updates=env,
-            step=f"initialize userspace build ({ctx.arch.name})",
-        )
+    jinx, build_dir, env = prepare_jinx_build(ctx)
+    for package in package_dependency_closure(USERSPACE_BUILD_PACKAGES):
+        reset_patched_source(package, ctx.ui)
+        discard_failed_tarball(package, ctx.ui)
     run(
         ctx,
         [
@@ -1113,13 +1284,85 @@ def build_sysroot(ctx: Context) -> Path:
             step=f"install userspace sysroot ({ctx.arch.name})",
             capture=False,
         )
-        remove_path(ctx.sysroot)
-        staging.rename(ctx.sysroot)
+        replace_directory(staging, ctx.sysroot, f".{ctx.arch.name}.old")
     finally:
         remove_path(staging)
     record_build_state(
         key=state_key,
         fingerprint=fingerprint,
+        outputs=(ctx.sysroot,),
+    )
+    return ctx.sysroot
+
+
+def rebuild_userland_package(ctx: Context, package: str) -> Path:
+    if package not in available_userland_packages():
+        supported = ", ".join(available_userland_packages())
+        raise BuildError(
+            f"Unknown userspace package {package!r}; choose one of: {supported}"
+        )
+    expected_sysroot_root = RUNTIME_ROOT / "sysroots"
+    for path in (DEFAULT_OUTPUT_DIR, RUNTIME_ROOT, expected_sysroot_root):
+        if path.is_symlink():
+            raise BuildError(f"Refusing to use symlinked runtime path: {path}")
+    if ctx.sysroot.is_symlink():
+        raise BuildError(f"Refusing to use symlinked sysroot: {ctx.sysroot}")
+    if ctx.sysroot.parent != expected_sysroot_root or ctx.sysroot.name != ctx.arch.name:
+        raise BuildError(f"Unexpected sysroot path: {ctx.sysroot}")
+    if not ctx.sysroot.is_dir():
+        raise BuildError(
+            f"Userspace sysroot is missing: {ctx.sysroot}; run "
+            f"'x.py build sysroot --arch {ctx.arch.name}' first"
+        )
+
+    jinx, build_dir, env = prepare_jinx_build(ctx)
+    rebuild_order = package_rebuild_order(package)
+    for rebuild_package in package_dependency_closure(rebuild_order):
+        reset_patched_source(rebuild_package, ctx.ui)
+        discard_failed_tarball(rebuild_package, ctx.ui)
+    run(
+        ctx,
+        [str(jinx / "jinx"), "update", "-b", package],
+        cwd=build_dir,
+        env_updates=env,
+        step=f"update dependencies for {package} ({ctx.arch.name})",
+        capture=False,
+    )
+    run(
+        ctx,
+        [str(jinx / "jinx"), "rebuild", *rebuild_order],
+        cwd=build_dir,
+        env_updates=env,
+        step=f"rebuild {' '.join(rebuild_order)} ({ctx.arch.name})",
+        capture=False,
+    )
+    staging = RUNTIME_ROOT / "sysroots" / f".{ctx.arch.name}.package.tmp"
+    remove_path(staging)
+    ensure_dir(staging)
+    try:
+        run(
+            ctx,
+            [
+                str(jinx / "jinx"),
+                "install",
+                str(staging),
+                *USERSPACE_PACKAGES,
+            ],
+            cwd=build_dir,
+            env_updates=env,
+            step=f"assemble updated sysroot with {package} ({ctx.arch.name})",
+            capture=False,
+        )
+        replace_directory(
+            staging,
+            ctx.sysroot,
+            f".{ctx.arch.name}.package.old",
+        )
+    finally:
+        remove_path(staging)
+    record_build_state(
+        key=f"userspace-{ctx.arch.name}",
+        fingerprint=userspace_fingerprint(ctx),
         outputs=(ctx.sysroot,),
     )
     return ctx.sysroot
@@ -1524,7 +1767,7 @@ def run_qemu(ctx: Context, *, image: str, firmware: str) -> None:
                 argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
             else:
                 argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
-            argv += ["-debugcon", "stdio"]
+            argv += ["-serial", "stdio"]
         elif ctx.arch.name == "riscv64":
             argv += [
                 "-M",
@@ -1863,6 +2106,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
   ./x.py                         Build the default x86_64 HDD image
   ./x.py build iso --arch riscv64 --profile release
   ./x.py build hdd --force
+  ./x.py package init
   ./x.py run -- --no-reboot
   ./x.py doctor
   ./x.py help build""",
@@ -1919,6 +2163,27 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
         help="Firmware mode.",
     )
     commands["run"] = run_parser
+
+    package_parser = subparsers.add_parser(
+        "package",
+        parents=[common],
+        formatter_class=HelpFormatter,
+        help="Rebuild a userspace package and reinstall the sysroot.",
+        description=(
+            "Rebuild one Jinx package plus affected reverse dependencies, "
+            "then replace the existing architecture sysroot."
+        ),
+        epilog="""Examples:
+  ./x.py package init
+  ./x.py package bash --arch riscv64
+  ./x.py package mlibc""",
+    )
+    package_parser.add_argument(
+        "package",
+        choices=available_userland_packages(),
+        help="Userspace package recipe to rebuild.",
+    )
+    commands["package"] = package_parser
 
     check = subparsers.add_parser(
         "check",
@@ -2102,6 +2367,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ctx.ui.detail(f"artifact: {_display_path(artifact)}")
         elif command == "run":
             run_qemu(ctx, image=args.image, firmware=args.firmware)
+        elif command == "package":
+            sysroot = rebuild_userland_package(ctx, args.package)
+            ctx.ui.detail(f"sysroot: {_display_path(sysroot)}")
         elif command == "check":
             check_kernel(ctx)
         elif command == "lint":

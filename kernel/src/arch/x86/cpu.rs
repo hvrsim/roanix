@@ -140,6 +140,7 @@ struct Idt {
 /// **NOTE:** The layout and offsets MUST exactly match the assembly
 /// routine `rtrap_entry`.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TrapFrame {
     rax: u64,
     rbx: u64,
@@ -250,6 +251,19 @@ pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64)
                 ss: 0x43,
             },
         );
+    }
+}
+
+/// Initializes a child user frame from its parent's syscall frame.
+///
+/// # Safety
+///
+/// `frame` must be valid for writes and `parent` must be a live user frame.
+pub unsafe fn init_forked_user_thread_frame(frame: *mut TrapFrame, parent: &TrapFrame) {
+    // SAFETY: the caller guarantees exclusive writable storage for `frame`.
+    unsafe {
+        ptr::write(frame, *parent);
+        (*frame).rax = 0;
     }
 }
 
@@ -666,12 +680,11 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
 /// Kernel syscall handler.
 #[unsafe(no_mangle)]
 extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
-    frame.rax = crate::sys::syscall::dispatch(
-        frame.rax,
-        [
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-        ],
-    ) as u64;
+    let number = frame.rax;
+    let arguments = [
+        frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+    ];
+    frame.rax = crate::proc::syscall::dispatch(frame, number, arguments) as u64;
     // Syscalls run with IRQs enabled, but final frame preparation and
     // scheduling must be atomic with respect to interrupt-driven switches.
     crate::arch::irqset(false);

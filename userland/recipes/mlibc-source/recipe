@@ -1,6 +1,6 @@
 #! /bin/sh
 
-version=0.0.0.20260718.7
+version=0.0.0.20260718.9
 revision=1
 git_url="https://github.com/managarm/mlibc.git"
 commit="4b09f2f0860cbe20775ab16018320e272564d102"

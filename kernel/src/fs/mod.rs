@@ -17,12 +17,12 @@ use log::info;
 pub use error::{Error, Result};
 pub use file::{FileRef, OpenFile, OpenFlags, SeekFrom};
 pub use vfs::{
-    create_dir, create_file, link, lookup, mount, open, remove_dir, rename, statfs, symlink,
-    sync_all, unlink,
+    create_dir, create_file, link, lookup, lookup_nofollow, mount, open, remove_dir, rename,
+    statfs, symlink, sync_all, unlink,
 };
 pub use vnode::{
-    CreateKind, DirEntry, FileSystem, FileSystemRef, FilesystemId, NodeId, SetAttr, StatFs, Vnode,
-    VnodeAttr, VnodeKey, VnodeKind,
+    CreateKind, DirEntry, FileSystem, FileSystemRef, FilesystemId, IoctlContext, NodeId, SetAttr,
+    StatFs, Vnode, VnodeAttr, VnodeKey, VnodeKind,
 };
 
 /// Initializes the VFS, mounts tmpfs as root, and mounts devtempfs at `/dev`.

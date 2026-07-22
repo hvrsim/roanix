@@ -1,0 +1,13 @@
+diff --git a/lib/mountlist.c b/lib/mountlist.c
+index 3b32e32..5bd36c0 100644
+--- a/lib/mountlist.c
++++ b/lib/mountlist.c
+@@ -1244,7 +1244,7 @@ read_file_system_list (bool need_fs_type)
+   }
+ #endif
+ 
+-#if MOUNTED_NOT_PORTED
++#if MOUNTED_NOT_PORTED && !defined __roanix__
+ # error "Please port gnulib mountlist.c to your platform!"
+ #endif
+ 

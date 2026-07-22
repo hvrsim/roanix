@@ -17,6 +17,10 @@ pub enum Error {
     NotDirectory,
     /// An operation is invalid for a directory.
     IsDirectory,
+    /// The target is not a terminal device.
+    NotTty,
+    /// A blocking operation was interrupted by terminal input.
+    Interrupted,
     /// A directory still contains entries.
     NotEmpty,
     /// The operation crosses filesystem boundaries.
@@ -31,6 +35,8 @@ pub enum Error {
     Unsupported,
     /// The filesystem or mount is busy.
     Busy,
+    /// A nonblocking operation would have to wait.
+    WouldBlock,
     /// The filesystem has no remaining capacity.
     NoSpace,
     /// A file would exceed the implementation limit.
@@ -54,6 +60,8 @@ impl fmt::Display for Error {
             Self::AlreadyExists => "already exists",
             Self::NotDirectory => "not a directory",
             Self::IsDirectory => "is a directory",
+            Self::NotTty => "not a terminal",
+            Self::Interrupted => "operation interrupted",
             Self::NotEmpty => "directory not empty",
             Self::CrossDevice => "cross-device operation",
             Self::SymlinkLoop => "too many symbolic links",
@@ -61,6 +69,7 @@ impl fmt::Display for Error {
             Self::InvalidArgument => "invalid argument",
             Self::Unsupported => "operation not supported",
             Self::Busy => "resource busy",
+            Self::WouldBlock => "operation would block",
             Self::NoSpace => "no space left",
             Self::FileTooLarge => "file too large",
             Self::PermissionDenied => "permission denied",

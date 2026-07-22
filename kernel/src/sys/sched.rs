@@ -30,7 +30,8 @@ use crate::{
         sync::Once,
         thread::{
             ExitedThreadAdapter, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState,
-            WakeResult, allocate_thread, allocate_user_thread, free_thread, idle_task,
+            WakeResult, allocate_forked_user_thread, allocate_thread, allocate_user_thread,
+            free_thread, idle_task,
         },
     },
 };
@@ -731,6 +732,26 @@ impl Scheduler {
             process,
             entry,
             stack,
+        );
+        self.enqueue_new_thread(NonNull::from(thread))
+    }
+
+    fn spawn_forked_user(
+        &self,
+        process: Arc<Process>,
+        parent_frame: &TrapFrame,
+        thread_pointer: u64,
+    ) -> usize {
+        let cpu_id = self.pick_spawn_cpu();
+        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        let thread = allocate_forked_user_thread(
+            tid,
+            cpu_id,
+            clock::monotonic_ns(),
+            MIN_INTERACT,
+            process,
+            parent_frame,
+            thread_pointer,
         );
         self.enqueue_new_thread(NonNull::from(thread))
     }
@@ -1721,6 +1742,15 @@ where
 /// Spawns the initial thread of a userspace process.
 pub(crate) fn run_user(process: Arc<Process>, entry: u64, stack: u64) -> usize {
     scheduler().spawn_user(process, entry, stack)
+}
+
+/// Spawns a fork child from the current user syscall frame.
+pub(crate) fn run_forked_user(
+    process: Arc<Process>,
+    parent_frame: &TrapFrame,
+    thread_pointer: u64,
+) -> usize {
+    scheduler().spawn_forked_user(process, parent_frame, thread_pointer)
 }
 
 /// Spawns an interrupt-thread style task with the supplied argument.

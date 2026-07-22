@@ -88,6 +88,16 @@ typedef int64_t (*roanix_device_write_fn)(
     size_t len);
 typedef uint64_t (*roanix_device_size_fn)(uintptr_t context);
 typedef int32_t (*roanix_device_sync_fn)(uintptr_t context);
+typedef int64_t (*roanix_device_ioctl_fn)(
+    uintptr_t context,
+    uintptr_t process_id,
+    int32_t process_group,
+    int32_t session_id,
+    uint8_t is_session_leader,
+    uint64_t request,
+    uint64_t value,
+    uint8_t *argument,
+    size_t argument_len);
 
 struct roanix_device_ops_v1 {
     uint32_t size;
@@ -99,6 +109,7 @@ struct roanix_device_ops_v1 {
     roanix_device_write_fn write;
     roanix_device_size_fn size_bytes;
     roanix_device_sync_fn sync;
+    roanix_device_ioctl_fn ioctl;
 };
 
 struct roanix_driver_host_v1 {

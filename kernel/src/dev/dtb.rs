@@ -8,8 +8,13 @@ use core::slice;
 
 use limine::request::DeviceTreeBlobRequest;
 
+use super::ResourceKey;
+
 const FDT_MAGIC: u32 = 0xD00D_FEED;
 const FDT_HEADER_LEN: usize = 40;
+
+/// Resource containing the validated raw flattened device tree.
+pub const DTB_RESOURCE: ResourceKey = ResourceKey::new(0x524F_414E_4958_4657, 2);
 
 #[used]
 #[doc(hidden)]
