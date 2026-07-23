@@ -1,32 +1,12 @@
-//! Inheritable bus resources.
+//! Typed, inheritable device resources.
 
 use alloc::sync::Arc;
-use core::{
-    ptr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     error::{Error, Result},
     tree::DriverId,
 };
-
-const RESOURCE_REVOKED: u64 = 1 << 63;
-const RESOURCE_CALLS_MASK: u64 = !RESOURCE_REVOKED;
-
-struct ResourceCallGuard<'a> {
-    state: &'a AtomicU64,
-}
-
-impl Drop for ResourceCallGuard<'_> {
-    fn drop(&mut self) {
-        let previous = self.state.fetch_sub(1, Ordering::Release);
-        assert!(
-            previous & RESOURCE_CALLS_MASK != 0,
-            "dev: resource callback count underflow"
-        );
-    }
-}
 
 /// Stable identifier for one published resource.
 #[repr(transparent)]
@@ -44,10 +24,28 @@ impl ResourceId {
     }
 }
 
+/// Stable identifier for one acquired resource lease.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResourceLeaseId(u64);
+
+impl ResourceLeaseId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Extensible 128-bit resource type key.
 ///
-/// The high half should identify a vendor, subsystem, or standardized
-/// namespace. The low half identifies a resource within that namespace.
+/// The high half identifies a vendor, subsystem, or standardized namespace.
+/// The low half identifies a resource within that namespace. Incompatible
+/// protocol revisions use a new key; compatible additions extend the
+/// size-prefixed operation table.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResourceKey {
@@ -67,6 +65,19 @@ impl ResourceKey {
     }
 }
 
+/// Namespace used for device-manager and future sysfs metadata.
+pub const PROPERTY_NAMESPACE: u64 = 0x524F_414E_4958_5052;
+/// Device subsystem name such as `pci`, `usb`, `block`, or `tty`.
+pub const PROPERTY_SUBSYSTEM: ResourceKey = ResourceKey::new(PROPERTY_NAMESPACE, 1);
+/// Subsystem-specific device type.
+pub const PROPERTY_DEVICE_TYPE: ResourceKey = ResourceKey::new(PROPERTY_NAMESPACE, 2);
+/// Driver-autoload and userspace matching alias.
+pub const PROPERTY_MODALIAS: ResourceKey = ResourceKey::new(PROPERTY_NAMESPACE, 3);
+/// Firmware or protocol compatibility string list.
+pub const PROPERTY_COMPATIBLE: ResourceKey = ResourceKey::new(PROPERTY_NAMESPACE, 4);
+/// Numeric or textual device class.
+pub const PROPERTY_CLASS: ResourceKey = ResourceKey::new(PROPERTY_NAMESPACE, 5);
+
 /// Resource access and behavior flags.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -75,14 +86,20 @@ pub struct ResourceFlags(u64);
 impl ResourceFlags {
     /// No special behavior.
     pub const EMPTY: Self = Self(0);
-    /// Resource data may be cached by consumers.
+    /// Resource data or operations may be cached by consumers.
     pub const CACHEABLE: Self = Self(1 << 0);
-    /// Resource data describes memory-mapped I/O.
+    /// Resource describes memory-mapped I/O.
     pub const MMIO: Self = Self(1 << 1);
-    /// Resource method may block the current thread.
+    /// Protocol operations may block the current thread.
     pub const MAY_BLOCK: Self = Self(1 << 2);
-    /// Resource is safe to use from interrupt context.
+    /// Protocol operations are safe to call from interrupt context.
     pub const IRQ_SAFE: Self = Self(1 << 3);
+    /// Provider cannot disappear while a consumer holds a lease.
+    pub const ORDERLY: Self = Self(1 << 4);
+    /// Protocol operations may be called concurrently.
+    pub const CONCURRENT: Self = Self(1 << 5);
+    /// Protocol operations may re-enter the provider.
+    pub const REENTRANT: Self = Self(1 << 6);
 
     /// Creates flags from their raw representation.
     pub const fn from_bits(bits: u64) -> Self {
@@ -100,126 +117,127 @@ impl ResourceFlags {
     }
 }
 
-/// Foreign-callable resource method.
-pub type ResourceCallback = unsafe extern "C" fn(
-    context: usize,
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    output_len: usize,
-    written: *mut usize,
-) -> i32;
-
-/// Callable operation published by a bus.
+/// Direct-call protocol published by a resource provider.
 #[derive(Copy, Clone)]
-pub struct ResourceMethod {
-    owner: Option<DriverId>,
+pub struct ResourceProtocol {
+    revision: u32,
     context: usize,
-    callback: ResourceCallback,
+    operations: *const u8,
+    operations_size: usize,
 }
 
-impl ResourceMethod {
-    /// Creates a callable resource.
+// SAFETY: publication requires the operation table and every callback it
+// contains to remain immutable and executable until the resource is removed.
+// Resource leases prevent provider removal while a consumer can use the table.
+unsafe impl Send for ResourceProtocol {}
+// SAFETY: protocol concurrency is described by resource flags and enforced by
+// the provider. The operation-table pointer itself is immutable.
+unsafe impl Sync for ResourceProtocol {}
+
+impl ResourceProtocol {
+    /// Creates a direct-call protocol descriptor.
     ///
     /// # Safety
     ///
-    /// `callback` must remain executable while this value exists, accept the
-    /// supplied byte ranges, initialize `written` on success, and be safe for
-    /// concurrent calls when the resource is shared between devices.
-    pub const unsafe fn new(context: usize, callback: ResourceCallback) -> Self {
-        Self {
-            owner: None,
-            context,
-            callback,
-        }
-    }
-
-    pub(crate) const unsafe fn new_driver(
-        owner: DriverId,
+    /// `operations` must address an immutable table of `operations_size` bytes
+    /// that remains live until the resource is removed. Function pointers in
+    /// the table must follow the protocol ABI represented by the resource key.
+    pub const unsafe fn new(
+        revision: u32,
         context: usize,
-        callback: ResourceCallback,
+        operations: *const u8,
+        operations_size: usize,
     ) -> Self {
         Self {
-            owner: Some(owner),
+            revision,
             context,
-            callback,
+            operations,
+            operations_size,
         }
     }
 
-    pub(crate) fn bind_owner(&mut self, owner: DriverId) {
-        self.owner = Some(owner);
+    /// Returns the compatible protocol revision.
+    pub const fn revision(self) -> u32 {
+        self.revision
     }
 
-    /// Invokes the resource without holding device-tree locks.
-    pub fn invoke(&self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let _callback = match self.owner {
-            Some(owner) => Some(super::driver::callback_guard(owner)?),
-            None => None,
-        };
-        let mut written = 0usize;
-        let input_ptr = if input.is_empty() {
-            ptr::null()
-        } else {
-            input.as_ptr()
-        };
-        let output_ptr = if output.is_empty() {
-            ptr::null_mut()
-        } else {
-            output.as_mut_ptr()
-        };
+    /// Returns the provider-defined call context.
+    pub const fn context(self) -> usize {
+        self.context
+    }
 
-        // SAFETY: the constructor contract guarantees the callback accepts
-        // these ranges and remains live. The slices provide valid buffers for
-        // the duration of the call.
-        let status = unsafe {
-            (self.callback)(
-                self.context,
-                input_ptr,
-                input.len(),
-                output_ptr,
-                output.len(),
-                &mut written,
-            )
-        };
-        if status != 0 {
-            return Err(Error::CallbackFailed(status));
-        }
-        if written > output.len() {
-            return Err(Error::CallbackFailed(-1));
-        }
-        Ok(written)
+    /// Returns the immutable operation table.
+    pub const fn operations(self) -> *const u8 {
+        self.operations
+    }
+
+    /// Returns the operation-table size.
+    pub const fn operations_size(self) -> usize {
+        self.operations_size
     }
 }
 
-/// Resource payload published by a bus.
+/// Physical address range delegated by a bus or firmware provider.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MemoryRegion {
+    physical: u64,
+    size: u64,
+}
+
+impl MemoryRegion {
+    /// Creates a non-empty physical range.
+    pub fn new(physical: u64, size: u64) -> Result<Self> {
+        if size == 0 || physical.checked_add(size).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self { physical, size })
+    }
+
+    /// Returns the first physical byte.
+    pub const fn physical(self) -> u64 {
+        self.physical
+    }
+
+    /// Returns the number of bytes in the range.
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+}
+
+/// Resource payload published by a provider.
 pub enum ResourceValue {
-    /// Immutable, shareable bytes.
+    /// Immutable bytes borrowed through a lease.
     Data(Arc<[u8]>),
-    /// Driver-provided operation.
-    Method(ResourceMethod),
+    /// Delegated physical range mapped through the memory service.
+    Memory(MemoryRegion),
+    /// Versioned direct-call protocol borrowed through a lease.
+    Protocol(ResourceProtocol),
 }
 
-/// Resource inherited by descendants of its owning bus.
+/// Resource inherited by descendants of its publishing bus.
 pub struct Resource {
     id: ResourceId,
+    owner: DriverId,
     key: ResourceKey,
     flags: ResourceFlags,
-    call_state: AtomicU64,
+    revoked: AtomicBool,
     value: ResourceValue,
 }
 
 impl Resource {
     pub(crate) fn new(
         id: ResourceId,
+        owner: DriverId,
         key: ResourceKey,
         flags: ResourceFlags,
         value: ResourceValue,
     ) -> Self {
         Self {
             id,
+            owner,
             key,
             flags,
-            call_state: AtomicU64::new(0),
+            revoked: AtomicBool::new(false),
             value,
         }
     }
@@ -227,6 +245,11 @@ impl Resource {
     /// Returns this resource's stable identifier.
     pub const fn id(&self) -> ResourceId {
         self.id
+    }
+
+    /// Returns the publishing driver.
+    pub const fn owner(&self) -> DriverId {
+        self.owner
     }
 
     /// Returns this resource's type key.
@@ -241,68 +264,53 @@ impl Resource {
 
     /// Returns shared data, if this is a data resource.
     pub fn data(&self) -> Result<Arc<[u8]>> {
-        if self.call_state.load(Ordering::Acquire) & RESOURCE_REVOKED != 0 {
-            return Err(Error::Busy);
-        }
+        self.ensure_live()?;
         match &self.value {
             ResourceValue::Data(data) => Ok(data.clone()),
-            ResourceValue::Method(_) => Err(Error::WrongKind),
+            ResourceValue::Memory(_) | ResourceValue::Protocol(_) => Err(Error::WrongKind),
         }
     }
 
-    /// Invokes this resource, if it is a method resource.
-    pub fn invoke(&self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let _call = self.acquire_call()?;
-        let result = match &self.value {
-            ResourceValue::Method(method) => method.invoke(input, output),
-            ResourceValue::Data(_) => Err(Error::WrongKind),
-        };
-        result
+    /// Returns a delegated physical memory range.
+    pub fn memory(&self) -> Result<MemoryRegion> {
+        self.ensure_live()?;
+        match &self.value {
+            ResourceValue::Memory(region) => Ok(*region),
+            ResourceValue::Data(_) | ResourceValue::Protocol(_) => Err(Error::WrongKind),
+        }
+    }
+
+    /// Returns a compatible direct-call protocol.
+    pub fn protocol(&self, minimum_revision: u32) -> Result<ResourceProtocol> {
+        self.ensure_live()?;
+        match &self.value {
+            ResourceValue::Protocol(protocol) if protocol.revision() >= minimum_revision => {
+                Ok(*protocol)
+            }
+            ResourceValue::Protocol(_) => Err(Error::Unsupported),
+            ResourceValue::Data(_) | ResourceValue::Memory(_) => Err(Error::WrongKind),
+        }
     }
 
     pub(crate) fn try_revoke(&self) -> Result<()> {
-        loop {
-            let state = self.call_state.load(Ordering::Acquire);
-            if state == RESOURCE_REVOKED {
-                return Ok(());
-            }
-            if state & RESOURCE_CALLS_MASK != 0 {
-                return Err(Error::Busy);
-            }
-            if self
-                .call_state
-                .compare_exchange(0, RESOURCE_REVOKED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        match self
+            .revoked
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(true) => Ok(()),
+            Err(false) => Err(Error::Busy),
         }
     }
 
     pub(crate) fn restore(&self) {
-        let _ = self.call_state.compare_exchange(
-            RESOURCE_REVOKED,
-            0,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
+        self.revoked.store(false, Ordering::Release);
     }
 
-    fn acquire_call(&self) -> Result<ResourceCallGuard<'_>> {
-        loop {
-            let state = self.call_state.load(Ordering::Acquire);
-            if state & RESOURCE_REVOKED != 0 || state & RESOURCE_CALLS_MASK == RESOURCE_CALLS_MASK {
-                return Err(Error::Busy);
-            }
-            if self
-                .call_state
-                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(ResourceCallGuard {
-                    state: &self.call_state,
-                });
-            }
+    pub(crate) fn ensure_live(&self) -> Result<()> {
+        if self.revoked.load(Ordering::Acquire) {
+            Err(Error::Busy)
+        } else {
+            Ok(())
         }
     }
 }

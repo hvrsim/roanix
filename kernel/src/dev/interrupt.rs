@@ -17,7 +17,8 @@ use core::{
 use log::error;
 
 use crate::sys::{
-    smp,
+    event::Event,
+    sched, smp,
     sync::{Mutex, Once},
 };
 
@@ -26,9 +27,6 @@ use super::{
     abi::{AbiSlice, STATUS_NOT_FOUND, STATUS_OK},
     driver::{self, CallbackOwner},
 };
-
-/// Version of interrupt-controller and route ABI records.
-pub const INTERRUPT_ABI_V1: u32 = 1;
 
 /// Inherited resource identifying the interrupt domain for a bus subtree.
 pub const INTERRUPT_DOMAIN_RESOURCE: ResourceKey = ResourceKey::new(0x524F_414E_4958_4952, 1);
@@ -49,11 +47,13 @@ pub const ROUTE_START_MASKED: u64 = 1 << 4;
 
 /// Interrupt handler requests a scheduler trap return.
 pub const HANDLER_RESCHEDULE: u32 = 1 << 0;
+/// Interrupt handler requests its managed thread callback.
+pub const HANDLER_WAKE_THREAD: u32 = 1 << 1;
 
 const CONTROLLER_FLAGS: u64 = CONTROLLER_ROOT;
 const ROUTE_FLAGS: u64 =
     ROUTE_EDGE | ROUTE_LEVEL | ROUTE_ACTIVE_HIGH | ROUTE_ACTIVE_LOW | ROUTE_START_MASKED;
-const DOMAIN_RECORD_SIZE: usize = 16;
+const DOMAIN_RECORD_SIZE: usize = 8;
 const MAX_INTERRUPT_SLOTS: usize = 1024;
 const INTERRUPT_SLOT_BITS: u32 = 16;
 const INTERRUPT_SLOT_MASK: u64 = (1 << INTERRUPT_SLOT_BITS) - 1;
@@ -106,11 +106,9 @@ impl InterruptId {
 /// Immutable route description passed to controller callbacks.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct InterruptRouteV1 {
+pub struct InterruptRoute {
     /// Size of this record.
     pub size: u32,
-    /// Must equal [`INTERRUPT_ABI_V1`].
-    pub abi_version: u32,
     /// Logical interrupt assigned by the kernel.
     pub interrupt: u64,
     /// Architecture vector, or `u32::MAX` when the architecture has none.
@@ -128,7 +126,7 @@ pub struct InterruptRouteV1 {
 /// Installs one controller route in a masked state.
 pub type InterruptConnectFn = unsafe extern "C" fn(
     context: usize,
-    route: *const InterruptRouteV1,
+    route: *const InterruptRoute,
     out_cookie: *mut u64,
 ) -> i32;
 /// Removes one masked controller route.
@@ -137,7 +135,7 @@ pub type InterruptDisconnectFn = unsafe extern "C" fn(context: usize, cookie: u6
 pub type InterruptLineFn = unsafe extern "C" fn(context: usize, cookie: u64) -> i32;
 /// Retargets one masked or live route.
 pub type InterruptSetAffinityFn =
-    unsafe extern "C" fn(context: usize, cookie: u64, route: *const InterruptRouteV1) -> i32;
+    unsafe extern "C" fn(context: usize, cookie: u64, route: *const InterruptRoute) -> i32;
 /// Claims one pending interrupt from a root controller.
 pub type InterruptClaimFn = unsafe extern "C" fn(
     context: usize,
@@ -151,15 +149,15 @@ pub type InterruptCompleteFn =
     unsafe extern "C" fn(context: usize, cpu: u32, platform_id: u64, interrupt: u64, cookie: u64);
 /// Device interrupt handler.
 pub type InterruptHandlerFn = unsafe extern "C" fn(context: usize, interrupt: u64) -> u32;
+/// Thread-context interrupt handler.
+pub type InterruptThreadFn = unsafe extern "C" fn(context: usize, interrupt: u64);
 
-/// Versioned controller callback table copied by the kernel.
+/// Controller callback table copied by the kernel.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct InterruptControllerV1 {
+pub struct InterruptController {
     /// Size of this record.
     pub size: u32,
-    /// Must equal [`INTERRUPT_ABI_V1`].
-    pub abi_version: u32,
     /// Controller capability flags.
     pub flags: u64,
     /// Opaque controller context.
@@ -215,7 +213,7 @@ struct ControllerRecord {
     owner: DriverId,
     bus: BusId,
     callback_owner: CallbackOwner,
-    operations: InterruptControllerV1,
+    operations: InterruptController,
     available: AtomicBool,
 }
 
@@ -241,6 +239,7 @@ struct RouteRecord {
     vector: Option<u8>,
     cookie: u64,
     masked: bool,
+    threaded: Option<Arc<ThreadedInterrupt>>,
     state: RouteState,
 }
 
@@ -253,6 +252,7 @@ struct RouteSnapshot {
     vector: Option<u8>,
     cookie: u64,
     masked: bool,
+    threaded: Option<Arc<ThreadedInterrupt>>,
 }
 
 struct RegistryState {
@@ -265,7 +265,9 @@ struct RegistryState {
     slot_generations: Box<[u64]>,
     pending_drivers: BTreeSet<DriverId>,
     #[cfg(target_arch = "x86_64")]
-    next_vector: u16,
+    vector_cursor: u16,
+    #[cfg(target_arch = "x86_64")]
+    used_vectors: [bool; 256],
 }
 
 struct InterruptRegistry {
@@ -275,8 +277,21 @@ struct InterruptRegistry {
 struct InterruptSlotData {
     owner: CallbackOwner,
     controller: InterruptControllerId,
-    handler: InterruptHandlerFn,
+    handler: Option<InterruptHandlerFn>,
     context: usize,
+    threaded: Option<Arc<ThreadedInterrupt>>,
+}
+
+struct ThreadedInterrupt {
+    owner: CallbackOwner,
+    interrupt: InterruptId,
+    callback: InterruptThreadFn,
+    context: usize,
+    pending: AtomicBool,
+    stopping: AtomicBool,
+    thread: AtomicUsize,
+    wake: Event,
+    exited: Event,
 }
 
 struct InterruptSlot {
@@ -308,6 +323,75 @@ unsafe impl Sync for InterruptSlot {}
 // interrupt slot, and the stored Arc is immutable while published.
 unsafe impl Sync for RootControllerSlot {}
 
+impl ThreadedInterrupt {
+    fn spawn(
+        owner: CallbackOwner,
+        interrupt: InterruptId,
+        callback: InterruptThreadFn,
+        context: usize,
+    ) -> Arc<Self> {
+        let threaded = Arc::new(Self {
+            owner,
+            interrupt,
+            callback,
+            context,
+            pending: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            thread: AtomicUsize::new(0),
+            wake: Event::new(),
+            exited: Event::new(),
+        });
+        let task = threaded.clone();
+        sched::create_ithread(move |_| task.run(), 0);
+        threaded
+    }
+
+    fn signal(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            self.wake.signal();
+        }
+    }
+
+    fn stop(&self) {
+        assert!(
+            !self.is_current(),
+            "dev/interrupt: threaded handler attempted to join itself"
+        );
+        self.stopping.store(true, Ordering::Release);
+        self.wake.signal();
+        self.exited.wait();
+    }
+
+    fn run(&self) {
+        self.thread
+            .store(sched::current_thread() as usize, Ordering::Release);
+        loop {
+            self.wake.wait();
+            self.wake.reset();
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if !self.pending.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            if let Ok(_callback) = self.owner.acquire_control() {
+                // SAFETY: the callback owner pins the driver code and this
+                // managed thread always invokes the registered C signature.
+                unsafe { (self.callback)(self.context, self.interrupt.get()) };
+            }
+        }
+        self.thread.store(0, Ordering::Release);
+        self.exited.signal();
+    }
+
+    fn is_current(&self) -> bool {
+        let thread = self.thread.load(Ordering::Acquire);
+        thread != 0
+            && sched::current_thread_opt()
+                .is_some_and(|current| current as usize == thread)
+    }
+}
+
 impl InterruptRegistry {
     fn new() -> Self {
         Self {
@@ -321,7 +405,9 @@ impl InterruptRegistry {
                 slot_generations: vec![0; MAX_INTERRUPT_SLOTS].into_boxed_slice(),
                 pending_drivers: BTreeSet::new(),
                 #[cfg(target_arch = "x86_64")]
-                next_vector: FIRST_EXTERNAL_VECTOR,
+                vector_cursor: FIRST_EXTERNAL_VECTOR,
+                #[cfg(target_arch = "x86_64")]
+                used_vectors: [false; 256],
             }),
         }
     }
@@ -336,10 +422,9 @@ impl ControllerRecord {
         flags: u64,
         target_cpu: u32,
         target_platform_id: u64,
-    ) -> InterruptRouteV1 {
-        InterruptRouteV1 {
-            size: mem::size_of::<InterruptRouteV1>() as u32,
-            abi_version: INTERRUPT_ABI_V1,
+    ) -> InterruptRoute {
+        InterruptRoute {
+            size: mem::size_of::<InterruptRoute>() as u32,
             interrupt: id.get(),
             vector: vector.map_or(u32::MAX, u32::from),
             target_cpu,
@@ -352,7 +437,7 @@ impl ControllerRecord {
         }
     }
 
-    fn connect(&self, route: &InterruptRouteV1) -> Result<u64> {
+    fn connect(&self, route: &InterruptRoute) -> Result<u64> {
         let _callback = self.callback_owner.acquire_control()?;
         let callback = self.operations.connect.ok_or(Error::Unsupported)?;
         let mut cookie = 0u64;
@@ -394,7 +479,7 @@ impl ControllerRecord {
         callback_result(unsafe { callback(self.operations.context, cookie) })
     }
 
-    fn set_affinity(&self, cookie: u64, route: &InterruptRouteV1) -> Result<()> {
+    fn set_affinity(&self, cookie: u64, route: &InterruptRoute) -> Result<()> {
         let _callback = self.callback_owner.acquire_control()?;
         let callback = self.operations.set_affinity.ok_or(Error::Unsupported)?;
         // SAFETY: controller registration validated this callback and both
@@ -448,14 +533,22 @@ impl InterruptSlot {
             self.finish_dispatch();
             return DispatchOutcome::unhandled();
         }
-        let result = match data.owner.acquire_irq() {
-            Ok(_callback) => {
-                // SAFETY: the callback owner pins the driver code and the
-                // registration contract requires an IRQ-safe callback.
-                unsafe { (data.handler)(data.context, id.get()) }
-            }
-            Err(_) => 0,
+        let result = match data.handler {
+            Some(handler) => match data.owner.acquire_irq() {
+                Ok(_callback) => {
+                    // SAFETY: the callback owner pins the driver code and the
+                    // registration contract requires an IRQ-safe callback.
+                    unsafe { handler(data.context, id.get()) }
+                }
+                Err(_) => 0,
+            },
+            None => HANDLER_WAKE_THREAD,
         };
+        if result & HANDLER_WAKE_THREAD != 0
+            && let Some(threaded) = &data.threaded
+        {
+            threaded.signal();
+        }
         self.finish_dispatch();
         DispatchOutcome {
             handled: true,
@@ -486,7 +579,7 @@ impl InterruptSlot {
         );
     }
 
-    fn remove_suspended(&self) {
+    fn remove_suspended(&self) -> InterruptSlotData {
         assert_eq!(
             self.published_id.load(Ordering::SeqCst),
             0,
@@ -495,11 +588,8 @@ impl InterruptSlot {
         self.wait_inactive();
         // SAFETY: the slot is unpublished, inactive, and exclusively owned by
         // the control plane.
-        let data = unsafe { (&mut *self.data.get()).take() };
-        assert!(
-            data.is_some(),
-            "dev/interrupt: removing an empty interrupt slot"
-        );
+        unsafe { (&mut *self.data.get()).take() }
+            .expect("dev/interrupt: removing an empty interrupt slot")
     }
 
     fn finish_dispatch(&self) {
@@ -621,13 +711,13 @@ pub(crate) fn init() {
 ///
 /// # Safety
 ///
-/// Every callback must follow the version-1 ABI and remain executable until
+/// Every callback must follow the driver interface and remain executable until
 /// controller removal. `claim`, `complete`, and interrupt handlers must be
 /// allocation-free, non-blocking, and safe in interrupt context.
 pub unsafe fn register_controller(
     owner: DriverId,
     bus: BusId,
-    operations: InterruptControllerV1,
+    operations: InterruptController,
 ) -> Result<InterruptControllerId> {
     let _owner = driver::mutation_guard(owner)?;
     validate_controller(&operations)?;
@@ -664,13 +754,24 @@ pub unsafe fn register_controller(
     };
 
     let resource = domain_record(controller.id);
-    if let Err(error) = super::publish_resource(
-        owner,
-        bus,
-        INTERRUPT_DOMAIN_RESOURCE,
-        ResourceFlags::CACHEABLE,
-        ResourceValue::Data(resource),
-    ) {
+    let publish = if bus == super::root_bus()? {
+        super::tree::publish_root_resource(
+            owner,
+            bus.node(),
+            INTERRUPT_DOMAIN_RESOURCE,
+            ResourceFlags::CACHEABLE,
+            ResourceValue::Data(resource),
+        )
+    } else {
+        super::publish_resource(
+            owner,
+            bus.node(),
+            INTERRUPT_DOMAIN_RESOURCE,
+            ResourceFlags::CACHEABLE,
+            ResourceValue::Data(resource),
+        )
+    };
+    if let Err(error) = publish {
         rollback_controller_registration(controller.id);
         return Err(error);
     }
@@ -710,7 +811,20 @@ pub fn unregister_controller(owner: DriverId, id: InterruptControllerId) -> Resu
         crate::arch::set_external_interrupts(false);
         ROOT_CONTROLLER.suspend(id);
     }
-    if let Err(error) = super::remove_resource(owner, controller.bus, INTERRUPT_DOMAIN_RESOURCE) {
+    let remove = if controller.bus == super::root_bus()? {
+        super::tree::remove_root_resource(
+            owner,
+            controller.bus.node(),
+            INTERRUPT_DOMAIN_RESOURCE,
+        )
+    } else {
+        super::remove_resource(
+            owner,
+            controller.bus.node(),
+            INTERRUPT_DOMAIN_RESOURCE,
+        )
+    };
+    if let Err(error) = remove {
         if is_root {
             ROOT_CONTROLLER.resume(id);
             #[cfg(target_arch = "riscv64")]
@@ -742,12 +856,19 @@ pub fn request_interrupt(
     specifier: &[u8],
     flags: u64,
     target_cpu: u32,
-    handler: InterruptHandlerFn,
+    handler: Option<InterruptHandlerFn>,
+    thread_handler: Option<InterruptThreadFn>,
     context: usize,
 ) -> Result<InterruptId> {
     let _owner = driver::mutation_guard(owner)?;
     validate_route_flags(flags)?;
     if specifier.len() > MAX_SPECIFIER_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    if handler.is_none() && thread_handler.is_none() {
+        return Err(Error::InvalidArgument);
+    }
+    if thread_handler.is_some() && handler.is_none() && flags & ROUTE_LEVEL != 0 {
         return Err(Error::InvalidArgument);
     }
     if super::node_info(node)?.owner != owner {
@@ -803,6 +924,7 @@ pub fn request_interrupt(
             vector,
             cookie: 0,
             masked: true,
+            threaded: None,
             state: RouteState::Connecting,
         };
         state.route_keys.insert(key.clone(), id);
@@ -820,6 +942,9 @@ pub fn request_interrupt(
         }
     };
 
+    let threaded = thread_handler.map(|callback| {
+        ThreadedInterrupt::spawn(callback_owner.clone(), id, callback, context)
+    });
     interrupt_slot(id).install(
         id,
         InterruptSlotData {
@@ -827,6 +952,7 @@ pub fn request_interrupt(
             controller: controller.id,
             handler,
             context,
+            threaded: threaded.clone(),
         },
     );
     #[cfg(target_arch = "x86_64")]
@@ -840,6 +966,7 @@ pub fn request_interrupt(
             .get_mut(&id)
             .expect("dev/interrupt: connecting route disappeared");
         record.cookie = cookie;
+        record.threaded = threaded.clone();
     }
 
     let start_masked = flags & ROUTE_START_MASKED != 0;
@@ -864,6 +991,14 @@ pub fn request_interrupt(
 pub fn release_interrupt(owner: DriverId, id: InterruptId) -> Result<()> {
     let _owner = driver::mutation_guard(owner)?;
     let snapshot = begin_route_update(owner, id)?;
+    if snapshot
+        .threaded
+        .as_ref()
+        .is_some_and(|threaded| threaded.is_current())
+    {
+        finish_route_update(id, snapshot.masked);
+        return Err(Error::Busy);
+    }
     if !snapshot.masked
         && let Err(error) = snapshot.controller.mask(snapshot.cookie, false)
     {
@@ -885,7 +1020,10 @@ pub fn release_interrupt(owner: DriverId, id: InterruptId) -> Result<()> {
         return Err(error);
     }
 
-    interrupt_slot(id).remove_suspended();
+    let data = interrupt_slot(id).remove_suspended();
+    if let Some(threaded) = data.threaded {
+        threaded.stop();
+    }
     remove_route_record(id);
     Ok(())
 }
@@ -1166,9 +1304,9 @@ pub(crate) fn restore_driver(owner: DriverId) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-pub(crate) fn remove_driver(owner: DriverId) {
+pub(crate) fn remove_driver(owner: DriverId) -> Result<()> {
     let Some(registry) = REGISTRY.get() else {
-        return;
+        return Ok(());
     };
     let (routes, root, controllers) = {
         let state = registry.state.lock();
@@ -1188,12 +1326,15 @@ pub(crate) fn remove_driver(owner: DriverId) {
             .controllers
             .values()
             .filter(|controller| controller.owner == owner)
-            .map(|controller| controller.id)
+            .map(|controller| (controller.id, controller.bus))
             .collect();
-        let root = state.root_controller.filter(|id| controllers.contains(id));
+        let root = state
+            .root_controller
+            .filter(|id| controllers.iter().any(|(controller, _)| controller == id));
         (routes, root, controllers)
     };
 
+    let mut first_error = None;
     for route in routes {
         quiesce_vector(route.vector);
         if let Err(error) = route.controller.disconnect(route.cookie, true) {
@@ -1202,33 +1343,50 @@ pub(crate) fn remove_driver(owner: DriverId) {
                 route.id.get(),
                 owner.get()
             );
+            first_error.get_or_insert(error);
+            continue;
         }
-        interrupt_slot(route.id).remove_suspended();
+        let data = interrupt_slot(route.id).remove_suspended();
+        if let Some(threaded) = data.threaded {
+            threaded.stop();
+        }
         remove_route_record(route.id);
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     if root.is_some() {
         ROOT_CONTROLLER.remove_suspended();
     }
 
+    if let Ok(root_bus) = super::root_bus() {
+        for (_, bus) in &controllers {
+            if *bus == root_bus
+                && let Err(error) = super::tree::remove_root_resource(
+                    owner,
+                    bus.node(),
+                    INTERRUPT_DOMAIN_RESOURCE,
+                )
+            {
+                return Err(error);
+            }
+        }
+    }
+
     let mut state = registry.state.lock();
-    for id in controllers {
+    for (id, _) in controllers {
         state.controllers.remove(&id);
         if state.root_controller == Some(id) {
             state.root_controller = None;
         }
     }
     state.pending_drivers.remove(&owner);
+    Ok(())
 }
 
-pub(crate) fn cleanup_failed_load(owner: DriverId) {
-    if let Err(error) = prepare_remove_driver(owner) {
-        error!(
-            "dev/interrupt: failed to quiesce objects for failed driver {}: {error}",
-            owner.get()
-        );
-        return;
-    }
-    remove_driver(owner);
+pub(crate) fn cleanup_failed_load(owner: DriverId) -> Result<()> {
+    prepare_remove_driver(owner)?;
+    remove_driver(owner)
 }
 
 fn dispatch_root_controller(
@@ -1337,6 +1495,7 @@ fn snapshot(id: InterruptId, route: &RouteRecord) -> RouteSnapshot {
         vector: route.vector,
         cookie: route.cookie,
         masked,
+        threaded: route.threaded.clone(),
     }
 }
 
@@ -1375,6 +1534,7 @@ fn abandon_connecting_route(id: InterruptId) {
         .remove(&id)
         .expect("dev/interrupt: connecting route disappeared");
     state.route_keys.remove(&route.key);
+    release_vector(&mut state, route.vector);
     release_interrupt_id(&mut state, id);
 }
 
@@ -1394,7 +1554,10 @@ fn rollback_connected_route(id: InterruptId, controller: &ControllerRecord, cook
             id.get()
         );
     }
-    interrupt_slot(id).remove_suspended();
+    let data = interrupt_slot(id).remove_suspended();
+    if let Some(threaded) = data.threaded {
+        threaded.stop();
+    }
     remove_route_record(id);
 }
 
@@ -1408,6 +1571,7 @@ fn remove_route_record(id: InterruptId) {
         .remove(&id)
         .expect("dev/interrupt: removing an unknown route");
     state.route_keys.remove(&route.key);
+    release_vector(&mut state, route.vector);
     release_interrupt_id(&mut state, id);
 }
 
@@ -1425,19 +1589,10 @@ fn rollback_controller_registration(id: InterruptControllerId) {
 fn resolve_domain(node: DeviceNodeId) -> Result<InterruptControllerId> {
     let data = super::resolve_resource(node, INTERRUPT_DOMAIN_RESOURCE)?.data()?;
     if data.len() != DOMAIN_RECORD_SIZE {
-        return Err(Error::AbiMismatch);
-    }
-    let size = u32::from_le_bytes(data[..4].try_into().expect("interrupt domain size width"));
-    let version = u32::from_le_bytes(
-        data[4..8]
-            .try_into()
-            .expect("interrupt domain version width"),
-    );
-    if size as usize != DOMAIN_RECORD_SIZE || version != INTERRUPT_ABI_V1 {
-        return Err(Error::AbiMismatch);
+        return Err(Error::InvalidArgument);
     }
     let id = u64::from_le_bytes(
-        data[8..16]
+        data[..8]
             .try_into()
             .expect("interrupt domain identifier width"),
     );
@@ -1449,22 +1604,19 @@ fn resolve_domain(node: DeviceNodeId) -> Result<InterruptControllerId> {
 
 fn domain_record(id: InterruptControllerId) -> Arc<[u8]> {
     let mut bytes = [0u8; DOMAIN_RECORD_SIZE];
-    bytes[..4].copy_from_slice(&(DOMAIN_RECORD_SIZE as u32).to_le_bytes());
-    bytes[4..8].copy_from_slice(&INTERRUPT_ABI_V1.to_le_bytes());
-    bytes[8..].copy_from_slice(&id.get().to_le_bytes());
+    bytes.copy_from_slice(&id.get().to_le_bytes());
     Arc::from(bytes)
 }
 
-fn validate_controller(operations: &InterruptControllerV1) -> Result<()> {
-    if operations.abi_version != INTERRUPT_ABI_V1
-        || (operations.size as usize) < mem::size_of::<InterruptControllerV1>()
+fn validate_controller(operations: &InterruptController) -> Result<()> {
+    if (operations.size as usize) < mem::size_of::<InterruptController>()
         || operations.flags & !CONTROLLER_FLAGS != 0
         || operations.connect.is_none()
         || operations.disconnect.is_none()
         || operations.mask.is_none()
         || operations.unmask.is_none()
     {
-        return Err(Error::AbiMismatch);
+        return Err(Error::InvalidArgument);
     }
     let root = operations.flags & CONTROLLER_ROOT != 0;
     if operations.claim.is_some() != operations.complete.is_some()
@@ -1546,13 +1698,36 @@ fn interrupt_slot(id: InterruptId) -> &'static InterruptSlot {
 
 #[cfg(target_arch = "x86_64")]
 fn allocate_vector(state: &mut RegistryState) -> Result<u8> {
-    if state.next_vector > LAST_EXTERNAL_VECTOR {
-        return Err(Error::NoSpace);
+    let count = LAST_EXTERNAL_VECTOR - FIRST_EXTERNAL_VECTOR + 1;
+    for _ in 0..count {
+        let vector = state.vector_cursor;
+        state.vector_cursor = if vector == LAST_EXTERNAL_VECTOR {
+            FIRST_EXTERNAL_VECTOR
+        } else {
+            vector + 1
+        };
+        if !state.used_vectors[vector as usize] {
+            state.used_vectors[vector as usize] = true;
+            return Ok(vector as u8);
+        }
     }
-    let vector = state.next_vector as u8;
-    state.next_vector += 1;
-    Ok(vector)
+    Err(Error::NoSpace)
 }
+
+#[cfg(target_arch = "x86_64")]
+fn release_vector(state: &mut RegistryState, vector: Option<u8>) {
+    if let Some(vector) = vector {
+        assert!(
+            state.used_vectors[vector as usize],
+            "dev/interrupt: interrupt vector double free"
+        );
+        state.used_vectors[vector as usize] = false;
+        VECTOR_MAP[vector as usize].store(VECTOR_EMPTY, Ordering::Release);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn release_vector(_state: &mut RegistryState, _vector: Option<u8>) {}
 
 #[cfg(target_arch = "x86_64")]
 fn quiesce_vector(vector: Option<u8>) {

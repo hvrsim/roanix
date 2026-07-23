@@ -8,10 +8,11 @@
 //! manuals. You can grab the latest copies [here](https://github.com/riscv/riscv-isa-manual/releases/tag/latest).
 //!
 
-use crate::sys::{debug, smp::CoreLocal};
+use crate::sys::{debug, smp::CoreLocal, sync::Mutex};
 use core::{
     arch::asm,
-    sync::atomic::{AtomicBool, Ordering},
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::sys::smp::{self, IpiTarget};
@@ -28,6 +29,12 @@ pub mod timer;
 /// during early bring-up before hart-local state becomes shared.
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 static EXTERNAL_INTERRUPTS_ENABLED: AtomicBool = AtomicBool::new(false);
+const MAX_ICACHE_CPUS: usize = 256;
+static ICACHE_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static ICACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ICACHE_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static ICACHE_SEEN: [AtomicU64; MAX_ICACHE_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_ICACHE_CPUS];
 
 /// SBI extension ID for the debug console.
 const DEBUG_EXT_ID: usize = 0x4442434E;
@@ -228,6 +235,50 @@ pub fn wfi() {
     // SAFETY: WFI only suspends this hart until an interrupt/event arrives.
     unsafe {
         asm!("wfi", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Synchronizes newly written executable code with local instruction fetch.
+pub fn sync_instruction_cache() {
+    let _guard = ICACHE_SYNC_LOCK.lock();
+    let sequence = ICACHE_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .checked_add(1)
+        .expect("riscv: instruction-cache sequence wrapped");
+    ICACHE_PUBLISHED.store(sequence, Ordering::Release);
+    sync_local_instruction_cache();
+    let cpu_id = thiscpu().id;
+    if cpu_id < MAX_ICACHE_CPUS {
+        ICACHE_SEEN[cpu_id].store(sequence, Ordering::Release);
+    }
+    let _ = smp::send_ipi(sync_remote_instruction_cache, IpiTarget::All);
+
+    loop {
+        let complete = (0..smp::cpu_count().min(MAX_ICACHE_CPUS)).all(|target| {
+            !smp::is_online(target)
+                || ICACHE_SEEN[target].load(Ordering::Acquire) >= sequence
+        });
+        if complete {
+            return;
+        }
+        spin_loop();
+    }
+}
+
+fn sync_remote_instruction_cache() {
+    let sequence = ICACHE_PUBLISHED.load(Ordering::Acquire);
+    sync_local_instruction_cache();
+    let cpu_id = thiscpu().id;
+    if cpu_id < MAX_ICACHE_CPUS {
+        ICACHE_SEEN[cpu_id].store(sequence, Ordering::Release);
+    }
+}
+
+fn sync_local_instruction_cache() {
+    // SAFETY: `fence.i` only orders prior writes against subsequent local
+    // instruction fetches and does not access memory directly.
+    unsafe {
+        asm!("fence.i", options(nostack, preserves_flags));
     }
 }
 

@@ -20,7 +20,6 @@ use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use crate::sys::{debug, smp::CoreLocal};
 
 pub mod cpu;
-pub mod ioapic;
 pub mod lapic;
 pub mod paging;
 pub mod serial;
@@ -64,11 +63,10 @@ pub(crate) fn console_write(line: &[u8]) {
         unsafe {
             dbgcon_e9.write(byte);
         }
-        let uart = serial::LegacyUart::com1();
         if byte == b'\n' {
-            uart.write(b"\r");
+            serial::write_debug(b"\r");
         }
-        uart.write(core::slice::from_ref(&byte));
+        serial::write_debug(core::slice::from_ref(&byte));
     }
 }
 
@@ -110,7 +108,6 @@ pub fn init_boot_cpu() {
 /// Initializes global x86 platform facilities that require memory services.
 pub fn init_platform() {
     timer::init();
-    ioapic::init().expect("x86: failed to initialize IOAPIC interrupt domain");
 }
 
 /// Performs per-CPU initialization for a secondary core.
@@ -231,3 +228,7 @@ pub fn reschedule() {
         asm!("int {vector}", vector = const lapic::SELF_RESCHEDULE_VECTOR);
     }
 }
+
+/// Synchronizes newly written executable code with instruction fetch.
+#[inline]
+pub fn sync_instruction_cache() {}

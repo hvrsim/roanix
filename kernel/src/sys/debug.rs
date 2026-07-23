@@ -345,6 +345,12 @@ pub(crate) fn disable_regular_sink_output() {
     REGULAR_SINK_OUTPUT.store(false, Ordering::Release);
 }
 
+/// Restores ordinary log mirroring to registered debug sinks.
+pub(crate) fn enable_regular_sink_output() {
+    let _state = DEBUG_STATE.lock();
+    REGULAR_SINK_OUTPUT.store(true, Ordering::Release);
+}
+
 /// Returns the first readable byte offset in the kernel log stream.
 pub(crate) fn log_start_offset() -> u64 {
     DEBUG_STATE.lock().ring.oldest_offset()

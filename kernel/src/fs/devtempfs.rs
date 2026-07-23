@@ -77,17 +77,17 @@ impl DeviceNodeKind {
 /// File operations implemented by a driver-owned device node.
 pub trait DeviceNodeOps: Send + Sync {
     /// Returns the initial byte offset for a new open file description.
-    fn initial_offset(&self, _flags: u32) -> Result<u64> {
+    fn initial_offset(&self, _file_context: usize, _flags: u32) -> Result<u64> {
         Ok(0)
     }
 
     /// Opens a new file description.
-    fn open(&self, _flags: u32) -> Result<()> {
-        Ok(())
+    fn open(&self, _flags: u32) -> Result<usize> {
+        Ok(0)
     }
 
     /// Closes a file description.
-    fn close(&self, _flags: u32) {}
+    fn close(&self, _file_context: usize, _flags: u32) {}
 
     /// Reads bytes at an explicit offset.
     fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> Result<usize> {
@@ -95,7 +95,13 @@ pub trait DeviceNodeOps: Send + Sync {
     }
 
     /// Reads bytes while observing the originating open flags.
-    fn read_at_with_flags(&self, offset: u64, buffer: &mut [u8], _flags: u32) -> Result<usize> {
+    fn read_at_with_flags(
+        &self,
+        _file_context: usize,
+        offset: u64,
+        buffer: &mut [u8],
+        _flags: u32,
+    ) -> Result<usize> {
         self.read_at(offset, buffer)
     }
 
@@ -105,12 +111,24 @@ pub trait DeviceNodeOps: Send + Sync {
     }
 
     /// Writes bytes while observing the originating open flags.
-    fn write_at_with_flags(&self, offset: u64, buffer: &[u8], _flags: u32) -> Result<usize> {
+    fn write_at_with_flags(
+        &self,
+        _file_context: usize,
+        offset: u64,
+        buffer: &[u8],
+        _flags: u32,
+    ) -> Result<usize> {
         self.write_at(offset, buffer)
     }
 
     /// Returns requested events that are immediately ready.
-    fn poll(&self, _offset: u64, _events: PollEvents, _flags: u32) -> Result<PollEvents> {
+    fn poll(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        _events: PollEvents,
+        _flags: u32,
+    ) -> Result<PollEvents> {
         Ok(PollEvents::empty())
     }
 
@@ -127,6 +145,7 @@ pub trait DeviceNodeOps: Send + Sync {
     /// Performs a device-specific control operation.
     fn ioctl(
         &self,
+        _file_context: usize,
         _context: IoctlContext,
         _request: u64,
         _value: u64,
@@ -567,7 +586,12 @@ impl VnodeOps for DevtempfsNode {
         self
     }
 
-    fn initial_offset(&self, _vnode: &Vnode, flags: u32) -> Result<u64> {
+    fn initial_offset(
+        &self,
+        _vnode: &Vnode,
+        file_context: usize,
+        flags: u32,
+    ) -> Result<u64> {
         match &self.data {
             DevtempfsData::Directory => {
                 self.ensure_live()?;
@@ -576,27 +600,28 @@ impl VnodeOps for DevtempfsNode {
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
                 let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
-                operations.initial_offset(flags)
+                operations.initial_offset(file_context, flags)
             }
         }
     }
 
-    fn open(&self, _vnode: &Vnode, flags: u32) -> Result<()> {
+    fn open(&self, _vnode: &Vnode, flags: u32) -> Result<usize> {
         if matches!(&self.data, DevtempfsData::Directory) {
-            return self.mark_open();
+            self.mark_open()?;
+            return Ok(0);
         }
         let _activity = self.begin_activity()?;
         let operations = self.device_operations()?;
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
-        operations.open(flags)?;
+        let file_context = operations.open(flags)?;
         if let Err(error) = self.mark_open() {
-            operations.close(flags);
+            operations.close(file_context, flags);
             return Err(error);
         }
-        Ok(())
+        Ok(file_context)
     }
 
-    fn close(&self, _vnode: &Vnode, flags: u32) {
+    fn close(&self, _vnode: &Vnode, file_context: usize, flags: u32) {
         if matches!(&self.data, DevtempfsData::Directory) {
             self.mark_closed();
             return;
@@ -613,7 +638,7 @@ impl VnodeOps for DevtempfsNode {
             self.mark_closed();
             return;
         };
-        operations.close(flags);
+        operations.close(file_context, flags);
         self.mark_closed();
     }
 
@@ -693,12 +718,13 @@ impl VnodeOps for DevtempfsNode {
     }
 
     fn read_at(&self, _vnode: &Vnode, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        self.read_at_with_flags(_vnode, offset, buffer, 0)
+        self.read_at_with_flags(_vnode, 0, offset, buffer, 0)
     }
 
     fn read_at_with_flags(
         &self,
         _vnode: &Vnode,
+        file_context: usize,
         offset: u64,
         buffer: &mut [u8],
         flags: u32,
@@ -707,7 +733,7 @@ impl VnodeOps for DevtempfsNode {
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         let read = self
             .device_operations()?
-            .read_at_with_flags(offset, buffer, flags)?;
+            .read_at_with_flags(file_context, offset, buffer, flags)?;
         if read > buffer.len() {
             return Err(Error::Io);
         }
@@ -716,12 +742,13 @@ impl VnodeOps for DevtempfsNode {
     }
 
     fn write_at(&self, _vnode: &Vnode, offset: u64, buffer: &[u8]) -> Result<usize> {
-        self.write_at_with_flags(_vnode, offset, buffer, 0)
+        self.write_at_with_flags(_vnode, 0, offset, buffer, 0)
     }
 
     fn write_at_with_flags(
         &self,
         _vnode: &Vnode,
+        file_context: usize,
         offset: u64,
         buffer: &[u8],
         flags: u32,
@@ -730,7 +757,7 @@ impl VnodeOps for DevtempfsNode {
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         let written = self
             .device_operations()?
-            .write_at_with_flags(offset, buffer, flags)?;
+            .write_at_with_flags(file_context, offset, buffer, flags)?;
         if written > buffer.len() {
             return Err(Error::Io);
         }
@@ -741,6 +768,7 @@ impl VnodeOps for DevtempfsNode {
     fn poll(
         &self,
         _vnode: &Vnode,
+        file_context: usize,
         offset: u64,
         events: PollEvents,
         flags: u32,
@@ -758,7 +786,7 @@ impl VnodeOps for DevtempfsNode {
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
                 let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
-                operations.poll(offset, events, flags)
+                operations.poll(file_context, offset, events, flags)
             }
         }
     }
@@ -815,6 +843,7 @@ impl VnodeOps for DevtempfsNode {
     fn ioctl(
         &self,
         _vnode: &Vnode,
+        file_context: usize,
         context: IoctlContext,
         request: u64,
         value: u64,
@@ -823,7 +852,7 @@ impl VnodeOps for DevtempfsNode {
         let _activity = self.begin_activity()?;
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         self.device_operations()?
-            .ioctl(context, request, value, argument)
+        .ioctl(file_context, context, request, value, argument)
     }
 }
 

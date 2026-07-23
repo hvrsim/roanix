@@ -23,8 +23,8 @@ pub enum Error {
     PermissionDenied,
     /// The object has dependents and cannot be removed.
     Busy,
-    /// The driver ABI version or record size is unsupported.
-    AbiMismatch,
+    /// Acquiring the resource would create a dependency cycle.
+    DependencyCycle,
     /// The requested operation is unsupported.
     Unsupported,
     /// A caller-provided output buffer is too small.
@@ -47,7 +47,7 @@ impl fmt::Display for Error {
             Self::WrongKind => formatter.write_str("wrong device-tree node kind"),
             Self::PermissionDenied => formatter.write_str("permission denied"),
             Self::Busy => formatter.write_str("resource busy"),
-            Self::AbiMismatch => formatter.write_str("driver ABI mismatch"),
+            Self::DependencyCycle => formatter.write_str("resource dependency cycle"),
             Self::Unsupported => formatter.write_str("operation unsupported"),
             Self::NoSpace => formatter.write_str("insufficient output space"),
             Self::CallbackFailed(status) => write!(formatter, "driver callback failed ({status})"),

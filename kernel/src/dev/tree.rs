@@ -1,13 +1,21 @@
 //! Hierarchical bus and device registry.
 
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sys::sync::{Mutex, Once};
 
 use super::{
     error::{Error, Result},
-    resource::{Resource, ResourceFlags, ResourceId, ResourceKey, ResourceValue},
+    resource::{
+        Resource, ResourceFlags, ResourceId, ResourceKey, ResourceLeaseId, ResourceValue,
+    },
 };
 
 const ROOT_NODE_ID: u64 = 1;
@@ -126,8 +134,8 @@ pub struct NodeInfo {
     pub owner: DriverId,
     /// Node type.
     pub kind: NodeKind,
-    /// Parent bus, or `None` for the root bus.
-    pub parent: Option<BusId>,
+    /// Provider node, or `None` for the root bus.
+    pub parent: Option<DeviceNodeId>,
     /// Name within the parent bus.
     pub name: Box<str>,
 }
@@ -135,16 +143,24 @@ pub struct NodeInfo {
 struct NodeRecord {
     info: NodeInfo,
     children: BTreeMap<Box<str>, DeviceNodeId>,
+    properties: BTreeMap<ResourceKey, Arc<[u8]>>,
     resources: BTreeMap<ResourceKey, Arc<Resource>>,
 }
 
 struct RegistryState {
     nodes: BTreeMap<DeviceNodeId, NodeRecord>,
+    leases: BTreeMap<ResourceLeaseId, LeaseRecord>,
+}
+
+struct LeaseRecord {
+    consumer: DriverId,
+    resource: Arc<Resource>,
 }
 
 struct DeviceRegistry {
     next_node: AtomicU64,
     next_resource: AtomicU64,
+    next_lease: AtomicU64,
     state: Mutex<RegistryState>,
 }
 
@@ -162,6 +178,7 @@ impl DeviceRegistry {
                 name: Box::from("root"),
             },
             children: BTreeMap::new(),
+            properties: BTreeMap::new(),
             resources: BTreeMap::new(),
         };
         let mut nodes = BTreeMap::new();
@@ -169,7 +186,11 @@ impl DeviceRegistry {
         Self {
             next_node: AtomicU64::new(ROOT_NODE_ID + 1),
             next_resource: AtomicU64::new(1),
-            state: Mutex::new(RegistryState { nodes }),
+            next_lease: AtomicU64::new(1),
+            state: Mutex::new(RegistryState {
+                nodes,
+                leases: BTreeMap::new(),
+            }),
         }
     }
 
@@ -183,6 +204,12 @@ impl DeviceRegistry {
         let id = self.next_resource.fetch_add(1, Ordering::Relaxed);
         assert!(id != 0, "dev: resource identifier wrapped");
         ResourceId::new(id)
+    }
+
+    fn allocate_lease_id(&self) -> ResourceLeaseId {
+        let id = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "dev: resource lease identifier wrapped");
+        ResourceLeaseId::new(id)
     }
 }
 
@@ -198,17 +225,17 @@ pub fn root_bus() -> Result<BusId> {
 }
 
 /// Registers a nested bus.
-pub fn register_bus(owner: DriverId, parent: BusId, name: &str) -> Result<BusId> {
+pub fn register_bus(owner: DriverId, parent: DeviceNodeId, name: &str) -> Result<BusId> {
     let _owner = super::driver::mutation_guard(owner)?;
-    let parent_owner = node_info(parent.node())?.owner;
+    let parent_owner = node_info(parent)?.owner;
     let _parent = super::driver::parent_guard(owner, parent_owner)?;
     register_node(owner, parent, name, NodeKind::Bus).map(BusId)
 }
 
-/// Registers a device below a bus.
-pub fn register_device(owner: DriverId, parent: BusId, name: &str) -> Result<DeviceId> {
+/// Registers a device below a provider node.
+pub fn register_device(owner: DriverId, parent: DeviceNodeId, name: &str) -> Result<DeviceId> {
     let _owner = super::driver::mutation_guard(owner)?;
-    let parent_owner = node_info(parent.node())?.owner;
+    let parent_owner = node_info(parent)?.owner;
     let _parent = super::driver::parent_guard(owner, parent_owner)?;
     register_node(owner, parent, name, NodeKind::Device).map(DeviceId)
 }
@@ -224,13 +251,26 @@ pub fn node_info(node: DeviceNodeId) -> Result<NodeInfo> {
         .ok_or(Error::NotFound)
 }
 
+pub(crate) fn all_nodes() -> Result<Vec<DeviceNodeId>> {
+    Ok(registry()?.state.lock().nodes.keys().copied().collect())
+}
+
+pub(crate) fn subtree_nodes(node: DeviceNodeId) -> Result<Vec<DeviceNodeId>> {
+    let state = registry()?.state.lock();
+    let mut nodes = Vec::new();
+    collect_subtree_nodes(&state, node, &mut nodes)?;
+    Ok(nodes)
+}
+
 /// Returns direct child snapshots in lexical name order.
 pub fn children(bus: BusId) -> Result<Vec<NodeInfo>> {
+    children_of(bus.node())
+}
+
+/// Returns direct child snapshots in lexical name order.
+pub fn children_of(node: DeviceNodeId) -> Result<Vec<NodeInfo>> {
     let state = registry()?.state.lock();
-    let record = state.nodes.get(&bus.node()).ok_or(Error::NotFound)?;
-    if record.info.kind != NodeKind::Bus {
-        return Err(Error::WrongKind);
-    }
+    let record = state.nodes.get(&node).ok_or(Error::NotFound)?;
     Ok(record
         .children
         .values()
@@ -239,77 +279,269 @@ pub fn children(bus: BusId) -> Result<Vec<NodeInfo>> {
         .collect())
 }
 
+/// Publishes immutable metadata on an owned node.
+pub fn set_property(
+    owner: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+    value: Arc<[u8]>,
+) -> Result<()> {
+    let _owner = super::driver::mutation_guard(owner)?;
+    let mut state = registry()?.state.lock();
+    let record = state.nodes.get_mut(&node).ok_or(Error::NotFound)?;
+    if record.info.owner != owner {
+        return Err(Error::PermissionDenied);
+    }
+    if record.properties.contains_key(&key) {
+        return Err(Error::AlreadyExists);
+    }
+    record.properties.insert(key, value);
+    drop(state);
+    super::binding::rescan();
+    Ok(())
+}
+
+/// Returns immutable metadata attached directly to a node.
+pub fn property(node: DeviceNodeId, key: ResourceKey) -> Result<Arc<[u8]>> {
+    registry()?
+        .state
+        .lock()
+        .nodes
+        .get(&node)
+        .ok_or(Error::NotFound)?
+        .properties
+        .get(&key)
+        .cloned()
+        .ok_or(Error::NotFound)
+}
+
 /// Removes a node and all same-owner descendants.
 pub fn remove_node(owner: DriverId, node: DeviceNodeId) -> Result<()> {
     let _owner = super::driver::mutation_guard(owner)?;
     if node.get() == ROOT_NODE_ID {
         return Err(Error::PermissionDenied);
     }
+    let owns_removal = if super::binding::is_blocked(node) {
+        false
+    } else {
+        super::binding::begin_remove_subtree(node)?;
+        true
+    };
     let registry = registry()?;
     let mut state = registry.state.lock();
-    ensure_owned_subtree(&state, owner, node)?;
-    revoke_subtree_resources(&state, node)?;
-    remove_subtree(&mut state, node);
-    Ok(())
+    let result = (|| {
+        ensure_owned_subtree(&state, owner, node)?;
+        revoke_subtree_resources(&state, node)?;
+        remove_subtree(&mut state, node);
+        Ok(())
+    })();
+    drop(state);
+    if owns_removal {
+        super::binding::finish_remove_subtree(node);
+    }
+    result
 }
 
-/// Publishes an inheritable resource on a bus owned by `owner`.
+/// Publishes a resource on a node owned by `owner`.
 pub fn publish_resource(
     owner: DriverId,
-    bus: BusId,
+    node: DeviceNodeId,
     key: ResourceKey,
     flags: ResourceFlags,
-    mut value: ResourceValue,
+    value: ResourceValue,
+) -> Result<ResourceId> {
+    publish_resource_inner(owner, node, key, flags, value, false)
+}
+
+pub(crate) fn publish_root_resource(
+    owner: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+    flags: ResourceFlags,
+    value: ResourceValue,
+) -> Result<ResourceId> {
+    if node != root_bus()?.node() {
+        return Err(Error::PermissionDenied);
+    }
+    publish_resource_inner(owner, node, key, flags, value, true)
+}
+
+fn publish_resource_inner(
+    owner: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+    flags: ResourceFlags,
+    value: ResourceValue,
+    allow_foreign_bus: bool,
 ) -> Result<ResourceId> {
     let _owner = super::driver::mutation_guard(owner)?;
-    if flags.contains(ResourceFlags::IRQ_SAFE) {
-        return Err(Error::Unsupported);
-    }
     let registry = registry()?;
     let id = registry.allocate_resource_id();
-    if let ResourceValue::Method(method) = &mut value {
-        method.bind_owner(owner);
-    }
-    let resource = Arc::new(Resource::new(id, key, flags, value));
+    let resource = Arc::new(Resource::new(id, owner, key, flags, value));
     let mut state = registry.state.lock();
-    let record = state.nodes.get_mut(&bus.node()).ok_or(Error::NotFound)?;
-    if record.info.kind != NodeKind::Bus {
-        return Err(Error::WrongKind);
-    }
-    if record.info.owner != owner {
+    let record = state.nodes.get_mut(&node).ok_or(Error::NotFound)?;
+    if record.info.owner != owner && !allow_foreign_bus {
         return Err(Error::PermissionDenied);
     }
     if record.resources.contains_key(&key) {
         return Err(Error::AlreadyExists);
     }
     record.resources.insert(key, resource);
+    drop(state);
+    super::binding::rescan();
     Ok(id)
 }
 
-/// Removes a resource from an owned bus.
-pub fn remove_resource(owner: DriverId, bus: BusId, key: ResourceKey) -> Result<()> {
-    let _owner = super::driver::mutation_guard(owner)?;
-    let mut state = registry()?.state.lock();
-    let record = state.nodes.get_mut(&bus.node()).ok_or(Error::NotFound)?;
-    if record.info.owner != owner {
+/// Removes a resource from an owned node.
+pub fn remove_resource(owner: DriverId, node: DeviceNodeId, key: ResourceKey) -> Result<()> {
+    remove_resource_inner(owner, node, key, false, false)
+}
+
+pub(crate) fn remove_root_resource(
+    owner: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+) -> Result<()> {
+    if node != root_bus()?.node() {
         return Err(Error::PermissionDenied);
     }
-    let resource = record.resources.get(&key).ok_or(Error::NotFound)?;
+    remove_resource_inner(owner, node, key, true, true)
+}
+
+fn remove_resource_inner(
+    owner: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+    allow_foreign_bus: bool,
+    cleanup: bool,
+) -> Result<()> {
+    let _owner = if cleanup {
+        super::driver::close_callback_guard(owner)?
+    } else {
+        super::driver::mutation_guard(owner)?
+    };
+    let mut state = registry()?.state.lock();
+    let resource = {
+        let record = state.nodes.get(&node).ok_or(Error::NotFound)?;
+        if record.info.owner != owner && !allow_foreign_bus {
+            return Err(Error::PermissionDenied);
+        }
+        record
+            .resources
+            .get(&key)
+            .cloned()
+            .ok_or(Error::NotFound)?
+    };
+    if state
+        .leases
+        .values()
+        .any(|lease| lease.resource.id() == resource.id())
+    {
+        return Err(Error::Busy);
+    }
     resource.try_revoke()?;
-    record.resources.remove(&key);
+    state
+        .nodes
+        .get_mut(&node)
+        .expect("dev: resource node disappeared while locked")
+        .resources
+        .remove(&key);
     Ok(())
 }
 
-/// Resolves the nearest matching resource through ancestor buses.
+/// Acquires the nearest inherited resource and pins its provider.
+pub fn acquire_resource(
+    consumer: DriverId,
+    node: DeviceNodeId,
+    key: ResourceKey,
+) -> Result<(ResourceLeaseId, Arc<Resource>)> {
+    let _consumer = super::driver::mutation_guard(consumer)?;
+    if super::binding::provider_blocked(node) {
+        return Err(Error::Busy);
+    }
+    let registry = registry()?;
+    let id = registry.allocate_lease_id();
+    let mut state = registry.state.lock();
+    let resource = resolve_resource_locked(&state, node, key)?;
+    resource.ensure_live()?;
+    let provider = resource.owner();
+    let _provider = if provider == consumer {
+        None
+    } else {
+        Some(super::driver::callback_guard(provider)?)
+    };
+    super::dependency::add(consumer, provider)?;
+    state.leases.insert(
+        id,
+        LeaseRecord {
+            consumer,
+            resource: resource.clone(),
+        },
+    );
+    Ok((id, resource))
+}
+
+/// Releases an acquired resource lease.
+pub fn release_resource(consumer: DriverId, lease: ResourceLeaseId) -> Result<()> {
+    release_resource_inner(consumer, lease, false)
+}
+
+pub(crate) fn release_resource_cleanup(
+    consumer: DriverId,
+    lease: ResourceLeaseId,
+) -> Result<()> {
+    release_resource_inner(consumer, lease, true)
+}
+
+fn release_resource_inner(
+    consumer: DriverId,
+    lease: ResourceLeaseId,
+    cleanup: bool,
+) -> Result<()> {
+    let _consumer = if cleanup {
+        super::driver::cleanup_guard(consumer)?
+    } else {
+        super::driver::mutation_guard(consumer)?
+    };
+    let mut state = registry()?.state.lock();
+    let record = state.leases.get(&lease).ok_or(Error::NotFound)?;
+    if record.consumer != consumer {
+        return Err(Error::PermissionDenied);
+    }
+    let provider = record.resource.owner();
+    state.leases.remove(&lease);
+    super::dependency::remove(consumer, provider);
+    Ok(())
+}
+
+/// Returns the resource pinned by an owned lease.
+pub fn leased_resource(
+    consumer: DriverId,
+    lease: ResourceLeaseId,
+) -> Result<Arc<Resource>> {
+    let _consumer = super::driver::mutation_guard(consumer)?;
+    let state = registry()?.state.lock();
+    let record = state.leases.get(&lease).ok_or(Error::NotFound)?;
+    if record.consumer != consumer {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(record.resource.clone())
+}
+
+/// Resolves the nearest matching resource through the provider chain.
 pub fn resolve_resource(node: DeviceNodeId, key: ResourceKey) -> Result<Arc<Resource>> {
     let state = registry()?.state.lock();
-    let mut current = match state.nodes.get(&node).ok_or(Error::NotFound)? {
-        record if record.info.kind == NodeKind::Bus => Some(BusId(node)),
-        record => record.info.parent,
-    };
+    resolve_resource_locked(&state, node, key)
+}
 
-    while let Some(bus) = current {
-        let record = state.nodes.get(&bus.node()).ok_or(Error::NotFound)?;
+fn resolve_resource_locked(
+    state: &RegistryState,
+    node: DeviceNodeId,
+    key: ResourceKey,
+) -> Result<Arc<Resource>> {
+    let mut current = Some(node);
+    while let Some(node) = current {
+        let record = state.nodes.get(&node).ok_or(Error::NotFound)?;
         if let Some(resource) = record.resources.get(&key) {
             return Ok(resource.clone());
         }
@@ -331,6 +563,11 @@ pub(crate) fn prepare_remove_driver(owner: DriverId) -> Result<()> {
                 return Err(Error::Busy);
             }
         }
+    }
+    if state.leases.values().any(|lease| {
+        lease.resource.owner() == owner && lease.consumer != owner
+    }) {
+        return Err(Error::Busy);
     }
     let resources = state
         .nodes
@@ -372,6 +609,22 @@ pub(crate) fn remove_driver(owner: DriverId) -> Result<()> {
             }
         }
     }
+    if state.leases.values().any(|lease| {
+        lease.resource.owner() == owner && lease.consumer != owner
+    }) {
+        return Err(Error::Busy);
+    }
+
+    let dependencies: Vec<_> = state
+        .leases
+        .values()
+        .filter(|lease| lease.consumer == owner)
+        .map(|lease| (lease.consumer, lease.resource.owner()))
+        .collect();
+    state.leases.retain(|_, lease| lease.consumer != owner);
+    for (consumer, provider) in dependencies {
+        super::dependency::remove(consumer, provider);
+    }
 
     let roots: Vec<_> = state
         .nodes
@@ -381,7 +634,7 @@ pub(crate) fn remove_driver(owner: DriverId) -> Result<()> {
                 && record.info.parent.is_some_and(|parent| {
                     state
                         .nodes
-                        .get(&parent.node())
+                        .get(&parent)
                         .is_some_and(|parent| parent.info.owner != owner)
                 })
         })
@@ -395,7 +648,7 @@ pub(crate) fn remove_driver(owner: DriverId) -> Result<()> {
 
 fn register_node(
     owner: DriverId,
-    parent: BusId,
+    parent: DeviceNodeId,
     name: &str,
     kind: NodeKind,
 ) -> Result<DeviceNodeId> {
@@ -403,10 +656,7 @@ fn register_node(
     let registry = registry()?;
     let id = registry.allocate_node_id();
     let mut state = registry.state.lock();
-    let parent_record = state.nodes.get_mut(&parent.node()).ok_or(Error::NotFound)?;
-    if parent_record.info.kind != NodeKind::Bus {
-        return Err(Error::WrongKind);
-    }
+    let parent_record = state.nodes.get_mut(&parent).ok_or(Error::NotFound)?;
     if parent_record.children.contains_key(name) {
         return Err(Error::AlreadyExists);
     }
@@ -424,9 +674,12 @@ fn register_node(
                 name,
             },
             children: BTreeMap::new(),
+            properties: BTreeMap::new(),
             resources: BTreeMap::new(),
         },
     );
+    drop(state);
+    super::binding::rescan();
     Ok(id)
 }
 
@@ -451,6 +704,13 @@ fn ensure_owned_subtree(state: &RegistryState, owner: DriverId, node: DeviceNode
 fn revoke_subtree_resources(state: &RegistryState, node: DeviceNodeId) -> Result<()> {
     let mut resources = Vec::new();
     collect_subtree_resources(state, node, &mut resources)?;
+    if state.leases.values().any(|lease| {
+        resources
+            .iter()
+            .any(|resource| resource.id() == lease.resource.id())
+    }) {
+        return Err(Error::Busy);
+    }
     revoke_resources(resources)
 }
 
@@ -481,6 +741,19 @@ fn collect_subtree_resources(
     Ok(())
 }
 
+fn collect_subtree_nodes(
+    state: &RegistryState,
+    node: DeviceNodeId,
+    nodes: &mut Vec<DeviceNodeId>,
+) -> Result<()> {
+    let record = state.nodes.get(&node).ok_or(Error::NotFound)?;
+    nodes.push(node);
+    for child in record.children.values() {
+        collect_subtree_nodes(state, *child, nodes)?;
+    }
+    Ok(())
+}
+
 fn remove_subtree(state: &mut RegistryState, node: DeviceNodeId) {
     let children: Vec<_> = state
         .nodes
@@ -493,7 +766,7 @@ fn remove_subtree(state: &mut RegistryState, node: DeviceNodeId) {
 
     let parent = state.nodes.get(&node).and_then(|record| record.info.parent);
     if let Some(parent) = parent
-        && let Some(parent) = state.nodes.get_mut(&parent.node())
+        && let Some(parent) = state.nodes.get_mut(&parent)
     {
         parent.children.retain(|_, child| *child != node);
     }

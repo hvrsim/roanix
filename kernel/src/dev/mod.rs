@@ -5,37 +5,40 @@
 //!
 
 pub mod abi;
-#[cfg(target_arch = "x86_64")]
-mod acpi;
+mod binding;
 pub mod console;
+mod dependency;
 mod driver;
-#[cfg(target_arch = "riscv64")]
-pub mod dtb;
+mod module;
 pub mod error;
 pub mod interrupt;
 mod platform;
 pub mod resource;
-mod serial;
-mod special;
 mod tree;
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) use acpi::rsdp_address as acpi_rsdp_address;
 pub use driver::{
     DriverInfo, info as driver_info, load as load_driver, loaded as loaded_drivers,
     unload as unload_driver,
 };
-pub(crate) use driver::{callback_guard, close_callback_guard, mutation_guard, parent_guard};
+pub(crate) use driver::{
+    callback_guard, close_callback_guard, mutation_guard, parent_guard,
+};
 pub use error::{Error, Result};
-pub use platform::{PlatformBuses, buses as platform_buses};
+pub use platform::{
+    CONSOLE_RESOURCE, CONSOLE_SERVICE_RESOURCE, DEVICE_FRONTEND_RESOURCE,
+    FIRMWARE_ACPI_RSDP_RESOURCE, FIRMWARE_DTB_RESOURCE, PlatformBuses,
+    buses as platform_buses,
+};
 pub use resource::{
-    Resource, ResourceCallback, ResourceFlags, ResourceId, ResourceKey, ResourceMethod,
-    ResourceValue,
+    MemoryRegion, Resource, ResourceFlags, ResourceId, ResourceKey, ResourceLeaseId,
+    ResourceProtocol, ResourceValue, PROPERTY_CLASS, PROPERTY_COMPATIBLE,
+    PROPERTY_DEVICE_TYPE, PROPERTY_MODALIAS, PROPERTY_NAMESPACE, PROPERTY_SUBSYSTEM,
 };
 pub use tree::{
-    BusId, DeviceId, DeviceNodeId, DriverId, KERNEL_DRIVER, NodeInfo, NodeKind, children,
-    node_info, publish_resource, register_bus, register_device, remove_node, remove_resource,
-    resolve_resource, root_bus,
+    BusId, DeviceId, DeviceNodeId, DriverId, KERNEL_DRIVER, NodeInfo, NodeKind, acquire_resource,
+    children, children_of, leased_resource, node_info, property, publish_resource,
+    register_bus, register_device, release_resource, remove_node, remove_resource,
+    resolve_resource, root_bus, set_property,
 };
 
 /// Initializes the device hierarchy.
@@ -43,21 +46,12 @@ pub fn init() {
     tree::init();
     driver::init();
     interrupt::init();
+    dependency::init();
+    binding::init();
     platform::init().expect("dev: failed to register platform buses");
-    serial::discover().expect("dev: failed to discover platform UARTs");
 }
 
-/// Loads statically linked driver descriptors after devtempfs is mounted.
-pub fn start_linked_drivers() -> Result<()> {
-    driver::load_linked()
-}
-
-/// Probes built-in platform drivers and publishes their device nodes.
-pub fn start_platform_drivers() -> Result<usize> {
-    serial::start()
-}
-
-/// Publishes kernel-native special devices in devtempfs.
-pub fn start_special_devices() -> Result<()> {
-    special::start()
+/// Loads packaged shared-object drivers from the initial filesystem.
+pub fn start_external_drivers() -> Result<usize> {
+    driver::load_directory("/usr/lib/roanix/drivers")
 }

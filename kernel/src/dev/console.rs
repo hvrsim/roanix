@@ -1,6 +1,6 @@
 //! Reusable character-console and TTY line discipline.
 
-use alloc::{boxed::Box, collections::VecDeque, format, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
@@ -112,6 +112,10 @@ pub const FIONREAD: u64 = 0x541B;
 pub const TIOCNOTTY: u64 = 0x5422;
 /// Return the controlling session.
 pub const TIOCGSID: u64 = 0x5429;
+/// Return the PTY slave number.
+pub const TIOCGPTN: u64 = 0x8004_5430;
+/// Lock or unlock a PTY slave.
+pub const TIOCSPTLCK: u64 = 0x4004_5431;
 /// Returns the canonical Roanix devtempfs path for this TTY.
 pub const TIOCGPATH: u64 = 0x5254_0001;
 
@@ -150,11 +154,19 @@ pub struct SerialSettings {
 
 /// Hardware backend consumed by the shared TTY line discipline.
 pub trait ConsoleBackend: Send + Sync {
+    /// Opens one TTY file description.
+    fn open(&self) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Closes one TTY file description.
+    fn close(&self) {}
+
     /// Returns one immediately available byte.
     fn try_read(&self) -> Option<u8>;
 
-    /// Writes every supplied byte.
-    fn write(&self, bytes: &[u8]);
+    /// Writes every supplied byte or reports why no progress was possible.
+    fn write(&self, bytes: &[u8], nonblocking: bool) -> FsResult<()>;
 
     /// Applies UART framing settings.
     fn configure(&self, _settings: SerialSettings) -> FsResult<()> {
@@ -169,6 +181,21 @@ pub trait ConsoleBackend: Send + Sync {
     /// Generates a serial break condition.
     fn send_break(&self, _duration: u64) -> FsResult<()> {
         Ok(())
+    }
+
+    /// Returns whether the peer or hardware endpoint has disconnected.
+    fn hung_up(&self) -> bool {
+        false
+    }
+
+    /// Returns whether one output byte can be accepted without waiting.
+    fn writable(&self) -> bool {
+        true
+    }
+
+    /// Returns whether terminal state should reset after the final close.
+    fn reset_on_last_close(&self) -> bool {
+        false
     }
 }
 
@@ -217,23 +244,25 @@ pub struct Tty {
     backend: Arc<dyn ConsoleBackend>,
     path: Box<str>,
     state: Mutex<TtyState>,
+    lifecycle_lock: Mutex<()>,
     output_lock: Mutex<()>,
     input_flushing: AtomicBool,
     input_generation: AtomicU64,
     opens: AtomicU64,
+    initial_baud: u32,
 }
 
 impl Tty {
     /// Creates a terminal with cooked defaults at the hardware's initial baud.
     pub fn new(
         backend: Arc<dyn ConsoleBackend>,
-        index: usize,
+        path: Box<str>,
         baud: u32,
     ) -> super::Result<Arc<Self>> {
         let termios = Termios::with_baud(baud).ok_or(super::Error::Unsupported)?;
         Ok(Arc::new(Self {
             backend,
-            path: format!("/dev/ttys{index}").into_boxed_str(),
+            path,
             state: Mutex::new(TtyState {
                 termios,
                 winsize: WinSize::default(),
@@ -246,14 +275,16 @@ impl Tty {
                 foreground_group: 0,
                 session: 0,
             }),
+            lifecycle_lock: Mutex::new(()),
             output_lock: Mutex::new(()),
             input_flushing: AtomicBool::new(false),
             input_generation: AtomicU64::new(0),
             opens: AtomicU64::new(0),
+            initial_baud: baud,
         }))
     }
 
-    fn pump_input(&self) -> usize {
+    fn pump_input(&self, nonblocking_echo: bool) -> usize {
         if self.input_flushing.load(Ordering::Acquire) {
             return 0;
         }
@@ -268,7 +299,7 @@ impl Tty {
             {
                 continue;
             }
-            self.process_input_generation(byte, generation);
+            self.process_input_generation(byte, generation, nonblocking_echo);
             count += 1;
         }
         count
@@ -276,10 +307,15 @@ impl Tty {
 
     fn process_input(&self, byte: u8) {
         let generation = self.input_generation.load(Ordering::Acquire);
-        self.process_input_generation(byte, generation);
+        self.process_input_generation(byte, generation, false);
     }
 
-    fn process_input_generation(&self, mut byte: u8, generation: u64) {
+    fn process_input_generation(
+        &self,
+        mut byte: u8,
+        generation: u64,
+        nonblocking_echo: bool,
+    ) {
         let mut state = self.state.lock();
         if self.input_flushing.load(Ordering::Acquire)
             || self.input_generation.load(Ordering::Acquire) != generation
@@ -317,14 +353,14 @@ impl Tty {
 
         if state.literal_next {
             state.literal_next = false;
-            self.enqueue(&mut state, InputItem::Byte(byte));
-            self.echo_input(&termios, byte);
+            self.enqueue(&mut state, InputItem::Byte(byte), nonblocking_echo);
+            self.echo_input(&termios, byte, nonblocking_echo);
             return;
         }
         if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VLNEXT, byte) {
             state.literal_next = true;
             if termios.local_flags & ECHO != 0 {
-                self.echo_bytes(b"^");
+                self.echo_bytes(b"^", nonblocking_echo);
             }
             return;
         }
@@ -338,22 +374,22 @@ impl Tty {
                 state.input.clear();
             }
             state.interrupted = true;
-            self.echo_control(&termios, byte);
-            self.echo_bytes(b"\r\n");
+            self.echo_control(&termios, byte, nonblocking_echo);
+            self.echo_bytes(b"\r\n", nonblocking_echo);
             return;
         }
 
         if termios.local_flags & ICANON != 0 {
             if control_matches(&termios, VERASE, byte) {
                 if erase_last_byte(&mut state.input) && termios.local_flags & ECHOE != 0 {
-                    self.echo_bytes(b"\x08 \x08");
+                    self.echo_bytes(b"\x08 \x08", nonblocking_echo);
                 }
                 return;
             }
             if control_matches(&termios, VKILL, byte) {
                 discard_current_line(&mut state.input);
                 if termios.local_flags & ECHOK != 0 {
-                    self.echo_bytes(b"\r\n");
+                    self.echo_bytes(b"\r\n", nonblocking_echo);
                 }
                 return;
             }
@@ -361,33 +397,33 @@ impl Tty {
                 let erased = erase_word(&mut state.input);
                 if termios.local_flags & ECHOE != 0 {
                     for _ in 0..erased {
-                        self.echo_bytes(b"\x08 \x08");
+                        self.echo_bytes(b"\x08 \x08", nonblocking_echo);
                     }
                 }
                 return;
             }
             if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VREPRINT, byte) {
-                self.echo_bytes(b"^R\r\n");
+                self.echo_bytes(b"^R\r\n", nonblocking_echo);
                 for item in current_line(&state.input) {
                     if let InputItem::Byte(byte) = item {
-                        self.echo_input(&termios, *byte);
+                        self.echo_input(&termios, *byte, nonblocking_echo);
                     }
                 }
                 return;
             }
             if control_matches(&termios, VEOF, byte) {
-                self.enqueue(&mut state, InputItem::Eof);
+                self.enqueue(&mut state, InputItem::Eof, nonblocking_echo);
                 return;
             }
         }
 
-        self.enqueue(&mut state, InputItem::Byte(byte));
+        self.enqueue(&mut state, InputItem::Byte(byte), nonblocking_echo);
         if termios.local_flags & ECHO != 0 || (byte == b'\n' && termios.local_flags & ECHONL != 0) {
-            self.echo_input(&termios, byte);
+            self.echo_input(&termios, byte, nonblocking_echo);
         }
     }
 
-    fn enqueue(&self, state: &mut TtyState, item: InputItem) {
+    fn enqueue(&self, state: &mut TtyState, item: InputItem, nonblocking_echo: bool) {
         if state.input.len() >= INPUT_CAPACITY {
             let delimiter = match item {
                 InputItem::Eof => true,
@@ -404,36 +440,43 @@ impl Tty {
                 return;
             }
             if state.termios.input_flags & IMAXBEL != 0 {
-                self.echo_bytes(b"\x07");
+                self.echo_bytes(b"\x07", nonblocking_echo);
             }
             return;
         }
         state.input.push_back(item);
     }
 
-    fn echo_input(&self, termios: &Termios, byte: u8) {
+    fn echo_input(&self, termios: &Termios, byte: u8, nonblocking: bool) {
         if byte == b'\n' {
-            self.echo_bytes(b"\r\n");
+            self.echo_bytes(b"\r\n", nonblocking);
         } else if is_control(byte) && termios.local_flags & ECHOCTL != 0 {
-            self.echo_control(termios, byte);
+            self.echo_control(termios, byte, nonblocking);
         } else {
-            self.echo_bytes(core::slice::from_ref(&byte));
+            self.echo_bytes(core::slice::from_ref(&byte), nonblocking);
         }
     }
 
-    fn echo_control(&self, _termios: &Termios, byte: u8) {
+    fn echo_control(&self, _termios: &Termios, byte: u8, nonblocking: bool) {
         let shown = if byte == 0x7f { b'?' } else { byte ^ 0x40 };
-        self.echo_bytes(&[b'^', shown]);
+        self.echo_bytes(&[b'^', shown], nonblocking);
     }
 
-    fn echo_bytes(&self, bytes: &[u8]) {
-        let _output = self.output_lock.lock();
-        self.backend.write(bytes);
+    fn echo_bytes(&self, bytes: &[u8], nonblocking: bool) {
+        let _output = if nonblocking {
+            let Some(output) = self.output_lock.try_lock() else {
+                return;
+            };
+            output
+        } else {
+            self.output_lock.lock()
+        };
+        let _ = self.backend.write(bytes, nonblocking);
     }
 
     fn read_canonical(&self, buffer: &mut [u8], nonblocking: bool) -> FsResult<usize> {
         loop {
-            self.pump_input();
+            self.pump_input(nonblocking);
             {
                 let mut state = self.state.lock();
                 if state.interrupted {
@@ -465,6 +508,9 @@ impl Tty {
                     return Ok(read);
                 }
             }
+            if self.backend.hung_up() {
+                return Ok(0);
+            }
             if nonblocking {
                 return Err(FsError::WouldBlock);
             }
@@ -484,7 +530,7 @@ impl Tty {
         let mut deadline = None;
 
         loop {
-            self.pump_input();
+            self.pump_input(nonblocking);
             {
                 let mut state = self.state.lock();
                 if state.interrupted {
@@ -515,6 +561,9 @@ impl Tty {
             {
                 return Ok(read);
             }
+            if read == 0 && self.backend.hung_up() {
+                return Ok(0);
+            }
             if nonblocking {
                 return if read == 0 {
                     Err(FsError::WouldBlock)
@@ -536,17 +585,24 @@ impl Tty {
     }
 
     fn write_transformed(&self, input: &[u8], nonblocking: bool) -> FsResult<usize> {
+        if self.backend.hung_up() {
+            return Err(FsError::Io);
+        }
         while self.state.lock().output_stopped {
-            self.pump_input();
+            self.pump_input(nonblocking);
             if nonblocking && self.state.lock().output_stopped {
                 return Err(FsError::WouldBlock);
             }
             clock::sleep(POLL_INTERVAL);
         }
         let output_flags = self.state.lock().termios.output_flags;
-        let _output = self.output_lock.lock();
+        let _output = if nonblocking {
+            self.output_lock.try_lock().ok_or(FsError::WouldBlock)?
+        } else {
+            self.output_lock.lock()
+        };
         if output_flags & OPOST == 0 {
-            self.backend.write(input);
+            self.backend.write(input, nonblocking)?;
             return Ok(input.len());
         }
 
@@ -563,7 +619,7 @@ impl Tty {
             }
             transformed.push(byte);
         }
-        self.backend.write(&transformed);
+        self.backend.write(&transformed, nonblocking)?;
         Ok(input.len())
     }
 
@@ -634,21 +690,47 @@ impl Tty {
 }
 
 impl DeviceNodeOps for Tty {
-    fn open(&self, _flags: u32) -> FsResult<()> {
+    fn open(&self, _flags: u32) -> FsResult<usize> {
+        let _lifecycle = self.lifecycle_lock.lock();
         let state = self.state.lock();
         if state.exclusive && self.opens.load(Ordering::Acquire) != 0 {
             return Err(FsError::Busy);
         }
+        self.backend.open()?;
         self.opens.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        Ok(0)
     }
 
-    fn close(&self, _flags: u32) {
+    fn close(&self, _file_context: usize, _flags: u32) {
+        let _lifecycle = self.lifecycle_lock.lock();
         let previous = self.opens.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "console: TTY open count underflow");
+        self.backend.close();
+        if previous == 1 && self.backend.reset_on_last_close() {
+            let termios = Termios::with_baud(self.initial_baud)
+                .expect("console: initial baud stopped being supported");
+            *self.state.lock() = TtyState {
+                termios,
+                winsize: WinSize::default(),
+                input: VecDeque::with_capacity(INPUT_CAPACITY),
+                literal_next: false,
+                output_stopped: false,
+                interrupted: false,
+                exclusive: false,
+                soft_carrier: true,
+                foreground_group: 0,
+                session: 0,
+            };
+        }
     }
 
-    fn read_at_with_flags(&self, _offset: u64, buffer: &mut [u8], flags: u32) -> FsResult<usize> {
+    fn read_at_with_flags(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        buffer: &mut [u8],
+        flags: u32,
+    ) -> FsResult<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -661,20 +743,32 @@ impl DeviceNodeOps for Tty {
     }
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> FsResult<usize> {
-        self.read_at_with_flags(offset, buffer, 0)
+        self.read_at_with_flags(0, offset, buffer, 0)
     }
 
     fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
         self.write_transformed(buffer, false)
     }
 
-    fn write_at_with_flags(&self, _offset: u64, buffer: &[u8], flags: u32) -> FsResult<usize> {
+    fn write_at_with_flags(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        buffer: &[u8],
+        flags: u32,
+    ) -> FsResult<usize> {
         let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
         self.write_transformed(buffer, nonblocking)
     }
 
-    fn poll(&self, _offset: u64, events: PollEvents, _flags: u32) -> FsResult<PollEvents> {
-        self.pump_input();
+    fn poll(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        events: PollEvents,
+        _flags: u32,
+    ) -> FsResult<PollEvents> {
+        self.pump_input(true);
         let state = self.state.lock();
         let mut ready = PollEvents::empty();
         let read_events = events & (PollEvents::IN | PollEvents::RDNORM);
@@ -689,7 +783,10 @@ impl DeviceNodeOps for Tty {
         if state.interrupted || readable {
             ready |= read_events;
         }
-        if !state.output_stopped {
+        if self.backend.hung_up() {
+            ready |= PollEvents::HUP;
+        }
+        if !state.output_stopped && self.backend.writable() {
             ready |= events & (PollEvents::OUT | PollEvents::WRNORM);
         }
         Ok(ready)
@@ -701,6 +798,7 @@ impl DeviceNodeOps for Tty {
 
     fn ioctl(
         &self,
+        _file_context: usize,
         context: IoctlContext,
         request: u64,
         value: u64,
@@ -726,11 +824,11 @@ impl DeviceNodeOps for Tty {
                 1 => self.state.lock().output_stopped = false,
                 2 => {
                     let byte = self.state.lock().termios.control[VSTOP];
-                    self.echo_bytes(core::slice::from_ref(&byte));
+                    self.echo_bytes(core::slice::from_ref(&byte), false);
                 }
                 3 => {
                     let byte = self.state.lock().termios.control[VSTART];
-                    self.echo_bytes(core::slice::from_ref(&byte));
+                    self.echo_bytes(core::slice::from_ref(&byte), false);
                 }
                 _ => return Err(FsError::InvalidArgument),
             },
@@ -796,7 +894,7 @@ impl DeviceNodeOps for Tty {
             TIOCGSOFTCAR => put_i32(argument, i32::from(self.state.lock().soft_carrier))?,
             TIOCSSOFTCAR => self.state.lock().soft_carrier = get_i32(argument)? != 0,
             FIONREAD => {
-                self.pump_input();
+                self.pump_input(true);
                 put_i32(
                     argument,
                     i32::try_from(self.queued_input()).unwrap_or(i32::MAX),
@@ -951,12 +1049,12 @@ pub fn ioctl_spec(request: u64) -> IoctlSpec {
             output: false,
             size: TERMIOS_SIZE,
         },
-        TIOCGPGRP | TIOCOUTQ | TIOCGSOFTCAR | FIONREAD | TIOCGSID => IoctlSpec {
+        TIOCGPGRP | TIOCOUTQ | TIOCGSOFTCAR | FIONREAD | TIOCGSID | TIOCGPTN => IoctlSpec {
             input: false,
             output: true,
             size: 4,
         },
-        TIOCSPGRP | TIOCSSOFTCAR => IoctlSpec {
+        TIOCSPGRP | TIOCSSOFTCAR | TIOCSPTLCK => IoctlSpec {
             input: true,
             output: false,
             size: 4,

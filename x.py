@@ -29,7 +29,9 @@ if sys.version_info < (3, 11):
 VERSION = "2.0"
 ROOT = Path(__file__).resolve().parent
 KERNEL_DIR = ROOT / "kernel"
+DRIVERS_DIR = ROOT / "drivers"
 USERLAND_DIR = ROOT / "userland"
+JINX_DRIVERS_SOURCE = USERLAND_DIR / "drivers"
 DEFAULT_ARCH = "x86_64"
 DEFAULT_PROFILE = "dev"
 DEFAULT_OUTPUT_DIR = ROOT / "build"
@@ -210,7 +212,14 @@ ARCHITECTURES: Mapping[str, Architecture] = {
     ),
 }
 
-USERSPACE_PACKAGES = ("bash", "coreutils", "python", "init", "os-test")
+USERSPACE_PACKAGES = (
+    "linux-headers",
+    "bash",
+    "coreutils",
+    "python",
+    "init",
+    "drivers",
+)
 USERSPACE_BUILD_PACKAGES = (
     "mlibc-headers",
     "mlibc",
@@ -608,6 +617,7 @@ def userspace_fingerprint(ctx: Context) -> str:
             USERLAND_DIR / "host-recipes",
             USERLAND_DIR / "recipes",
             USERLAND_DIR / "init",
+            DRIVERS_DIR,
         ),
     )
 
@@ -1221,6 +1231,7 @@ def replace_directory(staging: Path, destination: Path, backup_name: str) -> Non
 
 
 def prepare_jinx_build(ctx: Context) -> tuple[Path, Path, Mapping[str, str]]:
+    sync_driver_source()
     jinx = ensure_jinx(ctx)
     build_dir = RUNTIME_ROOT / f"jinx-build-{ctx.arch.name}"
     if build_dir.is_symlink():
@@ -1236,6 +1247,18 @@ def prepare_jinx_build(ctx: Context) -> tuple[Path, Path, Mapping[str, str]]:
             step=f"initialize userspace build ({ctx.arch.name})",
         )
     return jinx, build_dir, env
+
+
+def sync_driver_source() -> None:
+    staging = USERLAND_DIR / ".drivers.tmp"
+    remove_path(staging)
+    shutil.copytree(
+        DRIVERS_DIR,
+        staging,
+        ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.so"),
+    )
+    remove_path(JINX_DRIVERS_SOURCE)
+    staging.rename(JINX_DRIVERS_SOURCE)
 
 
 def build_sysroot(ctx: Context) -> Path:

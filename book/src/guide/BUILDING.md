@@ -57,7 +57,8 @@ $ python3 x.py build iso
 # Build kernel only
 $ python3 x.py build
 
-# Build mlibc, ncurses, readline, Bash, coreutils, init, and os-test, then install them into
+# Build mlibc, libgcc, libatomic, libstdc++, ncurses, readline, Bash,
+# coreutils, Python, and init, then install them into
 # build/runtime/sysroots/<architecture>.
 $ python3 x.py build sysroot --arch x86_64
 
@@ -82,6 +83,30 @@ program; the kernel imports the initramfs and starts `/sbin/init` through that
 ABI.
 HDD and ISO builds automatically build or reuse the userspace sysroot, repack
 it, and attach it as the Limine initramfs module.
+
+## Driver modules and DevKit
+
+Native drivers are freestanding C shared objects built from `drivers/`. Each
+module links the static DevKit runtime built from `drivers/devkit/`, includes
+`<devkit/devkit.h>`, and exports one `dk_driver_definition`.
+
+DevKit negotiates versioned kernel service tables during module startup.
+Drivers publish and acquire typed resources through leases; resource lookup is
+kept on the control path while acquired protocols use cached operation tables
+for direct calls. The kernel retains ownership of device topology, MMIO and
+interrupt authorization, resource lifetimes, TTY/devtmpfs frontends, and
+driver unload ordering.
+
+Modules may also register declarative `dk_driver_class` records. Classes match
+provider nodes by kind, exact properties, and required inherited resources;
+higher-priority matches bind first, and `DK_EDEFER` retries binding after the
+provider tree changes. Provider nodes may contain buses or devices, allowing
+layered stacks such as PCI function → NVMe controller and USB interface → HID.
+
+The `drivers` userspace package builds DevKit automatically and links it into
+every packaged module. xtool copies the source tree into the Jinx workspace, so
+driver builds should be invoked through `x.py` rather than by maintaining a
+second generated driver tree.
 
 ## Running Roanix
 

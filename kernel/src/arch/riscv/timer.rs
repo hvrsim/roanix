@@ -7,8 +7,10 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::dev::dtb;
-use crate::sys::clock::{self, ClockSource, EventTimer};
+use crate::sys::{
+    clock::{self, ClockSource, EventTimer},
+    firmware,
+};
 
 const CSR_STIMECMP: u16 = 0x14D;
 const SBI_EXT_TIME: usize = 0x54494D45;
@@ -71,8 +73,8 @@ impl EventTimer for RiscvEventTimer {
 /// Initializes the riscv counter source and timer delivery.
 pub fn init() {
     let timebase_hz =
-        dtb::timebase_frequency().expect("riscv/timer: timebase freq missing from DTB!");
-    let use_cpu_timer = dtb::all_cpus_support_sstc() == Some(true);
+        firmware::timebase_frequency().expect("riscv/timer: timebase freq missing from DTB!");
+    let use_cpu_timer = firmware::all_cpus_support_sstc() == Some(true);
 
     TIMEBASE_HZ.store(timebase_hz, Ordering::Relaxed);
     USE_CPU_TIMER.store(use_cpu_timer, Ordering::Relaxed);

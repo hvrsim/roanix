@@ -213,17 +213,22 @@ pub trait VnodeOps: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the initial byte offset for a new open file description.
-    fn initial_offset(&self, _vnode: &Vnode, _flags: u32) -> Result<u64> {
+    fn initial_offset(
+        &self,
+        _vnode: &Vnode,
+        _file_context: usize,
+        _flags: u32,
+    ) -> Result<u64> {
         Ok(0)
     }
 
     /// Notifies the filesystem that an open file description was created.
-    fn open(&self, _vnode: &Vnode, _flags: u32) -> Result<()> {
-        Ok(())
+    fn open(&self, _vnode: &Vnode, _flags: u32) -> Result<usize> {
+        Ok(0)
     }
 
     /// Notifies the filesystem that an open file description was destroyed.
-    fn close(&self, _vnode: &Vnode, _flags: u32) {}
+    fn close(&self, _vnode: &Vnode, _file_context: usize, _flags: u32) {}
 
     /// Returns current vnode metadata.
     fn getattr(&self, vnode: &Vnode) -> Result<VnodeAttr>;
@@ -284,6 +289,7 @@ pub trait VnodeOps: Any + Send + Sync {
     fn read_at_with_flags(
         &self,
         vnode: &Vnode,
+        _file_context: usize,
         offset: u64,
         buffer: &mut [u8],
         _flags: u32,
@@ -300,6 +306,7 @@ pub trait VnodeOps: Any + Send + Sync {
     fn write_at_with_flags(
         &self,
         vnode: &Vnode,
+        _file_context: usize,
         offset: u64,
         buffer: &[u8],
         _flags: u32,
@@ -311,6 +318,7 @@ pub trait VnodeOps: Any + Send + Sync {
     fn poll(
         &self,
         vnode: &Vnode,
+        _file_context: usize,
         _offset: u64,
         events: PollEvents,
         flags: u32,
@@ -369,6 +377,7 @@ pub trait VnodeOps: Any + Send + Sync {
     fn ioctl(
         &self,
         _vnode: &Vnode,
+        _file_context: usize,
         _context: IoctlContext,
         _request: u64,
         _value: u64,
@@ -432,8 +441,10 @@ impl Vnode {
         self.inner.operations.getattr(self)
     }
 
-    pub(crate) fn initial_offset(&self, flags: u32) -> Result<u64> {
-        self.inner.operations.initial_offset(self, flags)
+    pub(crate) fn initial_offset(&self, file_context: usize, flags: u32) -> Result<u64> {
+        self.inner
+            .operations
+            .initial_offset(self, file_context, flags)
     }
 
     /// Applies supported metadata changes.
@@ -485,13 +496,14 @@ impl Vnode {
 
     pub(crate) fn read_at_with_flags(
         &self,
+        file_context: usize,
         offset: u64,
         buffer: &mut [u8],
         flags: u32,
     ) -> Result<usize> {
         self.inner
             .operations
-            .read_at_with_flags(self, offset, buffer, flags)
+            .read_at_with_flags(self, file_context, offset, buffer, flags)
     }
 
     /// Writes bytes at an explicit offset.
@@ -501,22 +513,26 @@ impl Vnode {
 
     pub(crate) fn write_at_with_flags(
         &self,
+        file_context: usize,
         offset: u64,
         buffer: &[u8],
         flags: u32,
     ) -> Result<usize> {
         self.inner
             .operations
-            .write_at_with_flags(self, offset, buffer, flags)
+            .write_at_with_flags(self, file_context, offset, buffer, flags)
     }
 
     pub(crate) fn poll_with_flags(
         &self,
+        file_context: usize,
         offset: u64,
         events: PollEvents,
         flags: u32,
     ) -> Result<PollEvents> {
-        self.inner.operations.poll(self, offset, events, flags)
+        self.inner
+            .operations
+            .poll(self, file_context, offset, events, flags)
     }
 
     /// Atomically appends bytes.
@@ -552,6 +568,7 @@ impl Vnode {
     /// Performs a control operation.
     pub fn ioctl(
         &self,
+        file_context: usize,
         context: IoctlContext,
         request: u64,
         value: u64,
@@ -559,15 +576,15 @@ impl Vnode {
     ) -> Result<u64> {
         self.inner
             .operations
-            .ioctl(self, context, request, value, argument)
+            .ioctl(self, file_context, context, request, value, argument)
     }
 
-    pub(crate) fn open(&self, flags: u32) -> Result<()> {
+    pub(crate) fn open(&self, flags: u32) -> Result<usize> {
         self.inner.operations.open(self, flags)
     }
 
-    pub(crate) fn close(&self, flags: u32) {
-        self.inner.operations.close(self, flags);
+    pub(crate) fn close(&self, file_context: usize, flags: u32) {
+        self.inner.operations.close(self, file_context, flags);
     }
 
     /// Downcasts filesystem-private vnode operations.

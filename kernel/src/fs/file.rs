@@ -57,17 +57,83 @@ pub enum SeekFrom {
 pub struct OpenFile {
     vnode: Vnode,
     flags: AtomicU32,
-    offset: Mutex<u64>,
+    file_context: usize,
+    offset: FileOffset,
+}
+
+enum FileOffset {
+    Seekable(Mutex<u64>),
+    Stream {
+        read: Mutex<u64>,
+        write: Mutex<u64>,
+        read_snapshot: core::sync::atomic::AtomicU64,
+    },
+}
+
+impl FileOffset {
+    fn new(kind: VnodeKind, initial: u64) -> Self {
+        if matches!(
+            kind,
+            VnodeKind::CharacterDevice | VnodeKind::Fifo | VnodeKind::Socket
+        ) {
+            Self::Stream {
+                read: Mutex::new(initial),
+                write: Mutex::new(initial),
+                read_snapshot: core::sync::atomic::AtomicU64::new(initial),
+            }
+        } else {
+            Self::Seekable(Mutex::new(initial))
+        }
+    }
+
+    fn read(&self) -> &Mutex<u64> {
+        match self {
+            Self::Seekable(offset) | Self::Stream { read: offset, .. } => offset,
+        }
+    }
+
+    fn write(&self) -> &Mutex<u64> {
+        match self {
+            Self::Seekable(offset) | Self::Stream { write: offset, .. } => offset,
+        }
+    }
+
+    fn seekable(&self) -> Option<&Mutex<u64>> {
+        match self {
+            Self::Seekable(offset) => Some(offset),
+            Self::Stream { .. } => None,
+        }
+    }
+
+    fn publish_read(&self, offset: u64) {
+        if let Self::Stream { read_snapshot, .. } = self {
+            read_snapshot.store(offset, Ordering::Release);
+        }
+    }
+
+    fn poll_offset(&self) -> u64 {
+        match self {
+            Self::Seekable(offset) => *offset.lock(),
+            Self::Stream { read_snapshot, .. } => read_snapshot.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl OpenFile {
     pub(crate) fn new(vnode: Vnode, flags: OpenFlags) -> Result<FileRef> {
-        let offset = vnode.initial_offset(flags.bits())?;
-        vnode.open(flags.bits())?;
+        let file_context = vnode.open(flags.bits())?;
+        let offset = match vnode.initial_offset(file_context, flags.bits()) {
+            Ok(offset) => offset,
+            Err(error) => {
+                vnode.close(file_context, flags.bits());
+                return Err(error);
+            }
+        };
         Ok(Arc::new(Self {
+            offset: FileOffset::new(vnode.kind(), offset),
             vnode,
             flags: AtomicU32::new(flags.bits()),
-            offset: Mutex::new(offset),
+            file_context,
         }))
     }
 
@@ -94,11 +160,12 @@ impl OpenFile {
         if !self.flags().contains(OpenFlags::READ) {
             return Err(Error::BadFileDescriptor);
         }
-        let mut offset = self.offset.lock();
+        let mut offset = self.offset.read().lock();
         let read = self
             .vnode
-            .read_at_with_flags(*offset, buffer, self.flags().bits())?;
+            .read_at_with_flags(self.file_context, *offset, buffer, self.flags().bits())?;
         *offset = offset.saturating_add(read as u64);
+        self.offset.publish_read(*offset);
         Ok(read)
     }
 
@@ -108,7 +175,7 @@ impl OpenFile {
         if !flags.contains(OpenFlags::WRITE) {
             return Err(Error::BadFileDescriptor);
         }
-        let mut offset = self.offset.lock();
+        let mut offset = self.offset.write().lock();
         if flags.contains(OpenFlags::APPEND) && self.vnode.kind() == VnodeKind::Regular {
             let (written, new_offset) = self.vnode.append(buffer)?;
             *offset = new_offset;
@@ -117,7 +184,7 @@ impl OpenFile {
 
         let written = self
             .vnode
-            .write_at_with_flags(*offset, buffer, flags.bits())?;
+            .write_at_with_flags(self.file_context, *offset, buffer, flags.bits())?;
         *offset = offset.saturating_add(written as u64);
         Ok(written)
     }
@@ -140,13 +207,11 @@ impl OpenFile {
 
     /// Changes and returns the shared offset.
     pub fn seek(&self, from: SeekFrom) -> Result<u64> {
-        if matches!(
-            self.vnode.kind(),
-            VnodeKind::CharacterDevice | VnodeKind::Fifo | VnodeKind::Socket
-        ) {
-            return Err(Error::IllegalSeek);
-        }
-        let mut offset = self.offset.lock();
+        let mut offset = self
+            .offset
+            .seekable()
+            .ok_or(Error::IllegalSeek)?
+            .lock();
         let base = match from {
             SeekFrom::Start(value) => {
                 *offset = value;
@@ -184,9 +249,9 @@ impl OpenFile {
 
     /// Returns requested events that are immediately ready.
     pub fn poll(&self, events: PollEvents) -> Result<PollEvents> {
-        let offset = *self.offset.lock();
+        let offset = self.offset.poll_offset();
         self.vnode
-            .poll_with_flags(offset, events, self.flags().bits())
+            .poll_with_flags(self.file_context, offset, events, self.flags().bits())
     }
 
     /// Performs a device- or filesystem-specific control operation.
@@ -197,7 +262,8 @@ impl OpenFile {
         value: u64,
         argument: &mut [u8],
     ) -> Result<u64> {
-        self.vnode.ioctl(context, request, value, argument)
+        self.vnode
+            .ioctl(self.file_context, context, request, value, argument)
     }
 
     /// Reads a directory batch using the shared offset as the directory cookie.
@@ -205,7 +271,11 @@ impl OpenFile {
         if self.vnode.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
-        let mut cursor = self.offset.lock();
+        let mut cursor = self
+            .offset
+            .seekable()
+            .ok_or(Error::IllegalSeek)?
+            .lock();
         let (entries, next) = self.vnode.readdir(*cursor, maximum)?;
         *cursor = next;
         Ok(entries)
@@ -214,6 +284,7 @@ impl OpenFile {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        self.vnode.close(self.flags.load(Ordering::Relaxed));
+        self.vnode
+            .close(self.file_context, self.flags.load(Ordering::Relaxed));
     }
 }

@@ -1,6 +1,13 @@
 //! Driver module registration and lifecycle.
 
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    format,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     mem, str,
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
@@ -8,13 +15,14 @@ use core::{
 use log::error;
 
 use crate::{
-    fs::devtempfs,
+    fs::{self, OpenFlags, VnodeKind, devtempfs},
     sys::sync::{Mutex, Once},
 };
 
 use super::{
-    abi::{DRIVER_ABI_V1, DriverModuleV1, HOST_API_V1},
+    abi::{DRIVER_ABI_MAJOR, DRIVER_ABI_MINOR, DRIVER_BOOTSTRAP, DriverModule},
     error::{Error, Result},
+    module::{self, ModuleImage},
     tree::{self, DriverId, KERNEL_DRIVER},
 };
 
@@ -41,6 +49,7 @@ struct DriverRecord {
     state: AtomicU8,
     active_callbacks: AtomicU64,
     callbacks: DriverCallbacks,
+    _image: Option<ModuleImage>,
 }
 
 struct DriverRegistryState {
@@ -147,20 +156,32 @@ pub(crate) fn init() {
     DRIVERS.call_once(DriverRegistry::new);
 }
 
-/// Loads a version-1 driver descriptor.
+/// Loads a driver descriptor.
 ///
 /// The descriptor is copied, but its callback code and context must remain
 /// valid until [`unload`] succeeds.
 ///
 /// # Safety
 ///
-/// Every pointer and callback in `module` must satisfy the version-1 ABI
+/// Every pointer and callback in `module` must satisfy the driver interface
 /// contract and remain valid for the duration described above.
-pub unsafe fn load(module: &DriverModuleV1) -> Result<DriverId> {
-    if module.abi_version != DRIVER_ABI_V1
-        || (module.size as usize) < mem::size_of::<DriverModuleV1>()
+pub unsafe fn load(module: &DriverModule) -> Result<DriverId> {
+    // SAFETY: forwarded from this function's caller.
+    unsafe { load_with_image(module, None) }
+}
+
+unsafe fn load_with_image(
+    module: &DriverModule,
+    image: Option<ModuleImage>,
+) -> Result<DriverId> {
+    if (module.size as usize) < mem::size_of::<DriverModule>() {
+        return Err(Error::InvalidArgument);
+    }
+    if module.abi_major != DRIVER_ABI_MAJOR
+        || module.abi_minor > DRIVER_ABI_MINOR
+        || module.flags != 0
     {
-        return Err(Error::AbiMismatch);
+        return Err(Error::Unsupported);
     }
     let init = module.init.ok_or(Error::InvalidArgument)?;
     // SAFETY: required by this function's caller contract.
@@ -183,20 +204,72 @@ pub unsafe fn load(module: &DriverModuleV1) -> Result<DriverId> {
             context: module.context,
             fini: module.fini,
         },
+        _image: image,
     });
     registry.state.lock().drivers.insert(id, record.clone());
 
     // SAFETY: the module contract guarantees this callback follows the ABI and
-    // remains executable. The host table is static and immutable.
-    let status = unsafe { init(&HOST_API_V1, id.get(), module.context) };
+    // remains executable. The bootstrap is static and immutable.
+    let status = unsafe { init(&DRIVER_BOOTSTRAP, id.get(), module.context) };
     if status != 0 {
-        super::interrupt::cleanup_failed_load(id);
+        if let Err(error) = super::interrupt::cleanup_failed_load(id) {
+            record.state.store(STATE_UNLOADING, Ordering::Release);
+            error!(
+                "dev: retaining failed driver {} because interrupt cleanup failed: {error}",
+                id.get()
+            );
+            return Err(Error::CallbackFailed(status));
+        }
         record.state.store(STATE_UNLOADING, Ordering::Release);
-        cleanup_failed_load(id);
+        if let Err(error) = cleanup_failed_load(id) {
+            error!(
+                "dev: retaining failed driver {} because object cleanup failed: {error}",
+                id.get()
+            );
+        }
         return Err(Error::CallbackFailed(status));
     }
     record.state.store(STATE_LOADED, Ordering::Release);
+    super::binding::activate_driver(id);
     Ok(id)
+}
+
+/// Loads every shared-object driver in `path` in lexical filename order.
+pub(crate) fn load_directory(path: &str) -> Result<usize> {
+    let directory = fs::open(
+        path,
+        OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
+        0,
+    )
+    .map_err(map_filesystem_error)?;
+    let mut names = Vec::new();
+    loop {
+        let entries = directory.readdir(64).map_err(map_filesystem_error)?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            if entry.kind != VnodeKind::Regular || !entry.name.ends_with(b".so") {
+                continue;
+            }
+            let name = str::from_utf8(&entry.name).map_err(|_| Error::InvalidArgument)?;
+            names.push(String::from(name));
+        }
+    }
+    names.sort_unstable();
+
+    let directory = path.trim_end_matches('/');
+    for name in &names {
+        load_file(&format!("{directory}/{name}"))?;
+    }
+    Ok(names.len())
+}
+
+fn load_file(path: &str) -> Result<DriverId> {
+    let (image, descriptor) = module::load(path)?;
+    // SAFETY: the module loader validated that the descriptor lies inside the
+    // pinned image and that its entry follows the driver interface.
+    unsafe { load_with_image(&*descriptor, Some(image)) }
 }
 
 /// Logically unloads a driver after all dependents and open nodes are gone.
@@ -215,6 +288,9 @@ pub fn unload(id: DriverId) -> Result<()> {
         }
         record
     };
+    if super::binding::has_foreign_instances(id) {
+        return Err(Error::Busy);
+    }
 
     super::interrupt::prepare_remove_driver(id)?;
     let transitioned = {
@@ -250,6 +326,7 @@ pub fn unload(id: DriverId) -> Result<()> {
         return Err(map_filesystem_error(error));
     }
 
+    super::binding::remove_driver(id);
     if let Ok(filesystem) = devtempfs::global() {
         if let Err(error) = filesystem.remove_owner(id).map_err(map_filesystem_error) {
             let _ = tree::restore_driver_resources(id);
@@ -258,18 +335,27 @@ pub fn unload(id: DriverId) -> Result<()> {
             return Err(error);
         }
     }
-    if let Err(error) = tree::remove_driver(id) {
-        record.state.store(STATE_LOADED, Ordering::Release);
-        let _ = super::interrupt::restore_driver(id);
+    if let Err(error) = super::interrupt::remove_driver(id) {
+        error!(
+            "dev: retaining unloaded driver {} because interrupt removal failed: {error}",
+            id.get()
+        );
         return Err(error);
     }
-
-    super::interrupt::remove_driver(id);
     if let Some(fini) = record.callbacks.fini {
         // SAFETY: the descriptor contract keeps this callback executable until
-        // unload completes, and all externally reachable callback objects have
-        // been detached.
+        // unload completes. User and interrupt callbacks are quiesced, while
+        // consumed resources still pin their providers for final hardware
+        // shutdown and driver-owned allocation cleanup.
         unsafe { fini(id.get(), record.callbacks.context) };
+    }
+    super::abi::remove_driver_mappings(id);
+    if let Err(error) = tree::remove_driver(id) {
+        error!(
+            "dev: retaining unloaded driver {} because hierarchy cleanup failed: {error}",
+            id.get()
+        );
+        return Err(error);
     }
     registry.state.lock().drivers.remove(&id);
     Ok(())
@@ -321,6 +407,10 @@ pub(crate) fn callback_guard(id: DriverId) -> Result<CallbackGuard> {
 
 pub(crate) fn close_callback_guard(id: DriverId) -> Result<CallbackGuard> {
     callback_guard_with_states(id, false, true)
+}
+
+pub(crate) fn cleanup_guard(id: DriverId) -> Result<CallbackGuard> {
+    callback_guard_with_states(id, true, true)
 }
 
 pub(crate) fn mutation_guard(id: DriverId) -> Result<CallbackGuard> {
@@ -379,68 +469,18 @@ fn state_allowed(current: u8, allow_loading: bool, allow_unloading: bool) -> boo
         || (allow_unloading && current == STATE_UNLOADING)
 }
 
-/// Loads every statically linked driver descriptor.
-pub(crate) fn load_linked() -> Result<()> {
-    unsafe extern "C" {
-        static __roanix_drivers_start: u8;
-        static __roanix_drivers_end: u8;
-    }
-
-    let start = core::ptr::addr_of!(__roanix_drivers_start) as usize;
-    let end = core::ptr::addr_of!(__roanix_drivers_end) as usize;
-    let stride = mem::size_of::<*const DriverModuleV1>();
-    if end < start || start % mem::align_of::<*const DriverModuleV1>() != 0 {
-        return Err(Error::AbiMismatch);
-    }
-    let bytes = end - start;
-    if bytes % stride != 0 {
-        return Err(Error::AbiMismatch);
-    }
-
-    let mut cursor = start;
-    while cursor < end {
-        // SAFETY: the linker script aligns this section and keeps a packed
-        // array of descriptor pointers emitted by driver modules.
-        let descriptor = unsafe { (cursor as *const *const DriverModuleV1).read() };
-        if descriptor.is_null() {
-            return Err(Error::InvalidArgument);
-        }
-        // SAFETY: linked driver modules promise that section entries point to
-        // persistent versioned descriptors.
-        unsafe { load(&*descriptor)? };
-        cursor += stride;
-    }
-    Ok(())
-}
-
-fn cleanup_failed_load(id: DriverId) {
+fn cleanup_failed_load(id: DriverId) -> Result<()> {
+    super::binding::remove_driver(id);
     if let Ok(filesystem) = devtempfs::global() {
-        if let Err(error) = filesystem.force_remove_owner(id) {
-            error!(
-                "dev: failed to remove devtempfs objects for driver {}: {error}",
-                id.get()
-            );
-        }
+        filesystem
+            .force_remove_owner(id)
+            .map_err(map_filesystem_error)?;
     }
-    match tree::prepare_remove_driver(id) {
-        Ok(()) => {
-            if let Err(error) = tree::remove_driver(id) {
-                error!(
-                    "dev: failed to remove hierarchy objects for driver {}: {error}",
-                    id.get()
-                );
-            }
-        }
-        Err(error) => {
-            error!(
-                "dev: failed to revoke hierarchy objects for driver {}: {error}",
-                id.get()
-            );
-        }
-    }
-    if let Ok(registry) = registry() {
-        registry.state.lock().drivers.remove(&id);
-    }
+    tree::prepare_remove_driver(id)?;
+    super::abi::remove_driver_mappings(id);
+    tree::remove_driver(id)?;
+    registry()?.state.lock().drivers.remove(&id);
+    Ok(())
 }
 
 fn map_filesystem_error(error: crate::fs::Error) -> Error {

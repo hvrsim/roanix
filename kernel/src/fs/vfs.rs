@@ -162,7 +162,7 @@ pub fn open(path: &str, flags: OpenFlags, mode: u16) -> Result<FileRef> {
     if vnode.kind() == VnodeKind::Directory && flags.contains(OpenFlags::WRITE) {
         return Err(Error::IsDirectory);
     }
-    if flags.contains(OpenFlags::TRUNCATE) {
+    if flags.contains(OpenFlags::TRUNCATE) && vnode.kind() == VnodeKind::Regular {
         vnode.truncate(0)?;
     }
 

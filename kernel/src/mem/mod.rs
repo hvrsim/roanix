@@ -364,6 +364,11 @@ pub(super) fn publish_permission_shootdown() {
     synchronize_remote_tlbs();
 }
 
+/// Publishes kernel mapping or permission changes to every online CPU.
+pub(crate) fn synchronize_kernel_mappings() {
+    synchronize_remote_tlbs();
+}
+
 pub(crate) fn flush_remote_tlb_shootdown() {
     let Some(cpu) = arch::thiscpu_opt() else {
         return;
