@@ -62,6 +62,25 @@ macro_rules! syscall_handler {
             $frame:ident
             $(, $argument:ident : $argument_type:ty = $argument_index:literal)*
             $(,)?
+        ) -> raw
+        $body:block
+    ) => {
+        #[unsafe(no_mangle)]
+        pub(crate) extern "C" fn $name(
+            $frame: &mut $crate::arch::cpu::TrapFrame,
+        ) -> i64 {
+            $(
+                let $argument =
+                    $frame.syscall_argument($argument_index) as $argument_type;
+            )*
+            $body
+        }
+    };
+    (
+        $name:ident(
+            $frame:ident
+            $(, $argument:ident : $argument_type:ty = $argument_index:literal)*
+            $(,)?
         ) -> !
         $body:block
     ) => {

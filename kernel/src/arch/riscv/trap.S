@@ -3,6 +3,7 @@
 .extern rtrap
 .extern rmain
 .extern rsyscall_return
+.extern rsignal_return
 .extern syscall_not_implemented
 .extern syscall_table
 .extern syscall_table_count
@@ -135,6 +136,7 @@ rtrap_entry:
     csrci sstatus, 0x2
     mv a0, sp
     call rsyscall_return
+    call rsignal_return
     mv sp, a0
     j .prepare_return
 
@@ -142,6 +144,7 @@ rtrap_entry:
 .handle_trap:
     mv a0, sp
     call rtrap
+    call rsignal_return
     mv sp, a0
 
     /*

@@ -64,7 +64,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
 --- /dev/null
 +++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,852 @@
+@@ -0,0 +1,943 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -222,12 +222,13 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +
 +int Sysdeps<Open>::operator()(
 +        const char *path, int flags, mode_t mode, int *fd) {
-+    long result = roanix_syscall3(
-+        ROANIX_SYS_FILE_OPEN,
-+        as_word(path),
-+        flags,
-+        mode
-+    );
++    return Sysdeps<Openat>::operator()(AT_FDCWD, path, flags, mode, fd);
++}
++
++int Sysdeps<Openat>::operator()(
++        int dirfd, const char *path, int flags, mode_t mode, int *fd) {
++    long result = roanix_syscall4(
++        ROANIX_SYS_FILE_OPENAT, dirfd, as_word(path), flags, mode);
 +    int error = syscall_error(result);
 +    if (!error)
 +        *fd = static_cast<int>(result);
@@ -391,15 +392,13 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<Access>::operator()(const char *path, int mode) {
-+    return syscall_error(roanix_syscall2(
-+        ROANIX_SYS_FILE_ACCESS, as_word(path), mode));
++    return Sysdeps<Faccessat>::operator()(AT_FDCWD, path, mode, 0);
 +}
 +
 +int Sysdeps<Faccessat>::operator()(
 +        int dirfd, const char *path, int mode, int flags) {
-+    if (dirfd != AT_FDCWD || flags)
-+        return ENOSYS;
-+    return Sysdeps<Access>::operator()(path, mode);
++    return syscall_error(roanix_syscall4(
++        ROANIX_SYS_FILE_ACCESSAT, dirfd, as_word(path), mode, flags));
 +}
 +
 +int Sysdeps<Stat>::operator()(
@@ -413,10 +412,22 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    if (target == mlibc::fsfd_target::fd) {
 +        result = roanix_syscall2(
 +            ROANIX_SYS_FILE_FSTAT, fd, as_word(&source));
-+    } else if (target == mlibc::fsfd_target::path
-+            || (target == mlibc::fsfd_target::fd_path && fd == AT_FDCWD)) {
-+        result = roanix_syscall3(
-+            ROANIX_SYS_FILE_STAT, as_word(path), flags, as_word(&source));
++    } else if (target == mlibc::fsfd_target::path) {
++        result = roanix_syscall4(
++            ROANIX_SYS_FILE_STATAT,
++            AT_FDCWD,
++            as_word(path),
++            flags,
++            as_word(&source)
++        );
++    } else if (target == mlibc::fsfd_target::fd_path) {
++        result = roanix_syscall4(
++            ROANIX_SYS_FILE_STATAT,
++            fd,
++            as_word(path),
++            flags,
++            as_word(&source)
++        );
 +    } else {
 +        return ENOSYS;
 +    }
@@ -443,8 +454,23 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +
 +int Sysdeps<Readlink>::operator()(
 +        const char *path, void *buffer, size_t size, ssize_t *length) {
-+    long result = roanix_syscall3(
-+        ROANIX_SYS_FILE_READLINK, as_word(path), as_word(buffer), size);
++    return Sysdeps<Readlinkat>::operator()(
++        AT_FDCWD, path, buffer, size, length);
++}
++
++int Sysdeps<Readlinkat>::operator()(
++        int dirfd,
++        const char *path,
++        void *buffer,
++        size_t size,
++        ssize_t *length) {
++    long result = roanix_syscall4(
++        ROANIX_SYS_FILE_READLINKAT,
++        dirfd,
++        as_word(path),
++        as_word(buffer),
++        size
++    );
 +    int error = syscall_error(result);
 +    if (!error)
 +        *length = result;
@@ -452,20 +478,75 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
-+    if (dirfd != AT_FDCWD)
-+        return ENOSYS;
-+    return syscall_error(roanix_syscall2(
-+        ROANIX_SYS_FILE_UNLINK, as_word(path), flags));
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_UNLINKAT, dirfd, as_word(path), flags));
++}
++
++int Sysdeps<Rmdir>::operator()(const char *path) {
++    return sysdep<Unlinkat>(AT_FDCWD, path, AT_REMOVEDIR);
 +}
 +
 +int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) {
-+    return syscall_error(roanix_syscall2(
-+        ROANIX_SYS_FILE_MKDIR, as_word(path), mode));
++    return Sysdeps<Mkdirat>::operator()(AT_FDCWD, path, mode);
++}
++
++int Sysdeps<Mkdirat>::operator()(int dirfd, const char *path, mode_t mode) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_MKDIRAT, dirfd, as_word(path), mode));
 +}
 +
 +int Sysdeps<Rename>::operator()(const char *path, const char *new_path) {
-+    return syscall_error(roanix_syscall2(
-+        ROANIX_SYS_FILE_RENAME, as_word(path), as_word(new_path)));
++    return Sysdeps<Renameat>::operator()(
++        AT_FDCWD, path, AT_FDCWD, new_path);
++}
++
++int Sysdeps<Renameat>::operator()(
++        int old_dirfd,
++        const char *old_path,
++        int new_dirfd,
++        const char *new_path) {
++    return syscall_error(roanix_syscall4(
++        ROANIX_SYS_FILE_RENAMEAT,
++        old_dirfd,
++        as_word(old_path),
++        new_dirfd,
++        as_word(new_path)
++    ));
++}
++
++int Sysdeps<Link>::operator()(const char *old_path, const char *new_path) {
++    return Sysdeps<Linkat>::operator()(
++        AT_FDCWD, old_path, AT_FDCWD, new_path, 0);
++}
++
++int Sysdeps<Linkat>::operator()(
++        int old_dirfd,
++        const char *old_path,
++        int new_dirfd,
++        const char *new_path,
++        int flags) {
++    return syscall_error(roanix_syscall5(
++        ROANIX_SYS_FILE_LINKAT,
++        old_dirfd,
++        as_word(old_path),
++        new_dirfd,
++        as_word(new_path),
++        flags
++    ));
++}
++
++int Sysdeps<Symlink>::operator()(const char *target, const char *link_path) {
++    return Sysdeps<Symlinkat>::operator()(target, AT_FDCWD, link_path);
++}
++
++int Sysdeps<Symlinkat>::operator()(
++        const char *target, int dirfd, const char *link_path) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_SYMLINKAT,
++        as_word(target),
++        dirfd,
++        as_word(link_path)
++    ));
 +}
 +
 +int Sysdeps<Pipe>::operator()(int *fds, int flags) {
@@ -700,6 +781,16 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +        ROANIX_SYS_FILE_FCHMOD, fd, mode));
 +}
 +
++int Sysdeps<Chmod>::operator()(const char *path, mode_t mode) {
++    return Sysdeps<Fchmodat>::operator()(AT_FDCWD, path, mode, 0);
++}
++
++int Sysdeps<Fchmodat>::operator()(
++        int dirfd, const char *path, mode_t mode, int flags) {
++    return syscall_error(roanix_syscall4(
++        ROANIX_SYS_FILE_FCHMODAT, dirfd, as_word(path), mode, flags));
++}
++
 +int Sysdeps<Ttyname>::operator()(int fd, char *buffer, size_t size) {
 +    int error = Sysdeps<Isatty>::operator()(fd);
 +    if (error)
@@ -930,7 +1021,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
 --- /dev/null
 +++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,111 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -948,6 +1039,7 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    AnonAllocate,
 +    AnonFree,
 +    Open,
++    Openat,
 +    Socket,
 +    OpenDir,
 +    ReadEntries,
@@ -978,9 +1070,17 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Faccessat,
 +    Stat,
 +    Readlink,
++    Readlinkat,
++    Rmdir,
 +    Unlinkat,
 +    Mkdir,
++    Mkdirat,
++    Link,
++    Linkat,
++    Symlink,
++    Symlinkat,
 +    Rename,
++    Renameat,
 +    Pipe,
 +    Poll,
 +    Sleep,
@@ -996,7 +1096,9 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    GetRlimit,
 +    SetRlimit,
 +    GetRusage,
++    Chmod,
 +    Fchmod,
++    Fchmodat,
 +    Ttyname,
 +    GetLoginR,
 +    GetHostname,
@@ -1036,7 +1138,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
 --- /dev/null
 +++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,214 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1084,7 +1186,21 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +    ROANIX_SYS_FILE_FCHMOD,
 +    ROANIX_SYS_FILE_RENAME,
 +    ROANIX_SYS_FILE_POLL,
-+    ROANIX_SYS_SYSTEM_UNAME
++    ROANIX_SYS_SYSTEM_UNAME,
++    ROANIX_SYS_SIGNAL_ACTION,
++    ROANIX_SYS_SIGNAL_MASK,
++    ROANIX_SYS_SIGNAL_RETURN,
++    ROANIX_SYS_SIGNAL_FD,
++    ROANIX_SYS_FILE_OPENAT,
++    ROANIX_SYS_FILE_ACCESSAT,
++    ROANIX_SYS_FILE_STATAT,
++    ROANIX_SYS_FILE_READLINKAT,
++    ROANIX_SYS_FILE_UNLINKAT,
++    ROANIX_SYS_FILE_MKDIRAT,
++    ROANIX_SYS_FILE_FCHMODAT,
++    ROANIX_SYS_FILE_RENAMEAT,
++    ROANIX_SYS_FILE_LINKAT,
++    ROANIX_SYS_FILE_SYMLINKAT
 +};
 +
 +#define ROANIX_UTSNAME_FIELD_SIZE 65

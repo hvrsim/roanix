@@ -21,9 +21,13 @@ pub use vfs::{
     create_dir, create_file, link, lookup, lookup_nofollow, mount, open, remove_dir, rename,
     statfs, symlink, sync_all, unlink,
 };
+pub(crate) use vfs::{
+    create_dir_at, link_at, open_at, rename_at, resolve_at, root_anchor, symlink_at, unlink_at,
+    PathAnchor,
+};
 pub use vnode::{
-    CreateKind, DirEntry, FileSystem, FileSystemRef, FilesystemId, IoctlContext, NodeId, SetAttr,
-    PollEvents, StatFs, Vnode, VnodeAttr, VnodeKey, VnodeKind,
+    CreateKind, DirEntry, FileSystem, FileSystemRef, FilesystemId, IoctlContext, NodeId,
+    PollEvents, SetAttr, StatFs, Vnode, VnodeAttr, VnodeKey, VnodeKind,
 };
 
 /// Initializes the VFS, mounts tmpfs as root, and mounts devtempfs at `/dev`.

@@ -9,6 +9,7 @@ use crate::sys::sync::Mutex;
 
 use super::{
     error::{Error, Result},
+    vfs::PathAnchor,
     vnode::{DirEntry, IoctlContext, PollEvents, Vnode, VnodeAttr, VnodeKind},
 };
 
@@ -55,6 +56,7 @@ pub enum SeekFrom {
 
 /// Open vnode plus shared file offset and access flags.
 pub struct OpenFile {
+    anchor: PathAnchor,
     vnode: Vnode,
     flags: AtomicU32,
     file_context: usize,
@@ -120,7 +122,8 @@ impl FileOffset {
 }
 
 impl OpenFile {
-    pub(crate) fn new(vnode: Vnode, flags: OpenFlags) -> Result<FileRef> {
+    pub(crate) fn new(anchor: PathAnchor, flags: OpenFlags) -> Result<FileRef> {
+        let vnode = anchor.vnode().clone();
         let file_context = vnode.open(flags.bits())?;
         let offset = match vnode.initial_offset(file_context, flags.bits()) {
             Ok(offset) => offset,
@@ -130,6 +133,7 @@ impl OpenFile {
             }
         };
         Ok(Arc::new(Self {
+            anchor,
             offset: FileOffset::new(vnode.kind(), offset),
             vnode,
             flags: AtomicU32::new(flags.bits()),
@@ -140,6 +144,11 @@ impl OpenFile {
     /// Returns the underlying vnode.
     pub fn vnode(&self) -> &Vnode {
         &self.vnode
+    }
+
+    /// Returns the stable namespace location used for directory-relative lookup.
+    pub(crate) fn path_anchor(&self) -> PathAnchor {
+        self.anchor.clone()
     }
 
     /// Returns open flags.
@@ -161,9 +170,12 @@ impl OpenFile {
             return Err(Error::BadFileDescriptor);
         }
         let mut offset = self.offset.read().lock();
-        let read = self
-            .vnode
-            .read_at_with_flags(self.file_context, *offset, buffer, self.flags().bits())?;
+        let read = self.vnode.read_at_with_flags(
+            self.file_context,
+            *offset,
+            buffer,
+            self.flags().bits(),
+        )?;
         *offset = offset.saturating_add(read as u64);
         self.offset.publish_read(*offset);
         Ok(read)
@@ -182,9 +194,9 @@ impl OpenFile {
             return Ok(written);
         }
 
-        let written = self
-            .vnode
-            .write_at_with_flags(self.file_context, *offset, buffer, flags.bits())?;
+        let written =
+            self.vnode
+                .write_at_with_flags(self.file_context, *offset, buffer, flags.bits())?;
         *offset = offset.saturating_add(written as u64);
         Ok(written)
     }
@@ -207,11 +219,7 @@ impl OpenFile {
 
     /// Changes and returns the shared offset.
     pub fn seek(&self, from: SeekFrom) -> Result<u64> {
-        let mut offset = self
-            .offset
-            .seekable()
-            .ok_or(Error::IllegalSeek)?
-            .lock();
+        let mut offset = self.offset.seekable().ok_or(Error::IllegalSeek)?.lock();
         let base = match from {
             SeekFrom::Start(value) => {
                 *offset = value;
@@ -271,11 +279,7 @@ impl OpenFile {
         if self.vnode.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
-        let mut cursor = self
-            .offset
-            .seekable()
-            .ok_or(Error::IllegalSeek)?
-            .lock();
+        let mut cursor = self.offset.seekable().ok_or(Error::IllegalSeek)?.lock();
         let (entries, next) = self.vnode.readdir(*cursor, maximum)?;
         *cursor = next;
         Ok(entries)

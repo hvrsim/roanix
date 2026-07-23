@@ -45,6 +45,20 @@ syscall_table:
     .quad syscall_file_rename
     .quad syscall_file_poll
     .quad syscall_system_uname
+    .quad syscall_signal_action
+    .quad syscall_signal_mask
+    .quad syscall_signal_return
+    .quad syscall_signal_fd
+    .quad syscall_file_openat
+    .quad syscall_file_accessat
+    .quad syscall_file_statat
+    .quad syscall_file_readlinkat
+    .quad syscall_file_unlinkat
+    .quad syscall_file_mkdirat
+    .quad syscall_file_fchmodat
+    .quad syscall_file_renameat
+    .quad syscall_file_linkat
+    .quad syscall_file_symlinkat
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

@@ -183,6 +183,52 @@ impl TrapFrame {
             _ => panic!("x86: invalid syscall argument index {index}"),
         }
     }
+
+    pub(crate) fn is_user(&self) -> bool {
+        self.cs == 0x3b
+    }
+
+    pub(crate) fn user_stack(&self) -> u64 {
+        self.sp
+    }
+
+    pub(crate) fn setup_signal_handler(
+        &mut self,
+        stack: u64,
+        handler: u64,
+        _restorer: u64,
+        signal: u64,
+        info: u64,
+        context: u64,
+    ) {
+        self.sp = stack;
+        self.ip = handler;
+        self.rdi = signal;
+        self.rsi = info;
+        self.rdx = context;
+        self.rax = 0;
+        self.rflags &= !(1 << 10);
+    }
+
+    pub(crate) fn restore_signal(&mut self, saved: &Self) -> bool {
+        if saved.cs != 0x3b
+            || saved.ss != 0x43
+            || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX).contains(&saved.ip)
+            || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX).contains(&saved.sp)
+        {
+            return false;
+        }
+        *self = *saved;
+        self.cs = 0x3b;
+        self.ss = 0x43;
+        self.rflags |= (1 << 1) | (1 << 9);
+        self.rflags &= !((3 << 12) | (1 << 14) | (1 << 17));
+        true
+    }
+
+    pub(crate) fn syscall_result(&self) -> i64 {
+        self.rax as i64
+    }
 }
 
 /// Initializes a trap frame for a brand-new kernel thread.
@@ -563,6 +609,18 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
         }
     }
     if frame.vec < 32 {
+        if frame.cs == 0x3b {
+            let signal = match frame.vec {
+                0 => crate::proc::signal::SIGFPE,
+                1 | 3 => crate::proc::signal::SIGTRAP,
+                6 => crate::proc::signal::SIGILL,
+                13 | 14 => crate::proc::signal::SIGSEGV,
+                17 => crate::proc::signal::SIGBUS,
+                _ => crate::proc::signal::SIGILL,
+            };
+            crate::proc::signal::send_current(signal);
+            return frame;
+        }
         let (cpu_id, tid) = crate::arch::thiscpu_opt()
             .map(|cpu| (cpu.id, cpu.current_thread))
             .unwrap_or((usize::MAX, 0));

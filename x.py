@@ -202,13 +202,13 @@ ARCHITECTURES: Mapping[str, Architecture] = {
         name="x86_64",
         rust_target="x86_64-unknown-none",
         qemu_binary="qemu-system-x86_64",
-        qemu_memory="2G",
+        qemu_memory="4G",
     ),
     "riscv64": Architecture(
         name="riscv64",
         rust_target="riscv64gc-unknown-none-elf",
         qemu_binary="qemu-system-riscv64",
-        qemu_memory="2G",
+        qemu_memory="4G",
     ),
 }
 

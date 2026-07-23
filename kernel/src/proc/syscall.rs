@@ -211,21 +211,8 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_process_kill(_frame, pid: i64 = 0, signal: i32 = 1) {
-        if signal < 0 {
-            return Err(Errno::Invalid);
-        }
-        if pid == 0 || pid == -1 || pid < -1 {
-            return Ok(0);
-        }
-        let pid = usize::try_from(pid).map_err(|_| Errno::Invalid)?;
-        if proc::find(pid).is_none() {
-            return Err(Errno::NoProcess);
-        }
-        if signal == 0 {
-            Ok(0)
-        } else {
-            Err(Errno::NotSupported)
-        }
+        proc::signal::kill(pid, signal).map_err(map_process_error)?;
+        Ok(0)
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod elf;
 mod pipe;
+pub(crate) mod signal;
 pub(crate) mod syscall;
 
 use alloc::{
@@ -20,8 +21,8 @@ use log::info;
 
 use crate::{
     arch::cpu::TrapFrame,
-    fs::{FileRef, IoctlContext, VnodeKey, VnodeKind},
-    mem::{self, USER_ADDRESS_MAX, VmSpace},
+    fs::{FileRef, IoctlContext, PathAnchor, VnodeKey, VnodeKind},
+    mem::{self, VmSpace, USER_ADDRESS_MAX},
     sys::{
         event::Event,
         sched,
@@ -31,6 +32,7 @@ use crate::{
 };
 
 pub(crate) use pipe::{PipeEnd, PipeError};
+pub(crate) use signal::SignalFd;
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 static PROCESSES: Once<Mutex<ProcessRegistry>> = Once::new();
@@ -100,12 +102,20 @@ pub(crate) enum Descriptor {
     File(FileRef),
     /// Anonymous pipe endpoint.
     Pipe(Arc<PipeEnd>),
+    /// Pending-signal stream.
+    SignalFd(Arc<SignalFd>),
 }
 
 #[derive(Clone)]
 struct DescriptorEntry {
     descriptor: Descriptor,
     close_on_exec: bool,
+}
+
+#[derive(Clone)]
+struct WorkingDirectory {
+    path: String,
+    anchor: PathAnchor,
 }
 
 struct ProcessRegistry {
@@ -118,13 +128,14 @@ pub(crate) struct Process {
     pid: usize,
     address_space: IrqSpinLock<Arc<VmSpace>>,
     files: Mutex<Vec<Option<DescriptorEntry>>>,
-    cwd: Mutex<String>,
+    cwd: Mutex<WorkingDirectory>,
     parent: Mutex<Weak<Process>>,
     children: Mutex<BTreeMap<usize, Arc<Process>>>,
     child_event: Event,
     session: AtomicUsize,
     process_group: AtomicUsize,
     controlling_tty: Mutex<Option<FileRef>>,
+    signals: signal::SignalManager,
     exited: AtomicBool,
     exit_status: AtomicI32,
 }
@@ -141,17 +152,22 @@ impl ProcessRegistry {
 impl Process {
     fn new_root(address_space: Arc<VmSpace>) -> Arc<Self> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let cwd = WorkingDirectory {
+            path: "/".to_string(),
+            anchor: crate::fs::root_anchor().expect("proc: root filesystem unavailable"),
+        };
         let process = Arc::new(Self {
             pid,
             address_space: IrqSpinLock::new(address_space),
             files: Mutex::new(Vec::new()),
-            cwd: Mutex::new("/".to_string()),
+            cwd: Mutex::new(cwd),
             parent: Mutex::new(Weak::new()),
             children: Mutex::new(BTreeMap::new()),
             child_event: Event::new(),
             session: AtomicUsize::new(pid),
             process_group: AtomicUsize::new(pid),
             controlling_tty: Mutex::new(None),
+            signals: signal::SignalManager::new(),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
         });
@@ -174,6 +190,7 @@ impl Process {
             session: AtomicUsize::new(parent.session()),
             process_group: AtomicUsize::new(parent.process_group()),
             controlling_tty: Mutex::new(parent.controlling_tty.lock().clone()),
+            signals: signal::SignalManager::fork_from(&parent.signals),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
         });
@@ -205,10 +222,10 @@ impl Process {
             path.to_string()
         } else {
             let cwd = self.cwd.lock();
-            if cwd.as_str() == "/" {
+            if cwd.path.as_str() == "/" {
                 format!("/{path}")
             } else {
-                format!("{}/{path}", cwd.as_str())
+                format!("{}/{path}", cwd.path.as_str())
             }
         };
         let mut components = Vec::new();
@@ -230,18 +247,27 @@ impl Process {
 
     /// Changes the process working directory.
     pub(crate) fn set_cwd(&self, path: &str) -> Result<()> {
-        let path = self.resolve_path(path);
-        let vnode = crate::fs::lookup(&path)?;
-        if vnode.kind() != VnodeKind::Directory {
+        let current = self.cwd.lock().clone();
+        let anchor = crate::fs::resolve_at(&current.anchor, path, true)?;
+        if anchor.vnode().kind() != VnodeKind::Directory {
             return Err(crate::fs::Error::NotDirectory.into());
         }
-        *self.cwd.lock() = path;
+        let resolved_path = self.resolve_path(path);
+        *self.cwd.lock() = WorkingDirectory {
+            path: resolved_path,
+            anchor,
+        };
         Ok(())
     }
 
     /// Returns the process working directory.
     pub(crate) fn cwd(&self) -> String {
-        self.cwd.lock().clone()
+        self.cwd.lock().path.clone()
+    }
+
+    /// Returns the stable namespace location of the process working directory.
+    pub(crate) fn cwd_anchor(&self) -> PathAnchor {
+        self.cwd.lock().anchor.clone()
     }
 
     fn install_descriptor(&self, entry: DescriptorEntry, minimum: usize) -> Result<i32> {
@@ -454,7 +480,7 @@ impl Process {
     }
 
     fn encoded_exit_status(&self) -> i32 {
-        (self.exit_status.load(Ordering::Acquire) & 0xff) << 8
+        self.exit_status.load(Ordering::Acquire)
     }
 
     fn matches_wait(&self, selector: isize, caller_group: usize) -> bool {
@@ -466,7 +492,7 @@ impl Process {
         }
     }
 
-    fn mark_exited(self: &Arc<Self>, status: i32) {
+    fn mark_exited(self: &Arc<Self>, encoded_status: i32) {
         let terminal = if self.session() == self.pid {
             self.controlling_tty.lock().take()
         } else {
@@ -491,12 +517,13 @@ impl Process {
         let parent = parent_guard.upgrade();
         if let Some(parent) = parent {
             let _children = parent.children.lock();
-            self.exit_status.store(status, Ordering::Release);
+            self.exit_status.store(encoded_status, Ordering::Release);
             self.exited.store(true, Ordering::Release);
             self.files.lock().clear();
+            signal::send_kernel(&parent, signal::SIGCHLD);
             parent.child_event.signal();
         } else {
-            self.exit_status.store(status, Ordering::Release);
+            self.exit_status.store(encoded_status, Ordering::Release);
             self.exited.store(true, Ordering::Release);
             self.files.lock().clear();
         }
@@ -608,6 +635,7 @@ pub(crate) fn exec_current(
     mem::install_current_space(image.address_space);
     drop(previous);
     process.close_exec_descriptors();
+    process.signals.reset_for_exec();
     set_current_thread_pointer(0)?;
     // SAFETY: `frame` is the current thread's live syscall frame.
     unsafe {
@@ -742,7 +770,15 @@ pub(crate) fn create_session() -> Result<usize> {
 pub(crate) fn exit_current(status: i32) -> ! {
     if let Some(process) = current() {
         //info!("proc: pid={} exited with status {status}", process.pid());
-        process.mark_exited(status);
+        process.mark_exited((status & 0xff) << 8);
+    }
+    sched::exit_current()
+}
+
+/// Terminates the current process as the result of an uncaught signal.
+pub(crate) fn exit_current_signal(signal: u8) -> ! {
+    if let Some(process) = current() {
+        process.mark_exited(i32::from(signal & 0x7f));
     }
     sched::exit_current()
 }

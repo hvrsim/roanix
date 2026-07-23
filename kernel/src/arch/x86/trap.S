@@ -1,6 +1,7 @@
 .section .text
 
 .extern rsyscall_return
+.extern rsignal_return
 .extern syscall_not_implemented
 .extern syscall_table
 .extern syscall_table_count
@@ -61,6 +62,8 @@ rsyscall_entry:
     mov %rax, 0(%rsp)
     mov %rsp, %rdi
     call rsyscall_return
+    mov %rax, %rdi
+    call rsignal_return
     mov %rax, %rsp
 
 .Lrestore_syscall:
@@ -119,6 +122,8 @@ rtrap_entry:
     mov %rsp, %rdi
     xor %rbp, %rbp
     call rtrap
+    mov %rax, %rdi
+    call rsignal_return
     mov %rax, %rsp
 
 .Lrestore_trap:

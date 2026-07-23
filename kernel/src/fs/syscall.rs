@@ -1,10 +1,13 @@
 //! Filesystem syscall implementations.
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::{mem::size_of, time::Duration};
 
 use crate::{
-    fs::{self, IoctlContext, OpenFlags, PollEvents, SeekFrom, VnodeAttr, VnodeKind},
+    fs::{
+        self, IoctlContext, OpenFlags, PathAnchor, PollEvents, SeekFrom, Vnode, VnodeAttr,
+        VnodeKind,
+    },
     mem::VirtAddr,
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
     sys::clock,
@@ -40,8 +43,13 @@ const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 const PIPE_CLOEXEC: u64 = O_CLOEXEC;
+const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
+const AT_EACCESS: u64 = 0x200;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
+const AT_NO_AUTOMOUNT: u64 = 0x800;
+const AT_EMPTY_PATH: u64 = 0x1000;
 const USER_DIRENT_SIZE: usize = 280;
 
 const SEEK_SET: u64 = 0;
@@ -55,75 +63,36 @@ struct UserPollFd {
     revents: i16,
 }
 
+enum AtPath {
+    Vfs { base: PathAnchor, path: String },
+    Pipe,
+    SignalFd,
+}
+
+#[derive(Clone, Copy)]
+enum EmptyPath {
+    Reject,
+    AllowVfs,
+    AllowAny,
+}
+
 crate::syscall_handler! {
     syscall_file_open(_frame, path: u64 = 0, flags: u64 = 1, mode: u64 = 2) {
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        let allowed = O_ACCMODE
-            | O_CREAT
-            | O_EXCL
-            | O_NOCTTY
-            | O_TRUNC
-            | O_APPEND
-            | O_NONBLOCK
-            | O_LARGEFILE
-            | O_DIRECTORY
-            | O_NOFOLLOW
-            | O_CLOEXEC;
-        if flags & !allowed != 0 {
-            return Err(Errno::Invalid);
-        }
+        file_open_at(&process, AT_FDCWD, path, flags, mode)
+    }
+}
 
-        let mut open_flags = match flags & O_ACCMODE {
-            0 => OpenFlags::READ,
-            O_WRONLY => OpenFlags::WRITE,
-            O_RDWR => OpenFlags::READ | OpenFlags::WRITE,
-            _ => return Err(Errno::Invalid),
-        };
-        if flags & O_CREAT != 0 {
-            open_flags |= OpenFlags::CREATE;
-        }
-        if flags & O_EXCL != 0 {
-            open_flags |= OpenFlags::EXCLUSIVE;
-        }
-        if flags & O_TRUNC != 0 {
-            open_flags |= OpenFlags::TRUNCATE;
-        }
-        if flags & O_APPEND != 0 {
-            open_flags |= OpenFlags::APPEND;
-        }
-        if flags & O_DIRECTORY != 0 {
-            open_flags |= OpenFlags::DIRECTORY;
-        }
-        if flags & O_NOFOLLOW != 0 {
-            open_flags |= OpenFlags::NOFOLLOW;
-        }
-        if flags & O_NONBLOCK != 0 {
-            open_flags |= OpenFlags::NONBLOCK;
-        }
-        if flags & O_NOCTTY != 0 {
-            open_flags |= OpenFlags::NOCTTY;
-        }
-
-        let file = fs::open(&path, open_flags, mode as u16).map_err(map_fs_error)?;
-        let fd = process
-            .install_file(file.clone(), flags & O_CLOEXEC != 0)
-            .map_err(map_process_error)?;
-        if flags & O_NOCTTY == 0
-            && process.session() == process.pid()
-            && !process.has_controlling_tty()
-            && file
-                .ioctl(
-                    ioctl_context(&process)?,
-                    crate::dev::console::TIOCSCTTY,
-                    0,
-                    &mut [],
-                )
-                .is_ok()
-        {
-            process.set_controlling_tty(file.clone());
-        }
-        Ok(fd as u64)
+crate::syscall_handler! {
+    syscall_file_openat(
+        _frame,
+        dirfd: i32 = 0,
+        path: u64 = 1,
+        flags: u64 = 2,
+        mode: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_open_at(&process, dirfd, path, flags, mode)
     }
 }
 
@@ -149,6 +118,7 @@ crate::syscall_handler! {
         let read = match descriptor {
             Descriptor::File(file) => file.read(&mut bytes).map_err(map_fs_error)?,
             Descriptor::Pipe(pipe) => pipe.read(&mut bytes).map_err(map_pipe_error)?,
+            Descriptor::SignalFd(signal_fd) => signal_fd.read(&mut bytes)?,
         };
         process
             .address_space()
@@ -173,6 +143,7 @@ crate::syscall_handler! {
         let written = match process.descriptor(fd).ok_or(Errno::BadFileDescriptor)? {
             Descriptor::File(file) => file.write(&bytes).map_err(map_fs_error)?,
             Descriptor::Pipe(pipe) => pipe.write(&bytes).map_err(map_pipe_error)?,
+            Descriptor::SignalFd(_) => return Err(Errno::BadFileDescriptor),
         };
         Ok(written as u64)
     }
@@ -304,42 +275,41 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_access(_frame, path: u64 = 0, mode: u64 = 1) {
-        if mode & !0o7 != 0 {
-            return Err(Errno::Invalid);
-        }
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        let attributes = fs::lookup(&path)
-            .map_err(map_fs_error)?
-            .getattr()
-            .map_err(map_fs_error)?;
-        if mode & 0o4 != 0 && attributes.mode & 0o444 == 0 {
-            return Err(Errno::Access);
-        }
-        if mode & 0o2 != 0 && attributes.mode & 0o222 == 0 {
-            return Err(Errno::Access);
-        }
-        if mode & 0o1 != 0 && attributes.mode & 0o111 == 0 {
-            return Err(Errno::Access);
-        }
-        Ok(0)
+        file_access_at(&process, AT_FDCWD, path, mode, 0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_accessat(
+        _frame,
+        dirfd: i32 = 0,
+        path: u64 = 1,
+        mode: u64 = 2,
+        flags: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_access_at(&process, dirfd, path, mode, flags)
     }
 }
 
 crate::syscall_handler! {
     syscall_file_stat(_frame, path: u64 = 0, flags: u64 = 1, output: u64 = 2) {
-        if flags & !AT_SYMLINK_NOFOLLOW != 0 {
-            return Err(Errno::Invalid);
-        }
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        let vnode = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            fs::lookup_nofollow(&path)
-        } else {
-            fs::lookup(&path)
-        }
-        .map_err(map_fs_error)?;
-        write_user_stat(&process, output, vnode.getattr().map_err(map_fs_error)?)
+        file_stat_at(&process, AT_FDCWD, path, flags, output)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_statat(
+        _frame,
+        dirfd: i32 = 0,
+        path: u64 = 1,
+        flags: u64 = 2,
+        output: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_stat_at(&process, dirfd, path, flags, output)
     }
 }
 
@@ -353,6 +323,9 @@ crate::syscall_handler! {
             }
             Descriptor::Pipe(_) => {
                 write_user_stat_values(&process, output, 0, 0, 0o666, 6, 1, 0)
+            }
+            Descriptor::SignalFd(_) => {
+                write_user_stat_values(&process, output, 0, 0, 0o600, 1, 1, 0)
             }
         }
     }
@@ -387,6 +360,13 @@ crate::syscall_handler! {
                 Descriptor::Pipe(pipe) => {
                     Ok(pipe.access_mode() | if pipe.is_nonblocking() { O_NONBLOCK } else { 0 })
                 }
+                Descriptor::SignalFd(signal_fd) => {
+                    Ok(if signal_fd.is_nonblocking() {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    })
+                }
             },
             F_SETFL => {
                 if argument & !(O_ACCMODE | O_APPEND | O_NONBLOCK) != 0 {
@@ -397,6 +377,9 @@ crate::syscall_handler! {
                         file.set_status_flags(argument & O_APPEND != 0, argument & O_NONBLOCK != 0)
                     }
                     Descriptor::Pipe(pipe) => pipe.set_nonblocking(argument & O_NONBLOCK != 0),
+                    Descriptor::SignalFd(signal_fd) => {
+                        signal_fd.set_nonblocking(argument & O_NONBLOCK != 0)
+                    }
                 }
                 Ok(0)
             }
@@ -476,45 +459,49 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_readlink(_frame, path: u64 = 0, buffer: u64 = 1, size: u64 = 2) {
-        let size = checked_io_size(size)?;
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        let target = fs::lookup_nofollow(&path)
-            .map_err(map_fs_error)?
-            .readlink()
-            .map_err(map_fs_error)?;
-        let length = target.len().min(size);
-        process
-            .address_space()
-            .write_user(VirtAddr::new(buffer), &target[..length])
-            .map_err(map_memory_error)?;
-        Ok(length as u64)
+        file_readlink_at(&process, AT_FDCWD, path, buffer, size)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_readlinkat(
+        _frame,
+        dirfd: i32 = 0,
+        path: u64 = 1,
+        buffer: u64 = 2,
+        size: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_readlink_at(&process, dirfd, path, buffer, size)
     }
 }
 
 crate::syscall_handler! {
     syscall_file_unlink(_frame, path: u64 = 0, flags: u64 = 1) {
-        if flags & !AT_REMOVEDIR != 0 {
-            return Err(Errno::Invalid);
-        }
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        if flags & AT_REMOVEDIR != 0 {
-            fs::remove_dir(&path)
-        } else {
-            fs::unlink(&path)
-        }
-        .map_err(map_fs_error)?;
-        Ok(0)
+        file_unlink_at(&process, AT_FDCWD, path, flags)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_unlinkat(_frame, dirfd: i32 = 0, path: u64 = 1, flags: u64 = 2) {
+        let process = current_process()?;
+        file_unlink_at(&process, dirfd, path, flags)
     }
 }
 
 crate::syscall_handler! {
     syscall_file_mkdir(_frame, path: u64 = 0, mode: u64 = 1) {
         let process = current_process()?;
-        let path = process.resolve_path(&read_user_string(&process, path)?);
-        fs::create_dir(&path, mode as u16).map_err(map_fs_error)?;
-        Ok(0)
+        file_mkdir_at(&process, AT_FDCWD, path, mode)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_mkdirat(_frame, dirfd: i32 = 0, path: u64 = 1, mode: u64 = 2) {
+        let process = current_process()?;
+        file_mkdir_at(&process, dirfd, path, mode)
     }
 }
 
@@ -533,10 +520,66 @@ crate::syscall_handler! {
 crate::syscall_handler! {
     syscall_file_rename(_frame, source: u64 = 0, target: u64 = 1) {
         let process = current_process()?;
-        let source = process.resolve_path(&read_user_string(&process, source)?);
-        let target = process.resolve_path(&read_user_string(&process, target)?);
-        fs::rename(&source, &target).map_err(map_fs_error)?;
-        Ok(0)
+        file_rename_at(&process, AT_FDCWD, source, AT_FDCWD, target)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_renameat(
+        _frame,
+        source_dirfd: i32 = 0,
+        source: u64 = 1,
+        target_dirfd: i32 = 2,
+        target: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_rename_at(&process, source_dirfd, source, target_dirfd, target)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_fchmodat(
+        _frame,
+        dirfd: i32 = 0,
+        path: u64 = 1,
+        mode: u64 = 2,
+        flags: u64 = 3,
+    ) {
+        let process = current_process()?;
+        file_chmod_at(&process, dirfd, path, mode, flags)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_linkat(
+        _frame,
+        source_dirfd: i32 = 0,
+        source: u64 = 1,
+        target_dirfd: i32 = 2,
+        target: u64 = 3,
+        flags: u64 = 4,
+    ) {
+        let process = current_process()?;
+        file_link_at(
+            &process,
+            source_dirfd,
+            source,
+            target_dirfd,
+            target,
+            flags,
+        )
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_symlinkat(
+        _frame,
+        target: u64 = 0,
+        dirfd: i32 = 1,
+        path: u64 = 2,
+    ) {
+        let process = current_process()?;
+        file_symlink_at(&process, target, dirfd, path)
     }
 }
 
@@ -585,6 +628,7 @@ crate::syscall_handler! {
                         file.poll(requested).unwrap_or(PollEvents::ERR)
                     }
                     Some(Descriptor::Pipe(pipe)) => pipe.poll(requested),
+                    Some(Descriptor::SignalFd(signal_fd)) => signal_fd.poll(requested),
                     None => PollEvents::NVAL,
                 };
                 entry.revents = events.bits() as i16;
@@ -615,6 +659,319 @@ crate::syscall_handler! {
             clock::sleep(Duration::from_nanos(sleep_ns));
         }
     }
+}
+
+fn file_open_at(process: &Process, dirfd: i32, path: u64, flags: u64, mode: u64) -> Result<u64> {
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    let open_flags = parse_open_flags(flags)?;
+    let file = fs::open_at(&base, &path, open_flags, mode as u16).map_err(map_fs_error)?;
+    let fd = process
+        .install_file(file.clone(), flags & O_CLOEXEC != 0)
+        .map_err(map_process_error)?;
+    if flags & O_NOCTTY == 0
+        && process.session() == process.pid()
+        && !process.has_controlling_tty()
+        && file
+            .ioctl(
+                ioctl_context(process)?,
+                crate::dev::console::TIOCSCTTY,
+                0,
+                &mut [],
+            )
+            .is_ok()
+    {
+        process.set_controlling_tty(file);
+    }
+    Ok(fd as u64)
+}
+
+fn file_access_at(process: &Process, dirfd: i32, path: u64, mode: u64, flags: u64) -> Result<u64> {
+    if mode & !0o7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let empty = if flags & AT_EMPTY_PATH != 0 {
+        EmptyPath::AllowAny
+    } else {
+        EmptyPath::Reject
+    };
+    let mode_bits = match resolve_at_path(process, dirfd, path, empty)? {
+        AtPath::Vfs { base, path } => {
+            lookup_at(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?
+                .getattr()
+                .map_err(map_fs_error)?
+                .mode
+        }
+        AtPath::Pipe => 0o666,
+        AtPath::SignalFd => 0o600,
+    };
+    check_access(mode_bits, mode)?;
+    Ok(0)
+}
+
+fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u64) -> Result<u64> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let empty = if flags & AT_EMPTY_PATH != 0 {
+        EmptyPath::AllowAny
+    } else {
+        EmptyPath::Reject
+    };
+    match resolve_at_path(process, dirfd, path, empty)? {
+        AtPath::Vfs { base, path } => {
+            let vnode = lookup_at(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+            write_user_stat(process, output, vnode.getattr().map_err(map_fs_error)?)
+        }
+        AtPath::Pipe => write_user_stat_values(process, output, 0, 0, 0o666, 6, 1, 0),
+        AtPath::SignalFd => write_user_stat_values(process, output, 0, 0, 0o600, 1, 1, 0),
+    }
+}
+
+fn file_readlink_at(
+    process: &Process,
+    dirfd: i32,
+    path: u64,
+    buffer: u64,
+    size: u64,
+) -> Result<u64> {
+    let size = checked_io_size(size)?;
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::AllowVfs)?
+    else {
+        unreachable!("pipe paths are rejected by the resolver");
+    };
+    let target = lookup_at(&base, &path, false)?
+        .readlink()
+        .map_err(map_fs_error)?;
+    let length = target.len().min(size);
+    process
+        .address_space()
+        .write_user(VirtAddr::new(buffer), &target[..length])
+        .map_err(map_memory_error)?;
+    Ok(length as u64)
+}
+
+fn file_unlink_at(process: &Process, dirfd: i32, path: u64, flags: u64) -> Result<u64> {
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(Errno::Invalid);
+    }
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    fs::unlink_at(&base, &path, flags & AT_REMOVEDIR != 0).map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn file_mkdir_at(process: &Process, dirfd: i32, path: u64, mode: u64) -> Result<u64> {
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    fs::create_dir_at(&base, &path, mode as u16).map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn file_chmod_at(process: &Process, dirfd: i32, path: u64, mode: u64, flags: u64) -> Result<u64> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let empty = if flags & AT_EMPTY_PATH != 0 {
+        EmptyPath::AllowVfs
+    } else {
+        EmptyPath::Reject
+    };
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, empty)? else {
+        unreachable!("pipe paths are rejected by the resolver");
+    };
+    let vnode = lookup_at(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    if flags & AT_SYMLINK_NOFOLLOW != 0 && vnode.kind() == VnodeKind::Symlink {
+        return Err(Errno::NotSupported);
+    }
+    vnode
+        .setattr(fs::SetAttr {
+            size: None,
+            mode: Some(mode as u16),
+        })
+        .map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn file_rename_at(
+    process: &Process,
+    source_dirfd: i32,
+    source: u64,
+    target_dirfd: i32,
+    target: u64,
+) -> Result<u64> {
+    let AtPath::Vfs {
+        base: source_base,
+        path: source,
+    } = resolve_at_path(process, source_dirfd, source, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    let AtPath::Vfs {
+        base: target_base,
+        path: target,
+    } = resolve_at_path(process, target_dirfd, target, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    fs::rename_at(&source_base, &source, &target_base, &target).map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn file_link_at(
+    process: &Process,
+    source_dirfd: i32,
+    source: u64,
+    target_dirfd: i32,
+    target: u64,
+    flags: u64,
+) -> Result<u64> {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let source_empty = if flags & AT_EMPTY_PATH != 0 {
+        EmptyPath::AllowVfs
+    } else {
+        EmptyPath::Reject
+    };
+    let AtPath::Vfs {
+        base: source_base,
+        path: source,
+    } = resolve_at_path(process, source_dirfd, source, source_empty)?
+    else {
+        unreachable!("pipe paths are rejected by the resolver");
+    };
+    let AtPath::Vfs {
+        base: target_base,
+        path: target,
+    } = resolve_at_path(process, target_dirfd, target, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    fs::link_at(
+        &source_base,
+        &source,
+        flags & AT_SYMLINK_FOLLOW != 0,
+        &target_base,
+        &target,
+    )
+    .map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn file_symlink_at(process: &Process, target: u64, dirfd: i32, path: u64) -> Result<u64> {
+    let target = read_user_string(process, target)?;
+    let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::Reject)?
+    else {
+        unreachable!("non-empty paths cannot resolve to pipes");
+    };
+    fs::symlink_at(&target, &base, &path).map_err(map_fs_error)?;
+    Ok(0)
+}
+
+fn resolve_at_path(
+    process: &Process,
+    dirfd: i32,
+    address: u64,
+    empty: EmptyPath,
+) -> Result<AtPath> {
+    let path = read_user_string(process, address)?;
+    if path.starts_with('/') {
+        return Ok(AtPath::Vfs {
+            base: fs::root_anchor().map_err(map_fs_error)?,
+            path,
+        });
+    }
+    if path.is_empty() && matches!(empty, EmptyPath::Reject) {
+        return Err(Errno::NoEntry);
+    }
+
+    if dirfd == AT_FDCWD {
+        return Ok(AtPath::Vfs {
+            base: process.cwd_anchor(),
+            path: if path.is_empty() { ".".into() } else { path },
+        });
+    }
+
+    match process.descriptor(dirfd).ok_or(Errno::BadFileDescriptor)? {
+        Descriptor::File(file) => {
+            if !path.is_empty() && file.vnode().kind() != VnodeKind::Directory {
+                return Err(Errno::NotDirectory);
+            }
+            Ok(AtPath::Vfs {
+                base: file.path_anchor(),
+                path: if path.is_empty() { ".".into() } else { path },
+            })
+        }
+        Descriptor::Pipe(_) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
+            Ok(AtPath::Pipe)
+        }
+        Descriptor::Pipe(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
+        Descriptor::Pipe(_) => Err(Errno::NotDirectory),
+        Descriptor::SignalFd(_) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
+            Ok(AtPath::SignalFd)
+        }
+        Descriptor::SignalFd(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
+        Descriptor::SignalFd(_) => Err(Errno::NotDirectory),
+    }
+}
+
+fn lookup_at(base: &PathAnchor, path: &str, follow_final: bool) -> Result<Vnode> {
+    fs::resolve_at(base, path, follow_final)
+        .map(|anchor| anchor.vnode().clone())
+        .map_err(map_fs_error)
+}
+
+fn parse_open_flags(flags: u64) -> Result<OpenFlags> {
+    let allowed = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_CLOEXEC;
+    if flags & !allowed != 0 {
+        return Err(Errno::Invalid);
+    }
+
+    let mut open_flags = match flags & O_ACCMODE {
+        0 => OpenFlags::READ,
+        O_WRONLY => OpenFlags::WRITE,
+        O_RDWR => OpenFlags::READ | OpenFlags::WRITE,
+        _ => return Err(Errno::Invalid),
+    };
+    open_flags.set(OpenFlags::CREATE, flags & O_CREAT != 0);
+    open_flags.set(OpenFlags::EXCLUSIVE, flags & O_EXCL != 0);
+    open_flags.set(OpenFlags::TRUNCATE, flags & O_TRUNC != 0);
+    open_flags.set(OpenFlags::APPEND, flags & O_APPEND != 0);
+    open_flags.set(OpenFlags::DIRECTORY, flags & O_DIRECTORY != 0);
+    open_flags.set(OpenFlags::NOFOLLOW, flags & O_NOFOLLOW != 0);
+    open_flags.set(OpenFlags::NONBLOCK, flags & O_NONBLOCK != 0);
+    open_flags.set(OpenFlags::NOCTTY, flags & O_NOCTTY != 0);
+    Ok(open_flags)
+}
+
+fn check_access(mode_bits: u16, requested: u64) -> Result<()> {
+    if requested & 0o4 != 0 && mode_bits & 0o444 == 0 {
+        return Err(Errno::Access);
+    }
+    if requested & 0o2 != 0 && mode_bits & 0o222 == 0 {
+        return Err(Errno::Access);
+    }
+    if requested & 0o1 != 0 && mode_bits & 0o111 == 0 {
+        return Err(Errno::Access);
+    }
+    Ok(())
 }
 
 fn ioctl_context(process: &Process) -> Result<IoctlContext> {

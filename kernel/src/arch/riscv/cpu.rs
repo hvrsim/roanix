@@ -22,6 +22,14 @@ const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
 const SCAUSE_SUPERVISOR_EXTERNAL: u64 = 9;
+const SCAUSE_INSTRUCTION_MISALIGNED: u64 = 0;
+const SCAUSE_INSTRUCTION_ACCESS_FAULT: u64 = 1;
+const SCAUSE_ILLEGAL_INSTRUCTION: u64 = 2;
+const SCAUSE_BREAKPOINT: u64 = 3;
+const SCAUSE_LOAD_MISALIGNED: u64 = 4;
+const SCAUSE_LOAD_ACCESS_FAULT: u64 = 5;
+const SCAUSE_STORE_MISALIGNED: u64 = 6;
+const SCAUSE_STORE_ACCESS_FAULT: u64 = 7;
 const SCAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
 const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
 const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
@@ -92,6 +100,48 @@ impl TrapFrame {
             5 => self.a5,
             _ => panic!("riscv: invalid syscall argument index {index}"),
         }
+    }
+
+    pub(crate) fn is_user(&self) -> bool {
+        self.sstatus & SSTATUS_SPP == 0
+    }
+
+    pub(crate) fn user_stack(&self) -> u64 {
+        self.prev_sp
+    }
+
+    pub(crate) fn setup_signal_handler(
+        &mut self,
+        stack: u64,
+        handler: u64,
+        restorer: u64,
+        signal: u64,
+        info: u64,
+        context: u64,
+    ) {
+        self.prev_sp = stack;
+        self.ip = handler;
+        self.a0 = signal;
+        self.a1 = info;
+        self.a2 = context;
+        self.ra = restorer;
+    }
+
+    pub(crate) fn restore_signal(&mut self, saved: &Self) -> bool {
+        if saved.sstatus & SSTATUS_SPP != 0
+            || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX).contains(&saved.ip)
+            || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX)
+                .contains(&saved.prev_sp)
+        {
+            return false;
+        }
+        *self = *saved;
+        self.sstatus = SSTATUS_SPIE;
+        true
+    }
+
+    pub(crate) fn syscall_result(&self) -> i64 {
+        self.a0 as i64
     }
 }
 
@@ -430,6 +480,25 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             if result.is_ok() {
                 return frame;
             }
+        }
+
+        if frame.scause & SCAUSE_INTERRUPT == 0 {
+            let signal = match frame.scause {
+                SCAUSE_ILLEGAL_INSTRUCTION => crate::proc::signal::SIGILL,
+                SCAUSE_BREAKPOINT => crate::proc::signal::SIGTRAP,
+                SCAUSE_INSTRUCTION_MISALIGNED
+                | SCAUSE_INSTRUCTION_ACCESS_FAULT
+                | SCAUSE_LOAD_MISALIGNED
+                | SCAUSE_LOAD_ACCESS_FAULT
+                | SCAUSE_STORE_MISALIGNED
+                | SCAUSE_STORE_ACCESS_FAULT => crate::proc::signal::SIGBUS,
+                SCAUSE_INSTRUCTION_PAGE_FAULT
+                | SCAUSE_LOAD_PAGE_FAULT
+                | SCAUSE_STORE_PAGE_FAULT => crate::proc::signal::SIGSEGV,
+                _ => crate::proc::signal::SIGILL,
+            };
+            crate::proc::signal::send_current(signal);
+            return frame;
         }
     }
 
