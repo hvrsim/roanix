@@ -1,6 +1,9 @@
 .section .text
 
-.extern rsyscall
+.extern rsyscall_return
+.extern syscall_not_implemented
+.extern syscall_table
+.extern syscall_table_count
 .extern rtrap
 .globl rsyscall_entry
 .globl rtrap_entry
@@ -41,10 +44,23 @@ rsyscall_entry:
     cld
     sti
 
-    /* Trigger the syscall handler. */
+    /* Index directly into the syscall handler table. */
+    mov 0(%rsp), %rax
     mov %rsp, %rdi
     xor %rbp, %rbp
-    call rsyscall
+    cmp syscall_table_count(%rip), %rax
+    jae .Lunknown_syscall
+    lea syscall_table(%rip), %rcx
+    call *(%rcx,%rax,8)
+    jmp .Lfinish_syscall
+
+.Lunknown_syscall:
+    call syscall_not_implemented
+
+.Lfinish_syscall:
+    mov %rax, 0(%rsp)
+    mov %rsp, %rdi
+    call rsyscall_return
     mov %rax, %rsp
 
 .Lrestore_syscall:

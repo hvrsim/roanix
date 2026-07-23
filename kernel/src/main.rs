@@ -17,6 +17,7 @@ pub mod fs;
 pub mod mem;
 pub mod proc;
 pub mod sys;
+mod syscall;
 
 #[used]
 #[doc(hidden)]

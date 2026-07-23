@@ -35,6 +35,7 @@ mod object;
 mod page;
 pub mod phys;
 mod pmap;
+mod syscall;
 pub mod swap;
 
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};

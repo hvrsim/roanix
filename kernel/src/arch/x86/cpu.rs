@@ -60,7 +60,11 @@ use x86_64::registers::rflags::RFlags;
 
 use crate::sys::{smp::CoreLocal, sync::Once};
 
-core::arch::global_asm!(include_str!("trap.S"), options(att_syntax));
+core::arch::global_asm!(
+    include_str!("trap.S"),
+    include_str!("../../syscall.S"),
+    options(att_syntax)
+);
 
 unsafe extern "C" {
     fn rsyscall_entry();
@@ -165,6 +169,20 @@ pub struct TrapFrame {
     rflags: u64,
     sp: u64,
     ss: u64,
+}
+
+impl TrapFrame {
+    pub(crate) fn syscall_argument(&self, index: usize) -> u64 {
+        match index {
+            0 => self.rdi,
+            1 => self.rsi,
+            2 => self.rdx,
+            3 => self.r10,
+            4 => self.r8,
+            5 => self.r9,
+            _ => panic!("x86: invalid syscall argument index {index}"),
+        }
+    }
 }
 
 /// Initializes a trap frame for a brand-new kernel thread.
@@ -706,14 +724,9 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     next
 }
 
-/// Kernel syscall handler.
+/// Finalizes a syscall after its table-selected handler returns.
 #[unsafe(no_mangle)]
-extern "C" fn rsyscall(frame: &mut TrapFrame) -> *mut TrapFrame {
-    let number = frame.rax;
-    let arguments = [
-        frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-    ];
-    frame.rax = crate::proc::syscall::dispatch(frame, number, arguments) as u64;
+extern "C" fn rsyscall_return(frame: &mut TrapFrame) -> *mut TrapFrame {
     // Syscalls run with IRQs enabled, but final frame preparation and
     // scheduling must be atomic with respect to interrupt-driven switches.
     crate::arch::irqset(false);

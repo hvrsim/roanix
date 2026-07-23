@@ -16,4 +16,5 @@ pub mod random;
 pub mod sched;
 pub mod smp;
 pub mod sync;
+mod syscall;
 pub mod thread;

@@ -2,6 +2,10 @@
 
 .extern rtrap
 .extern rmain
+.extern rsyscall_return
+.extern syscall_not_implemented
+.extern syscall_table
+.extern syscall_table_count
 
 .globl rv64_start
 .globl rthread_resume
@@ -15,7 +19,7 @@ rv64_start:
     csrrc x0, sstatus, t0
     csrw sscratch, zero
 
-    jal rmain
+    call rmain
 
     /* halt and catch fire (just kidding, no fire :^) */
     csrci sstatus, 0x2
@@ -98,9 +102,46 @@ rtrap_entry:
     la gp, __global_pointer$
 .option pop
 
-    /* finally, set the context and jump to the C handler */
+    /* Dispatch user ecalls directly through the syscall table. */
+    ld t0, 248(sp)
+    li t1, 8
+    bne t0, t1, .handle_trap
+    ld t0, 272(sp)
+    andi t0, t0, 0x100
+    bnez t0, .handle_trap
+
+    csrsi sstatus, 0x2
+    ld t0, 264(sp)
+    addi t0, t0, 4
+    sd t0, 264(sp)
+
+    ld t0, 56(sp)
+    la t1, syscall_table_count
+    ld t1, 0(t1)
+    bgeu t0, t1, .unknown_syscall
+    la t1, syscall_table
+    slli t0, t0, 3
+    add t1, t1, t0
+    ld t1, 0(t1)
+    j .call_syscall
+
+.unknown_syscall:
+    la t1, syscall_not_implemented
+
+.call_syscall:
     mv a0, sp
-    jal rtrap
+    jalr t1
+    sd a0, 0(sp)
+    csrci sstatus, 0x2
+    mv a0, sp
+    call rsyscall_return
+    mv sp, a0
+    j .prepare_return
+
+    /* Set the context and jump to the generic trap handler. */
+.handle_trap:
+    mv a0, sp
+    call rtrap
     mv sp, a0
 
     /*

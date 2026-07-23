@@ -7,7 +7,7 @@
 
 use core::arch::asm;
 
-core::arch::global_asm!(include_str!("trap.S"));
+core::arch::global_asm!(include_str!("trap.S"), include_str!("../../syscall.S"));
 
 unsafe extern "C" {
     static rtrap_entry: u8;
@@ -22,7 +22,6 @@ const SCAUSE_INTERRUPT: u64 = 1 << 63;
 const SCAUSE_SUPERVISOR_SOFTWARE: u64 = 1;
 const SCAUSE_SUPERVISOR_TIMER: u64 = 5;
 const SCAUSE_SUPERVISOR_EXTERNAL: u64 = 9;
-const SCAUSE_USER_ECALL: u64 = 8;
 const SCAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
 const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
 const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
@@ -80,6 +79,20 @@ pub struct TrapFrame {
     ip: u64,
     sstatus: u64,
     reserved: u64,
+}
+
+impl TrapFrame {
+    pub(crate) fn syscall_argument(&self, index: usize) -> u64 {
+        match index {
+            0 => self.a0,
+            1 => self.a1,
+            2 => self.a2,
+            3 => self.a3,
+            4 => self.a4,
+            5 => self.a5,
+            _ => panic!("riscv: invalid syscall argument index {index}"),
+        }
+    }
 }
 
 /// Initializes a trap frame for a brand-new kernel thread.
@@ -403,20 +416,6 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     }
 
     if frame.sstatus & SSTATUS_SPP == 0 {
-        if frame.scause == SCAUSE_USER_ECALL {
-            crate::arch::irqset(true);
-            frame.ip = frame.ip.wrapping_add(4);
-            let number = frame.a7;
-            let arguments = [frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5];
-            frame.a0 = crate::proc::syscall::dispatch(frame, number, arguments) as u64;
-            crate::arch::irqset(false);
-            // SAFETY: `frame` is the current thread's live user trap frame.
-            unsafe {
-                prepare_thread_frame(frame, crate::proc::current_thread_pointer());
-            }
-            return crate::sys::sched::trap_return(frame);
-        }
-
         let access = match frame.scause {
             SCAUSE_INSTRUCTION_PAGE_FAULT => Some(crate::mem::FaultAccess::Execute),
             SCAUSE_LOAD_PAGE_FAULT => Some(crate::mem::FaultAccess::Read),
@@ -438,4 +437,14 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
         "CPU trap triggered at IP=0x{:X}, stval=0x{:X}, cause=0x{:X}",
         frame.ip, frame.stval, frame.scause
     );
+}
+
+/// Finalizes a syscall after its table-selected handler returns.
+#[unsafe(no_mangle)]
+extern "C" fn rsyscall_return(frame: &mut TrapFrame) -> *mut TrapFrame {
+    // SAFETY: `frame` is the current thread's live user trap frame.
+    unsafe {
+        prepare_thread_frame(frame, crate::proc::current_thread_pointer());
+    }
+    crate::sys::sched::trap_return(frame)
 }

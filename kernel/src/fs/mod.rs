@@ -6,6 +6,7 @@ pub mod devtempfs;
 pub mod error;
 pub mod file;
 pub mod path;
+mod syscall;
 pub mod tmpfs;
 pub mod vfs;
 pub mod vnode;
