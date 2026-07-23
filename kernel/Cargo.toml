@@ -29,3 +29,10 @@ unsafe_op_in_unsafe_fn = "deny"
 all = { level = "warn", priority = -1 }
 missing_safety_doc = "deny"
 undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

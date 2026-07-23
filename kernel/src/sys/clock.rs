@@ -5,7 +5,7 @@
 //! sleep queues.
 //!
 
-use core::{hint::spin_loop, time::Duration};
+use core::{hint::spin_loop, ptr::NonNull, time::Duration};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::info;
@@ -14,14 +14,19 @@ use crate::{
     arch,
     sys::{
         event::Event,
+        sched,
         smp::{self, IrqSpinLock},
         sync::Once,
+        thread::Thread,
     },
 };
 
 static CLOCK_SETUP: Once<()> = Once::new();
-static CLOCKSOURCE: Once<&'static dyn ClockSource> = Once::new();
+static CLOCKSOURCE: Once<RegisteredClockSource> = Once::new();
 static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
+
+const CLOCK_SCALE_MAX_SHIFT: u32 = 48;
+const NSEC_PER_SEC: u128 = 1_000_000_000;
 
 /// Monotonic counter source used for timekeeping and delays.
 pub trait ClockSource: Sync {
@@ -56,6 +61,21 @@ pub trait EventTimer: Sync {
     fn stop(&self);
 }
 
+/// Precomputed fixed-point conversion between nanoseconds and counter cycles.
+#[derive(Copy, Clone)]
+pub(crate) struct ClockScale {
+    ns_mult: u64,
+    ns_shift: u32,
+    cycles_mult: u64,
+    cycles_shift: u32,
+}
+
+#[derive(Copy, Clone)]
+struct RegisteredClockSource {
+    source: &'static dyn ClockSource,
+    scale: ClockScale,
+}
+
 /// Local timer state stored in [`crate::sys::smp::CoreLocal`].
 pub(crate) struct PerCpuClock {
     state: IrqSpinLock<LocalClockState>,
@@ -74,19 +94,28 @@ struct Timer {
     link: RBTreeLink,
     deadline_ns: u64,
     order: u64,
-    event: Event,
+    target: TimerTarget,
 }
 
 #[derive(Copy, Clone)]
 struct ExpiredTimer {
-    event: *const Event,
+    target: TimerTarget,
+}
+
+#[derive(Copy, Clone)]
+enum TimerTarget {
+    Event(NonNull<Event>),
+    Thread {
+        thread: NonNull<Thread>,
+        park_seq: u64,
+    },
 }
 
 // SAFETY: timers are only linked/unlinked while protected by the local timer
-// lock for their owning CPU, and the embedded event synchronizes its waiters.
+// lock for their owning CPU, and every target remains live through removal.
 unsafe impl Send for Timer {}
 // SAFETY: timer fields are immutable while linked except under the local clock
-// lock, and the embedded event provides its own synchronization.
+// lock, and target wakeup synchronization is handled by Event or the scheduler.
 unsafe impl Sync for Timer {}
 
 intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });
@@ -108,13 +137,89 @@ struct LocalClockState {
 }
 
 impl Timer {
-    const fn new(deadline_ns: u64) -> Self {
+    const fn new(deadline_ns: u64, target: TimerTarget) -> Self {
         Self {
             link: RBTreeLink::new(),
             deadline_ns,
             order: 0,
-            event: Event::new(),
+            target,
         }
+    }
+
+    fn for_event(deadline_ns: u64, event: &Event) -> Self {
+        Self::new(deadline_ns, TimerTarget::Event(NonNull::from(event)))
+    }
+
+    fn for_thread(deadline_ns: u64, thread: *mut Thread, park_seq: u64) -> Self {
+        Self::new(
+            deadline_ns,
+            TimerTarget::Thread {
+                thread: NonNull::new(thread).expect("clock: null sleep thread"),
+                park_seq,
+            },
+        )
+    }
+}
+
+impl ClockScale {
+    /// Builds a conversion scale for `frequency_hz`.
+    pub(crate) fn new(frequency_hz: u64) -> Self {
+        assert!(frequency_hz != 0, "clock: zero-frequency clocksource");
+
+        let frequency = u128::from(frequency_hz);
+        let (ns_mult, ns_shift) = {
+            let mut shift = CLOCK_SCALE_MAX_SHIFT;
+            loop {
+                let unit = 1u128 << shift;
+                let multiplier = (NSEC_PER_SEC * unit + frequency / 2) / frequency;
+                if (1..=u64::MAX as u128).contains(&multiplier) {
+                    break (multiplier as u64, shift);
+                }
+
+                assert!(shift != 0, "clock: unable to scale clocksource frequency");
+                shift -= 1;
+            }
+        };
+        let (cycles_mult, cycles_shift) = {
+            let mut shift = CLOCK_SCALE_MAX_SHIFT;
+            loop {
+                let unit = 1u128 << shift;
+                let multiplier = (frequency * unit + NSEC_PER_SEC - 1) / NSEC_PER_SEC;
+                if (1..=u64::MAX as u128).contains(&multiplier) {
+                    break (multiplier as u64, shift);
+                }
+
+                assert!(shift != 0, "clock: unable to scale clocksource frequency");
+                shift -= 1;
+            }
+        };
+
+        Self {
+            ns_mult,
+            ns_shift,
+            cycles_mult,
+            cycles_shift,
+        }
+    }
+
+    #[inline]
+    fn cycles_to_ns(self, cycles: u64) -> u64 {
+        ((u128::from(cycles) * u128::from(self.ns_mult)) >> self.ns_shift)
+            .min(u64::MAX as u128) as u64
+    }
+
+    /// Converts nanoseconds to counter cycles, rounding up.
+    #[inline]
+    pub(crate) fn ns_to_cycles(self, ns: u64) -> u64 {
+        if ns == 0 {
+            return 0;
+        }
+
+        let product = u128::from(ns) * u128::from(self.cycles_mult);
+        let round = (1u128 << self.cycles_shift) - 1;
+        ((product + round) >> self.cycles_shift)
+            .max(1)
+            .min(u64::MAX as u128) as u64
     }
 }
 
@@ -156,7 +261,7 @@ impl LocalClockState {
         let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
             .expect("clock: timer tree lost armed timer");
         Some(ExpiredTimer {
-            event: &timer.event,
+            target: timer.target,
         })
     }
 
@@ -231,9 +336,13 @@ pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
         CLOCKSOURCE.get().is_none(),
         "clock: clocksource already registered"
     );
-    CLOCKSOURCE.call_once(|| clocksource);
+    let frequency_hz = clocksource.frequency_hz();
+    CLOCKSOURCE.call_once(|| RegisteredClockSource {
+        source: clocksource,
+        scale: ClockScale::new(frequency_hz),
+    });
 
-    let (whole, frac, unit) = format_frequency(clocksource.frequency_hz());
+    let (whole, frac, unit) = format_frequency(frequency_hz);
     info!(
         "clock: active clocksource={} ({}.{:02} {}, rating={})",
         clocksource.name(),
@@ -260,11 +369,10 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 pub(crate) fn start_cpu() {
     CLOCK_SETUP.call_once(bootstrap_clocks);
 
-    let now_ns = monotonic_ns();
     let arm = local_clock().lock().start();
 
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
 }
 
@@ -272,7 +380,7 @@ pub(crate) fn start_cpu() {
 pub fn stop() {
     let arm = local_clock().lock().stop();
     if let Some(deadline) = arm {
-        apply_deadline(deadline, monotonic_ns());
+        apply_deadline(deadline);
     }
 }
 
@@ -296,51 +404,62 @@ pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
     }
 
     assert!(arch::irqstate() && !smp::in_interrupt_context());
+    let current = sched::current_thread();
+    // SAFETY: the scheduler keeps the current thread allocation live while it
+    // is executing.
+    unsafe { &*current }.pin_migration();
     arch::irqset(false);
 
     let now_ns = monotonic_ns();
-    let mut timer = core::pin::pin!(Timer::new(now_ns.saturating_add(duration_ns)));
+    let timeout_event = core::pin::pin!(Event::new());
+    let mut timer = core::pin::pin!(Timer::for_event(
+        now_ns.saturating_add(duration_ns),
+        timeout_event.as_ref().get_ref(),
+    ));
     let arm = {
         let mut local = local_clock().lock();
         local.insert_timer(timer.as_mut().get_mut())
     };
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
 
     arch::irqset(true);
-    let winner = Event::wait_any(&[event, &timer.as_ref().get_ref().event]);
+    let winner = Event::wait_any(&[event, timeout_event.as_ref().get_ref()]);
     if winner == 1 {
+        // SAFETY: this balances the pin acquired before timer registration.
+        unsafe { &*current }.unpin_migration();
         return false;
     }
 
     arch::irqset(false);
-    let now_ns = monotonic_ns();
     let arm = local_clock().lock().remove_timer(timer.as_ref().get_ref());
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
     arch::irqset(true);
+    // SAFETY: this balances the pin acquired before timer registration.
+    unsafe { &*current }.unpin_migration();
     true
 }
 
 /// Returns monotonic nanoseconds derived from the active local counter.
+#[inline]
 pub fn monotonic_ns() -> u64 {
-    let source = clocksource();
-    cycles_to_ns(source.frequency_hz(), source.counter())
+    let registered = registered_clocksource();
+    registered.scale.cycles_to_ns(registered.source.counter())
 }
 
 /// Updates the current CPU's scheduler deadline and re-arms the local timer if
 /// needed.
 pub fn set_scheduler_deadline(deadline_ns: u64) {
-    let now_ns = monotonic_ns();
     let arm = {
         let mut local = local_clock().lock();
         local.set_scheduler_deadline(deadline_ns)
     };
 
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
 }
 
@@ -352,9 +471,19 @@ pub fn handle_local_timer_interrupt() {
         let mut local = local_clock().lock();
         local.take_expired(now_ns)
     } {
-        // SAFETY: the timer remains pinned on the sleeping thread's stack
-        // until this signal completes and allows that thread to return.
-        unsafe { &*expired.event }.signal();
+        match expired.target {
+            TimerTarget::Event(event) => {
+                // SAFETY: the non-null pointer references the pinned timeout
+                // event, which remains alive until this signal completes.
+                unsafe { event.as_ref() }.signal();
+            }
+            TimerTarget::Thread { thread, park_seq } => {
+                assert!(
+                    sched::wake(thread.as_ptr(), park_seq),
+                    "clock: expired sleep timer had a stale park sequence"
+                );
+            }
+        }
     }
 
     let arm = {
@@ -363,7 +492,7 @@ pub fn handle_local_timer_interrupt() {
     };
 
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
 }
 
@@ -372,10 +501,10 @@ fn delay_ns(ns: u64) {
         return;
     }
 
-    let source = clocksource();
-    let start = source.counter();
-    let target = ns_to_cycles(source.frequency_hz(), ns);
-    while source.counter().wrapping_sub(start) < target {
+    let registered = registered_clocksource();
+    let start = registered.source.counter();
+    let target = registered.scale.ns_to_cycles(ns);
+    while registered.source.counter().wrapping_sub(start) < target {
         spin_loop();
     }
 }
@@ -391,8 +520,16 @@ fn sleep_ns(ns: u64) {
     // and programmed local deadline always match.
     arch::irqset(false);
 
+    let current = sched::current_thread();
+    // SAFETY: the scheduler keeps the current thread allocation live while it
+    // is executing.
+    let park_seq = unsafe { (&*current).prepare_park() };
     let now_ns = monotonic_ns();
-    let mut timer = core::pin::pin!(Timer::new(now_ns.saturating_add(ns)));
+    let mut timer = core::pin::pin!(Timer::for_thread(
+        now_ns.saturating_add(ns),
+        current,
+        park_seq,
+    ));
 
     let arm = {
         let mut local = local_clock().lock();
@@ -400,12 +537,11 @@ fn sleep_ns(ns: u64) {
     };
 
     if let Some(deadline) = arm {
-        apply_deadline(deadline, now_ns);
+        apply_deadline(deadline);
     }
 
-    // The persistent event signal handles expiry racing with entry into wait.
-    arch::irqset(true);
-    timer.as_ref().get_ref().event.wait();
+    sched::park_current(current, park_seq);
+    debug_assert!(!timer.as_ref().get_ref().link.is_linked());
 }
 
 fn bootstrap_clocks() {
@@ -416,10 +552,10 @@ fn bootstrap_clocks() {
             .call_once(PerCpuClock::new);
     }
 
-    let (whole, frac, unit) = format_frequency(clocksource().frequency_hz());
+    let (whole, frac, unit) = format_frequency(registered_clocksource().source.frequency_hz());
     info!(
         "clock: source={} ({}.{:02} {}, timer={})",
-        clocksource().name(),
+        registered_clocksource().source.name(),
         whole,
         frac,
         unit,
@@ -440,13 +576,14 @@ fn clock_for_cpu(cpu_id: usize) -> &'static IrqSpinLock<LocalClockState> {
         .state
 }
 
-fn apply_deadline(deadline_ns: u64, now_ns: u64) {
+fn apply_deadline(deadline_ns: u64) {
     let timer = event_timer();
     if deadline_ns == 0 {
         timer.stop();
         return;
     }
 
+    let now_ns = monotonic_ns();
     let min_ns = timer.min_period_ns();
     let max_ns = timer.max_period_ns();
     let delay_ns = deadline_ns.saturating_sub(now_ns).clamp(min_ns, max_ns);
@@ -470,29 +607,13 @@ fn duration_to_ns(duration: Duration) -> u64 {
     ns.min(u64::MAX as u128) as u64
 }
 
-fn clocksource() -> &'static dyn ClockSource {
-    *CLOCKSOURCE
+#[inline]
+fn registered_clocksource() -> &'static RegisteredClockSource {
+    CLOCKSOURCE
         .get()
         .expect("clock: no active clocksource registered")
 }
 
 fn event_timer() -> &'static dyn EventTimer {
     *EVENT_TIMER.get().expect("clock: no event timer registered")
-}
-
-fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {
-    if ns == 0 {
-        return 0;
-    }
-
-    let cycles = (ns as u128)
-        .saturating_mul(freq_hz as u128)
-        .saturating_add(999_999_999)
-        / 1_000_000_000;
-    cycles.max(1).min(u64::MAX as u128) as u64
-}
-
-fn cycles_to_ns(freq_hz: u64, cycles: u64) -> u64 {
-    ((cycles as u128).saturating_mul(1_000_000_000u128) / freq_hz as u128).min(u64::MAX as u128)
-        as u64
 }

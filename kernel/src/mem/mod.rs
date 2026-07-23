@@ -35,8 +35,8 @@ mod object;
 mod page;
 pub mod phys;
 mod pmap;
-mod syscall;
 pub mod swap;
+mod syscall;
 
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 pub use error::{Error, Result};
@@ -265,9 +265,7 @@ pub fn install_current_space(space: Arc<VmSpace>) {
     // SAFETY: the current thread owns its address-space slot while executing;
     // the slot itself is protected by an IRQ-safe spin lock.
     let previous = unsafe { &*thread }.replace_address_space(Some(space.clone()));
-    space
-        .activate()
-        .expect("mem: failed to activate current address space");
+    activate_thread_space(Some(space));
     drop(previous);
 }
 
@@ -276,7 +274,7 @@ pub fn clear_current_space() {
     let thread = sched::current_thread();
     // SAFETY: the current thread owns its address-space slot while executing.
     let previous = unsafe { &*thread }.replace_address_space(None);
-    activate_kernel();
+    activate_kernel_space();
     drop(previous);
 }
 
@@ -288,16 +286,30 @@ pub fn current_space() -> Option<Arc<VmSpace>> {
 }
 
 pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
-    match space {
-        Some(space) => {
-            if arch::paging::active_root() != space.pmap().root() {
-                space
-                    .activate()
-                    .expect("mem: failed to activate scheduled address space");
-            }
-        }
-        None => activate_kernel(),
+    let Some(space) = space else {
+        // Kernel-only threads can safely borrow the previous user pmap because
+        // every address space contains the same permanent kernel mappings.
+        return;
+    };
+
+    let root = space.pmap().root();
+    let mut active = arch::thiscpu().active_address_space.lock();
+    if active
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &space))
+    {
+        debug_assert_eq!(arch::paging::active_root(), root);
+        return;
     }
+
+    if arch::paging::active_root() != root {
+        space
+            .activate()
+            .expect("mem: failed to activate scheduled address space");
+    }
+    let previous = core::mem::replace(&mut *active, Some(space));
+    drop(active);
+    drop(previous);
 }
 
 pub(super) fn allocate_page_id() -> u64 {
@@ -502,14 +514,21 @@ fn synchronize_remote_tlbs() {
     }
 }
 
-fn activate_kernel() {
+fn activate_kernel_space() {
+    let mut active = arch::thiscpu().active_address_space.lock();
     if arch::paging::active_root() == kernel_root() {
+        let previous = active.take();
+        drop(active);
+        drop(previous);
         return;
     }
     // SAFETY: the root was captured from the bootloader-provided kernel page
     // table and remains live for the kernel lifetime.
     unsafe { arch::paging::activate_root(kernel_root()) }
         .expect("mem: failed to restore kernel pmap");
+    let previous = active.take();
+    drop(active);
+    drop(previous);
 }
 
 fn state() -> &'static MemoryState {

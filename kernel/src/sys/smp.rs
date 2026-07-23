@@ -18,7 +18,7 @@
 //! state through ad-hoc interrupt side effects.
 //!
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     cell::UnsafeCell,
     hint::spin_loop,
@@ -35,6 +35,7 @@ use limine::mp::RequestFlags;
 
 use crate::{
     arch,
+    mem::VmSpace,
     sys::{clock::PerCpuClock, sched::PerCpuScheduler, sync::Once},
 };
 
@@ -86,6 +87,9 @@ pub struct CoreLocal {
     /// Currently running thread ID on this CPU, if any.
     pub current_thread: usize,
 
+    /// User address space retained while kernel-only threads run.
+    pub(crate) active_address_space: IrqSpinLock<Option<Arc<VmSpace>>>,
+
     /// Timer state owned by this CPU.
     pub(crate) clock: Once<PerCpuClock>,
 
@@ -135,6 +139,7 @@ impl CoreLocal {
             kernel_stack: 0,
             user_stack: 0,
             current_thread: 0,
+            active_address_space: IrqSpinLock::new(None),
             clock: Once::new(),
             scheduler: Once::new(),
             ipi: Once::new(),

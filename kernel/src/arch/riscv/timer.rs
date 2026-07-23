@@ -8,8 +8,9 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sys::{
-    clock::{self, ClockSource, EventTimer},
+    clock::{self, ClockScale, ClockSource, EventTimer},
     firmware,
+    sync::Once,
 };
 
 const CSR_STIMECMP: u16 = 0x14D;
@@ -18,6 +19,7 @@ const SBI_TIME_SET_TIMER: usize = 0;
 const SBI_LEGACY_SET_TIMER: usize = 0x00;
 
 static TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
+static TIMEBASE_SCALE: Once<ClockScale> = Once::new();
 static USE_CPU_TIMER: AtomicBool = AtomicBool::new(false);
 static RISCV_CLOCKSOURCE: RiscvClockSource = RiscvClockSource;
 static RISCV_EVENT_TIMER: RiscvEventTimer = RiscvEventTimer;
@@ -61,7 +63,10 @@ impl EventTimer for RiscvEventTimer {
     }
 
     fn set_oneshot(&self, delay_ns: u64) {
-        let delta = ns_to_cycles(TIMEBASE_HZ.load(Ordering::Relaxed), delay_ns);
+        let delta = TIMEBASE_SCALE
+            .get()
+            .expect("riscv/timer: timebase scale not initialized")
+            .ns_to_cycles(delay_ns);
         set_active_timer_deadline(read_time().wrapping_add(delta));
     }
 
@@ -77,6 +82,7 @@ pub fn init() {
     let use_cpu_timer = firmware::all_cpus_support_sstc() == Some(true);
 
     TIMEBASE_HZ.store(timebase_hz, Ordering::Relaxed);
+    TIMEBASE_SCALE.call_once(|| ClockScale::new(timebase_hz));
     USE_CPU_TIMER.store(use_cpu_timer, Ordering::Relaxed);
     stop_active_timer();
     clock::register_clocksource(&RISCV_CLOCKSOURCE);
@@ -143,13 +149,4 @@ fn set_active_timer_deadline(deadline: u64) {
 
 fn use_cpu_timer() -> bool {
     USE_CPU_TIMER.load(Ordering::Relaxed)
-}
-
-fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {
-    ((ns as u128)
-        .saturating_mul(freq_hz as u128)
-        .saturating_add(999_999_999u128)
-        / 1_000_000_000u128)
-        .max(1)
-        .min(u64::MAX as u128) as u64
 }

@@ -32,14 +32,22 @@ crate::syscall_handler! {
         let now = clock::monotonic_ns();
         let seconds_value = (now / 1_000_000_000) as i64;
         let nanoseconds_value = (now % 1_000_000_000) as i64;
-        process
-            .address_space()
-            .write_user(VirtAddr::new(seconds), &seconds_value.to_ne_bytes())
-            .map_err(map_memory_error)?;
-        process
-            .address_space()
-            .write_user(VirtAddr::new(nanoseconds), &nanoseconds_value.to_ne_bytes())
-            .map_err(map_memory_error)?;
+        let address_space = process.address_space();
+        if seconds.checked_add(8) == Some(nanoseconds) {
+            let mut timespec = [0u8; 16];
+            timespec[..8].copy_from_slice(&seconds_value.to_ne_bytes());
+            timespec[8..].copy_from_slice(&nanoseconds_value.to_ne_bytes());
+            address_space
+                .write_user(VirtAddr::new(seconds), &timespec)
+                .map_err(map_memory_error)?;
+        } else {
+            address_space
+                .write_user(VirtAddr::new(seconds), &seconds_value.to_ne_bytes())
+                .map_err(map_memory_error)?;
+            address_space
+                .write_user(VirtAddr::new(nanoseconds), &nanoseconds_value.to_ne_bytes())
+                .map_err(map_memory_error)?;
+        }
         Ok(0)
     }
 }

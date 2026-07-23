@@ -14,7 +14,7 @@ use x86_64::registers::model_specific::Msr;
 use crate::{
     arch,
     mem::{self, PhysAddr, VirtAddr, VmFlags},
-    sys::sync::Once,
+    sys::{clock::ClockScale, sync::Once},
 };
 
 /// Timer interrupt vector used by the local APIC.
@@ -70,7 +70,9 @@ struct LapicState {
     access: ApicAccess,
     timer_mode: TimerMode,
     tsc_hz: u64,
+    tsc_scale: ClockScale,
     lapic_timer_hz: u64,
+    lapic_timer_scale: Option<ClockScale>,
 }
 
 static LAPIC_STATE: Once<LapicState> = Once::new();
@@ -131,7 +133,9 @@ pub fn init(tsc_hz: u64) {
         access,
         timer_mode,
         tsc_hz,
+        tsc_scale: ClockScale::new(tsc_hz),
         lapic_timer_hz,
+        lapic_timer_scale: (lapic_timer_hz != 0).then(|| ClockScale::new(lapic_timer_hz)),
     });
 
     if timer_mode == TimerMode::LocalOneShot {
@@ -181,18 +185,15 @@ pub fn set_oneshot(delay_ns: u64) {
 
     match state.timer_mode {
         TimerMode::TscDeadline => {
-            let deadline = rdtsc().wrapping_add(ns_to_cycles(local_tsc_hz(), delay_ns));
+            let deadline = rdtsc().wrapping_add(state.tsc_scale.ns_to_cycles(delay_ns));
             write_msr(IA32_TSC_DEADLINE_MSR, deadline);
-            write_register(
-                state.access,
-                LAPIC_LVT_TIMER,
-                TIMER_VECTOR as u32 | LVT_TIMER_TSC_DEADLINE,
-            );
         }
         TimerMode::LocalOneShot => {
-            let count = ns_to_lapic_ticks(local_lapic_timer_hz(), delay_ns);
-            write_register(state.access, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
-            write_register(state.access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
+            let count = state
+                .lapic_timer_scale
+                .expect("x86/lapic: local timer scale missing")
+                .ns_to_cycles(delay_ns)
+                .min(u64::from(u32::MAX)) as u32;
             write_register(state.access, LAPIC_INITIAL_COUNT, count);
         }
     }
@@ -202,15 +203,10 @@ pub fn set_oneshot(delay_ns: u64) {
 pub fn stop_timer() {
     let state = lapic_state();
 
-    write_register(state.access, LAPIC_INITIAL_COUNT, 0);
-    if state.timer_mode == TimerMode::TscDeadline {
-        write_msr(IA32_TSC_DEADLINE_MSR, 0);
+    match state.timer_mode {
+        TimerMode::TscDeadline => write_msr(IA32_TSC_DEADLINE_MSR, 0),
+        TimerMode::LocalOneShot => write_register(state.access, LAPIC_INITIAL_COUNT, 0),
     }
-    write_register(
-        state.access,
-        LAPIC_LVT_TIMER,
-        TIMER_VECTOR as u32 | timer_lvt_bits(state.timer_mode) | LVT_MASKED,
-    );
 }
 
 /// Returns the minimum programmable interval.
@@ -288,7 +284,7 @@ fn init_thiscpu(access: ApicAccess, timer_mode: TimerMode) {
         }
         TimerMode::LocalOneShot => {
             write_register(access, LAPIC_DIVIDE_CONFIG, DIVIDE_BY_16);
-            write_register(access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32 | LVT_MASKED);
+            write_register(access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
             write_register(access, LAPIC_INITIAL_COUNT, 0);
         }
     }
@@ -342,6 +338,7 @@ fn calibrate_lapic_timer(access: ApicAccess, tsc_hz: u64) -> u64 {
 
     let current = read_register(access, LAPIC_CURRENT_COUNT);
     write_register(access, LAPIC_INITIAL_COUNT, 0);
+    write_register(access, LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
 
     let elapsed = u32::MAX.wrapping_sub(current) as u128;
     let hz = elapsed.saturating_mul(1_000_000_000u128) / LAPIC_TIMER_CALIBRATION_NS as u128;
@@ -358,13 +355,6 @@ fn send_fixed_ipi(access: ApicAccess, lapic_id: u32, vector: u8) {
             let icr = ((lapic_id as u64) << 32) | vector as u64;
             write_register64(access, LAPIC_ICR_LOW, icr);
         }
-    }
-}
-
-fn timer_lvt_bits(timer_mode: TimerMode) -> u32 {
-    match timer_mode {
-        TimerMode::TscDeadline => LVT_TIMER_TSC_DEADLINE,
-        TimerMode::LocalOneShot => 0,
     }
 }
 
@@ -427,12 +417,6 @@ fn x2apic_msr(offset: u32) -> u32 {
     X2APIC_MSR_BASE + (offset >> 4)
 }
 
-fn local_tsc_hz() -> u64 {
-    let hz = arch::thiscpu().platform.tsc_hz;
-    debug_assert!(hz != 0, "x86/lapic: local TSC frequency not initialized");
-    hz
-}
-
 fn local_lapic_timer_hz() -> u64 {
     let hz = arch::thiscpu().platform.lapic_timer_hz;
     debug_assert!(hz != 0, "x86/lapic: local timer frequency not initialized");
@@ -482,15 +466,6 @@ fn ns_to_cycles(freq_hz: u64, ns: u64) -> u64 {
         / 1_000_000_000u128)
         .max(1)
         .min(u64::MAX as u128) as u64
-}
-
-fn ns_to_lapic_ticks(freq_hz: u64, ns: u64) -> u32 {
-    ((ns as u128)
-        .saturating_mul(freq_hz as u128)
-        .saturating_add(999_999_999u128)
-        / 1_000_000_000u128)
-        .max(1)
-        .min(u32::MAX as u128) as u32
 }
 
 fn rdtsc() -> u64 {
