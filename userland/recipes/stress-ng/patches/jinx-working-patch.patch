@@ -1,0 +1,80 @@
+diff --git a/core-affinity.c b/core-affinity.c
+index a6f178f..5de04e3 100644
+--- a/core-affinity.c
++++ b/core-affinity.c
+@@ -27,6 +27,33 @@
+ #include <sys/types.h>
+ #include <dirent.h>
+ 
++#if !defined(CPU_EQUAL)
++static bool stress_cpu_equal(const cpu_set_t *left, const cpu_set_t *right)
++{
++	return memcmp(left, right, sizeof(*left)) == 0;
++}
++
++#define CPU_EQUAL(left, right) stress_cpu_equal((left), (right))
++#endif
++
++#if !defined(CPU_OR)
++static void stress_cpu_or(
++	cpu_set_t *result,
++	const cpu_set_t *left,
++	const cpu_set_t *right)
++{
++	unsigned char *output = (unsigned char *)result;
++	const unsigned char *lhs = (const unsigned char *)left;
++	const unsigned char *rhs = (const unsigned char *)right;
++	size_t i;
++
++	for (i = 0; i < sizeof(*result); i++)
++		output[i] = lhs[i] | rhs[i];
++}
++
++#define CPU_OR(result, left, right) stress_cpu_or((result), (left), (right))
++#endif
++
+ static const char option[] = "taskset";
+ 
+ #if defined(HAVE_SCHED_GETAFFINITY) && \
+diff --git a/stress-ng.h b/stress-ng.h
+index 9311740..f09a316 100644
+--- a/stress-ng.h
++++ b/stress-ng.h
+@@ -113,6 +113,9 @@
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
++#if defined(HAVE_SYS_IPC_H)
++#include <sys/ipc.h>
++#endif
+ #include <sys/wait.h>
+ #if defined(HAVE_SYSCALL_H)
+ #include <sys/syscall.h>
+diff --git a/stress-lsm.c b/stress-lsm.c
+index ec466e1..8ec08a2 100644
+--- a/stress-lsm.c
++++ b/stress-lsm.c
+@@ -32,7 +32,8 @@ static const stress_help_t help[] = {
+ 
+ #if defined(__NR_lsm_list_modules) &&	\
+     defined(__NR_lsm_get_self_attr) &&	\
+-    defined(__NR_lsm_set_self_attr) &&	\
++    defined(__NR_lsm_set_self_attr) &&	\
++    !defined(__roanix__) &&		\
+     defined(HAVE_LINUX_LSM_H)
+ 
+ /*
+diff --git a/stress-opcode.c b/stress-opcode.c
+index 27c622e..4134bb6 100644
+--- a/stress-opcode.c
++++ b/stress-opcode.c
+@@ -491,7 +491,9 @@ static int stress_opcode(stress_args_t *args)
+ 			stress_proc_name_set(buf);
+ 		}
+ again:
++#if defined(STRESS_OPCODE_USE_SIGLONGJMP)
+ 		jmp_env_set = false;
++#endif
+ 		pid = fork();
+ 		if (pid < 0) {
+ 			if (stress_redo_fork(args, errno))

@@ -1,0 +1,66 @@
+#! /bin/sh
+
+version=0.21.04
+revision=1
+tarball_url="https://github.com/ColinIanKing/stress-ng/archive/refs/tags/V${version}.tar.gz"
+tarball_blake2b="e314fb3277da300c284b98e2ef068a55943c77a0860d9f02f03f29b3ecd1a19187915f2bec179539a0b020e38d0ef0c5a992111991e30ea5b947778c3f0f384c"
+hostdeps="gcc-host pkg-config"
+deps="sys-libs"
+
+configure() {
+    cp -a "${source_dir}"/. .
+}
+
+build() {
+    make -j${parallelism} \
+        CC="${OS_TRIPLET}-gcc" \
+        CXX="${OS_TRIPLET}-g++" \
+        CPP="${OS_TRIPLET}-cpp" \
+        AR="${OS_TRIPLET}-ar" \
+        KERNEL=Roanix \
+        PRESERVE_CFLAGS=1 \
+        CFLAGS="${TARGET_CFLAGS} ${TARGET_CPPFLAGS}" \
+        CXXFLAGS="${TARGET_CXXFLAGS} ${TARGET_CPPFLAGS}" \
+        LDFLAGS="${TARGET_LDFLAGS}" \
+        LIB_ACL= \
+        LIB_AIO= \
+        LIB_APPARMOR= \
+        LIB_BSD= \
+        LIB_CRYPT= \
+        LIB_DL= \
+        LIB_EGL= \
+        LIB_FSNOTIFY= \
+        LIB_GBM= \
+        LIB_GENL= \
+        LIB_GLES2= \
+        LIB_GMP= \
+        LIB_IPSEC_MB= \
+        LIB_JPEG= \
+        LIB_JUDY= \
+        LIB_KMOD= \
+        LIB_LZMA= \
+        LIB_MD= \
+        LIB_MPFR= \
+        LIB_NETWORK= \
+        LIB_NL= \
+        LIB_NSL= \
+        LIB_PTHREAD= \
+        LIB_SCTP= \
+        LIB_SOCKET= \
+        LIB_XXHASH= \
+        LIB_Z=
+}
+
+package() {
+    make install \
+        CC="${OS_TRIPLET}-gcc" \
+        CXX="${OS_TRIPLET}-g++" \
+        KERNEL=Roanix \
+        DESTDIR="${dest_dir}" \
+        BINDIR="${prefix}/bin" \
+        MANDIR="${prefix}/share/man/man1" \
+        JOBDIR="${prefix}/share/stress-ng/example-jobs" \
+        BASHDIR="${prefix}/share/bash-completion/completions"
+
+    post_package_strip
+}
