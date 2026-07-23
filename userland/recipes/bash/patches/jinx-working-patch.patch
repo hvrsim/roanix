@@ -1,0 +1,51 @@
+diff --git a/support/shobj-conf b/support/shobj-conf
+index c3df351..4274ab0 100755
+--- a/support/shobj-conf
++++ b/support/shobj-conf
+@@ -123,7 +123,7 @@ sunos5*|solaris2*)
+ 	;;
+ 
+ # All versions of Linux (including Gentoo/FreeBSD) or the semi-mythical GNU Hurd.
+-linux*-*|gnu*-*|k*bsd*-gnu-*|midnightbsd*|freebsd*|dragonfly*)
++linux*-*|gnu*-*|k*bsd*-gnu-*|midnightbsd*|freebsd*|dragonfly*|roanix*)
+ 	SHOBJ_CFLAGS=-fPIC
+ 	SHOBJ_LD='${CC}'
+ 	SHOBJ_LDFLAGS='-shared -Wl,-soname,$@'
+diff --git a/lib/termcap/termcap.c b/lib/termcap/termcap.c
+index 2b47062..a18af16 100644
+--- a/lib/termcap/termcap.c
++++ b/lib/termcap/termcap.c
+@@ -611,7 +611,7 @@ scan_file (char *str, int fd, struct buffer *bufp)
+   bufp->ateof = 0;
+   *bufp->ptr = '\0';
+ 
+-  lseek (fd, 0L, 0);
++  lseek (fd, 0L, SEEK_SET);
+ 
+   while (!bufp->ateof)
+     {
+diff --git a/shell.c b/shell.c
+index e59029c..653cca1 100644
+--- a/shell.c
++++ b/shell.c
+@@ -1654,7 +1654,7 @@ open_shell_script (char *script_name)
+ #endif
+ 
+   /* Only do this with non-tty file descriptors we can seek on. */
+-  if (fd_is_tty == 0 && (lseek (fd, 0L, 1) != -1))
++  if (fd_is_tty == 0 && (lseek (fd, 0L, SEEK_CUR) != -1))
+     {
+       /* Check to see if the `file' in `bash file' is a binary file
+ 	 according to the same tests done by execute_simple_command (),
+@@ -1691,10 +1691,10 @@ open_shell_script (char *script_name)
+ 	  exit (EX_BINARY_FILE);
+ 	}
+       /* Now rewind the file back to the beginning. */
+-      lseek (fd, 0L, 0);
++      lseek (fd, 0L, SEEK_SET);
+     }
+ 
+   /* Open the script.  But try to move the file descriptor to a randomly
+      large one, in the hopes that any descriptors used by the script will
+      not match with ours. */
+   fd = move_to_high_fd (fd, 1, -1);

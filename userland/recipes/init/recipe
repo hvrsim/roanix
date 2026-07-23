@@ -1,10 +1,10 @@
 #! /bin/sh
 
 version=0.1
-revision=6
+revision=1
 source_dir="init"
-hostdeps="bootstrap-gcc binutils"
-deps="base"
+hostdeps="gcc-host binutils"
+deps="sys-libs"
 
 configure() {
     cp -a "${source_dir}"/. .

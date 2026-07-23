@@ -1,0 +1,29 @@
+#! /bin/sh
+
+version=0.1
+revision=3
+source_dir="drivers"
+hostdeps="gcc-host binutils"
+
+configure() {
+    cp -a "${source_dir}"/. .
+    make ARCH="${JINX_ARCH}" clean
+}
+
+build() {
+    make \
+        ARCH="${JINX_ARCH}" \
+        CC="${OS_TRIPLET}-gcc" \
+        LD="${OS_TRIPLET}-ld" \
+        AR="${OS_TRIPLET}-ar" \
+        STRIP="${OS_TRIPLET}-strip" \
+        -j"${parallelism}"
+}
+
+package() {
+    make \
+        ARCH="${JINX_ARCH}" \
+        DESTDIR="${dest_dir}" \
+        PREFIX="${prefix}" \
+        install
+}

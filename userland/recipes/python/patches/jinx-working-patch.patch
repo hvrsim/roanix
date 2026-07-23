@@ -1,0 +1,106 @@
+diff --git a/Lib/site.py b/Lib/site.py
+index 041dca1..1ea2b98 100644
+--- a/Lib/site.py
++++ b/Lib/site.py
+@@ -409,6 +409,10 @@ def getsitepackages(prefixes=None):
+                                     f"{implementation}{ver[0]}.{ver[1]}{abi_thread}",
+                                     "site-packages")
+                 sitepackages.append(path)
++                path = os.path.join(prefix, libdir,
++                                    f"{implementation}{ver[0]}.{ver[1]}{abi_thread}",
++                                    "dist-packages")
++                sitepackages.append(path)
+         else:
+             sitepackages.append(prefix)
+             sitepackages.append(os.path.join(prefix, "Lib", "site-packages"))
+diff --git a/Objects/mimalloc/prim/unix/prim.c b/Objects/mimalloc/prim/unix/prim.c
+index 4d3fb65..31b6e5c 100644
+--- a/Objects/mimalloc/prim/unix/prim.c
++++ b/Objects/mimalloc/prim/unix/prim.c
+@@ -51,7 +51,7 @@ terms of the MIT license. A copy of the license can be found in the file
+   #include <sys/sysctl.h>
+ #endif
+ 
+-#if !defined(__HAIKU__) && !defined(__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__OpenBSD__) && !defined(__FreeBSD__) && !defined(__sun) && !defined(__NetBSD__)
++#if !defined(__HAIKU__) && !defined(__APPLE__) && !defined(__CYGWIN__) && !defined(_AIX) && !defined(__OpenBSD__) && !defined(__FreeBSD__) && !defined(__sun) && !defined(__NetBSD__) && !defined(__roanix__)
+   #define MI_HAS_SYSCALL_H
+   #include <sys/syscall.h>
+ #endif
+@@ -156,6 +156,9 @@ int _mi_prim_free(void* addr, size_t size ) {
+ static int unix_madvise(void* addr, size_t size, int advice) {
+   #if defined(__sun)
+   return madvise((caddr_t)addr, size, advice);  // Solaris needs cast (issue #520)
++  #elif defined(__roanix__)
++  (void)addr; (void)size; (void)advice;
++  return 0;
+   #else
+   return madvise(addr, size, advice);
+   #endif
+@@ -759,7 +762,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
+   return true;
+ }
+ 
+-#elif defined(__linux__) || defined(__HAIKU__)
++#elif defined(__linux__) || defined(__HAIKU__) || defined(__roanix__)
+ 
+ #include <sys/types.h>
+ #include <sys/stat.h>
+diff --git a/configure b/configure
+index 901a26c..b3f1b51 100755
+--- a/configure
++++ b/configure
+@@ -4049,6 +4049,9 @@ then
+ 	*-*-linux-android*)
+ 		ac_sys_system=Linux-android
+ 		;;
++	*-*-roanix*)
++		ac_sys_system=Roanix
++		;;
+ 	*-*-linux*)
+ 		ac_sys_system=Linux
+ 		;;
+@@ -4491,7 +4494,7 @@ fi
+ 
+ if test "$cross_compiling" = yes; then
+ 	case "$host" in
+-	*-*-linux*)
++	*-*-roanix*|*-*-linux*)
+ 		case "$host_cpu" in
+ 		arm*)
+ 			_host_ident=arm
+@@ -7587,7 +7590,7 @@ printf "%s\n" "#define Py_ENABLE_SHARED 1" >>confdefs.h
+         PY3LIBRARY=libpython3.so
+       fi
+       ;;
+-    Linux*|GNU*|NetBSD*|FreeBSD*|DragonFly*|OpenBSD*|VxWorks*)
++    Roanix*|Linux*|GNU*|NetBSD*|FreeBSD*|DragonFly*|OpenBSD*|VxWorks*)
+       LDLIBRARY='libpython$(LDVERSION).so'
+       BLDLIBRARY='-L. -lpython$(LDVERSION)'
+       RUNSHARED=LD_LIBRARY_PATH=`pwd`${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+@@ -12983,7 +12986,7 @@ then
+ 	Emscripten*|WASI*)
+ 		LDSHARED='$(CC) -shared'
+ 		LDCXXSHARED='$(CXX) -shared';;
+-	Linux*|GNU*|QNX*|VxWorks*|Haiku*)
++	Roanix*|Linux*|GNU*|QNX*|VxWorks*|Haiku*)
+ 		LDSHARED='$(CC) -shared'
+ 		LDCXXSHARED='$(CXX) -shared';;
+ 	FreeBSD*)
+@@ -13068,7 +13071,7 @@ then
+ 		 then CCSHARED="-fPIC";
+ 		 else CCSHARED="+z";
+ 		 fi;;
+-	Linux*|GNU*) CCSHARED="-fPIC";;
++	Roanix*|Linux*|GNU*) CCSHARED="-fPIC";;
+ 	Emscripten*|WASI*)
+ 		if test "x$enable_wasm_dynamic_linking" = xyes
+ then :
+@@ -13106,7 +13109,7 @@ then
+ 	    LINKFORSHARED="-Wl,-E -Wl,+s";;
+ #	    LINKFORSHARED="-Wl,-E -Wl,+s -Wl,+b\$(BINLIBDEST)/lib-dynload";;
+ 	Linux-android*) LINKFORSHARED="-pie -Xlinker -export-dynamic";;
+-	Linux*|GNU*) LINKFORSHARED="-Xlinker -export-dynamic";;
++	Roanix*|Linux*|GNU*) LINKFORSHARED="-Xlinker -export-dynamic";;
+ 	# -u libsys_s pulls in all symbols in libsys
+ 	Darwin/*|iOS/*)
+ 		LINKFORSHARED="$extra_undefs -framework CoreFoundation"

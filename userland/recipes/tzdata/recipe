@@ -1,0 +1,57 @@
+#! /bin/sh
+
+version=2026c
+revision=1
+tarball_url="https://data.iana.org/time-zones/releases/tzdata${version}.tar.gz"
+tarball_blake2b="53a759b9081736b5daba8574b2f6a6852fcd0fbb85237d90e5c589f4126a445a9fbbf338383fc14cee09fa4bb38b546a8285adcbdd944d93eb7e1242cae8feda"
+imagedeps="tzdata"
+hostdeps="gcc-host binutils"
+deps="mlibc libgcc libstdc++ libatomic"
+
+early_prepare() {
+    curl -Lo tzcode.tar.gz "https://data.iana.org/time-zones/releases/tzcode${version}.tar.gz"
+    b2sum tzcode.tar.gz | grep -q 09939593ad33e894d7ad62f8a7e1ee09a4490143a4c744551f81e836eb1b63f96926d362e415d1e254d2fe2d52378017c190b027e1d99a00b94014a413e329dd
+    tar -xf tzcode.tar.gz
+    rm tzcode.tar.gz
+}
+
+prepare() {
+    sed -i 's/sbin/bin/g' Makefile
+}
+
+build() {
+    cp -rp ${source_dir}/. ./
+
+    make \
+        CC="$OS_TRIPLET-gcc" \
+        AR="$OS_TRIPLET-ar" \
+        CFLAGS="$TARGET_CFLAGS $TARGET_CPPFLAGS" \
+        LDFLAGS="$TARGET_LDFLAGS"
+}
+
+package() {
+    make DESTDIR="${dest_dir}" ZIC=zic install
+
+    timezones="africa antarctica asia australasia europe northamerica southamerica etcetera backward factory"
+
+    # Create the required directories
+    mkdir -p ${dest_dir}/etc
+    mkdir -p ${dest_dir}${prefix}/share/zoneinfo/posix
+    mkdir -p ${dest_dir}${prefix}/share/zoneinfo/right
+
+    # Create the time zone files without leap seconds, convention puts these in both zoneinfo and zoneinfo/posix.
+    # After that. create time time zone files with leap seconds
+    zic -b fat -d ${dest_dir}${prefix}/share/zoneinfo $timezones
+    zic -b fat -d ${dest_dir}${prefix}/share/zoneinfo/posix $timezones
+    zic -b fat -d ${dest_dir}${prefix}/share/zoneinfo/right -L leapseconds $timezones
+
+    # Create the posixrules file, POSIX requires daylight saving rules to be in accordance with US rules, thus use New York
+    zic -b fat -d ${dest_dir}${prefix}/share/zoneinfo -p America/New_York
+
+    # Default to UTC for localtime.
+    ln -sf ${prefix}/share/zoneinfo/UTC ${dest_dir}/etc/localtime
+
+    install -m644 -t ${dest_dir}${prefix}/share/zoneinfo iso3166.tab leap-seconds.list zone1970.tab zone.tab SECURITY
+
+    post_package_strip
+}

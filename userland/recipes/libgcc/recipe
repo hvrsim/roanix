@@ -1,0 +1,32 @@
+#! /bin/sh
+
+skip_pkg_check=yes
+version="$(. "${base_dir}/host-recipes/gcc-host/recipe" && echo ${version})"
+revision=2
+hostdeps="gcc-host pkg-config"
+imagedeps="build-essential"
+deps="mlibc"
+
+build() {
+    make \
+        -C "${build_dir}/host-builds/gcc-host/build" \
+        -j"${parallelism}" \
+        all-target-libgcc
+}
+
+package() {
+    cd "${build_dir}"/host-builds/gcc-host/build
+
+    rm -rf tmp_libgcc_dir
+    mkdir tmp_libgcc_dir
+
+    DESTDIR="$(realpath tmp_libgcc_dir)" make install-target-libgcc
+
+    mkdir -p "${dest_dir}${prefix}"
+
+    cp -r tmp_libgcc_dir/usr/local/lib "${dest_dir}${prefix}"/
+    cp -r \
+        tmp_libgcc_dir/usr/local/lib/gcc/${OS_TRIPLET}/${version}/* \
+        "${dest_dir}${prefix}/lib/"
+    cp -r tmp_libgcc_dir/usr/local/${OS_TRIPLET}/* "${dest_dir}${prefix}"/
+}

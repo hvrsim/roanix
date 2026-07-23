@@ -1,0 +1,71 @@
+#! /bin/sh
+
+version=14.3.0
+revision=4
+tarball_url="https://ftpmirror.gnu.org/gnu/gcc/gcc-${version}/gcc-${version}.tar.xz"
+tarball_sha512="cb4e3259640721bbd275c723fe4df53d12f9b1673afb3db274c22c6aa457865dccf2d6ea20b4fd4c591f6152e6d4b87516c402015900f06ce9d43af66d3b7a93"
+imagedeps="build-essential texinfo"
+hostrundeps="binutils"
+deps="mlibc-headers"
+source_imagedeps="ca-certificates curl"
+source_hostdeps=""
+source_deps=""
+source_allow_network=yes
+clean_workdirs=no
+
+early_prepare() {
+    ./contrib/download_prerequisites
+}
+
+configure() {
+    target_options=""
+    if [ "${JINX_ARCH}" = riscv64 ]; then
+        target_options="--with-arch=rv64gc --with-abi=lp64d"
+    fi
+
+    cp -a "${source_dir}"/. .
+    mkdir build
+    cd build
+    # shellcheck disable=SC2086
+    CFLAGS_FOR_TARGET="${TARGET_CFLAGS} -fPIC" \
+    CXXFLAGS_FOR_TARGET="${TARGET_CXXFLAGS} -fPIC" \
+    ../configure \
+        --prefix="${prefix}" \
+        --target="${OS_TRIPLET}" \
+        --with-sysroot="${sysroot}" \
+        --with-gxx-include-dir="${sysroot}/usr/include/c++/${version}" \
+        --with-pic \
+        --enable-languages=c,c++,lto \
+        --enable-initfini-array \
+        --enable-shared \
+        --enable-host-shared \
+        --enable-lto \
+        --enable-default-pie \
+        --enable-default-ssp \
+        --enable-threads=posix \
+        --with-linker-hash-style=gnu \
+        --enable-linker-build-id \
+        --disable-bootstrap \
+        --disable-multilib \
+        --disable-nls \
+        --disable-libgomp \
+        --disable-libquadmath \
+        --disable-libssp \
+        --disable-libvtv \
+        --disable-werror \
+        ${target_options}
+}
+
+build() {
+    make -C build -j"${parallelism}" all-gcc
+}
+
+package() {
+    make -C build install-gcc DESTDIR="${dest_dir}"
+
+    plugin_dir="${dest_dir}${prefix}/lib/bfd-plugins"
+    mkdir -p "${plugin_dir}"
+    ln -s \
+        "../../libexec/gcc/${OS_TRIPLET}/${version}/liblto_plugin.so" \
+        "${plugin_dir}/liblto_plugin.so"
+}

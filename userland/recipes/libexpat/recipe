@@ -1,0 +1,25 @@
+#! /bin/sh
+
+version=2.8.2
+fixed_version=$(echo ${version} | sed 's/\./_/g')
+revision=2
+tarball_url="https://github.com/libexpat/libexpat/releases/download/R_${fixed_version}/expat-${version}.tar.gz"
+tarball_blake2b="183421407a1ff2c852fcfd01c95372ba06c17933836898980fabd9b842ffc5e29aa2d679d76cc4729934ed88bd715a19d6a880c9549f76ac8ca5fd654d4f30f1"
+hostdeps="cmake gcc-host pkg-config"
+deps="sys-libs"
+
+configure() {
+    cmake_configure \
+        -DCMAKE_C_FLAGS="${TARGET_CFLAGS} ${TARGET_CPPFLAGS}" \
+        -DEXPAT_WITH_GETENTROPY=ON
+}
+
+build() {
+    cmake --build . -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" cmake --install .
+
+    post_package_strip
+}

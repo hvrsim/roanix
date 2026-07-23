@@ -1,0 +1,26 @@
+#! /bin/sh
+
+version=3.7.1
+revision=1
+tarball_url="https://github.com/libffi/libffi/releases/download/v${version}/libffi-${version}.tar.gz"
+tarball_blake2b="642741667d55aa2921fc250adea68eafd2519e786199fd2d0463a57ab6e830b51d97a361156bc2761d8c1bfecb9156ddc3147b6f81f4379bc054b98a29675526"
+hostdeps="gcc-host pkg-config"
+deps="sys-libs"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    autotools_configure
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+
+    post_package_strip
+}

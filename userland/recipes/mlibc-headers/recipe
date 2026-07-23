@@ -1,20 +1,25 @@
 #! /bin/sh
 
-from_source=mlibc-source
-revision=5
-imagedeps="meson ninja-build"
-hostdeps="bootstrap-gcc binutils"
+name=mlibc-headers
+from_source=mlibc
+revision=2
+imagedeps="ninja-build meson build-essential"
+deps="linux-headers"
+
+prepare() {
+    meson subprojects download freestnd-c-hdrs freestnd-cxx-hdrs frigg libsmarter
+}
 
 configure() {
     meson setup build "${source_dir}" \
-        --cross-file="${CROSS_FILE}" \
+        --cross-file="${base_dir}/build-support/cross_file-${JINX_ARCH}.txt" \
         --prefix="${prefix}" \
-        --libdir=lib \
         -Dheaders_only=true \
+        -Dlinux_kernel_headers="${build_dir}/builds/linux-headers/stage/include" \
         -Dposix_option=enabled \
-        -Dlinux_option=disabled \
+        -Dlinux_option=enabled \
         -Dglibc_option=enabled \
-        -Dbsd_option=disabled
+        -Dbsd_option=enabled
 }
 
 build() {

@@ -1,22 +1,37 @@
 #! /bin/sh
 
-from_source=mlibc-source
-revision=7
-imagedeps="meson ninja-build"
-hostdeps="bootstrap-gcc binutils"
+version=0.0.0.20260718.9
+revision=6
+git_url="https://github.com/managarm/mlibc.git"
+commit="4b09f2f0860cbe20775ab16018320e272564d102"
+shallow=yes
+source_imagedeps="git meson"
+source_hostdeps=""
+source_deps=""
+source_allow_network=yes
+
+imagedeps="build-essential meson ninja-build"
+hostdeps="gcc-host binutils libgcc-binaries"
 deps="mlibc-headers"
 
+prepare() {
+    meson subprojects download freestnd-c-hdrs freestnd-cxx-hdrs frigg libsmarter
+}
+
 configure() {
-    meson setup build "${source_dir}" \
-        --cross-file="${CROSS_FILE}" \
-        --prefix="${prefix}" \
+    LDFLAGS="${TARGET_LDFLAGS} -Wl,/usr/local/libgcc-binaries/libgcc-${JINX_ARCH}.a" \
+        meson setup build "${source_dir}" \
+        --cross-file="${base_dir}/build-support/cross_file-${JINX_ARCH}.txt" \
+	--prefix="${prefix}" \
         --libdir=lib \
         -Dno_headers=true \
+        -Dlinux_kernel_headers="${build_dir}/builds/linux-headers/stage/include" \
+        -Dlibgcc_dependency=false \
         -Ddefault_library=shared \
         -Dposix_option=enabled \
-        -Dlinux_option=disabled \
+        -Dlinux_option=enabled \
         -Dglibc_option=enabled \
-        -Dbsd_option=disabled
+        -Dbsd_option=enabled
 }
 
 build() {

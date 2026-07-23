@@ -1,0 +1,43 @@
+#! /bin/sh
+
+version=20260501T022739Z
+revision=1
+git_url="https://github.com/osdev0/libgcc-binaries.git"
+commit="1a7ff7f824dd16a198ce241bd3652ad23228de62"
+shallow=yes
+source_imagedeps="ca-certificates curl"
+source_hostdeps=""
+source_deps=""
+source_allow_network=yes
+
+early_prepare() {
+    release_url="https://github.com/osdev0/libgcc-binaries/releases/download/${version}"
+
+    curl -fL \
+        -o libgcc-x86_64.a \
+        "${release_url}/libgcc-x86_64.a"
+    echo "1f92410650b9202527a413bfc1e439dba3dc454b2452c3d57b378feaedeb9106  libgcc-x86_64.a" |
+        sha256sum -c -
+
+    curl -fL \
+        -o libgcc-riscv64.a \
+        "${release_url}/libgcc-riscv64.a"
+    echo "6d92219b290465a46be67ada3739e88a33f9c2264c03cfefca4a24c37a091138  libgcc-riscv64.a" |
+        sha256sum -c -
+}
+
+package() {
+    install -Dm644 \
+        "${source_dir}/libgcc-x86_64.a" \
+        "${dest_dir}${prefix}/libgcc-binaries/libgcc-x86_64.a"
+    install -Dm644 \
+        "${source_dir}/libgcc-riscv64.a" \
+        "${dest_dir}${prefix}/libgcc-binaries/libgcc-riscv64.a"
+
+    install -Dm644 \
+        "${source_dir}/COPYING.RUNTIME" \
+        "${dest_dir}${prefix}/share/licenses/libgcc-binaries/COPYING.RUNTIME"
+    install -Dm644 \
+        "${source_dir}/COPYING3" \
+        "${dest_dir}${prefix}/share/licenses/libgcc-binaries/COPYING3"
+}

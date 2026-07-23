@@ -1,0 +1,43 @@
+diff --git a/lib/getlocalename_l-unsafe.c b/lib/getlocalename_l-unsafe.c
+index cac2f35..af08450 100644
+--- a/lib/getlocalename_l-unsafe.c
++++ b/lib/getlocalename_l-unsafe.c
+@@ -658,6 +658,9 @@ getlocalename_l_unsafe (int category, locale_t locale)
+       };
+       const char *name = ((struct __locale_t *) locale)->mb_cur_max == 4 ? "C.UTF-8" : "C";
+       return (struct string_with_storage) { name, STORAGE_INDEFINITE };
++#elif defined __roanix__
++      /* Roanix currently supports only the global C/POSIX locale.  */
++      return (struct string_with_storage) { "C", STORAGE_INDEFINITE };
+ #else
+  #error "Please port gnulib getlocalename_l-unsafe.c to your platform! Report this to bug-gnulib."
+ #endif
+diff --git a/lib/mountlist.c b/lib/mountlist.c
+index 77ea8ce..5b97a0c 100644
+--- a/lib/mountlist.c
++++ b/lib/mountlist.c
+@@ -1244,7 +1244,7 @@ read_file_system_list (bool need_fs_type)
+   }
+ #endif
+ 
+-#if MOUNTED_NOT_PORTED
++#if MOUNTED_NOT_PORTED && !defined __roanix__
+ # error "Please port gnulib mountlist.c to your platform!"
+ #endif
+ 
+diff --git a/src/stat.c b/src/stat.c
+index e682bc6..922a810 100644
+--- a/src/stat.c
++++ b/src/stat.c
+@@ -73,11 +73,7 @@
+ #include "xvasprintf.h"
+ #include "statx.h"
+ 
+-#if HAVE_STATX && defined STATX_INO
+-# define USE_STATX 1
+-#else
+ # define USE_STATX 0
+-#endif
+ 
+ #if USE_STATVFS
+ # define STRUCT_STATXFS_F_FSID_IS_INTEGER STRUCT_STATVFS_F_FSID_IS_INTEGER

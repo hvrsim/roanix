@@ -1,0 +1,32 @@
+#! /bin/sh
+
+version=3.0.3
+revision=1
+tarball_url="https://distfiles.ariadne.space/pkgconf/pkgconf-${version}.tar.xz"
+tarball_blake2b="1de3b5f81b1bf291c3861c39244e2020de5333046f594161e687aa56388615b5b6d97db07cee9f19d66d6c6dae09a50e8b1045f8718ab8c7bea5e630a1252e2e"
+imagedeps="build-essential"
+
+configure() {
+    "${source_dir}"/configure \
+        --prefix="${prefix}"
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" make install
+    mkdir -p "${dest_dir}${prefix}/share/pkgconfig/personality.d"
+    cat <<EOF >"${dest_dir}${prefix}/share/pkgconfig/personality.d/${OS_TRIPLET}.personality"
+Triplet: ${OS_TRIPLET}
+SysrootDir: ${sysroot}
+DefaultSearchPaths: ${sysroot}/usr/lib/pkgconfig:${sysroot}/usr/share/pkgconfig
+SystemIncludePaths: ${sysroot}/usr/include
+SystemLibraryPaths: ${sysroot}/usr/lib
+EOF
+    ln -s pkgconf "${dest_dir}${prefix}/bin/${OS_TRIPLET}-pkg-config"
+
+        strip_command=strip \
+    post_package_strip
+}
