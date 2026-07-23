@@ -59,6 +59,19 @@ syscall_table:
     .quad syscall_file_renameat
     .quad syscall_file_linkat
     .quad syscall_file_symlinkat
+    .quad syscall_signal_altstack
+    .quad syscall_signal_pending
+    .quad syscall_signal_suspend
+    .quad syscall_signal_timed_wait
+    .quad syscall_epoll_create
+    .quad syscall_epoll_ctl
+    .quad syscall_epoll_wait
+    .quad syscall_inotify_init
+    .quad syscall_inotify_add
+    .quad syscall_inotify_remove
+    .quad syscall_timerfd_create
+    .quad syscall_timerfd_settime
+    .quad syscall_timerfd_gettime
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

@@ -64,7 +64,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
 --- /dev/null
 +++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,943 @@
+@@ -0,0 +1,1167 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -112,6 +112,26 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +constexpr unsigned long kTcflsh = 0x540B;
 +constexpr unsigned long kTiocgwinsz = 0x5413;
 +constexpr unsigned long kTiocswinsz = 0x5414;
++
++static_assert(ROANIX_SYS_SIGNAL_RETURN == 44);
++
++extern "C" [[gnu::naked]] void roanix_signal_restore() {
++#if defined(__x86_64__)
++    __asm__ volatile(
++        "mov $44, %rax\n"
++        "syscall\n"
++        "ud2\n"
++    );
++#elif defined(__riscv) && __riscv_xlen == 64
++    __asm__ volatile(
++        "li a7, 44\n"
++        "ecall\n"
++        "unimp\n"
++    );
++#else
++#error "unsupported Roanix signal architecture"
++#endif
++}
 +
 +} // namespace
 +
@@ -365,20 +385,87 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +int Sysdeps<Sigaction>::operator()(
-+        int, const struct sigaction *, struct sigaction *old_action) {
-+    if (old_action)
-+        memset(old_action, 0, sizeof(*old_action));
-+    return 0;
++        int signal,
++        const struct sigaction *action,
++        struct sigaction *old_action) {
++    struct sigaction adjusted;
++    if (action) {
++        adjusted = *action;
++        adjusted.sa_flags |= SA_RESTORER;
++        adjusted.sa_restorer = roanix_signal_restore;
++        action = &adjusted;
++    }
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_SIGNAL_ACTION,
++        signal,
++        as_word(action),
++        as_word(old_action)
++    ));
 +}
 +
 +int Sysdeps<Sigprocmask>::operator()(
-+        int, const sigset_t *, sigset_t *old_set) {
-+    if (old_set) {
-+        auto bytes = reinterpret_cast<unsigned char *>(old_set);
-+        for (size_t i = 0; i < sizeof(*old_set); i++)
-+            bytes[i] = 0;
-+    }
-+    return 0;
++        int how, const sigset_t *set, sigset_t *old_set) {
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_SIGNAL_MASK,
++        how,
++        as_word(set),
++        as_word(old_set)
++    ));
++}
++
++int Sysdeps<ThreadSigmask>::operator()(
++        int how, const sigset_t *set, sigset_t *old_set) {
++    return Sysdeps<Sigprocmask>::operator()(how, set, old_set);
++}
++
++int Sysdeps<Sigaltstack>::operator()(const stack_t *stack, stack_t *old_stack) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_SIGNAL_ALTSTACK, as_word(stack), as_word(old_stack)));
++}
++
++int Sysdeps<Sigpending>::operator()(sigset_t *set) {
++    return syscall_error(roanix_syscall1(
++        ROANIX_SYS_SIGNAL_PENDING, as_word(set)));
++}
++
++int Sysdeps<Sigsuspend>::operator()(const sigset_t *set) {
++    return syscall_error(roanix_syscall1(
++        ROANIX_SYS_SIGNAL_SUSPEND, as_word(set)));
++}
++
++int Sysdeps<Sigtimedwait>::operator()(
++        const sigset_t *set,
++        siginfo_t *info,
++        const struct timespec *timeout,
++        int *signal) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_SIGNAL_TIMED_WAIT,
++        as_word(set),
++        as_word(info),
++        as_word(timeout)
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *signal = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Pause>::operator()() {
++    sigset_t mask;
++    int error = sysdep<Sigprocmask>(SIG_SETMASK, nullptr, &mask);
++    if (error)
++        return error;
++    return sysdep<Sigsuspend>(&mask);
++}
++
++int Sysdeps<SignalfdCreate>::operator()(
++        const sigset_t *mask, int flags, int *fd) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_SIGNAL_FD, -1, as_word(mask), flags);
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
 +}
 +
 +int Sysdeps<Chdir>::operator()(const char *path) {
@@ -562,6 +649,98 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    if (!error)
 +        *num_events = static_cast<int>(result);
 +    return error;
++}
++
++int Sysdeps<EpollCreate>::operator()(int flags, int *fd) {
++    long result = roanix_syscall1(ROANIX_SYS_EPOLL_CREATE, flags);
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<EpollCtl>::operator()(
++        int epoll_fd, int operation, int fd, struct epoll_event *event) {
++    return syscall_error(roanix_syscall4(
++        ROANIX_SYS_EPOLL_CTL,
++        epoll_fd,
++        operation,
++        fd,
++        as_word(event)
++    ));
++}
++
++int Sysdeps<EpollPwait>::operator()(
++        int epoll_fd,
++        struct epoll_event *events,
++        int maximum,
++        int timeout,
++        const sigset_t *signal_mask,
++        int *raised) {
++    if (signal_mask)
++        return ENOSYS;
++    long result = roanix_syscall4(
++        ROANIX_SYS_EPOLL_WAIT,
++        epoll_fd,
++        as_word(events),
++        maximum,
++        timeout
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *raised = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<InotifyCreate>::operator()(int flags, int *fd) {
++    long result = roanix_syscall1(ROANIX_SYS_INOTIFY_INIT, flags);
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<InotifyAddWatch>::operator()(
++        int fd, const char *path, uint32_t mask, int *watch) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_INOTIFY_ADD, fd, as_word(path), mask);
++    int error = syscall_error(result);
++    if (!error)
++        *watch = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<InotifyRmWatch>::operator()(int fd, int watch) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_INOTIFY_REMOVE, fd, watch));
++}
++
++int Sysdeps<TimerfdCreate>::operator()(int clock, int flags, int *fd) {
++    long result = roanix_syscall2(
++        ROANIX_SYS_TIMERFD_CREATE, clock, flags);
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<TimerfdSettime>::operator()(
++        int fd,
++        int flags,
++        const struct itimerspec *value,
++        struct itimerspec *old_value) {
++    return syscall_error(roanix_syscall4(
++        ROANIX_SYS_TIMERFD_SETTIME,
++        fd,
++        flags,
++        as_word(value),
++        as_word(old_value)
++    ));
++}
++
++int Sysdeps<TimerfdGettime>::operator()(int fd, struct itimerspec *value) {
++    return syscall_error(roanix_syscall2(
++        ROANIX_SYS_TIMERFD_GETTIME, fd, as_word(value)));
 +}
 +
 +int Sysdeps<Sleep>::operator()(time_t *seconds, long *nanoseconds) {
@@ -842,6 +1021,51 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    return error;
 +}
 +
++int Sysdeps<Openpt>::operator()(int flags, int *fd) {
++    return sysdep<Open>("/dev/ptmx", flags, 0, fd);
++}
++
++int Sysdeps<Openpty>::operator()(
++        int *master_fd,
++        int *slave_fd,
++        char *name,
++        const struct termios *settings,
++        const struct winsize *window) {
++    int master;
++    int error = sysdep<Open>(
++        "/dev/ptmx", O_RDWR | O_NOCTTY, 0, &master);
++    if (error)
++        return error;
++
++    char path[32];
++    error = sysdep<Ptsname>(master, path, sizeof(path));
++    if (!error)
++        error = sysdep<Unlockpt>(master);
++
++    int slave = -1;
++    if (!error)
++        error = sysdep<Open>(path, O_RDWR | O_NOCTTY, 0, &slave);
++    if (!error && settings)
++        error = sysdep<Tcsetattr>(slave, TCSAFLUSH, settings);
++    if (!error && window)
++        error = sysdep<Tcsetwinsize>(slave, window);
++
++    if (error) {
++        if (slave >= 0)
++            sysdep<Close>(slave);
++        sysdep<Close>(master);
++        return error;
++    }
++
++    if (name) {
++        size_t length = strlen(path) + 1;
++        memcpy(name, path, length);
++    }
++    *master_fd = master;
++    *slave_fd = slave;
++    return 0;
++}
++
 +int Sysdeps<Ptsname>::operator()(int fd, char *buffer, size_t length) {
 +    unsigned int index;
 +    int result;
@@ -1021,7 +1245,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
 --- /dev/null
 +++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,129 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1064,6 +1288,13 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Kill,
 +    Sigaction,
 +    Sigprocmask,
++    ThreadSigmask,
++    Sigaltstack,
++    Sigpending,
++    Sigsuspend,
++    Sigtimedwait,
++    Pause,
++    SignalfdCreate,
 +    Chdir,
 +    GetCwd,
 +    Access,
@@ -1083,6 +1314,15 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Renameat,
 +    Pipe,
 +    Poll,
++    EpollCreate,
++    EpollCtl,
++    EpollPwait,
++    InotifyCreate,
++    InotifyAddWatch,
++    InotifyRmWatch,
++    TimerfdCreate,
++    TimerfdSettime,
++    TimerfdGettime,
 +    Sleep,
 +    GetGid,
 +    GetEgid,
@@ -1110,6 +1350,8 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Pselect,
 +    Isatty,
 +    Ioctl,
++    Openpt,
++    Openpty,
 +    Ptsname,
 +    Unlockpt,
 +    Tcgetattr,
@@ -1138,7 +1380,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
 --- /dev/null
 +++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,227 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1200,7 +1442,20 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +    ROANIX_SYS_FILE_FCHMODAT,
 +    ROANIX_SYS_FILE_RENAMEAT,
 +    ROANIX_SYS_FILE_LINKAT,
-+    ROANIX_SYS_FILE_SYMLINKAT
++    ROANIX_SYS_FILE_SYMLINKAT,
++    ROANIX_SYS_SIGNAL_ALTSTACK,
++    ROANIX_SYS_SIGNAL_PENDING,
++    ROANIX_SYS_SIGNAL_SUSPEND,
++    ROANIX_SYS_SIGNAL_TIMED_WAIT,
++    ROANIX_SYS_EPOLL_CREATE,
++    ROANIX_SYS_EPOLL_CTL,
++    ROANIX_SYS_EPOLL_WAIT,
++    ROANIX_SYS_INOTIFY_INIT,
++    ROANIX_SYS_INOTIFY_ADD,
++    ROANIX_SYS_INOTIFY_REMOVE,
++    ROANIX_SYS_TIMERFD_CREATE,
++    ROANIX_SYS_TIMERFD_SETTIME,
++    ROANIX_SYS_TIMERFD_GETTIME
 +};
 +
 +#define ROANIX_UTSNAME_FIELD_SIZE 65

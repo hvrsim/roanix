@@ -213,12 +213,7 @@ pub trait VnodeOps: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the initial byte offset for a new open file description.
-    fn initial_offset(
-        &self,
-        _vnode: &Vnode,
-        _file_context: usize,
-        _flags: u32,
-    ) -> Result<u64> {
+    fn initial_offset(&self, _vnode: &Vnode, _file_context: usize, _flags: u32) -> Result<u64> {
         Ok(0)
     }
 
@@ -330,9 +325,7 @@ pub trait VnodeOps: Any + Send + Sync {
         {
             supported |= PollEvents::IN | PollEvents::RDNORM;
         }
-        if flags.contains(super::file::OpenFlags::WRITE)
-            && vnode.kind() == VnodeKind::Regular
-        {
+        if flags.contains(super::file::OpenFlags::WRITE) && vnode.kind() == VnodeKind::Regular {
             supported |= PollEvents::OUT | PollEvents::WRNORM;
         }
         Ok(events & supported)
@@ -424,6 +417,14 @@ impl Vnode {
         self.inner.kind
     }
 
+    fn inotify_mask(&self, mask: u32) -> u32 {
+        mask | if self.kind() == VnodeKind::Directory {
+            crate::proc::inotify::IN_ISDIR
+        } else {
+            0
+        }
+    }
+
     /// Creates a non-owning vnode reference.
     pub fn downgrade(&self) -> VnodeWeak {
         VnodeWeak {
@@ -449,7 +450,14 @@ impl Vnode {
 
     /// Applies supported metadata changes.
     pub fn setattr(&self, attr: SetAttr) -> Result<()> {
-        self.inner.operations.setattr(self, attr)
+        self.inner.operations.setattr(self, attr)?;
+        crate::proc::inotify::notify(
+            self.key(),
+            self.inotify_mask(crate::proc::inotify::IN_ATTRIB),
+            0,
+            None,
+        );
+        Ok(())
     }
 
     /// Looks up one direct child.
@@ -464,17 +472,47 @@ impl Vnode {
 
     /// Creates a direct child.
     pub(super) fn create(&self, name: &[u8], kind: CreateKind, mode: u16) -> Result<Self> {
-        self.inner.operations.create(self, name, kind, mode)
+        let child = self.inner.operations.create(self, name, kind, mode)?;
+        let mask = crate::proc::inotify::IN_CREATE
+            | if child.kind() == VnodeKind::Directory {
+                crate::proc::inotify::IN_ISDIR
+            } else {
+                0
+            };
+        crate::proc::inotify::notify(self.key(), mask, 0, Some(name));
+        Ok(child)
     }
 
     /// Adds a hard link in this directory.
     pub(super) fn link(&self, name: &[u8], target: &Self) -> Result<()> {
-        self.inner.operations.link(self, name, target)
+        self.inner.operations.link(self, name, target)?;
+        crate::proc::inotify::notify(self.key(), crate::proc::inotify::IN_CREATE, 0, Some(name));
+        crate::proc::inotify::notify(target.key(), crate::proc::inotify::IN_ATTRIB, 0, None);
+        Ok(())
     }
 
     /// Removes one direct child.
     pub(super) fn unlink(&self, name: &[u8], remove_directory: bool) -> Result<()> {
-        self.inner.operations.unlink(self, name, remove_directory)
+        let target = self.lookup(name)?;
+        self.inner.operations.unlink(self, name, remove_directory)?;
+        let directory_flag = if target.kind() == VnodeKind::Directory {
+            crate::proc::inotify::IN_ISDIR
+        } else {
+            0
+        };
+        crate::proc::inotify::notify(
+            self.key(),
+            crate::proc::inotify::IN_DELETE | directory_flag,
+            0,
+            Some(name),
+        );
+        crate::proc::inotify::notify(
+            target.key(),
+            crate::proc::inotify::IN_DELETE_SELF | directory_flag,
+            0,
+            None,
+        );
+        Ok(())
     }
 
     /// Atomically renames a direct child.
@@ -484,14 +522,63 @@ impl Vnode {
         target_directory: &Self,
         target_name: &[u8],
     ) -> Result<()> {
+        let source = self.lookup(source_name)?;
+        let replaced = target_directory.lookup(target_name).ok();
         self.inner
             .operations
-            .rename(self, source_name, target_directory, target_name)
+            .rename(self, source_name, target_directory, target_name)?;
+        let cookie = crate::proc::inotify::next_cookie();
+        let directory_flag = if source.kind() == VnodeKind::Directory {
+            crate::proc::inotify::IN_ISDIR
+        } else {
+            0
+        };
+        crate::proc::inotify::notify(
+            self.key(),
+            crate::proc::inotify::IN_MOVED_FROM | directory_flag,
+            cookie,
+            Some(source_name),
+        );
+        crate::proc::inotify::notify(
+            target_directory.key(),
+            crate::proc::inotify::IN_MOVED_TO | directory_flag,
+            cookie,
+            Some(target_name),
+        );
+        crate::proc::inotify::notify(
+            source.key(),
+            crate::proc::inotify::IN_MOVE_SELF | directory_flag,
+            cookie,
+            None,
+        );
+        if let Some(replaced) = replaced.filter(|replaced| replaced.key() != source.key()) {
+            crate::proc::inotify::notify(
+                replaced.key(),
+                crate::proc::inotify::IN_DELETE_SELF
+                    | if replaced.kind() == VnodeKind::Directory {
+                        crate::proc::inotify::IN_ISDIR
+                    } else {
+                        0
+                    },
+                0,
+                None,
+            );
+        }
+        Ok(())
     }
 
     /// Reads bytes at an explicit offset.
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        self.inner.operations.read_at(self, offset, buffer)
+        let read = self.inner.operations.read_at(self, offset, buffer)?;
+        if read != 0 {
+            crate::proc::inotify::notify(
+                self.key(),
+                self.inotify_mask(crate::proc::inotify::IN_ACCESS),
+                0,
+                None,
+            );
+        }
+        Ok(read)
     }
 
     pub(crate) fn read_at_with_flags(
@@ -501,14 +588,33 @@ impl Vnode {
         buffer: &mut [u8],
         flags: u32,
     ) -> Result<usize> {
-        self.inner
-            .operations
-            .read_at_with_flags(self, file_context, offset, buffer, flags)
+        let read =
+            self.inner
+                .operations
+                .read_at_with_flags(self, file_context, offset, buffer, flags)?;
+        if read != 0 {
+            crate::proc::inotify::notify(
+                self.key(),
+                self.inotify_mask(crate::proc::inotify::IN_ACCESS),
+                0,
+                None,
+            );
+        }
+        Ok(read)
     }
 
     /// Writes bytes at an explicit offset.
     pub fn write_at(&self, offset: u64, buffer: &[u8]) -> Result<usize> {
-        self.inner.operations.write_at(self, offset, buffer)
+        let written = self.inner.operations.write_at(self, offset, buffer)?;
+        if written != 0 {
+            crate::proc::inotify::notify(
+                self.key(),
+                self.inotify_mask(crate::proc::inotify::IN_MODIFY),
+                0,
+                None,
+            );
+        }
+        Ok(written)
     }
 
     pub(crate) fn write_at_with_flags(
@@ -518,9 +624,19 @@ impl Vnode {
         buffer: &[u8],
         flags: u32,
     ) -> Result<usize> {
-        self.inner
-            .operations
-            .write_at_with_flags(self, file_context, offset, buffer, flags)
+        let written =
+            self.inner
+                .operations
+                .write_at_with_flags(self, file_context, offset, buffer, flags)?;
+        if written != 0 {
+            crate::proc::inotify::notify(
+                self.key(),
+                self.inotify_mask(crate::proc::inotify::IN_MODIFY),
+                0,
+                None,
+            );
+        }
+        Ok(written)
     }
 
     pub(crate) fn poll_with_flags(
@@ -537,12 +653,28 @@ impl Vnode {
 
     /// Atomically appends bytes.
     pub fn append(&self, buffer: &[u8]) -> Result<(usize, u64)> {
-        self.inner.operations.append(self, buffer)
+        let result = self.inner.operations.append(self, buffer)?;
+        if result.0 != 0 {
+            crate::proc::inotify::notify(
+                self.key(),
+                self.inotify_mask(crate::proc::inotify::IN_MODIFY),
+                0,
+                None,
+            );
+        }
+        Ok(result)
     }
 
     /// Changes file size.
     pub fn truncate(&self, size: u64) -> Result<()> {
-        self.inner.operations.truncate(self, size)
+        self.inner.operations.truncate(self, size)?;
+        crate::proc::inotify::notify(
+            self.key(),
+            self.inotify_mask(crate::proc::inotify::IN_MODIFY),
+            0,
+            None,
+        );
+        Ok(())
     }
 
     /// Returns this vnode's unified page-cache object.
@@ -552,12 +684,26 @@ impl Vnode {
 
     /// Reads a symbolic-link target.
     pub fn readlink(&self) -> Result<Box<[u8]>> {
-        self.inner.operations.readlink(self)
+        let target = self.inner.operations.readlink(self)?;
+        crate::proc::inotify::notify(
+            self.key(),
+            self.inotify_mask(crate::proc::inotify::IN_ACCESS),
+            0,
+            None,
+        );
+        Ok(target)
     }
 
     /// Reads a batch of directory entries.
     pub fn readdir(&self, cursor: u64, maximum: usize) -> Result<(Vec<DirEntry>, u64)> {
-        self.inner.operations.readdir(self, cursor, maximum)
+        let entries = self.inner.operations.readdir(self, cursor, maximum)?;
+        crate::proc::inotify::notify(
+            self.key(),
+            self.inotify_mask(crate::proc::inotify::IN_ACCESS),
+            0,
+            None,
+        );
+        Ok(entries)
     }
 
     /// Flushes vnode state.
@@ -580,11 +726,24 @@ impl Vnode {
     }
 
     pub(crate) fn open(&self, flags: u32) -> Result<usize> {
-        self.inner.operations.open(self, flags)
+        let context = self.inner.operations.open(self, flags)?;
+        crate::proc::inotify::notify(
+            self.key(),
+            self.inotify_mask(crate::proc::inotify::IN_OPEN),
+            0,
+            None,
+        );
+        Ok(context)
     }
 
     pub(crate) fn close(&self, file_context: usize, flags: u32) {
         self.inner.operations.close(self, file_context, flags);
+        let mask = if flags & (1 << 1) != 0 {
+            crate::proc::inotify::IN_CLOSE_WRITE
+        } else {
+            crate::proc::inotify::IN_CLOSE_NOWRITE
+        };
+        crate::proc::inotify::notify(self.key(), self.inotify_mask(mask), 0, None);
     }
 
     /// Downcasts filesystem-private vnode operations.

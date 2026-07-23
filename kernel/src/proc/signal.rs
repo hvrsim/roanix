@@ -5,17 +5,21 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    mem::{MaybeUninit, offset_of, size_of},
+    mem::{offset_of, size_of, MaybeUninit},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use crate::{
     arch::cpu::TrapFrame,
     fs::PollEvents,
-    mem::{USER_ADDRESS_MIN, VirtAddr},
+    mem::{VirtAddr, USER_ADDRESS_MAX, USER_ADDRESS_MIN},
     proc::{Descriptor, Error, Process, Result},
-    sys::{event::Event, sched, sync::Mutex},
-    syscall::{Errno, Result as SyscallResult, current_process, map_memory_error, raw_result},
+    sys::{clock, event::Event, sched, sync::Mutex},
+    syscall::{
+        current_process, map_memory_error, raw_result, read_user_timespec, Errno,
+        Result as SyscallResult,
+    },
 };
 
 const SIGNAL_MAX: usize = 64;
@@ -61,9 +65,13 @@ const SUPPORTED_ACTION_FLAGS: u64 = SA_NOCLDSTOP
 
 const SFD_NONBLOCK: u64 = 0o4000;
 const SFD_CLOEXEC: u64 = 0o2000000;
+const SS_ONSTACK: i32 = 1;
+const SS_DISABLE: i32 = 2;
+const MINSIGSTKSZ: u64 = 2048;
 const SIGNALFD_RECORD_SIZE: usize = 128;
 const USER_SIGSET_SIZE: usize = 128;
 const USER_SIGACTION_SIZE: usize = 24 + USER_SIGSET_SIZE;
+const USER_STACK_SIZE: usize = 24;
 const SIGNAL_FRAME_MAGIC: u64 = 0x524f_414e_5349_4746;
 const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 128;
@@ -110,10 +118,24 @@ struct SignalInfo {
     synchronous: bool,
 }
 
+enum SignalWait {
+    Ready(SignalInfo),
+    Interrupted,
+    Sleep,
+}
+
+#[derive(Clone, Copy)]
+struct SignalStack {
+    pointer: u64,
+    size: u64,
+}
+
 struct SignalState {
     actions: [SignalAction; SIGNAL_MAX + 1],
     pending: VecDeque<SignalInfo>,
     mask: u64,
+    alt_stack: Option<SignalStack>,
+    suspend_restore_mask: Option<u64>,
     stopped: Option<(usize, u64)>,
 }
 
@@ -145,6 +167,8 @@ impl SignalManager {
                 actions: [SignalAction::DEFAULT; SIGNAL_MAX + 1],
                 pending: VecDeque::new(),
                 mask: 0,
+                alt_stack: None,
+                suspend_restore_mask: None,
                 stopped: None,
             }),
             event: Event::new(),
@@ -158,6 +182,8 @@ impl SignalManager {
                 actions: parent.actions,
                 pending: VecDeque::new(),
                 mask: parent.mask,
+                alt_stack: parent.alt_stack,
+                suspend_restore_mask: None,
                 stopped: None,
             }),
             event: Event::new(),
@@ -171,6 +197,8 @@ impl SignalManager {
                 *action = SignalAction::DEFAULT;
             }
         }
+        state.alt_stack = None;
+        state.suspend_restore_mask = None;
         state.stopped = None;
     }
 
@@ -205,6 +233,75 @@ impl SignalManager {
 
     fn restore_mask(&self, mask: u64) {
         self.state.lock().mask = mask & !unblockable_mask();
+    }
+
+    fn pending_mask(&self) -> u64 {
+        self.state
+            .lock()
+            .pending
+            .iter()
+            .fold(0, |mask, info| mask | signal_bit(info.signal))
+    }
+
+    fn alt_stack(&self) -> Option<SignalStack> {
+        self.state.lock().alt_stack
+    }
+
+    fn replace_alt_stack(&self, stack: Option<SignalStack>) {
+        self.state.lock().alt_stack = stack;
+    }
+
+    fn begin_suspend(&self, mask: u64) {
+        let mut state = self.state.lock();
+        if state.suspend_restore_mask.is_none() {
+            state.suspend_restore_mask = Some(state.mask);
+        }
+        state.mask = mask & !unblockable_mask();
+    }
+
+    fn take_suspend_restore_mask(&self) -> Option<u64> {
+        self.state.lock().suspend_restore_mask.take()
+    }
+
+    fn prepare_interrupt_wait(&self) -> bool {
+        let state = self.state.lock();
+        if state
+            .pending
+            .iter()
+            .any(|info| interrupts_suspend(&state, info))
+        {
+            return true;
+        }
+        self.event.reset();
+        false
+    }
+
+    fn prepare_signal_wait(&self, waited: u64) -> SignalWait {
+        let mut state = self.state.lock();
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|info| waited & signal_bit(info.signal) != 0)
+        {
+            let info = state
+                .pending
+                .remove(index)
+                .expect("signal: selected waited signal vanished");
+            if state.pending.is_empty() {
+                self.event.reset();
+            }
+            return SignalWait::Ready(info);
+        }
+        if state.pending.iter().any(|info| {
+            info.synchronous
+                || info.signal == SIGKILL
+                || info.signal == SIGSTOP
+                || state.mask & signal_bit(info.signal) == 0
+        }) {
+            return SignalWait::Interrupted;
+        }
+        self.event.reset();
+        SignalWait::Sleep
     }
 
     fn enqueue(&self, info: SignalInfo) {
@@ -439,6 +536,9 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
 
     loop {
         let Some(info) = process.signals.take_deliverable() else {
+            if let Some(mask) = process.signals.take_suspend_restore_mask() {
+                process.signals.restore_mask(mask);
+            }
             return;
         };
         let signal = info.signal;
@@ -463,8 +563,12 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
             super::exit_current_signal(signal);
         }
 
-        let old_mask = process.signals.mask();
-        let mut next_mask = old_mask | action.mask;
+        let active_mask = process.signals.mask();
+        let restore_mask = process
+            .signals
+            .take_suspend_restore_mask()
+            .unwrap_or(active_mask);
+        let mut next_mask = active_mask | action.mask;
         if action.flags & SA_NODEFER == 0 {
             next_mask |= signal_bit(signal);
         }
@@ -476,12 +580,22 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
 
         let signal_frame = UserSignalFrame {
             magic: SIGNAL_FRAME_MAGIC,
-            old_mask,
+            old_mask: restore_mask,
             saved: *frame,
             info: siginfo(info),
         };
+        let stack = if action.flags & SA_ONSTACK != 0 {
+            process
+                .signals
+                .alt_stack()
+                .filter(|stack| !stack_contains(*stack, frame.user_stack()))
+                .and_then(|stack| stack.pointer.checked_add(stack.size))
+                .unwrap_or_else(|| frame.user_stack())
+        } else {
+            frame.user_stack()
+        };
         let Some((frame_address, handler_stack, return_slot)) =
-            signal_frame_addresses(frame.user_stack(), size_of::<UserSignalFrame>() as u64)
+            signal_frame_addresses(stack, size_of::<UserSignalFrame>() as u64)
         else {
             super::exit_current_signal(SIGSEGV);
         };
@@ -597,6 +711,120 @@ crate::syscall_handler! {
     }
 }
 
+crate::syscall_handler! {
+    syscall_signal_altstack(frame, new_stack: u64 = 0, old_stack: u64 = 1) {
+        let process = current_process()?;
+        let current = process.signals.alt_stack();
+        let on_stack = current.is_some_and(|stack| stack_contains(stack, frame.user_stack()));
+        if old_stack != 0 {
+            write_user_stack(&process, old_stack, current, on_stack)?;
+        }
+        if new_stack != 0 {
+            if on_stack {
+                return Err(Errno::Permission);
+            }
+            let (pointer, flags, size) = read_user_stack(&process, new_stack)?;
+            match flags {
+                SS_DISABLE => process.signals.replace_alt_stack(None),
+                0 => {
+                    let end = pointer.checked_add(size).ok_or(Errno::OutOfMemory)?;
+                    if pointer < USER_ADDRESS_MIN
+                        || end > USER_ADDRESS_MAX
+                        || size < MINSIGSTKSZ
+                    {
+                        return Err(Errno::OutOfMemory);
+                    }
+                    process
+                        .signals
+                        .replace_alt_stack(Some(SignalStack { pointer, size }));
+                }
+                _ => return Err(Errno::Invalid),
+            }
+        }
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_signal_pending(_frame, output: u64 = 0) {
+        let process = current_process()?;
+        write_user_mask(&process, output, process.signals.pending_mask())?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_signal_suspend(_frame, mask: u64 = 0) {
+        let process = current_process()?;
+        process
+            .signals
+            .begin_suspend(read_user_mask(&process, mask)?);
+        loop {
+            if process.signals.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            process.signals.event.wait();
+        }
+    }
+}
+
+crate::syscall_handler! {
+    syscall_signal_timed_wait(
+        _frame,
+        mask: u64 = 0,
+        info: u64 = 1,
+        timeout: u64 = 2,
+    ) {
+        let process = current_process()?;
+        let mask = read_user_mask(&process, mask)? & !unblockable_mask();
+        if mask == 0 {
+            return Err(Errno::Invalid);
+        }
+        let timeout = if timeout == 0 {
+            None
+        } else {
+            Some(read_user_timespec(&process, timeout)?)
+        };
+        let signal = wait_for_matching_signal(&process, mask, timeout)?;
+        if info != 0 {
+            write_user_signal_info(&process, info, signal)?;
+        }
+        Ok(u64::from(signal.signal))
+    }
+}
+
+fn wait_for_matching_signal(
+    process: &Process,
+    mask: u64,
+    timeout: Option<Duration>,
+) -> SyscallResult<SignalInfo> {
+    let deadline = timeout.map(|duration| {
+        let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        clock::monotonic_ns().saturating_add(nanoseconds)
+    });
+
+    loop {
+        match process.signals.prepare_signal_wait(mask) {
+            SignalWait::Ready(info) => return Ok(info),
+            SignalWait::Interrupted => return Err(Errno::Interrupted),
+            SignalWait::Sleep => {}
+        }
+
+        let remaining = deadline.map(|deadline| deadline.saturating_sub(clock::monotonic_ns()));
+        if remaining == Some(0) {
+            return Err(Errno::TryAgain);
+        }
+        match remaining {
+            Some(nanoseconds) => {
+                if !clock::wait_timeout(&process.signals.event, Duration::from_nanos(nanoseconds)) {
+                    return Err(Errno::TryAgain);
+                }
+            }
+            None => process.signals.event.wait(),
+        }
+    }
+}
+
 fn restore_signal_frame(frame: &mut TrapFrame) -> SyscallResult<i64> {
     let process = current_process()?;
     let signal_frame = read_signal_frame(&process, frame.user_stack())?;
@@ -651,6 +879,50 @@ fn write_user_mask(process: &Process, address: u64, mask: u64) -> SyscallResult<
     process
         .address_space()
         .write_user(VirtAddr::new(address), &bytes)
+        .map_err(map_memory_error)
+}
+
+fn read_user_stack(process: &Process, address: u64) -> SyscallResult<(u64, i32, u64)> {
+    let mut bytes = [0u8; USER_STACK_SIZE];
+    process
+        .address_space()
+        .read_user(VirtAddr::new(address), &mut bytes)
+        .map_err(map_memory_error)?;
+    Ok((
+        u64::from_ne_bytes(bytes[..8].try_into().expect("stack pointer width")),
+        i32::from_ne_bytes(bytes[8..12].try_into().expect("stack flags width")),
+        u64::from_ne_bytes(bytes[16..24].try_into().expect("stack size width")),
+    ))
+}
+
+fn write_user_stack(
+    process: &Process,
+    address: u64,
+    stack: Option<SignalStack>,
+    on_stack: bool,
+) -> SyscallResult<()> {
+    let mut bytes = [0u8; USER_STACK_SIZE];
+    let (pointer, flags, size) = match stack {
+        Some(stack) => (
+            stack.pointer,
+            if on_stack { SS_ONSTACK } else { 0 },
+            stack.size,
+        ),
+        None => (0, SS_DISABLE, 0),
+    };
+    bytes[..8].copy_from_slice(&pointer.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&flags.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&size.to_ne_bytes());
+    process
+        .address_space()
+        .write_user(VirtAddr::new(address), &bytes)
+        .map_err(map_memory_error)
+}
+
+fn write_user_signal_info(process: &Process, address: u64, info: SignalInfo) -> SyscallResult<()> {
+    process
+        .address_space()
+        .write_user(VirtAddr::new(address), &siginfo(info))
         .map_err(map_memory_error)
 }
 
@@ -742,6 +1014,25 @@ fn signalfd_info(info: SignalInfo) -> [u8; SIGNALFD_RECORD_SIZE] {
     let mut record = [0u8; SIGNALFD_RECORD_SIZE];
     encode_signalfd_info(&mut record, info);
     record
+}
+
+fn stack_contains(stack: SignalStack, pointer: u64) -> bool {
+    stack
+        .pointer
+        .checked_add(stack.size)
+        .is_some_and(|end| (stack.pointer..end).contains(&pointer))
+}
+
+fn interrupts_suspend(state: &SignalState, info: &SignalInfo) -> bool {
+    if !info.synchronous
+        && info.signal != SIGKILL
+        && info.signal != SIGSTOP
+        && state.mask & signal_bit(info.signal) != 0
+    {
+        return false;
+    }
+    let action = state.actions[info.signal as usize];
+    action.handler != SIG_IGN && !(action.handler == SIG_DFL && default_ignored(info.signal))
 }
 
 #[cfg(target_arch = "x86_64")]

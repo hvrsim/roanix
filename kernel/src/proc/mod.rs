@@ -1,9 +1,12 @@
 //! Process ownership and executable startup.
 
 mod elf;
+pub(crate) mod epoll;
+pub(crate) mod inotify;
 mod pipe;
 pub(crate) mod signal;
 pub(crate) mod syscall;
+pub(crate) mod timerfd;
 
 use alloc::{
     collections::BTreeMap,
@@ -21,7 +24,7 @@ use log::info;
 
 use crate::{
     arch::cpu::TrapFrame,
-    fs::{FileRef, IoctlContext, PathAnchor, VnodeKey, VnodeKind},
+    fs::{FileRef, IoctlContext, PathAnchor, PollEvents, VnodeKey, VnodeKind},
     mem::{self, VmSpace, USER_ADDRESS_MAX},
     sys::{
         event::Event,
@@ -32,7 +35,10 @@ use crate::{
 };
 
 pub(crate) use pipe::{PipeEnd, PipeError};
+pub(crate) use epoll::Epoll;
+pub(crate) use inotify::Inotify;
 pub(crate) use signal::SignalFd;
+pub(crate) use timerfd::TimerFd;
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 static PROCESSES: Once<Mutex<ProcessRegistry>> = Once::new();
@@ -104,6 +110,61 @@ pub(crate) enum Descriptor {
     Pipe(Arc<PipeEnd>),
     /// Pending-signal stream.
     SignalFd(Arc<SignalFd>),
+    /// Set of descriptor readiness watches.
+    Epoll(Arc<Epoll>),
+    /// Filesystem notification queue.
+    Inotify(Arc<Inotify>),
+    /// Clock expiration counter.
+    TimerFd(Arc<TimerFd>),
+}
+
+/// Stable identity of one open descriptor description.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DescriptorKey {
+    kind: u8,
+    pointer: usize,
+}
+
+impl Descriptor {
+    pub(crate) fn key(&self) -> DescriptorKey {
+        match self {
+            Self::File(value) => DescriptorKey {
+                kind: 0,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+            Self::Pipe(value) => DescriptorKey {
+                kind: 1,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+            Self::SignalFd(value) => DescriptorKey {
+                kind: 2,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+            Self::Epoll(value) => DescriptorKey {
+                kind: 3,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+            Self::Inotify(value) => DescriptorKey {
+                kind: 4,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+            Self::TimerFd(value) => DescriptorKey {
+                kind: 5,
+                pointer: Arc::as_ptr(value) as usize,
+            },
+        }
+    }
+
+    pub(crate) fn poll(&self, requested: PollEvents) -> PollEvents {
+        match self {
+            Self::File(file) => file.poll(requested).unwrap_or(PollEvents::ERR),
+            Self::Pipe(pipe) => pipe.poll(requested),
+            Self::SignalFd(signal_fd) => signal_fd.poll(requested),
+            Self::Epoll(epoll) => epoll.poll(requested),
+            Self::Inotify(inotify) => inotify.poll(requested),
+            Self::TimerFd(timer) => timer.poll(requested),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -329,6 +390,14 @@ impl Process {
             .get(index)?
             .as_ref()
             .map(|entry| entry.descriptor.clone())
+    }
+
+    /// Returns whether this process still owns a descriptor description.
+    pub(crate) fn contains_descriptor(&self, key: DescriptorKey) -> bool {
+        self.files.lock().iter().any(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| entry.descriptor.key() == key)
+        })
     }
 
     /// Duplicates `fd` into the first slot at or above `minimum`.

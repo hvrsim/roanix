@@ -66,7 +66,7 @@ struct UserPollFd {
 enum AtPath {
     Vfs { base: PathAnchor, path: String },
     Pipe,
-    SignalFd,
+    Anonymous,
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +119,9 @@ crate::syscall_handler! {
             Descriptor::File(file) => file.read(&mut bytes).map_err(map_fs_error)?,
             Descriptor::Pipe(pipe) => pipe.read(&mut bytes).map_err(map_pipe_error)?,
             Descriptor::SignalFd(signal_fd) => signal_fd.read(&mut bytes)?,
+            Descriptor::Epoll(_) => return Err(Errno::BadFileDescriptor),
+            Descriptor::Inotify(inotify) => inotify.read(&mut bytes)?,
+            Descriptor::TimerFd(timer) => timer.read(&mut bytes)?,
         };
         process
             .address_space()
@@ -143,7 +146,12 @@ crate::syscall_handler! {
         let written = match process.descriptor(fd).ok_or(Errno::BadFileDescriptor)? {
             Descriptor::File(file) => file.write(&bytes).map_err(map_fs_error)?,
             Descriptor::Pipe(pipe) => pipe.write(&bytes).map_err(map_pipe_error)?,
-            Descriptor::SignalFd(_) => return Err(Errno::BadFileDescriptor),
+            Descriptor::SignalFd(_)
+            | Descriptor::Epoll(_)
+            | Descriptor::Inotify(_)
+            | Descriptor::TimerFd(_) => {
+                return Err(Errno::BadFileDescriptor);
+            }
         };
         Ok(written as u64)
     }
@@ -327,6 +335,9 @@ crate::syscall_handler! {
             Descriptor::SignalFd(_) => {
                 write_user_stat_values(&process, output, 0, 0, 0o600, 1, 1, 0)
             }
+            Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) => {
+                write_user_stat_values(&process, output, 0, 0, 0o600, 1, 1, 0)
+            }
         }
     }
 }
@@ -367,6 +378,21 @@ crate::syscall_handler! {
                         0
                     })
                 }
+                Descriptor::Epoll(_) => Ok(0),
+                Descriptor::Inotify(inotify) => {
+                    Ok(if inotify.is_nonblocking() {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    })
+                }
+                Descriptor::TimerFd(timer) => {
+                    Ok(if timer.is_nonblocking() {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    })
+                }
             },
             F_SETFL => {
                 if argument & !(O_ACCMODE | O_APPEND | O_NONBLOCK) != 0 {
@@ -379,6 +405,13 @@ crate::syscall_handler! {
                     Descriptor::Pipe(pipe) => pipe.set_nonblocking(argument & O_NONBLOCK != 0),
                     Descriptor::SignalFd(signal_fd) => {
                         signal_fd.set_nonblocking(argument & O_NONBLOCK != 0)
+                    }
+                    Descriptor::Epoll(_) => {}
+                    Descriptor::Inotify(inotify) => {
+                        inotify.set_nonblocking(argument & O_NONBLOCK != 0)
+                    }
+                    Descriptor::TimerFd(timer) => {
+                        timer.set_nonblocking(argument & O_NONBLOCK != 0)
                     }
                 }
                 Ok(0)
@@ -629,6 +662,9 @@ crate::syscall_handler! {
                     }
                     Some(Descriptor::Pipe(pipe)) => pipe.poll(requested),
                     Some(Descriptor::SignalFd(signal_fd)) => signal_fd.poll(requested),
+                    Some(Descriptor::Epoll(epoll)) => epoll.poll(requested),
+                    Some(Descriptor::Inotify(inotify)) => inotify.poll(requested),
+                    Some(Descriptor::TimerFd(timer)) => timer.poll(requested),
                     None => PollEvents::NVAL,
                 };
                 entry.revents = events.bits() as i16;
@@ -705,7 +741,7 @@ fn file_access_at(process: &Process, dirfd: i32, path: u64, mode: u64, flags: u6
                 .mode
         }
         AtPath::Pipe => 0o666,
-        AtPath::SignalFd => 0o600,
+        AtPath::Anonymous => 0o600,
     };
     check_access(mode_bits, mode)?;
     Ok(0)
@@ -726,7 +762,7 @@ fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u6
             write_user_stat(process, output, vnode.getattr().map_err(map_fs_error)?)
         }
         AtPath::Pipe => write_user_stat_values(process, output, 0, 0, 0o666, 6, 1, 0),
-        AtPath::SignalFd => write_user_stat_values(process, output, 0, 0, 0o600, 1, 1, 0),
+        AtPath::Anonymous => write_user_stat_values(process, output, 0, 0, 0o600, 1, 1, 0),
     }
 }
 
@@ -915,10 +951,23 @@ fn resolve_at_path(
         Descriptor::Pipe(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
         Descriptor::Pipe(_) => Err(Errno::NotDirectory),
         Descriptor::SignalFd(_) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
-            Ok(AtPath::SignalFd)
+            Ok(AtPath::Anonymous)
         }
         Descriptor::SignalFd(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
         Descriptor::SignalFd(_) => Err(Errno::NotDirectory),
+        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_)
+            if path.is_empty() && matches!(empty, EmptyPath::AllowAny) =>
+        {
+            Ok(AtPath::Anonymous)
+        }
+        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_)
+            if path.is_empty() =>
+        {
+            Err(Errno::BadFileDescriptor)
+        }
+        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) => {
+            Err(Errno::NotDirectory)
+        }
     }
 }
 
