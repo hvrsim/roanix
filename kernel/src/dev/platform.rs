@@ -31,6 +31,8 @@ const CONSOLE_FEATURE_RAW: u32 = 1 << 1;
 const CONSOLE_FEATURE_TERMIOS: u32 = 1 << 2;
 const CONSOLE_FEATURE_WINSIZE: u32 = 1 << 3;
 const CONSOLE_FEATURE_FLOW_CONTROL: u32 = 1 << 4;
+const CONSOLE_FEATURE_JOB_CONTROL: u32 = 1 << 5;
+const CONSOLE_FEATURE_EVENT_IO: u32 = 1 << 6;
 
 /// Registered platform bus handles.
 #[derive(Copy, Clone)]
@@ -117,6 +119,8 @@ fn console_capability() -> Arc<[u8]> {
         | CONSOLE_FEATURE_RAW
         | CONSOLE_FEATURE_TERMIOS
         | CONSOLE_FEATURE_WINSIZE
-        | CONSOLE_FEATURE_FLOW_CONTROL;
+        | CONSOLE_FEATURE_FLOW_CONTROL
+        | CONSOLE_FEATURE_JOB_CONTROL
+        | CONSOLE_FEATURE_EVENT_IO;
     Arc::from(features.to_le_bytes())
 }

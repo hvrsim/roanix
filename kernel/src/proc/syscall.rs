@@ -222,6 +222,25 @@ crate::syscall_handler! {
     }
 }
 
+crate::syscall_handler! {
+    syscall_thread_create(
+        _frame,
+        entry: u64 = 0,
+        stack: u64 = 1,
+        thread_pointer: u64 = 2,
+    ) {
+        proc::create_thread(entry, stack, thread_pointer)
+            .map(|tid| tid as u64)
+            .map_err(map_process_error)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_thread_exit(_frame) -> ! {
+        proc::exit_current_thread()
+    }
+}
+
 fn futexes() -> &'static Mutex<BTreeMap<FutexKey, Arc<Futex>>> {
     FUTEXES.call_once(|| Mutex::new(BTreeMap::new()))
 }

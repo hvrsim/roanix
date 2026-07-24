@@ -10,7 +10,7 @@ use crate::{
     },
     mem::VirtAddr,
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
-    sys::clock,
+    sys::{clock, event::Event},
     syscall::{
         Errno, Result, current_process, map_fs_error, map_memory_error, map_process_error,
         read_user_string,
@@ -19,6 +19,7 @@ use crate::{
 
 const MAX_IO_SIZE: usize = 16 * 1024 * 1024;
 const MAX_IOCTL_SIZE: usize = 4096;
+const STACK_IO_SIZE: usize = 4096;
 
 const O_ACCMODE: u64 = 0o3;
 const O_WRONLY: u64 = 0o1;
@@ -43,6 +44,7 @@ const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 const PIPE_CLOEXEC: u64 = O_CLOEXEC;
+const PIPE_NONBLOCK: u64 = O_NONBLOCK;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
@@ -114,19 +116,23 @@ crate::syscall_handler! {
         }
         let process = current_process()?;
         let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
-        let mut bytes = vec![0u8; size];
-        let read = match descriptor {
-            Descriptor::File(file) => file.read(&mut bytes).map_err(map_fs_error)?,
-            Descriptor::Pipe(pipe) => pipe.read(&mut bytes).map_err(map_pipe_error)?,
-            Descriptor::SignalFd(signal_fd) => signal_fd.read(&mut bytes)?,
-            Descriptor::Epoll(_) => return Err(Errno::BadFileDescriptor),
-            Descriptor::Inotify(inotify) => inotify.read(&mut bytes)?,
-            Descriptor::TimerFd(timer) => timer.read(&mut bytes)?,
+        check_terminal_job_control(&process, &descriptor, false)?;
+        let address_space = process.address_space();
+        let read = if size <= STACK_IO_SIZE {
+            let mut bytes = [0u8; STACK_IO_SIZE];
+            let read = descriptor_read(&descriptor, &mut bytes[..size])?;
+            address_space
+                .write_user(VirtAddr::new(buffer), &bytes[..read])
+                .map_err(map_memory_error)?;
+            read
+        } else {
+            let mut bytes = vec![0u8; size];
+            let read = descriptor_read(&descriptor, &mut bytes)?;
+            address_space
+                .write_user(VirtAddr::new(buffer), &bytes[..read])
+                .map_err(map_memory_error)?;
+            read
         };
-        process
-            .address_space()
-            .write_user(VirtAddr::new(buffer), &bytes[..read])
-            .map_err(map_memory_error)?;
         Ok(read as u64)
     }
 }
@@ -138,20 +144,21 @@ crate::syscall_handler! {
             return Ok(0);
         }
         let process = current_process()?;
-        let mut bytes = vec![0u8; size];
-        process
-            .address_space()
-            .read_user(VirtAddr::new(buffer), &mut bytes)
-            .map_err(map_memory_error)?;
-        let written = match process.descriptor(fd).ok_or(Errno::BadFileDescriptor)? {
-            Descriptor::File(file) => file.write(&bytes).map_err(map_fs_error)?,
-            Descriptor::Pipe(pipe) => pipe.write(&bytes).map_err(map_pipe_error)?,
-            Descriptor::SignalFd(_)
-            | Descriptor::Epoll(_)
-            | Descriptor::Inotify(_)
-            | Descriptor::TimerFd(_) => {
-                return Err(Errno::BadFileDescriptor);
-            }
+        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+        check_terminal_job_control(&process, &descriptor, true)?;
+        let address_space = process.address_space();
+        let written = if size <= STACK_IO_SIZE {
+            let mut bytes = [0u8; STACK_IO_SIZE];
+            address_space
+                .read_user(VirtAddr::new(buffer), &mut bytes[..size])
+                .map_err(map_memory_error)?;
+            descriptor_write(&descriptor, &bytes[..size])?
+        } else {
+            let mut bytes = vec![0u8; size];
+            address_space
+                .read_user(VirtAddr::new(buffer), &mut bytes)
+                .map_err(map_memory_error)?;
+            descriptor_write(&descriptor, &bytes)?
         };
         Ok(written as u64)
     }
@@ -199,13 +206,13 @@ crate::syscall_handler! {
             if group <= 0 || !proc::process_group_in_session(group as usize, process.session()) {
                 return Err(Errno::Permission);
             }
-            if request == crate::dev::console::TIOCSCTTY
-                && process
-                    .controlling_tty_key()
-                    .is_some_and(|key| key != file.vnode().key())
-            {
-                return Err(Errno::Access);
-            }
+        }
+        if request == crate::dev::console::TIOCSCTTY
+            && process
+                .controlling_tty_key()
+                .is_some_and(|key| key != file.vnode().key())
+        {
+            return Err(Errno::Access);
         }
         let result = file
             .ioctl(ioctl_context(&process)?, request, argument, &mut bytes)
@@ -423,12 +430,16 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_pipe(_frame, output: u64 = 0, flags: u64 = 1) {
-        if flags & !PIPE_CLOEXEC != 0 {
+        if flags & !(PIPE_CLOEXEC | PIPE_NONBLOCK) != 0 {
             return Err(Errno::Invalid);
         }
         let process = current_process()?;
         let close_on_exec = flags & PIPE_CLOEXEC != 0;
         let (reader, writer) = PipeEnd::pair();
+        if flags & PIPE_NONBLOCK != 0 {
+            reader.set_nonblocking(true);
+            writer.set_nonblocking(true);
+        }
         let read_fd = process
             .install_descriptor_value(Descriptor::Pipe(reader), close_on_exec)
             .map_err(map_process_error)?;
@@ -650,23 +661,20 @@ crate::syscall_handler! {
 
         loop {
             let mut ready = 0usize;
+            let mut descriptors = Vec::with_capacity(entries.len());
             for entry in &mut entries {
                 entry.revents = 0;
                 if entry.fd < 0 {
+                    descriptors.push(None);
                     continue;
                 }
                 let requested = PollEvents::from_bits_retain(entry.events as u16);
-                let events = match process.descriptor(entry.fd) {
-                    Some(Descriptor::File(file)) => {
-                        file.poll(requested).unwrap_or(PollEvents::ERR)
-                    }
-                    Some(Descriptor::Pipe(pipe)) => pipe.poll(requested),
-                    Some(Descriptor::SignalFd(signal_fd)) => signal_fd.poll(requested),
-                    Some(Descriptor::Epoll(epoll)) => epoll.poll(requested),
-                    Some(Descriptor::Inotify(inotify)) => inotify.poll(requested),
-                    Some(Descriptor::TimerFd(timer)) => timer.poll(requested),
+                let descriptor = process.descriptor(entry.fd);
+                let events = match &descriptor {
+                    Some(descriptor) => descriptor.poll(requested),
                     None => PollEvents::NVAL,
                 };
+                descriptors.push(descriptor);
                 entry.revents = events.bits() as i16;
                 if !events.is_empty() {
                     ready += 1;
@@ -689,10 +697,39 @@ crate::syscall_handler! {
                 return Ok(ready as u64);
             }
 
-            let sleep_ns = deadline
-                .map(|value| value.saturating_sub(now).min(POLL_INTERVAL_NS))
-                .unwrap_or(POLL_INTERVAL_NS);
-            clock::sleep(Duration::from_nanos(sleep_ns));
+            let mut wait_events = Vec::<&Event>::new();
+            let mut event_driven = true;
+            for (entry, descriptor) in entries.iter().zip(&descriptors) {
+                if entry.fd < 0 {
+                    continue;
+                }
+                let Some(descriptor) = descriptor else {
+                    continue;
+                };
+                let requested = PollEvents::from_bits_retain(entry.events as u16)
+                    | PollEvents::ERR
+                    | PollEvents::HUP;
+                event_driven &= descriptor.poll_events(requested, &mut wait_events);
+            }
+            wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
+            wait_events.dedup_by_key(|event| *event as *const Event as usize);
+
+            if event_driven && !wait_events.is_empty() {
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_sub(now).max(1);
+                    let _ = clock::wait_any_timeout(
+                        &wait_events,
+                        Duration::from_nanos(remaining),
+                    );
+                } else {
+                    Event::wait_any(&wait_events);
+                }
+            } else {
+                let sleep_ns = deadline
+                    .map(|value| value.saturating_sub(now).min(POLL_INTERVAL_NS))
+                    .unwrap_or(POLL_INTERVAL_NS);
+                clock::sleep(Duration::from_nanos(sleep_ns));
+            }
         }
     }
 }
@@ -1122,6 +1159,60 @@ fn open_flags_to_user(flags: OpenFlags) -> u64 {
     result
 }
 
+fn descriptor_read(descriptor: &Descriptor, buffer: &mut [u8]) -> Result<usize> {
+    match descriptor {
+        Descriptor::File(file) => file.read(buffer).map_err(map_fs_error),
+        Descriptor::Pipe(pipe) => pipe.read(buffer).map_err(map_pipe_error),
+        Descriptor::SignalFd(signal_fd) => signal_fd.read(buffer),
+        Descriptor::Epoll(_) => Err(Errno::BadFileDescriptor),
+        Descriptor::Inotify(inotify) => inotify.read(buffer),
+        Descriptor::TimerFd(timer) => timer.read(buffer),
+    }
+}
+
+fn descriptor_write(descriptor: &Descriptor, buffer: &[u8]) -> Result<usize> {
+    match descriptor {
+        Descriptor::File(file) => file.write(buffer).map_err(map_fs_error),
+        Descriptor::Pipe(pipe) => pipe.write(buffer).map_err(map_pipe_error),
+        Descriptor::SignalFd(_)
+        | Descriptor::Epoll(_)
+        | Descriptor::Inotify(_)
+        | Descriptor::TimerFd(_) => Err(Errno::BadFileDescriptor),
+    }
+}
+
+fn check_terminal_job_control(
+    process: &Process,
+    descriptor: &Descriptor,
+    writing: bool,
+) -> Result<()> {
+    let Descriptor::File(file) = descriptor else {
+        return Ok(());
+    };
+    if process.controlling_tty_key() != Some(file.vnode().key()) {
+        return Ok(());
+    }
+    let Some(terminal) = file.terminal_state() else {
+        return Ok(());
+    };
+    if terminal.session <= 0
+        || terminal.session as usize != process.session()
+        || terminal.foreground_group <= 0
+        || terminal.foreground_group as usize == process.process_group()
+        || writing && !terminal.stop_background_output
+    {
+        return Ok(());
+    }
+
+    let signal = if writing {
+        proc::signal::SIGTTOU
+    } else {
+        proc::signal::SIGTTIN
+    };
+    proc::signal::send_kernel_process_group(process.process_group(), signal);
+    Err(Errno::Interrupted)
+}
+
 fn checked_io_size(size: u64) -> Result<usize> {
     let size = usize::try_from(size).map_err(|_| Errno::Overflow)?;
     if size > MAX_IO_SIZE {
@@ -1134,6 +1225,11 @@ fn map_pipe_error(error: PipeError) -> Errno {
     match error {
         PipeError::BadDescriptor => Errno::BadFileDescriptor,
         PipeError::TryAgain => Errno::TryAgain,
-        PipeError::BrokenPipe => Errno::BrokenPipe,
+        PipeError::BrokenPipe => {
+            if let Some(process) = proc::current() {
+                proc::signal::send_kernel(&process, proc::signal::SIGPIPE);
+            }
+            Errno::BrokenPipe
+        }
     }
 }

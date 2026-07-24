@@ -13,7 +13,7 @@ use core::{
 
 use bitflags::bitflags;
 
-use crate::mem::VmObject;
+use crate::{mem::VmObject, sys::event::Event};
 
 use super::error::{Error, Result};
 
@@ -147,6 +147,17 @@ pub struct IoctlContext {
     pub session_id: i32,
     /// Whether the caller is its session leader.
     pub is_session_leader: bool,
+}
+
+/// Job-control state exposed by terminal vnodes.
+#[derive(Copy, Clone)]
+pub(crate) struct TerminalState {
+    /// Session that owns the controlling terminal.
+    pub session: i32,
+    /// Foreground process group.
+    pub foreground_group: i32,
+    /// Whether background writes should stop their process group.
+    pub stop_background_output: bool,
 }
 
 /// Node type requested from a directory create operation.
@@ -329,6 +340,22 @@ pub trait VnodeOps: Any + Send + Sync {
             supported |= PollEvents::OUT | PollEvents::WRNORM;
         }
         Ok(events & supported)
+    }
+
+    /// Appends events that can wake a readiness rescan.
+    fn poll_events<'a>(
+        &'a self,
+        _vnode: &Vnode,
+        _file_context: usize,
+        _events: PollEvents,
+        _output: &mut Vec<&'a Event>,
+    ) -> bool {
+        false
+    }
+
+    /// Returns terminal job-control state when this vnode is a TTY.
+    fn terminal_state(&self, _vnode: &Vnode) -> Option<TerminalState> {
+        None
     }
 
     /// Appends bytes atomically and returns `(written, new_offset)`.
@@ -649,6 +676,21 @@ impl Vnode {
         self.inner
             .operations
             .poll(self, file_context, offset, events, flags)
+    }
+
+    pub(crate) fn poll_events<'a>(
+        &'a self,
+        file_context: usize,
+        events: PollEvents,
+        output: &mut Vec<&'a Event>,
+    ) -> bool {
+        self.inner
+            .operations
+            .poll_events(self, file_context, events, output)
+    }
+
+    pub(crate) fn terminal_state(&self) -> Option<TerminalState> {
+        self.inner.operations.terminal_state(self)
     }
 
     /// Atomically appends bytes.

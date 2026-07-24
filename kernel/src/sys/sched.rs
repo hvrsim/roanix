@@ -11,7 +11,7 @@
 //! the 127 Hz scheduler statclock and sleep timers.
 //!
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     array,
     ptr::NonNull,
@@ -23,11 +23,12 @@ use intrusive_collections::LinkedList;
 
 use crate::{
     arch,
+    mem::VmSpace,
     proc::Process,
     sys::{
         clock,
         smp::{self, IrqSpinLock},
-        sync::Once,
+        sync::{Mutex, Once},
         thread::{
             ExitedThreadAdapter, Thread, ThreadAdapter, ThreadClass, ThreadFlags, ThreadState,
             WakeResult, allocate_forked_user_thread, allocate_thread, allocate_user_thread,
@@ -602,6 +603,7 @@ struct Scheduler {
     cpu_count: usize,
     next_tid: AtomicUsize,
     config: SchedulerConfig,
+    retired_address_spaces: Mutex<Vec<(u64, Arc<VmSpace>)>>,
 }
 
 impl Scheduler {
@@ -610,6 +612,7 @@ impl Scheduler {
             cpu_count,
             next_tid: AtomicUsize::new(1),
             config: SchedulerConfig::new(),
+            retired_address_spaces: Mutex::new(Vec::new()),
         }
     }
 
@@ -751,6 +754,7 @@ impl Scheduler {
     }
 
     fn spawn_user(&self, process: Arc<Process>, entry: u64, stack: u64) -> usize {
+        process.register_thread();
         let cpu_id = self.pick_spawn_cpu();
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
         let thread = allocate_user_thread(
@@ -761,6 +765,30 @@ impl Scheduler {
             process,
             entry,
             stack,
+            0,
+        );
+        self.enqueue_new_thread(NonNull::from(thread))
+    }
+
+    fn spawn_user_thread(
+        &self,
+        process: Arc<Process>,
+        entry: u64,
+        stack: u64,
+        thread_pointer: u64,
+    ) -> usize {
+        process.register_thread();
+        let cpu_id = self.pick_spawn_cpu();
+        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        let thread = allocate_user_thread(
+            tid,
+            cpu_id,
+            clock::monotonic_ns(),
+            MIN_INTERACT,
+            process,
+            entry,
+            stack,
+            thread_pointer,
         );
         self.enqueue_new_thread(NonNull::from(thread))
     }
@@ -771,6 +799,7 @@ impl Scheduler {
         parent_frame: &TrapFrame,
         thread_pointer: u64,
     ) -> usize {
+        process.register_thread();
         let cpu_id = self.pick_spawn_cpu();
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
         let thread = allocate_forked_user_thread(
@@ -1710,6 +1739,16 @@ impl Scheduler {
                 return;
             };
 
+            if let Some(root) = thread_ref(thread).address_space_root()
+                && crate::mem::address_space_root_active(root)
+            {
+                let space = thread_ref(thread)
+                    .take_address_space()
+                    .expect("sched: exited user thread lost its address space");
+                self.retired_address_spaces.lock().push((root, space));
+                crate::mem::release_inactive_address_space_roots();
+            }
+
             // SAFETY: exited threads were removed from all run/current queues
             // before reaching the reaper.
             unsafe { free_thread(thread.as_ptr()) };
@@ -1717,6 +1756,17 @@ impl Scheduler {
     }
 
     fn reap_all_exited(&self) {
+        let mut retired = self.retired_address_spaces.lock();
+        let mut index = 0;
+        while index < retired.len() {
+            if crate::mem::address_space_root_active(retired[index].0) {
+                index += 1;
+            } else {
+                retired.swap_remove(index);
+            }
+        }
+        drop(retired);
+
         for cpu_id in 0..self.cpu_count {
             self.reap_exited(cpu_id);
         }
@@ -1836,6 +1886,16 @@ where
 /// Spawns the initial thread of a userspace process.
 pub(crate) fn run_user(process: Arc<Process>, entry: u64, stack: u64) -> usize {
     scheduler().spawn_user(process, entry, stack)
+}
+
+/// Spawns another userspace thread in an existing process.
+pub(crate) fn run_user_thread(
+    process: Arc<Process>,
+    entry: u64,
+    stack: u64,
+    thread_pointer: u64,
+) -> usize {
+    scheduler().spawn_user_thread(process, entry, stack, thread_pointer)
 }
 
 /// Spawns a fork child from the current user syscall frame.

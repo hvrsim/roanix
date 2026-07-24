@@ -64,7 +64,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
 --- /dev/null
 +++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1167 @@
+@@ -0,0 +1,1259 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -83,8 +83,10 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +#include <termios.h>
 +#include <unistd.h>
 +
++#include <bits/ensure.h>
 +#include <mlibc/all-sysdeps.hpp>
 +#include <mlibc/tcb.hpp>
++#include <mlibc/thread.hpp>
 +#include <roanix/syscall.h>
 +
 +namespace {
@@ -134,6 +136,26 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +}
 +
 +} // namespace
++
++#if !MLIBC_BUILDING_RTLD
++
++extern "C" void __mlibc_start_thread();
++
++extern "C" void __mlibc_enter_thread(
++        void *entry, void *user_arg, Tcb *tcb) {
++    if (mlibc::sysdep<TcbSet>(tcb))
++        __ensure(!"failed to install thread pointer");
++
++    while (!__atomic_load_n(&tcb->tid, __ATOMIC_RELAXED))
++        mlibc::sysdep<FutexWait>(&tcb->tid, 0, nullptr);
++
++    __atomic_fetch_or(
++        &tcb->cancelBits, tcbCancelEnableBit, __ATOMIC_RELAXED);
++    tcb->invokeThreadFunc(entry, user_arg);
++    mlibc::thread_exit(tcb->returnValue);
++}
++
++#endif
 +
 +namespace {
 +
@@ -187,6 +209,76 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    roanix_syscall1(ROANIX_SYS_PROCESS_EXIT, status);
 +    __builtin_unreachable();
 +}
++
++#if !MLIBC_BUILDING_RTLD
++
++[[noreturn]] void Sysdeps<ThreadExit>::operator()() {
++    roanix_syscall0(ROANIX_SYS_THREAD_EXIT);
++    __builtin_unreachable();
++}
++
++int Sysdeps<PrepareStack>::operator()(
++        void **stack,
++        void *entry,
++        void *user_arg,
++        void *tcb,
++        size_t *stack_size,
++        size_t *guard_size,
++        void **stack_base) {
++    constexpr size_t default_stack_size = 2 * 1024 * 1024;
++    if (!*stack_size)
++        *stack_size = default_stack_size;
++    *guard_size = 0;
++
++    if (*stack) {
++        *stack_base = *stack;
++    } else {
++        int error = sysdep<VmMap>(
++            nullptr,
++            *stack_size,
++            PROT_READ | PROT_WRITE,
++            MAP_PRIVATE | MAP_ANONYMOUS,
++            -1,
++            0,
++            stack_base
++        );
++        if (error)
++            return error;
++    }
++
++    uintptr_t top =
++        reinterpret_cast<uintptr_t>(*stack_base) + *stack_size;
++    top &= ~uintptr_t{15};
++    if (top < reinterpret_cast<uintptr_t>(*stack_base) + 3 * sizeof(uintptr_t))
++        return EINVAL;
++
++    auto pointer = reinterpret_cast<uintptr_t *>(top);
++    *--pointer = reinterpret_cast<uintptr_t>(tcb);
++    *--pointer = reinterpret_cast<uintptr_t>(user_arg);
++    *--pointer = reinterpret_cast<uintptr_t>(entry);
++    *stack = pointer;
++    return 0;
++}
++
++int Sysdeps<Clone>::operator()(void *tcb, pid_t *tid, void *stack) {
++    uintptr_t thread_pointer = reinterpret_cast<uintptr_t>(tcb);
++#if defined(__riscv) && __riscv_xlen == 64
++    thread_pointer += sizeof(Tcb);
++#endif
++    long result = roanix_syscall3(
++        ROANIX_SYS_THREAD_CREATE,
++        static_cast<long>(
++            reinterpret_cast<uintptr_t>(__mlibc_start_thread)),
++        as_word(stack),
++        static_cast<long>(thread_pointer)
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *tid = static_cast<pid_t>(result);
++    return error;
++}
++
++#endif
 +
 +int Sysdeps<TcbSet>::operator()(void *pointer) {
 +    uintptr_t thread_pointer = reinterpret_cast<uintptr_t>(pointer);
@@ -1245,7 +1337,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
 --- /dev/null
 +++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,132 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1257,6 +1349,9 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    LibcPanic,
 +    FutexTid,
 +    Exit,
++    ThreadExit,
++    PrepareStack,
++    Clone,
 +    TcbSet,
 +    FutexWait,
 +    FutexWake,
@@ -1380,7 +1475,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
 --- /dev/null
 +++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,229 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1455,7 +1550,9 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +    ROANIX_SYS_INOTIFY_REMOVE,
 +    ROANIX_SYS_TIMERFD_CREATE,
 +    ROANIX_SYS_TIMERFD_SETTIME,
-+    ROANIX_SYS_TIMERFD_GETTIME
++    ROANIX_SYS_TIMERFD_GETTIME,
++    ROANIX_SYS_THREAD_CREATE,
++    ROANIX_SYS_THREAD_EXIT
 +};
 +
 +#define ROANIX_UTSNAME_FIELD_SIZE 65
@@ -1608,12 +1705,48 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +#endif
 +
 +#endif
+diff --git a/sysdeps/roanix/riscv64/thread.S b/sysdeps/roanix/riscv64/thread.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..6db9df968cb50af8700a52be77fcaa92bb0d018a
+--- /dev/null
++++ b/sysdeps/roanix/riscv64/thread.S
+@@ -0,0 +1,12 @@
++.section .text
++.global __mlibc_start_thread
++.type __mlibc_start_thread, @function
++__mlibc_start_thread:
++    ld a0, 0(sp)
++    ld a1, 8(sp)
++    ld a2, 16(sp)
++    addi sp, sp, 24
++    andi sp, sp, -16
++    call __mlibc_enter_thread
++    unimp
++.section .note.GNU-stack,"",@progbits
+diff --git a/sysdeps/roanix/x86_64/thread.S b/sysdeps/roanix/x86_64/thread.S
+new file mode 100644
+index 0000000000000000000000000000000000000000..7140633ac9a243d52b0efe98f608d3a5b1f61c4d
+--- /dev/null
++++ b/sysdeps/roanix/x86_64/thread.S
+@@ -0,0 +1,12 @@
++.section .text
++.global __mlibc_start_thread
++.type __mlibc_start_thread, @function
++__mlibc_start_thread:
++    pop %rdi
++    pop %rsi
++    pop %rdx
++    call __mlibc_enter_thread
++    ud2
++.size __mlibc_start_thread, . - __mlibc_start_thread
++.section .note.GNU-stack,"",@progbits
++
 diff --git a/sysdeps/roanix/meson.build b/sysdeps/roanix/meson.build
 new file mode 100644
 index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd084da5b780
 --- /dev/null
 +++ b/sysdeps/roanix/meson.build
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,131 @@
 +sysdep_supported_options = {
 +    'posix': true,
 +    'linux': true,
@@ -1628,6 +1761,7 @@ index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd08
 +libc_sources += files(
 +    'generic/entry.cpp',
 +    'generic/sysdeps.cpp',
++    host_machine.cpu_family() / 'thread.S',
 +)
 +
 +if not no_headers

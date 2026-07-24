@@ -385,15 +385,27 @@ static int configure_locked(
     return 1;
 }
 
-static int32_t backend_try_read(uintptr_t context, uint8_t *output)
+static int64_t backend_read(
+    uintptr_t context,
+    uint8_t *output,
+    size_t length)
 {
     struct uart_state *uart = (struct uart_state *)context;
+    if (output == NULL && length != 0)
+        return DK_EINVAL;
+    if (length == 0)
+        return 0;
     uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
-    int available = (uart_read(uart, 5) & 1u) != 0;
-    if (available)
-        *output = uart_read(uart, 0);
+    size_t read = 0;
+    while (read < length && (uart_read(uart, 5) & 1u) != 0)
+        output[read++] = uart_read(uart, 0);
     dk_spin_unlock_irqrestore(&uart->lock, irq_state);
-    return available;
+    return read > INT64_MAX ? INT64_MAX : (int64_t)read;
+}
+
+static int32_t backend_try_read(uintptr_t context, uint8_t *output)
+{
+    return backend_read(context, output, 1) == 1;
 }
 
 static int32_t backend_write(
@@ -460,6 +472,22 @@ static int32_t backend_writable(uintptr_t context)
     int writable = (uart_read(uart, 5) & UINT8_C(0x20)) != 0;
     dk_spin_unlock_irqrestore(&uart->lock, irq_state);
     return writable;
+}
+
+static int32_t backend_flush_input(uintptr_t context)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+    while ((uart_read(uart, 5) & 1u) != 0)
+        (void)uart_read(uart, 0);
+    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    return DK_OK;
+}
+
+static int64_t backend_queued_output(uintptr_t context)
+{
+    (void)context;
+    return 0;
 }
 
 static int32_t backend_break(uintptr_t context, uint64_t duration_ms)
@@ -564,6 +592,13 @@ static int32_t publish_uart(
         .writable = backend_writable,
         .hung_up = NULL,
         .destroy = NULL,
+        .read = backend_read,
+        .flush_input = backend_flush_input,
+        .flush_output = NULL,
+        .queued_output = backend_queued_output,
+        .readable_event = 0,
+        .writable_event = 0,
+        .hangup_event = 0,
     };
     return dk_console_create_tty(
         device,

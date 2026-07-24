@@ -132,6 +132,7 @@ pub struct DriverSerialSettings {
 type ConsoleOpenFn = unsafe extern "C" fn(context: usize) -> i32;
 type ConsoleCloseFn = unsafe extern "C" fn(context: usize);
 type ConsoleTryReadFn = unsafe extern "C" fn(context: usize, output: *mut u8) -> i32;
+type ConsoleReadFn = unsafe extern "C" fn(context: usize, output: *mut u8, len: usize) -> i64;
 type ConsoleWriteFn =
     unsafe extern "C" fn(context: usize, data: *const u8, len: usize, nonblocking: u8) -> i32;
 type ConsoleConfigureFn =
@@ -140,6 +141,7 @@ type ConsoleSimpleFn = unsafe extern "C" fn(context: usize) -> i32;
 type ConsoleBreakFn = unsafe extern "C" fn(context: usize, duration_ms: u64) -> i32;
 type ConsoleHungUpFn = unsafe extern "C" fn(context: usize) -> i32;
 type ConsoleWritableFn = unsafe extern "C" fn(context: usize) -> i32;
+type ConsoleQueuedFn = unsafe extern "C" fn(context: usize) -> i64;
 type ConsoleDestroyFn = unsafe extern "C" fn(context: usize);
 
 /// Hardware/backend callbacks consumed by the kernel TTY service.
@@ -159,6 +161,38 @@ pub struct DriverConsoleOps {
     writable: Option<ConsoleWritableFn>,
     hung_up: Option<ConsoleHungUpFn>,
     destroy: Option<ConsoleDestroyFn>,
+    read: Option<ConsoleReadFn>,
+    flush_input: Option<ConsoleSimpleFn>,
+    flush_output: Option<ConsoleSimpleFn>,
+    queued_output: Option<ConsoleQueuedFn>,
+    readable_event: usize,
+    writable_event: usize,
+    hangup_event: usize,
+}
+
+impl DriverConsoleOps {
+    const EMPTY: Self = Self {
+        size: 0,
+        flags: 0,
+        context: 0,
+        open: None,
+        close: None,
+        try_read: None,
+        write: None,
+        configure: None,
+        flush: None,
+        send_break: None,
+        writable: None,
+        hung_up: None,
+        destroy: None,
+        read: None,
+        flush_input: None,
+        flush_output: None,
+        queued_output: None,
+        readable_event: 0,
+        writable_event: 0,
+        hangup_event: 0,
+    };
 }
 
 impl AbiSlice {
@@ -175,9 +209,7 @@ impl AbiSlice {
         if self.data.is_null() {
             return Err(Error::InvalidArgument);
         }
-        if self.len > isize::MAX as usize
-            || (self.data as usize).checked_add(self.len).is_none()
-        {
+        if self.len > isize::MAX as usize || (self.data as usize).checked_add(self.len).is_none() {
             return Err(Error::InvalidArgument);
         }
         // SAFETY: guaranteed by the caller contract and null-checked above.
@@ -186,19 +218,15 @@ impl AbiSlice {
 }
 
 /// Driver initialization callback.
-pub type DriverInitFn = unsafe extern "C" fn(
-    bootstrap: *const DriverBootstrap,
-    driver: u64,
-    context: usize,
-) -> i32;
+pub type DriverInitFn =
+    unsafe extern "C" fn(bootstrap: *const DriverBootstrap, driver: u64, context: usize) -> i32;
 /// Driver finalization callback.
 pub type DriverFiniFn = unsafe extern "C" fn(driver: u64, context: usize);
 /// Device open callback.
 pub type DeviceOpenFn =
     unsafe extern "C" fn(context: usize, flags: u32, file_context: *mut usize) -> i32;
 /// Device close callback.
-pub type DeviceCloseFn =
-    unsafe extern "C" fn(context: usize, file_context: usize, flags: u32);
+pub type DeviceCloseFn = unsafe extern "C" fn(context: usize, file_context: usize, flags: u32);
 /// Device initial-offset callback. Negative values are error statuses.
 pub type DeviceInitialOffsetFn =
     unsafe extern "C" fn(context: usize, file_context: usize, flags: u32) -> i64;
@@ -232,6 +260,8 @@ pub type DevicePollFn = unsafe extern "C" fn(
     events: u16,
     flags: u32,
 ) -> i64;
+/// Returns one kernel event handle for an open device description.
+pub type DeviceEventFn = unsafe extern "C" fn(context: usize, file_context: usize) -> usize;
 /// Device-control callback. Non-negative values are successful return values.
 pub type DeviceIoctlFn = unsafe extern "C" fn(
     context: usize,
@@ -279,11 +309,8 @@ pub struct DriverMatchProperty {
 }
 
 /// Per-provider driver instance creation callback.
-pub type DriverBindFn = unsafe extern "C" fn(
-    context: usize,
-    provider: u64,
-    out_instance_context: *mut usize,
-) -> i32;
+pub type DriverBindFn =
+    unsafe extern "C" fn(context: usize, provider: u64, out_instance_context: *mut usize) -> i32;
 /// Per-provider driver instance destruction callback.
 pub type DriverUnbindFn =
     unsafe extern "C" fn(context: usize, provider: u64, instance_context: usize);
@@ -344,6 +371,31 @@ pub struct DriverDeviceOps {
     pub poll: Option<DevicePollFn>,
     /// Optional control callback.
     pub ioctl: Option<DeviceIoctlFn>,
+    /// Optional per-open readable event callback.
+    pub readable_event: Option<DeviceEventFn>,
+    /// Optional per-open writable event callback.
+    pub writable_event: Option<DeviceEventFn>,
+    /// Optional per-open hangup event callback.
+    pub hangup_event: Option<DeviceEventFn>,
+}
+
+impl DriverDeviceOps {
+    const EMPTY: Self = Self {
+        size: 0,
+        context: 0,
+        open: None,
+        close: None,
+        initial_offset: None,
+        read: None,
+        write: None,
+        size_bytes: None,
+        sync: None,
+        poll: None,
+        ioctl: None,
+        readable_event: None,
+        writable_event: None,
+        hangup_event: None,
+    };
 }
 
 /// Common prefix of every versioned service table.
@@ -473,12 +525,8 @@ pub struct DriverCoreApi {
     /// Returns the kernel-log end offset.
     pub kmsg_end: unsafe extern "C" fn() -> u64,
     /// Reads kernel-log bytes. Negative values are error statuses.
-    pub kmsg_read: unsafe extern "C" fn(
-        offset: u64,
-        output: *mut u8,
-        len: usize,
-        nonblocking: u8,
-    ) -> i64,
+    pub kmsg_read:
+        unsafe extern "C" fn(offset: u64, output: *mut u8, len: usize, nonblocking: u8) -> i64,
     /// Appends one or more kernel-log records.
     pub kmsg_append: unsafe extern "C" fn(input: *const u8, len: usize) -> i32,
     /// Stops regular log records from being mirrored to early consoles.
@@ -503,12 +551,8 @@ pub struct DriverRegistryApi {
     /// Removes an owned hierarchy node.
     pub remove_node: unsafe extern "C" fn(driver: u64, node: u64) -> i32,
     /// Publishes immutable metadata on an owned node.
-    pub set_node_property: unsafe extern "C" fn(
-        driver: u64,
-        node: u64,
-        key: ResourceKey,
-        value: AbiSlice,
-    ) -> i32,
+    pub set_node_property:
+        unsafe extern "C" fn(driver: u64, node: u64, key: ResourceKey, value: AbiSlice) -> i32,
     /// Copies immutable metadata attached directly to a node.
     pub read_node_property: unsafe extern "C" fn(
         node: u64,
@@ -549,8 +593,7 @@ pub struct DriverRegistryApi {
         out_resource: *mut u64,
     ) -> i32,
     /// Removes an idle resource from an owned node.
-    pub remove_resource:
-        unsafe extern "C" fn(driver: u64, node: u64, key: ResourceKey) -> i32,
+    pub remove_resource: unsafe extern "C" fn(driver: u64, node: u64, key: ResourceKey) -> i32,
     /// Acquires immutable inherited data without copying.
     pub acquire_data_resource: unsafe extern "C" fn(
         driver: u64,
@@ -658,11 +701,8 @@ pub struct DriverBindingApi {
     /// Common service header.
     pub header: DriverServiceHeader,
     /// Registers a driver class owned by the calling module.
-    pub register_class: unsafe extern "C" fn(
-        driver: u64,
-        class: *const DriverClass,
-        out_class: *mut u64,
-    ) -> i32,
+    pub register_class:
+        unsafe extern "C" fn(driver: u64, class: *const DriverClass, out_class: *mut u64) -> i32,
     /// Unregisters an idle driver class.
     pub unregister_class: unsafe extern "C" fn(driver: u64, class: u64) -> i32,
 }
@@ -698,8 +738,7 @@ pub struct DriverDeviceFrontendOps {
         out_node: *mut u64,
     ) -> i32,
     /// Removes a driver-owned devtempfs node.
-    pub remove_node:
-        unsafe extern "C" fn(context: usize, driver: u64, node: u64) -> i32,
+    pub remove_node: unsafe extern "C" fn(context: usize, driver: u64, node: u64) -> i32,
 }
 
 /// Kernel console/TTY protocol published as a root resource.
@@ -861,14 +900,17 @@ struct ForeignDeviceOps {
 
 struct ForeignConsoleBackend {
     operations: DriverConsoleOps,
+    owner: driver::CallbackOwner,
 }
 
 impl Drop for ForeignConsoleBackend {
     fn drop(&mut self) {
         if let Some(callback) = self.operations.destroy {
-            // SAFETY: the copied callback table remains pinned until its TTY
-            // node is removed and this backend is destroyed.
-            unsafe { callback(self.operations.context) };
+            if let Ok(_callback) = self.owner.acquire_cleanup() {
+                // SAFETY: the cleanup guard pins the copied callback table
+                // while the backend releases its driver-owned context.
+                unsafe { callback(self.operations.context) };
+            }
         }
     }
 }
@@ -878,27 +920,47 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.open else {
             return Ok(());
         };
-        // SAFETY: the owning driver is pinned by the surrounding TTY callback.
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        // SAFETY: the callback guard pins the owning driver.
         callback_status(unsafe { callback(self.operations.context) })
     }
 
     fn close(&self) {
         if let Some(callback) = self.operations.close {
-            // SAFETY: the owning driver is pinned by the surrounding TTY callback.
-            unsafe { callback(self.operations.context) };
+            if let Ok(_callback) = self.owner.acquire_cleanup() {
+                // SAFETY: the callback guard pins the owning driver.
+                unsafe { callback(self.operations.context) };
+            }
         }
     }
 
     fn try_read(&self) -> Option<u8> {
         let callback = self.operations.try_read?;
+        let _callback = self.owner.acquire_control().ok()?;
         let mut byte = 0u8;
         // SAFETY: `byte` is writable for one byte and the driver is pinned.
         let status = unsafe { callback(self.operations.context, &mut byte) };
         (status == 1).then_some(byte)
     }
 
+    fn read(&self, output: &mut [u8]) -> fs::Result<usize> {
+        let Some(callback) = self.operations.read else {
+            return ConsoleBackend::read_fallback(self, output);
+        };
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        let pointer = if output.is_empty() {
+            ptr::null_mut()
+        } else {
+            output.as_mut_ptr()
+        };
+        // SAFETY: `output` is writable for the duration of this callback.
+        let value = unsafe { callback(self.operations.context, pointer, output.len()) };
+        callback_count(value, output.len())
+    }
+
     fn write(&self, bytes: &[u8], nonblocking: bool) -> fs::Result<()> {
         let callback = self.operations.write.ok_or(fs::Error::Unsupported)?;
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
         let data = if bytes.is_empty() {
             ptr::null()
         } else {
@@ -919,6 +981,7 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.configure else {
             return Ok(());
         };
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
         let settings = DriverSerialSettings {
             baud: settings.baud,
             data_bits: settings.data_bits,
@@ -934,7 +997,26 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.flush else {
             return Ok(());
         };
-        // SAFETY: the owning driver is pinned by the surrounding TTY callback.
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        // SAFETY: the callback guard pins the owning driver.
+        callback_status(unsafe { callback(self.operations.context) })
+    }
+
+    fn flush_input(&self) -> fs::Result<()> {
+        let Some(callback) = self.operations.flush_input else {
+            return Ok(());
+        };
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        // SAFETY: the callback guard pins the owning driver.
+        callback_status(unsafe { callback(self.operations.context) })
+    }
+
+    fn flush_output(&self) -> fs::Result<()> {
+        let Some(callback) = self.operations.flush_output else {
+            return Ok(());
+        };
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        // SAFETY: the callback guard pins the owning driver.
         callback_status(unsafe { callback(self.operations.context) })
     }
 
@@ -942,7 +1024,8 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.send_break else {
             return Ok(());
         };
-        // SAFETY: the owning driver is pinned by the surrounding TTY callback.
+        let _callback = self.owner.acquire_control().map_err(|_| fs::Error::Io)?;
+        // SAFETY: the callback guard pins the owning driver.
         callback_status(unsafe { callback(self.operations.context, duration) })
     }
 
@@ -950,7 +1033,10 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.hung_up else {
             return false;
         };
-        // SAFETY: the owning driver is pinned by the surrounding TTY callback.
+        let Ok(_callback) = self.owner.acquire_control() else {
+            return true;
+        };
+        // SAFETY: the callback guard pins the owning driver.
         unsafe { callback(self.operations.context) > 0 }
     }
 
@@ -958,8 +1044,35 @@ impl ConsoleBackend for ForeignConsoleBackend {
         let Some(callback) = self.operations.writable else {
             return true;
         };
-        // SAFETY: the owning driver is pinned by the surrounding TTY callback.
+        let Ok(_callback) = self.owner.acquire_control() else {
+            return false;
+        };
+        // SAFETY: the callback guard pins the owning driver.
         unsafe { callback(self.operations.context) > 0 }
+    }
+
+    fn queued_output(&self) -> usize {
+        let Some(callback) = self.operations.queued_output else {
+            return 0;
+        };
+        let Ok(_callback) = self.owner.acquire_control() else {
+            return 0;
+        };
+        // SAFETY: the callback guard pins the owning driver.
+        let value = unsafe { callback(self.operations.context) };
+        usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+    }
+
+    fn readable_event(&self) -> Option<&Event> {
+        event_ref(self.operations.readable_event)
+    }
+
+    fn writable_event(&self) -> Option<&Event> {
+        event_ref(self.operations.writable_event)
+    }
+
+    fn hangup_event(&self) -> Option<&Event> {
+        event_ref(self.operations.hangup_event)
     }
 
     fn reset_on_last_close(&self) -> bool {
@@ -975,9 +1088,7 @@ impl DeviceNodeOps for ForeignDeviceOps {
         let mut file_context = 0usize;
         // SAFETY: the copied callback table was validated when the node was
         // created and devtempfs pins the owning driver around this call.
-        callback_status(unsafe {
-            callback(self.operations.context, flags, &mut file_context)
-        })?;
+        callback_status(unsafe { callback(self.operations.context, flags, &mut file_context) })?;
         Ok(file_context)
     }
 
@@ -1102,6 +1213,44 @@ impl DeviceNodeOps for ForeignDeviceOps {
         }
         let bits = u16::try_from(value).map_err(|_| fs::Error::Io)?;
         fs::PollEvents::from_bits(bits).ok_or(fs::Error::Io)
+    }
+
+    fn poll_events<'a>(
+        &'a self,
+        file_context: usize,
+        events: fs::PollEvents,
+        output: &mut Vec<&'a Event>,
+    ) -> bool {
+        let mut complete = true;
+        let mut append = |requested: bool, callback: Option<DeviceEventFn>| {
+            if !requested {
+                return;
+            }
+            let Some(callback) = callback else {
+                complete = false;
+                return;
+            };
+            // SAFETY: devtempfs pins the owning driver around this call.
+            let handle = unsafe { callback(self.operations.context, file_context) };
+            if let Some(event) = event_ref(handle) {
+                output.push(event);
+            } else {
+                complete = false;
+            }
+        };
+        append(
+            events.intersects(fs::PollEvents::IN | fs::PollEvents::RDNORM),
+            self.operations.readable_event,
+        );
+        append(
+            events.intersects(fs::PollEvents::OUT | fs::PollEvents::WRNORM),
+            self.operations.writable_event,
+        );
+        append(
+            events.contains(fs::PollEvents::HUP),
+            self.operations.hangup_event,
+        );
+        complete
     }
 
     fn ioctl(
@@ -1390,13 +1539,7 @@ unsafe extern "C" fn host_publish_memory_resource(
             return Err(Error::InvalidArgument);
         }
         let region = MemoryRegion::new(physical, length)?;
-        let id = super::publish_resource(
-            owner,
-            node,
-            key,
-            flags,
-            ResourceValue::Memory(region),
-        )?;
+        let id = super::publish_resource(owner, node, key, flags, ResourceValue::Memory(region))?;
         // SAFETY: required by the host function ABI.
         if let Err(error) = unsafe { write_out(out_resource, id.get()) } {
             let _ = super::remove_resource(owner, node, key);
@@ -1462,15 +1605,10 @@ unsafe extern "C" fn host_publish_protocol_resource(
     result.map_or_else(status, |_| STATUS_OK)
 }
 
-unsafe extern "C" fn host_remove_resource(
-    driver_id: u64,
-    node: u64,
-    key: ResourceKey,
-) -> i32 {
+unsafe extern "C" fn host_remove_resource(driver_id: u64, node: u64, key: ResourceKey) -> i32 {
     let owner = DriverId::new(driver_id);
-    let result = driver::authorize(owner).and_then(|()| {
-        super::remove_resource(owner, DeviceNodeId::from_raw(node), key)
-    });
+    let result = driver::authorize(owner)
+        .and_then(|()| super::remove_resource(owner, DeviceNodeId::from_raw(node), key));
     result.map_or_else(status, |_| STATUS_OK)
 }
 
@@ -1483,8 +1621,7 @@ unsafe extern "C" fn host_acquire_data_resource(
     let result = (|| {
         let owner = DriverId::new(driver_id);
         driver::authorize(owner)?;
-        let (lease, resource) =
-            super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
+        let (lease, resource) = super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
         let data = match resource.data() {
             Ok(data) => data,
             Err(error) => {
@@ -1520,8 +1657,7 @@ unsafe extern "C" fn host_acquire_memory_resource(
     let result = (|| {
         let owner = DriverId::new(driver_id);
         driver::authorize(owner)?;
-        let (lease, resource) =
-            super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
+        let (lease, resource) = super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
         let region = match resource.memory() {
             Ok(region) => region,
             Err(error) => {
@@ -1555,8 +1691,7 @@ unsafe extern "C" fn host_acquire_protocol_resource(
     let result = (|| {
         let owner = DriverId::new(driver_id);
         driver::authorize(owner)?;
-        let (lease, resource) =
-            super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
+        let (lease, resource) = super::acquire_resource(owner, DeviceNodeId::from_raw(node), key)?;
         let protocol = match resource.protocol(minimum_revision) {
             Ok(protocol) => protocol,
             Err(error) => {
@@ -1935,8 +2070,7 @@ unsafe extern "C" fn host_map_mmio_resource(
         driver::authorize(owner)?;
         let registry = mmio_registry();
         let mut state = registry.state.lock();
-        let resource =
-            super::leased_resource(owner, ResourceLeaseId::new(lease))?;
+        let resource = super::leased_resource(owner, ResourceLeaseId::new(lease))?;
         if !resource.flags().contains(ResourceFlags::MMIO) {
             return Err(Error::WrongKind);
         }
@@ -2007,10 +2141,7 @@ unsafe extern "C" fn host_release_mmio_mapping(driver_id: u64, mapping: u64) -> 
     result.map_or_else(status, |_| STATUS_OK)
 }
 
-fn mmio_range(
-    physical: u64,
-    size: usize,
-) -> super::Result<(usize, Box<[crate::mem::PhysAddr]>)> {
+fn mmio_range(physical: u64, size: usize) -> super::Result<(usize, Box<[crate::mem::PhysAddr]>)> {
     if size == 0 {
         return Err(Error::InvalidArgument);
     }
@@ -2189,10 +2320,7 @@ pub(crate) fn remove_driver_mappings(owner: DriverId) {
     }
 }
 
-unsafe extern "C" fn host_physical_to_virtual(
-    physical: u64,
-    out_address: *mut usize,
-) -> i32 {
+unsafe extern "C" fn host_physical_to_virtual(physical: u64, out_address: *mut usize) -> i32 {
     let result = physical
         .checked_add(crate::mem::hhdm_offset())
         .ok_or(Error::InvalidArgument)
@@ -2245,9 +2373,11 @@ unsafe extern "C" fn host_console_create_tty(
         }
         // SAFETY: required by the host function interface.
         let operations = unsafe { read_console_operations(operations)? };
-        let backend: Arc<dyn ConsoleBackend> = Arc::new(ForeignConsoleBackend { operations });
-        let tty: Arc<dyn DeviceNodeOps> =
-            Tty::new(backend, Box::<str>::from(path), baud)?;
+        let backend: Arc<dyn ConsoleBackend> = Arc::new(ForeignConsoleBackend {
+            operations,
+            owner: driver::callback_owner(owner)?,
+        });
+        let tty: Arc<dyn DeviceNodeOps> = Tty::new(backend, Box::<str>::from(path), baud)?;
         let node = filesystem
             .create_device(
                 owner,
@@ -2302,17 +2432,11 @@ unsafe extern "C" fn service_devfs_create_device(
     let _ = context;
     // SAFETY: forwarded from the device-frontend protocol contract.
     unsafe {
-        host_devfs_create_device(
-            driver, parent, name, kind, mode, device, operations, output,
-        )
+        host_devfs_create_device(driver, parent, name, kind, mode, device, operations, output)
     }
 }
 
-unsafe extern "C" fn service_devfs_remove_node(
-    context: usize,
-    driver: u64,
-    node: u64,
-) -> i32 {
+unsafe extern "C" fn service_devfs_remove_node(context: usize, driver: u64, node: u64) -> i32 {
     let _ = context;
     // SAFETY: forwarded from the device-frontend protocol contract.
     unsafe { host_devfs_remove_node(driver, node) }
@@ -2475,15 +2599,33 @@ unsafe fn read_console_operations(
     }
     // SAFETY: the interface guarantees that the size field is readable.
     let size = unsafe { core::ptr::addr_of!((*operations).size).read() } as usize;
-    if size < mem::size_of::<DriverConsoleOps>() {
+    let minimum = mem::offset_of!(DriverConsoleOps, read);
+    if size < minimum {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: the validated record size covers the complete callback table.
-    let operations = unsafe { operations.read() };
-    if operations.try_read.is_none() || operations.write.is_none() {
+    let mut copied = DriverConsoleOps::EMPTY;
+    // SAFETY: both records are valid for the copied prefix, and `copied`
+    // supplies zero defaults for append-only fields absent from older drivers.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            operations.cast::<u8>(),
+            (&raw mut copied).cast::<u8>(),
+            size.min(mem::size_of::<DriverConsoleOps>()),
+        );
+    }
+    if (copied.try_read.is_none() && copied.read.is_none()) || copied.write.is_none() {
         return Err(Error::InvalidArgument);
     }
-    Ok(operations)
+    for event in [
+        copied.readable_event,
+        copied.writable_event,
+        copied.hangup_event,
+    ] {
+        if event != 0 && event_ref(event).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+    }
+    Ok(copied)
 }
 
 unsafe fn output_slice<'a>(output: *mut u8, len: usize) -> super::Result<&'a mut [u8]> {
@@ -2523,10 +2665,7 @@ unsafe fn write_out<T>(output: *mut T, value: T) -> super::Result<()> {
     if !is_aligned(output) {
         return Err(Error::InvalidArgument);
     }
-    if (output as usize)
-        .checked_add(mem::size_of::<T>())
-        .is_none()
-    {
+    if (output as usize).checked_add(mem::size_of::<T>()).is_none() {
         return Err(Error::InvalidArgument);
     }
     // SAFETY: the host ABI requires a writable, aligned output pointer.
@@ -2534,20 +2673,28 @@ unsafe fn write_out<T>(output: *mut T, value: T) -> super::Result<()> {
     Ok(())
 }
 
-unsafe fn read_operations(
-    operations: *const DriverDeviceOps,
-) -> super::Result<DriverDeviceOps> {
+unsafe fn read_operations(operations: *const DriverDeviceOps) -> super::Result<DriverDeviceOps> {
     if !is_aligned(operations) {
         return Err(Error::InvalidArgument);
     }
     // SAFETY: the interface guarantees that the size field is readable. No
     // reference to the potentially shorter foreign record is created.
     let size = unsafe { core::ptr::addr_of!((*operations).size).read() } as usize;
-    if size < mem::size_of::<DriverDeviceOps>() {
+    let minimum = mem::offset_of!(DriverDeviceOps, readable_event);
+    if size < minimum {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: the validated record size covers the complete callback table.
-    Ok(unsafe { operations.read() })
+    let mut copied = DriverDeviceOps::EMPTY;
+    // SAFETY: both records cover the copied prefix and append-only fields that
+    // are absent from older drivers retain initialized null defaults.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            operations.cast::<u8>(),
+            (&raw mut copied).cast::<u8>(),
+            size.min(mem::size_of::<DriverDeviceOps>()),
+        );
+    }
+    Ok(copied)
 }
 
 unsafe fn read_interrupt_controller(

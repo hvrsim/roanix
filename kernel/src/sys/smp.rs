@@ -18,13 +18,13 @@
 //! state through ad-hoc interrupt side effects.
 //!
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::UnsafeCell,
     hint::spin_loop,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use limine::{mp, request::MpRequest};
@@ -35,7 +35,6 @@ use limine::mp::RequestFlags;
 
 use crate::{
     arch,
-    mem::VmSpace,
     sys::{clock::PerCpuClock, sched::PerCpuScheduler, sync::Once},
 };
 
@@ -87,8 +86,8 @@ pub struct CoreLocal {
     /// Currently running thread ID on this CPU, if any.
     pub current_thread: usize,
 
-    /// User address space retained while kernel-only threads run.
-    pub(crate) active_address_space: IrqSpinLock<Option<Arc<VmSpace>>>,
+    /// Page-table root currently active on this CPU.
+    pub(crate) active_address_root: AtomicU64,
 
     /// Timer state owned by this CPU.
     pub(crate) clock: Once<PerCpuClock>,
@@ -139,7 +138,7 @@ impl CoreLocal {
             kernel_stack: 0,
             user_stack: 0,
             current_thread: 0,
-            active_address_space: IrqSpinLock::new(None),
+            active_address_root: AtomicU64::new(0),
             clock: Once::new(),
             scheduler: Once::new(),
             ipi: Once::new(),

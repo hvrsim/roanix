@@ -11,7 +11,7 @@ use crate::{
     fs::PollEvents,
     mem::VirtAddr,
     proc::{Descriptor, DescriptorKey, Process},
-    sys::{clock, sync::Mutex},
+    sys::{clock, event::Event, sync::Mutex},
     syscall::{Errno, Result, current_process, map_memory_error, map_process_error},
 };
 
@@ -56,6 +56,7 @@ struct EpollState {
 pub(crate) struct Epoll {
     process: Weak<Process>,
     state: Mutex<EpollState>,
+    changed: Event,
 }
 
 impl Epoll {
@@ -65,6 +66,7 @@ impl Epoll {
             state: Mutex::new(EpollState {
                 watches: BTreeMap::new(),
             }),
+            changed: Event::new(),
         })
     }
 
@@ -79,7 +81,7 @@ impl Epoll {
         }
         let key = descriptor.key();
         let mut state = self.state.lock();
-        match operation {
+        let result = match operation {
             EPOLL_CTL_ADD => {
                 let event = event.ok_or(Errno::Fault)?;
                 validate_events(event.events)?;
@@ -110,7 +112,11 @@ impl Epoll {
                 Ok(())
             }
             _ => Err(Errno::Invalid),
+        };
+        if result.is_ok() {
+            self.changed.signal();
         }
+        result
     }
 
     fn collect_ready(&self, maximum: usize) -> Vec<UserEpollEvent> {
@@ -166,6 +172,28 @@ impl Epoll {
                 ready != 0
             }
         })
+    }
+
+    fn wait_descriptors(&self) -> Vec<(Descriptor, PollEvents)> {
+        let Some(process) = self.process.upgrade() else {
+            return Vec::new();
+        };
+        let mut state = self.state.lock();
+        state
+            .watches
+            .retain(|key, _| process.contains_descriptor(*key));
+        self.changed.reset();
+        state
+            .watches
+            .values()
+            .filter(|watch| !watch.disabled)
+            .map(|watch| {
+                (
+                    watch.descriptor.clone(),
+                    poll_mask(watch.events) | PollEvents::ERR | PollEvents::HUP,
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn poll(&self, requested: PollEvents) -> PollEvents {
@@ -251,10 +279,31 @@ crate::syscall_handler! {
             if timeout_ms == 0 || deadline.is_some_and(|value| now >= value) {
                 return Ok(0);
             }
-            let sleep_ns = deadline
-                .map(|value| value.saturating_sub(now).min(WAIT_INTERVAL_NS))
-                .unwrap_or(WAIT_INTERVAL_NS);
-            clock::sleep(Duration::from_nanos(sleep_ns));
+
+            let descriptors = epoll.wait_descriptors();
+            let mut wait_events = alloc::vec![&epoll.changed];
+            let mut event_driven = true;
+            for (descriptor, requested) in &descriptors {
+                event_driven &= descriptor.poll_events(*requested, &mut wait_events);
+            }
+            wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
+            wait_events.dedup_by_key(|event| *event as *const Event as usize);
+
+            if event_driven {
+                if let Some(deadline) = deadline {
+                    let _ = clock::wait_any_timeout(
+                        &wait_events,
+                        Duration::from_nanos(deadline.saturating_sub(now).max(1)),
+                    );
+                } else {
+                    Event::wait_any(&wait_events);
+                }
+            } else {
+                let sleep_ns = deadline
+                    .map(|value| value.saturating_sub(now).min(WAIT_INTERVAL_NS))
+                    .unwrap_or(WAIT_INTERVAL_NS);
+                clock::sleep(Duration::from_nanos(sleep_ns));
+            }
         }
     }
 }

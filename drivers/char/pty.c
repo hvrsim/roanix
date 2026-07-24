@@ -32,8 +32,10 @@ struct pty_slot {
     uint8_t *storage;
     struct byte_ring to_master;
     struct byte_ring to_slave;
+    uintptr_t master_state;
     uintptr_t master_readable;
     uintptr_t master_writable;
+    uintptr_t slave_readable;
     uintptr_t slave_writable;
 };
 
@@ -132,9 +134,9 @@ static int activate_slot(struct pty_slot *slot)
     if (storage == NULL) {
         return 0;
     }
+    (void)dk_event_reset(slot->master_state);
     (void)dk_event_reset(slot->master_readable);
-    (void)dk_event_reset(slot->master_writable);
-    (void)dk_event_reset(slot->slave_writable);
+    (void)dk_event_reset(slot->slave_readable);
 
     uintptr_t irq_state = dk_spin_lock_irqsave(&slot->lock);
     if (slot->state != SLOT_RESERVED) {
@@ -161,6 +163,8 @@ static int activate_slot(struct pty_slot *slot)
         .length = 0,
     };
     dk_spin_unlock_irqrestore(&slot->lock, irq_state);
+    (void)dk_event_signal(slot->master_writable);
+    (void)dk_event_signal(slot->slave_writable);
     return 1;
 }
 
@@ -214,6 +218,7 @@ static void master_close(
     if (slot->state == SLOT_ACTIVE && slot->master_open != 0) {
         slot->master_open = 0;
         (void)dk_event_signal(slot->master_writable);
+        (void)dk_event_signal(slot->slave_readable);
         (void)dk_event_signal(slot->slave_writable);
         (void)take_cleanup_locked(slot, &resources);
     }
@@ -248,6 +253,8 @@ static int64_t master_read(
         if (slot->to_master.length != 0) {
             size_t read = ring_read(&slot->to_master, data, length);
             writable = slot->master_writable;
+            if (slot->to_master.length == 0)
+                (void)dk_event_reset(slot->master_readable);
             dk_spin_unlock_irqrestore(&slot->lock, irq_state);
             (void)dk_event_signal(writable);
             return (int64_t)read;
@@ -258,7 +265,7 @@ static int64_t master_read(
                     dk_spin_unlock_irqrestore(&slot->lock, irq_state);
                     return DK_EAGAIN;
                 }
-                readable = slot->master_readable;
+                readable = slot->master_state;
                 (void)dk_event_reset(readable);
                 dk_spin_unlock_irqrestore(&slot->lock, irq_state);
                 (void)dk_event_wait(readable);
@@ -311,7 +318,7 @@ static int64_t master_write(
                 dk_spin_unlock_irqrestore(&slot->lock, irq_state);
                 return DK_EAGAIN;
             }
-            writable = slot->master_readable;
+            writable = slot->master_state;
             (void)dk_event_reset(writable);
             dk_spin_unlock_irqrestore(&slot->lock, irq_state);
             (void)dk_event_wait(writable);
@@ -319,7 +326,11 @@ static int64_t master_write(
         }
         if (ring_available(&slot->to_slave) != 0) {
             size_t written = ring_write(&slot->to_slave, data, length);
+            uintptr_t readable = slot->slave_readable;
+            if (ring_available(&slot->to_slave) == 0)
+                (void)dk_event_reset(slot->slave_writable);
             dk_spin_unlock_irqrestore(&slot->lock, irq_state);
+            (void)dk_event_signal(readable);
             return (int64_t)written;
         }
         if ((flags & DK_OPEN_NONBLOCK) != 0) {
@@ -417,6 +428,31 @@ static int64_t master_ioctl(
     return DK_ENOTTY;
 }
 
+static dk_event_t master_readable_event(
+    uintptr_t context,
+    uintptr_t file_context)
+{
+    (void)context;
+    struct pty_slot *slot = slot_from_context(file_context);
+    return slot != NULL ? slot->master_readable : 0;
+}
+
+static dk_event_t master_writable_event(
+    uintptr_t context,
+    uintptr_t file_context)
+{
+    (void)context;
+    struct pty_slot *slot = slot_from_context(file_context);
+    return slot != NULL ? slot->slave_writable : 0;
+}
+
+static dk_event_t master_hangup_event(
+    uintptr_t context,
+    uintptr_t file_context)
+{
+    return master_readable_event(context, file_context);
+}
+
 static int32_t slave_open(uintptr_t context)
 {
     struct pty_slot *slot = slot_from_context(context);
@@ -431,7 +467,9 @@ static int32_t slave_open(uintptr_t context)
     }
     slot->slave_seen = 1;
     ++slot->slave_opens;
-    (void)dk_event_signal(slot->master_readable);
+    if (slot->to_master.length == 0)
+        (void)dk_event_reset(slot->master_readable);
+    (void)dk_event_signal(slot->master_state);
     dk_spin_unlock_irqrestore(&slot->lock, irq_state);
     return DK_OK;
 }
@@ -449,7 +487,9 @@ static void slave_close(uintptr_t context)
         if (slot->slave_opens == 0) {
             slot->to_slave.head = 0;
             slot->to_slave.length = 0;
+            (void)dk_event_reset(slot->slave_readable);
         }
+        (void)dk_event_signal(slot->master_state);
         (void)dk_event_signal(slot->master_readable);
         (void)dk_event_signal(slot->slave_writable);
         (void)take_cleanup_locked(slot, &resources);
@@ -458,23 +498,34 @@ static void slave_close(uintptr_t context)
     release_resources(&resources);
 }
 
-static int32_t slave_try_read(uintptr_t context, uint8_t *output)
+static int64_t slave_read(
+    uintptr_t context,
+    uint8_t *output,
+    size_t length)
 {
     struct pty_slot *slot = slot_from_context(context);
-    if (slot == NULL || output == NULL)
+    if (slot == NULL || (output == NULL && length != 0))
+        return DK_EINVAL;
+    if (length == 0)
         return 0;
     uintptr_t writable = 0;
     uintptr_t irq_state = dk_spin_lock_irqsave(&slot->lock);
-    int available = slot->state == SLOT_ACTIVE &&
-                    slot->to_slave.length != 0;
-    if (available) {
-        (void)ring_read(&slot->to_slave, output, 1);
+    size_t read = 0;
+    if (slot->state == SLOT_ACTIVE && slot->to_slave.length != 0) {
+        read = ring_read(&slot->to_slave, output, length);
         writable = slot->slave_writable;
+        if (slot->to_slave.length == 0)
+            (void)dk_event_reset(slot->slave_readable);
     }
     dk_spin_unlock_irqrestore(&slot->lock, irq_state);
     if (writable != 0)
         (void)dk_event_signal(writable);
-    return available;
+    return (int64_t)read;
+}
+
+static int32_t slave_try_read(uintptr_t context, uint8_t *output)
+{
+    return slave_read(context, output, 1) == 1;
 }
 
 static int32_t slave_write(
@@ -509,6 +560,8 @@ static int32_t slave_write(
                 data + offset,
                 length - offset);
             readable = slot->master_readable;
+            if (ring_available(&slot->to_master) == 0)
+                (void)dk_event_reset(slot->master_writable);
             dk_spin_unlock_irqrestore(&slot->lock, irq_state);
             (void)dk_event_signal(readable);
             continue;
@@ -545,6 +598,58 @@ static int32_t slave_writable(uintptr_t context)
     return writable;
 }
 
+static int32_t slave_flush_input(uintptr_t context)
+{
+    struct pty_slot *slot = slot_from_context(context);
+    if (slot == NULL)
+        return DK_EINVAL;
+    uintptr_t writable = 0;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&slot->lock);
+    if (slot->state == SLOT_ACTIVE) {
+        slot->to_slave.head = 0;
+        slot->to_slave.length = 0;
+        (void)dk_event_reset(slot->slave_readable);
+        writable = slot->slave_writable;
+    }
+    dk_spin_unlock_irqrestore(&slot->lock, irq_state);
+    if (writable != 0)
+        (void)dk_event_signal(writable);
+    return DK_OK;
+}
+
+static int32_t slave_flush_output(uintptr_t context)
+{
+    struct pty_slot *slot = slot_from_context(context);
+    if (slot == NULL)
+        return DK_EINVAL;
+    uintptr_t writable = 0;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&slot->lock);
+    if (slot->state == SLOT_ACTIVE) {
+        slot->to_master.head = 0;
+        slot->to_master.length = 0;
+        if (slot->slave_opens != 0)
+            (void)dk_event_reset(slot->master_readable);
+        writable = slot->master_writable;
+    }
+    dk_spin_unlock_irqrestore(&slot->lock, irq_state);
+    if (writable != 0)
+        (void)dk_event_signal(writable);
+    return DK_OK;
+}
+
+static int64_t slave_queued_output(uintptr_t context)
+{
+    struct pty_slot *slot = slot_from_context(context);
+    if (slot == NULL)
+        return 0;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&slot->lock);
+    size_t queued = slot->state == SLOT_ACTIVE
+        ? slot->to_master.length
+        : 0;
+    dk_spin_unlock_irqrestore(&slot->lock, irq_state);
+    return queued > INT64_MAX ? INT64_MAX : (int64_t)queued;
+}
+
 static const struct dk_device_ops master_operations = {
     .size = sizeof(master_operations),
     .context = 0,
@@ -557,6 +662,9 @@ static const struct dk_device_ops master_operations = {
     .sync = NULL,
     .poll = master_poll,
     .ioctl = master_ioctl,
+    .readable_event = master_readable_event,
+    .writable_event = master_writable_event,
+    .hangup_event = master_hangup_event,
 };
 
 static size_t decimal_name(uint32_t value, char *output)
@@ -618,6 +726,13 @@ static int32_t publish_slave(
         .writable = slave_writable,
         .hung_up = slave_hung_up,
         .destroy = NULL,
+        .read = slave_read,
+        .flush_input = slave_flush_input,
+        .flush_output = slave_flush_output,
+        .queued_output = slave_queued_output,
+        .readable_event = slot->slave_readable,
+        .writable_event = slot->master_writable,
+        .hangup_event = slot->slave_readable,
     };
     return dk_console_create_tty(
         device,
@@ -670,10 +785,16 @@ static int32_t pty_start(dk_driver_t driver, uintptr_t context)
         slot->state = SLOT_FREE;
         slot->index = (uint32_t)index;
         slot->locked = 1;
+        status = dk_event_create(&slot->master_state);
+        if (status != DK_OK)
+            goto fail_events;
         status = dk_event_create(&slot->master_readable);
         if (status != DK_OK)
             goto fail_events;
         status = dk_event_create(&slot->master_writable);
+        if (status != DK_OK)
+            goto fail_events;
+        status = dk_event_create(&slot->slave_readable);
         if (status != DK_OK)
             goto fail_events;
         status = dk_event_create(&slot->slave_writable);
@@ -715,6 +836,10 @@ static int32_t pty_start(dk_driver_t driver, uintptr_t context)
 fail_events:
     for (size_t index = 0; index < PTY_SLOT_COUNT; ++index) {
         struct pty_slot *slot = &slots[index];
+        if (slot->master_state != 0) {
+            (void)dk_event_destroy(slot->master_state);
+            slot->master_state = 0;
+        }
         if (slot->master_readable != 0) {
             (void)dk_event_destroy(slot->master_readable);
             slot->master_readable = 0;
@@ -722,6 +847,10 @@ fail_events:
         if (slot->master_writable != 0) {
             (void)dk_event_destroy(slot->master_writable);
             slot->master_writable = 0;
+        }
+        if (slot->slave_readable != 0) {
+            (void)dk_event_destroy(slot->slave_readable);
+            slot->slave_readable = 0;
         }
         if (slot->slave_writable != 0) {
             (void)dk_event_destroy(slot->slave_writable);
@@ -737,10 +866,14 @@ static void pty_stop(dk_driver_t driver, uintptr_t context)
     (void)context;
     for (size_t index = 0; index < PTY_SLOT_COUNT; ++index) {
         struct pty_slot *slot = &slots[index];
+        if (slot->master_state != 0)
+            (void)dk_event_destroy(slot->master_state);
         if (slot->master_readable != 0)
             (void)dk_event_destroy(slot->master_readable);
         if (slot->master_writable != 0)
             (void)dk_event_destroy(slot->master_writable);
+        if (slot->slave_readable != 0)
+            (void)dk_event_destroy(slot->slave_readable);
         if (slot->slave_writable != 0)
             (void)dk_event_destroy(slot->slave_writable);
     }

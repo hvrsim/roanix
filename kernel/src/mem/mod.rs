@@ -242,6 +242,9 @@ pub(crate) fn register_cpu() {
     let cpu_id = arch::thiscpu().id;
     alloc::register_tlb_cpu(cpu_id);
     register_tlb_cpu(cpu_id);
+    arch::thiscpu()
+        .active_address_root
+        .store(arch::paging::active_root().as_u64(), Ordering::Release);
 }
 
 fn register_tlb_cpu(cpu_id: usize) {
@@ -291,13 +294,11 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
         // every address space contains the same permanent kernel mappings.
         return;
     };
-
     let root = space.pmap().root();
-    let mut active = arch::thiscpu().active_address_space.lock();
-    if active
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &space))
-    {
+    let active = arch::thiscpu()
+        .active_address_root
+        .load(Ordering::Acquire);
+    if active == root.as_u64() {
         debug_assert_eq!(arch::paging::active_root(), root);
         return;
     }
@@ -307,9 +308,40 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
             .activate()
             .expect("mem: failed to activate scheduled address space");
     }
-    let previous = core::mem::replace(&mut *active, Some(space));
-    drop(active);
-    drop(previous);
+    arch::thiscpu()
+        .active_address_root
+        .store(root.as_u64(), Ordering::Release);
+}
+
+/// Returns whether any CPU still has `root` installed.
+pub(crate) fn address_space_root_active(root: u64) -> bool {
+    (0..smp::cpu_count()).any(|cpu_id| {
+        smp::core_local(cpu_id).is_some_and(|cpu| {
+            cpu.active_address_root.load(Ordering::Acquire) == root
+        })
+    })
+}
+
+/// Requests CPUs running kernel-only threads to release borrowed user roots.
+pub(crate) fn release_inactive_address_space_roots() {
+    release_inactive_address_space_root();
+    let _ = smp::send_ipi(release_inactive_address_space_root, smp::IpiTarget::All);
+}
+
+fn release_inactive_address_space_root() {
+    let cpu = arch::thiscpu();
+    let active = cpu.active_address_root.load(Ordering::Acquire);
+    if active == 0 || active == kernel_root().as_u64() {
+        return;
+    }
+    let current_root = sched::current_thread_opt().and_then(|thread| {
+        // SAFETY: scheduler current-thread pointers remain live while executing.
+        unsafe { &*thread }.address_space_root()
+    });
+    if current_root == Some(active) {
+        return;
+    }
+    activate_kernel_space();
 }
 
 pub(super) fn allocate_page_id() -> u64 {
@@ -515,20 +547,19 @@ fn synchronize_remote_tlbs() {
 }
 
 fn activate_kernel_space() {
-    let mut active = arch::thiscpu().active_address_space.lock();
     if arch::paging::active_root() == kernel_root() {
-        let previous = active.take();
-        drop(active);
-        drop(previous);
+        arch::thiscpu()
+            .active_address_root
+            .store(kernel_root().as_u64(), Ordering::Release);
         return;
     }
     // SAFETY: the root was captured from the bootloader-provided kernel page
     // table and remains live for the kernel lifetime.
     unsafe { arch::paging::activate_root(kernel_root()) }
         .expect("mem: failed to restore kernel pmap");
-    let previous = active.take();
-    drop(active);
-    drop(previous);
+    arch::thiscpu()
+        .active_address_root
+        .store(kernel_root().as_u64(), Ordering::Release);
 }
 
 fn state() -> &'static MemoryState {

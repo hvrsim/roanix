@@ -72,6 +72,8 @@ syscall_table:
     .quad syscall_timerfd_create
     .quad syscall_timerfd_settime
     .quad syscall_timerfd_gettime
+    .quad syscall_thread_create
+    .quad syscall_thread_exit
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

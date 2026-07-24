@@ -25,7 +25,7 @@ use log::info;
 use crate::{
     arch::cpu::TrapFrame,
     fs::{FileRef, IoctlContext, PathAnchor, PollEvents, VnodeKey, VnodeKind},
-    mem::{self, VmSpace, USER_ADDRESS_MAX},
+    mem::{self, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmSpace},
     sys::{
         event::Event,
         sched,
@@ -34,9 +34,9 @@ use crate::{
     },
 };
 
-pub(crate) use pipe::{PipeEnd, PipeError};
 pub(crate) use epoll::Epoll;
 pub(crate) use inotify::Inotify;
+pub(crate) use pipe::{PipeEnd, PipeError};
 pub(crate) use signal::SignalFd;
 pub(crate) use timerfd::TimerFd;
 
@@ -165,6 +165,20 @@ impl Descriptor {
             Self::TimerFd(timer) => timer.poll(requested),
         }
     }
+
+    pub(crate) fn poll_events<'a>(
+        &'a self,
+        requested: PollEvents,
+        output: &mut Vec<&'a Event>,
+    ) -> bool {
+        match self {
+            Self::File(file) => file.poll_events(requested, output),
+            Self::Pipe(pipe) => pipe.poll_events(requested, output),
+            Self::SignalFd(signal_fd) => signal_fd.poll_events(requested, output),
+            Self::Epoll(_) | Self::TimerFd(_) => false,
+            Self::Inotify(inotify) => inotify.poll_events(requested, output),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -197,6 +211,7 @@ pub(crate) struct Process {
     process_group: AtomicUsize,
     controlling_tty: Mutex<Option<FileRef>>,
     signals: signal::SignalManager,
+    active_threads: AtomicUsize,
     exited: AtomicBool,
     exit_status: AtomicI32,
 }
@@ -229,6 +244,7 @@ impl Process {
             process_group: AtomicUsize::new(pid),
             controlling_tty: Mutex::new(None),
             signals: signal::SignalManager::new(),
+            active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
         });
@@ -252,6 +268,7 @@ impl Process {
             process_group: AtomicUsize::new(parent.process_group()),
             controlling_tty: Mutex::new(parent.controlling_tty.lock().clone()),
             signals: signal::SignalManager::fork_from(&parent.signals),
+            active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
         });
@@ -544,8 +561,22 @@ impl Process {
         Ok(self.pid)
     }
 
-    fn is_exited(&self) -> bool {
+    pub(crate) fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn register_thread(&self) {
+        self.active_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn unregister_thread(&self) -> bool {
+        let previous = self.active_threads.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "proc: active thread count underflow");
+        previous == 1
+    }
+
+    fn thread_count(&self) -> usize {
+        self.active_threads.load(Ordering::Acquire)
     }
 
     fn encoded_exit_status(&self) -> i32 {
@@ -690,6 +721,26 @@ pub(crate) fn fork_current(frame: &TrapFrame) -> Result<usize> {
     Ok(pid)
 }
 
+/// Creates another userspace thread in the current process.
+pub(crate) fn create_thread(entry: u64, stack: u64, thread_pointer: u64) -> Result<usize> {
+    if !(USER_ADDRESS_MIN..USER_ADDRESS_MAX).contains(&entry)
+        || !(USER_ADDRESS_MIN..USER_ADDRESS_MAX).contains(&stack)
+        || thread_pointer >= USER_ADDRESS_MAX
+    {
+        return Err(Error::InvalidArgument);
+    }
+    let process = current().ok_or(Error::InvalidArgument)?;
+    if process.is_exited() {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(sched::run_user_thread(
+        process,
+        entry,
+        stack,
+        thread_pointer,
+    ))
+}
+
 /// Replaces the current process image.
 pub(crate) fn exec_current(
     frame: &mut TrapFrame,
@@ -698,6 +749,9 @@ pub(crate) fn exec_current(
     environment: &[String],
 ) -> Result<()> {
     let process = current().ok_or(Error::InvalidArgument)?;
+    if process.thread_count() != 1 {
+        return Err(Error::InvalidArgument);
+    }
     let path = process.resolve_path(path);
     let image = elf::load(&path, arguments, environment)?;
     let previous = process.replace_address_space(image.address_space.clone());
@@ -840,6 +894,7 @@ pub(crate) fn exit_current(status: i32) -> ! {
     if let Some(process) = current() {
         //info!("proc: pid={} exited with status {status}", process.pid());
         process.mark_exited((status & 0xff) << 8);
+        process.unregister_thread();
     }
     sched::exit_current()
 }
@@ -848,6 +903,29 @@ pub(crate) fn exit_current(status: i32) -> ! {
 pub(crate) fn exit_current_signal(signal: u8) -> ! {
     if let Some(process) = current() {
         process.mark_exited(i32::from(signal & 0x7f));
+        process.unregister_thread();
     }
     sched::exit_current()
+}
+
+/// Terminates only the current userspace thread.
+pub(crate) fn exit_current_thread() -> ! {
+    if let Some(process) = current()
+        && process.unregister_thread()
+        && !process.is_exited()
+    {
+        process.mark_exited(0);
+    }
+    sched::exit_current()
+}
+
+/// Terminates a peer thread after another thread exited the process.
+pub(crate) fn exit_current_thread_if_process_exited() {
+    let Some(process) = current() else {
+        return;
+    };
+    if process.is_exited() {
+        process.unregister_thread();
+        sched::exit_current();
+    }
 }

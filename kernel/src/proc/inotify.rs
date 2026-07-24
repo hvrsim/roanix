@@ -218,6 +218,17 @@ impl Inotify {
         }
     }
 
+    pub(crate) fn poll_events<'a>(
+        &'a self,
+        requested: PollEvents,
+        output: &mut alloc::vec::Vec<&'a Event>,
+    ) -> bool {
+        if requested.contains(PollEvents::IN) {
+            output.push(&self.event);
+        }
+        true
+    }
+
     pub(crate) fn is_nonblocking(&self) -> bool {
         self.nonblocking.load(Ordering::Acquire)
     }

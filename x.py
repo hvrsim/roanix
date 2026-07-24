@@ -216,6 +216,7 @@ USERSPACE_PACKAGES = (
     "linux-headers",
     "bash",
     "coreutils",
+    "stress-ng",
     "python",
     "init",
     "drivers",

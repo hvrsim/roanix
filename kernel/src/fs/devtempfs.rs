@@ -15,6 +15,7 @@ use crate::{
     dev::{DeviceNodeId, DriverId, KERNEL_DRIVER},
     sys::{
         clock,
+        event::Event,
         sync::{Mutex, Once},
     },
 };
@@ -24,7 +25,7 @@ use super::{
     path,
     vnode::{
         DirEntry, FileSystem, FilesystemId, IoctlContext, NodeId, PollEvents, SetAttr, StatFs,
-        Vnode, VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
+        TerminalState, Vnode, VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
     },
 };
 
@@ -130,6 +131,21 @@ pub trait DeviceNodeOps: Send + Sync {
         _flags: u32,
     ) -> Result<PollEvents> {
         Ok(PollEvents::empty())
+    }
+
+    /// Appends events that can wake a readiness rescan.
+    fn poll_events<'a>(
+        &'a self,
+        _file_context: usize,
+        _events: PollEvents,
+        _output: &mut Vec<&'a Event>,
+    ) -> bool {
+        false
+    }
+
+    /// Returns terminal job-control state for TTY devices.
+    fn terminal_state(&self) -> Option<TerminalState> {
+        None
     }
 
     /// Returns the current logical size.
@@ -586,12 +602,7 @@ impl VnodeOps for DevtempfsNode {
         self
     }
 
-    fn initial_offset(
-        &self,
-        _vnode: &Vnode,
-        file_context: usize,
-        flags: u32,
-    ) -> Result<u64> {
+    fn initial_offset(&self, _vnode: &Vnode, file_context: usize, flags: u32) -> Result<u64> {
         match &self.data {
             DevtempfsData::Directory => {
                 self.ensure_live()?;
@@ -731,9 +742,9 @@ impl VnodeOps for DevtempfsNode {
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
-        let read = self
-            .device_operations()?
-            .read_at_with_flags(file_context, offset, buffer, flags)?;
+        let read =
+            self.device_operations()?
+                .read_at_with_flags(file_context, offset, buffer, flags)?;
         if read > buffer.len() {
             return Err(Error::Io);
         }
@@ -755,9 +766,9 @@ impl VnodeOps for DevtempfsNode {
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
-        let written = self
-            .device_operations()?
-            .write_at_with_flags(file_context, offset, buffer, flags)?;
+        let written =
+            self.device_operations()?
+                .write_at_with_flags(file_context, offset, buffer, flags)?;
         if written > buffer.len() {
             return Err(Error::Io);
         }
@@ -788,6 +799,34 @@ impl VnodeOps for DevtempfsNode {
                 let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
                 operations.poll(file_context, offset, events, flags)
             }
+        }
+    }
+
+    fn poll_events<'a>(
+        &'a self,
+        _vnode: &Vnode,
+        file_context: usize,
+        events: PollEvents,
+        output: &mut Vec<&'a Event>,
+    ) -> bool {
+        match &self.data {
+            DevtempfsData::Directory => false,
+            DevtempfsData::Device(operations) => {
+                let Ok(_activity) = self.begin_activity() else {
+                    return false;
+                };
+                let Ok(_guard) = crate::dev::callback_guard(self.owner) else {
+                    return false;
+                };
+                operations.poll_events(file_context, events, output)
+            }
+        }
+    }
+
+    fn terminal_state(&self, _vnode: &Vnode) -> Option<TerminalState> {
+        match &self.data {
+            DevtempfsData::Directory => None,
+            DevtempfsData::Device(operations) => operations.terminal_state(),
         }
     }
 
@@ -852,7 +891,7 @@ impl VnodeOps for DevtempfsNode {
         let _activity = self.begin_activity()?;
         let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         self.device_operations()?
-        .ioctl(file_context, context, request, value, argument)
+            .ioctl(file_context, context, request, value, argument)
     }
 }
 

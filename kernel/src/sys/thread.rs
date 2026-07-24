@@ -262,6 +262,19 @@ impl Thread {
         self.address_space.lock().clone()
     }
 
+    /// Returns the current user page-table root without cloning its owner.
+    pub(crate) fn address_space_root(&self) -> Option<u64> {
+        self.address_space
+            .lock()
+            .as_ref()
+            .map(|space| space.pmap().root().as_u64())
+    }
+
+    /// Removes the user address-space owner during exited-thread reclamation.
+    pub(crate) fn take_address_space(&self) -> Option<Arc<VmSpace>> {
+        self.address_space.lock().take()
+    }
+
     /// Returns the process associated with this thread.
     pub(crate) fn process(&self) -> Option<Arc<Process>> {
         self.process.clone()
@@ -481,6 +494,7 @@ pub(crate) fn allocate_user_thread(
     process: Arc<Process>,
     entry: u64,
     stack: u64,
+    thread_pointer: u64,
 ) -> &'static mut Thread {
     let address_space = process.address_space();
     let thread = allocate_thread_record(
@@ -494,6 +508,7 @@ pub(crate) fn allocate_user_thread(
         Some(process),
         Some(address_space),
     );
+    thread.set_thread_pointer(thread_pointer);
     // SAFETY: `frame` points inside the exclusively owned stack allocation and
     // is properly aligned for the architecture trap frame.
     unsafe {

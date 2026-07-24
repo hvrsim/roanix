@@ -5,7 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    mem::{offset_of, size_of, MaybeUninit},
+    mem::{MaybeUninit, offset_of, size_of},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
@@ -13,12 +13,12 @@ use core::{
 use crate::{
     arch::cpu::TrapFrame,
     fs::PollEvents,
-    mem::{VirtAddr, USER_ADDRESS_MAX, USER_ADDRESS_MIN},
+    mem::{USER_ADDRESS_MAX, USER_ADDRESS_MIN, VirtAddr},
     proc::{Descriptor, Error, Process, Result},
     sys::{clock, event::Event, sched, sync::Mutex},
     syscall::{
-        current_process, map_memory_error, raw_result, read_user_timespec, Errno,
-        Result as SyscallResult,
+        Errno, Result as SyscallResult, current_process, map_memory_error, raw_result,
+        read_user_timespec,
     },
 };
 
@@ -26,20 +26,24 @@ const SIGNAL_MAX: usize = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
+pub(crate) const SIGHUP: u8 = 1;
+pub(crate) const SIGINT: u8 = 2;
+pub(crate) const SIGQUIT: u8 = 3;
 pub(crate) const SIGILL: u8 = 4;
 pub(crate) const SIGTRAP: u8 = 5;
 pub(crate) const SIGBUS: u8 = 7;
 pub(crate) const SIGFPE: u8 = 8;
 const SIGKILL: u8 = 9;
 pub(crate) const SIGSEGV: u8 = 11;
+pub(crate) const SIGPIPE: u8 = 13;
 pub(crate) const SIGCHLD: u8 = 17;
-const SIGCONT: u8 = 18;
+pub(crate) const SIGCONT: u8 = 18;
 const SIGSTOP: u8 = 19;
-const SIGTSTP: u8 = 20;
-const SIGTTIN: u8 = 21;
-const SIGTTOU: u8 = 22;
+pub(crate) const SIGTSTP: u8 = 20;
+pub(crate) const SIGTTIN: u8 = 21;
+pub(crate) const SIGTTOU: u8 = 22;
 const SIGURG: u8 = 23;
-const SIGWINCH: u8 = 28;
+pub(crate) const SIGWINCH: u8 = 28;
 const SIGRTMIN: u8 = 35;
 
 const SIG_BLOCK: i32 = 0;
@@ -87,6 +91,7 @@ pub(crate) struct SignalAction {
 /// Applies pending signal state to the frame selected for userspace return.
 #[unsafe(no_mangle)]
 extern "C" fn rsignal_return(frame: &mut TrapFrame) -> *mut TrapFrame {
+    super::exit_current_thread_if_process_exited();
     deliver_pending(frame);
     frame
 }
@@ -455,6 +460,14 @@ impl SignalFd {
         }
     }
 
+    pub(crate) fn poll_events<'a>(
+        &'a self,
+        _requested: PollEvents,
+        _output: &mut alloc::vec::Vec<&'a Event>,
+    ) -> bool {
+        false
+    }
+
     pub(crate) fn is_nonblocking(&self) -> bool {
         self.nonblocking.load(Ordering::Acquire)
     }
@@ -510,6 +523,23 @@ pub(crate) fn send_kernel(process: &Arc<Process>, signal: u8) {
         sender_uid: 0,
         synchronous: false,
     });
+}
+
+/// Queues a kernel-generated signal for every live member of a process group.
+pub(crate) fn send_kernel_process_group(group: usize, signal: u8) {
+    if group == 0 || signal == 0 || usize::from(signal) > SIGNAL_MAX {
+        return;
+    }
+    let targets = super::process_registry()
+        .lock()
+        .processes
+        .values()
+        .filter_map(Weak::upgrade)
+        .filter(|process| !process.is_exited() && process.process_group() == group)
+        .collect::<alloc::vec::Vec<_>>();
+    for process in targets {
+        send_kernel(&process, signal);
+    }
 }
 
 /// Queues a synchronous kernel-generated signal for the current process.

@@ -5,12 +5,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
 
-use crate::sys::sync::Mutex;
+use crate::sys::{event::Event, sync::Mutex};
 
 use super::{
     error::{Error, Result},
     vfs::PathAnchor,
-    vnode::{DirEntry, IoctlContext, PollEvents, Vnode, VnodeAttr, VnodeKind},
+    vnode::{DirEntry, IoctlContext, PollEvents, TerminalState, Vnode, VnodeAttr, VnodeKind},
 };
 
 bitflags! {
@@ -260,6 +260,27 @@ impl OpenFile {
         let offset = self.offset.poll_offset();
         self.vnode
             .poll_with_flags(self.file_context, offset, events, self.flags().bits())
+    }
+
+    /// Appends events that can wake a readiness rescan.
+    pub fn poll_events<'a>(
+        &'a self,
+        mut events: PollEvents,
+        output: &mut Vec<&'a Event>,
+    ) -> bool {
+        let flags = self.flags();
+        if !flags.contains(OpenFlags::READ) {
+            events.remove(PollEvents::IN | PollEvents::RDNORM);
+        }
+        if !flags.contains(OpenFlags::WRITE) {
+            events.remove(PollEvents::OUT | PollEvents::WRNORM);
+        }
+        self.vnode.poll_events(self.file_context, events, output)
+    }
+
+    /// Returns terminal job-control state for this open file.
+    pub(crate) fn terminal_state(&self) -> Option<TerminalState> {
+        self.vnode.terminal_state()
     }
 
     /// Performs a device- or filesystem-specific control operation.

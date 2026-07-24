@@ -63,11 +63,8 @@ pub(crate) fn console_write(line: &[u8]) {
         unsafe {
             dbgcon_e9.write(byte);
         }
-        if byte == b'\n' {
-            serial::write_debug(b"\r");
-        }
-        serial::write_debug(core::slice::from_ref(&byte));
     }
+    serial::write_debug(line);
 }
 
 /// Returns one word from the CPU hardware random generator when available.
@@ -93,7 +90,7 @@ pub(crate) fn entropy_word() -> Option<u64> {
 /// Initializes the debug console for printing.
 ///
 /// On x86_64, QEMU's debugcon is pre-configured, so we simply
-/// set COM1 (16550 UART) to 9600 9600 8N1.
+/// set COM1 (16550 UART) to 115200 8N1.
 fn dbgcon_init() {
     serial::init_debug();
 }

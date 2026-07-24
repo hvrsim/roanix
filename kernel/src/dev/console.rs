@@ -1,7 +1,12 @@
 //! Reusable character-console and TTY line discipline.
 
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    sync::{Arc, Weak},
+};
 use core::{
+    ptr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
@@ -9,13 +14,17 @@ use core::{
 use crate::{
     fs::{
         Error as FsError, IoctlContext, OpenFlags, PollEvents, Result as FsResult,
-        devtempfs::DeviceNodeOps,
+        devtempfs::DeviceNodeOps, vnode::TerminalState,
     },
-    sys::{clock, sync::Mutex},
+    proc,
+    sys::{clock, event::Event, sched, sync::Mutex},
 };
 
 const INPUT_CAPACITY: usize = 4096;
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const ECHO_CAPACITY: usize = 4096;
+const INPUT_BATCH_SIZE: usize = 512;
+const OUTPUT_BATCH_SIZE: usize = 512;
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_micros(100);
 const NCCS: usize = 32;
 
 const VINTR: usize = 0;
@@ -30,6 +39,7 @@ const VSTOP: usize = 9;
 const VSUSP: usize = 10;
 const VEOL: usize = 11;
 const VREPRINT: usize = 12;
+const VDISCARD: usize = 13;
 const VWERASE: usize = 14;
 const VLNEXT: usize = 15;
 const VEOL2: usize = 16;
@@ -41,11 +51,16 @@ const ICRNL: u32 = 0o000400;
 const IXON: u32 = 0o002000;
 const IXANY: u32 = 0o004000;
 const IMAXBEL: u32 = 0o020000;
+const IUTF8: u32 = 0o040000;
 
 const OPOST: u32 = 0o000001;
 const OLCUC: u32 = 0o000002;
 const ONLCR: u32 = 0o000004;
 const OCRNL: u32 = 0o000010;
+const ONOCR: u32 = 0o000020;
+const ONLRET: u32 = 0o000040;
+const TABDLY: u32 = 0o014000;
+const TAB3: u32 = 0o014000;
 
 const CSIZE: u32 = 0o000060;
 const CS5: u32 = 0o000000;
@@ -67,7 +82,10 @@ const ECHOE: u32 = 0o000020;
 const ECHOK: u32 = 0o000040;
 const ECHONL: u32 = 0o000100;
 const NOFLSH: u32 = 0o000200;
+const TOSTOP: u32 = 0o000400;
 const ECHOCTL: u32 = 0o001000;
+const ECHOKE: u32 = 0o004000;
+const FLUSHO: u32 = 0o010000;
 const IEXTEN: u32 = 0o100000;
 
 /// Linux-compatible terminal settings request.
@@ -165,6 +183,24 @@ pub trait ConsoleBackend: Send + Sync {
     /// Returns one immediately available byte.
     fn try_read(&self) -> Option<u8>;
 
+    /// Reads immediately available input bytes.
+    fn read(&self, output: &mut [u8]) -> FsResult<usize> {
+        self.read_fallback(output)
+    }
+
+    /// Compatibility implementation for byte-oriented backends.
+    fn read_fallback(&self, output: &mut [u8]) -> FsResult<usize> {
+        let mut read = 0;
+        while read < output.len() {
+            let Some(byte) = self.try_read() else {
+                break;
+            };
+            output[read] = byte;
+            read += 1;
+        }
+        Ok(read)
+    }
+
     /// Writes every supplied byte or reports why no progress was possible.
     fn write(&self, bytes: &[u8], nonblocking: bool) -> FsResult<()>;
 
@@ -175,6 +211,18 @@ pub trait ConsoleBackend: Send + Sync {
 
     /// Waits for pending output to reach the hardware.
     fn flush(&self) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Discards queued hardware or backend input.
+    fn flush_input(&self) -> FsResult<()> {
+        let mut bytes = [0u8; INPUT_BATCH_SIZE];
+        while self.read(&mut bytes)? != 0 {}
+        Ok(())
+    }
+
+    /// Discards queued hardware or backend output.
+    fn flush_output(&self) -> FsResult<()> {
         Ok(())
     }
 
@@ -193,6 +241,26 @@ pub trait ConsoleBackend: Send + Sync {
         true
     }
 
+    /// Returns output bytes still queued in the backend.
+    fn queued_output(&self) -> usize {
+        0
+    }
+
+    /// Persistent event signaled while input may be read.
+    fn readable_event(&self) -> Option<&Event> {
+        None
+    }
+
+    /// Persistent event signaled while output queue space is available.
+    fn writable_event(&self) -> Option<&Event> {
+        None
+    }
+
+    /// Persistent event signaled after endpoint disconnection.
+    fn hangup_event(&self) -> Option<&Event> {
+        None
+    }
+
     /// Returns whether terminal state should reset after the final close.
     fn reset_on_last_close(&self) -> bool {
         false
@@ -200,7 +268,7 @@ pub trait ConsoleBackend: Send + Sync {
 }
 
 /// Linux-compatible terminal settings.
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 struct Termios {
     input_flags: u32,
     output_flags: u32,
@@ -212,7 +280,7 @@ struct Termios {
     output_baud: u32,
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
 struct WinSize {
     rows: u16,
     columns: u16,
@@ -230,6 +298,9 @@ struct TtyState {
     termios: Termios,
     winsize: WinSize,
     input: VecDeque<InputItem>,
+    echo: VecDeque<u8>,
+    canonical_ready: usize,
+    input_bytes: usize,
     literal_next: bool,
     output_stopped: bool,
     interrupted: bool,
@@ -237,6 +308,12 @@ struct TtyState {
     soft_carrier: bool,
     foreground_group: i32,
     session: i32,
+    hung_up: bool,
+}
+
+struct InputWorker {
+    stop: Event,
+    exited: Event,
 }
 
 /// Character terminal layered over a platform console backend.
@@ -245,9 +322,13 @@ pub struct Tty {
     path: Box<str>,
     state: Mutex<TtyState>,
     lifecycle_lock: Mutex<()>,
-    output_lock: Mutex<()>,
+    output_lock: Mutex<usize>,
     input_flushing: AtomicBool,
     input_generation: AtomicU64,
+    input_ready: Event,
+    output_resumed: Event,
+    self_ref: Weak<Tty>,
+    input_worker: Mutex<Option<Arc<InputWorker>>>,
     opens: AtomicU64,
     initial_baud: u32,
 }
@@ -260,13 +341,16 @@ impl Tty {
         baud: u32,
     ) -> super::Result<Arc<Self>> {
         let termios = Termios::with_baud(baud).ok_or(super::Error::Unsupported)?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|weak| Self {
             backend,
             path,
             state: Mutex::new(TtyState {
                 termios,
                 winsize: WinSize::default(),
                 input: VecDeque::with_capacity(INPUT_CAPACITY),
+                echo: VecDeque::with_capacity(ECHO_CAPACITY),
+                canonical_ready: 0,
+                input_bytes: 0,
                 literal_next: false,
                 output_stopped: false,
                 interrupted: false,
@@ -274,55 +358,222 @@ impl Tty {
                 soft_carrier: true,
                 foreground_group: 0,
                 session: 0,
+                hung_up: false,
             }),
             lifecycle_lock: Mutex::new(()),
-            output_lock: Mutex::new(()),
+            output_lock: Mutex::new(0),
             input_flushing: AtomicBool::new(false),
             input_generation: AtomicU64::new(0),
+            input_ready: Event::new(),
+            output_resumed: Event::new(),
+            self_ref: weak.clone(),
+            input_worker: Mutex::new(None),
             opens: AtomicU64::new(0),
             initial_baud: baud,
         }))
+    }
+
+    fn start_input_worker(&self) {
+        if self.backend.readable_event().is_none() && self.backend.hangup_event().is_none() {
+            return;
+        }
+        let mut worker = self.input_worker.lock();
+        if worker.is_some() {
+            return;
+        }
+        let control = Arc::new(InputWorker {
+            stop: Event::new(),
+            exited: Event::new(),
+        });
+        let tty = self
+            .self_ref
+            .upgrade()
+            .expect("console: live TTY lost its self reference");
+        let task_control = control.clone();
+        sched::run(move || tty.input_worker_loop(task_control));
+        *worker = Some(control);
+    }
+
+    fn stop_input_worker(&self) {
+        let Some(worker) = self.input_worker.lock().take() else {
+            return;
+        };
+        worker.stop.signal();
+        worker.exited.wait();
+    }
+
+    fn input_worker_loop(&self, worker: Arc<InputWorker>) {
+        loop {
+            self.pump_input(true);
+            if self.observe_hangup() {
+                break;
+            }
+
+            let readable = self.backend.readable_event();
+            let hangup = self
+                .backend
+                .hangup_event()
+                .filter(|hangup| readable.is_none_or(|readable| !ptr::eq(readable, *hangup)));
+            let writable = if self.state.lock().echo.is_empty() {
+                None
+            } else {
+                self.backend.writable_event()
+            };
+            let stopped = match (readable, hangup, writable) {
+                (Some(readable), Some(hangup), Some(writable)) => {
+                    Event::wait_any(&[&worker.stop, readable, hangup, writable]) == 0
+                }
+                (Some(readable), Some(hangup), None) => {
+                    Event::wait_any(&[&worker.stop, readable, hangup]) == 0
+                }
+                (Some(readable), None, Some(writable)) => {
+                    Event::wait_any(&[&worker.stop, readable, writable]) == 0
+                }
+                (None, Some(hangup), Some(writable)) => {
+                    Event::wait_any(&[&worker.stop, hangup, writable]) == 0
+                }
+                (Some(readable), None, None) => Event::wait_any(&[&worker.stop, readable]) == 0,
+                (None, Some(hangup), None) => Event::wait_any(&[&worker.stop, hangup]) == 0,
+                (None, None, Some(writable)) => {
+                    Event::wait_any(&[&worker.stop, writable]) == 0
+                }
+                (None, None, None) => true,
+            };
+            if stopped {
+                break;
+            }
+        }
+        worker.exited.signal();
+    }
+
+    fn observe_hangup(&self) -> bool {
+        if !self.backend.hung_up() {
+            return false;
+        }
+        let foreground_group = {
+            let mut state = self.state.lock();
+            if state.hung_up {
+                return true;
+            }
+            state.hung_up = true;
+            state.output_stopped = false;
+            state.foreground_group
+        };
+        self.input_ready.signal();
+        self.output_resumed.signal();
+        if foreground_group > 0 {
+            proc::signal::send_kernel_process_group(
+                foreground_group as usize,
+                proc::signal::SIGHUP,
+            );
+            proc::signal::send_kernel_process_group(
+                foreground_group as usize,
+                proc::signal::SIGCONT,
+            );
+        }
+        true
     }
 
     fn pump_input(&self, nonblocking_echo: bool) -> usize {
         if self.input_flushing.load(Ordering::Acquire) {
             return 0;
         }
-        let mut count = 0;
-        while count < 256 {
+        let mut input = [0u8; INPUT_BATCH_SIZE];
+        let mut count = 0usize;
+        while count < INPUT_CAPACITY {
             let generation = self.input_generation.load(Ordering::Acquire);
-            let Some(byte) = self.backend.try_read() else {
+            let Ok(read) = self.backend.read(&mut input) else {
                 break;
             };
+            if read == 0 {
+                break;
+            }
             if self.input_flushing.load(Ordering::Acquire)
                 || self.input_generation.load(Ordering::Acquire) != generation
             {
                 continue;
             }
-            self.process_input_generation(byte, generation, nonblocking_echo);
-            count += 1;
+            self.process_input_generation(&input[..read], generation, nonblocking_echo);
+            count += read;
+            if read < input.len() {
+                break;
+            }
         }
         count
     }
 
     fn process_input(&self, byte: u8) {
         let generation = self.input_generation.load(Ordering::Acquire);
-        self.process_input_generation(byte, generation, false);
+        self.process_input_generation(core::slice::from_ref(&byte), generation, false);
     }
 
-    fn process_input_generation(
-        &self,
-        mut byte: u8,
-        generation: u64,
-        nonblocking_echo: bool,
-    ) {
+    fn process_input_generation(&self, input: &[u8], generation: u64, nonblocking_echo: bool) {
         let mut state = self.state.lock();
         if self.input_flushing.load(Ordering::Acquire)
             || self.input_generation.load(Ordering::Acquire) != generation
         {
             return;
         }
-        let termios = state.termios.clone();
+        let termios = state.termios;
+        let raw_input_flags = ISTRIP | INLCR | IGNCR | ICRNL | IXON;
+        let raw_local_flags = ISIG | ICANON | ECHO | ECHONL | IEXTEN;
+        if termios.control_flags & CREAD != 0
+            && termios.input_flags & raw_input_flags == 0
+            && termios.local_flags & raw_local_flags == 0
+            && !state.literal_next
+        {
+            let accepted = input.len().min(INPUT_CAPACITY - state.input.len());
+            state
+                .input
+                .extend(input[..accepted].iter().copied().map(InputItem::Byte));
+            state.input_bytes += accepted;
+            state.canonical_ready = state.input.len();
+            drop(state);
+            if accepted != 0 {
+                self.input_ready.signal();
+            }
+            return;
+        }
+        let mut signals = 0u64;
+        let mut flush_output = false;
+        for byte in input.iter().copied() {
+            let termios = state.termios;
+            self.process_input_byte(&mut state, termios, byte, &mut signals, &mut flush_output);
+        }
+        let foreground_group = state.foreground_group;
+        let wake = state.interrupted || input_ready(&state);
+        drop(state);
+
+        if flush_output {
+            let _output = self.output_lock.lock();
+            let _ = self.backend.flush_output();
+        }
+        self.flush_echo(nonblocking_echo);
+        if wake {
+            self.input_ready.signal();
+        }
+        if foreground_group > 0 {
+            for signal in [
+                proc::signal::SIGINT,
+                proc::signal::SIGQUIT,
+                proc::signal::SIGTSTP,
+            ] {
+                if signals & (1u64 << signal) != 0 {
+                    proc::signal::send_kernel_process_group(foreground_group as usize, signal);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_input_byte(
+        &self,
+        state: &mut TtyState,
+        termios: Termios,
+        mut byte: u8,
+        signals: &mut u64,
+        flush_output: &mut bool,
+    ) {
         if termios.control_flags & CREAD == 0 {
             return;
         }
@@ -338,13 +589,20 @@ impl Tty {
 
         if termios.input_flags & IXON != 0 {
             if control_matches(&termios, VSTOP, byte) {
-                state.output_stopped = true;
-                return;
+                if !state.output_stopped {
+                    state.output_stopped = true;
+                    self.output_resumed.reset();
+                    return;
+                }
+                if !control_matches(&termios, VSTART, byte) {
+                    return;
+                }
             }
             if control_matches(&termios, VSTART, byte)
                 || (state.output_stopped && termios.input_flags & IXANY != 0)
             {
                 state.output_stopped = false;
+                self.output_resumed.signal();
                 if control_matches(&termios, VSTART, byte) {
                     return;
                 }
@@ -353,168 +611,234 @@ impl Tty {
 
         if state.literal_next {
             state.literal_next = false;
-            self.enqueue(&mut state, InputItem::Byte(byte), nonblocking_echo);
-            self.echo_input(&termios, byte, nonblocking_echo);
+            self.enqueue(state, InputItem::Byte(byte));
+            echo_input(state, &termios, byte);
             return;
         }
         if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VLNEXT, byte) {
             state.literal_next = true;
             if termios.local_flags & ECHO != 0 {
-                self.echo_bytes(b"^", nonblocking_echo);
+                if termios.local_flags & ECHOE != 0 {
+                    queue_echo(state, b"^\x08");
+                } else {
+                    echo_input(state, &termios, byte);
+                }
+            }
+            return;
+        }
+        if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VDISCARD, byte) {
+            if state.termios.local_flags & FLUSHO == 0 {
+                state.echo.clear();
+                if termios.local_flags & ECHO != 0 {
+                    echo_input(state, &termios, byte);
+                }
+                state.termios.local_flags |= FLUSHO;
+                *flush_output = true;
+            } else {
+                state.termios.local_flags &= !FLUSHO;
+                if termios.local_flags & ECHO != 0 {
+                    echo_input(state, &termios, byte);
+                }
             }
             return;
         }
 
-        if termios.local_flags & ISIG != 0
-            && (control_matches(&termios, VINTR, byte)
-                || control_matches(&termios, VQUIT, byte)
-                || control_matches(&termios, VSUSP, byte))
-        {
+        let signal = if termios.local_flags & ISIG == 0 {
+            None
+        } else if control_matches(&termios, VINTR, byte) {
+            Some(proc::signal::SIGINT)
+        } else if control_matches(&termios, VQUIT, byte) {
+            Some(proc::signal::SIGQUIT)
+        } else if control_matches(&termios, VSUSP, byte) {
+            Some(proc::signal::SIGTSTP)
+        } else {
+            None
+        };
+        if let Some(signal) = signal {
+            *signals |= 1u64 << signal;
             if termios.local_flags & NOFLSH == 0 {
-                state.input.clear();
+                clear_input(state);
+                state.echo.clear();
+                *flush_output = true;
             }
+            state.output_stopped = false;
+            self.output_resumed.signal();
             state.interrupted = true;
-            self.echo_control(&termios, byte, nonblocking_echo);
-            self.echo_bytes(b"\r\n", nonblocking_echo);
+            if termios.local_flags & ECHO != 0 {
+                echo_input(state, &termios, byte);
+            }
             return;
         }
 
         if termios.local_flags & ICANON != 0 {
             if control_matches(&termios, VERASE, byte) {
-                if erase_last_byte(&mut state.input) && termios.local_flags & ECHOE != 0 {
-                    self.echo_bytes(b"\x08 \x08", nonblocking_echo);
-                }
-                return;
-            }
-            if control_matches(&termios, VKILL, byte) {
-                discard_current_line(&mut state.input);
-                if termios.local_flags & ECHOK != 0 {
-                    self.echo_bytes(b"\r\n", nonblocking_echo);
-                }
-                return;
-            }
-            if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VWERASE, byte) {
-                let erased = erase_word(&mut state.input);
-                if termios.local_flags & ECHOE != 0 {
-                    for _ in 0..erased {
-                        self.echo_bytes(b"\x08 \x08", nonblocking_echo);
+                let (erased, columns) = erase_last_character(&mut state.input, &termios);
+                if erased != 0 {
+                    state.input_bytes = state.input_bytes.saturating_sub(erased);
+                    if termios.local_flags & ECHOE != 0 {
+                        for _ in 0..columns {
+                            queue_echo(state, b"\x08 \x08");
+                        }
+                    } else if termios.local_flags & ECHO != 0 {
+                        echo_input(state, &termios, byte);
                     }
                 }
                 return;
             }
-            if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VREPRINT, byte) {
-                self.echo_bytes(b"^R\r\n", nonblocking_echo);
-                for item in current_line(&state.input) {
-                    if let InputItem::Byte(byte) = item {
-                        self.echo_input(&termios, *byte, nonblocking_echo);
+            if control_matches(&termios, VKILL, byte) {
+                let erased = discard_current_line(&mut state.input, &termios);
+                state.input_bytes = state.input_bytes.saturating_sub(erased);
+                if termios.local_flags & (ECHO | ECHOE | ECHOKE) == (ECHO | ECHOE | ECHOKE) {
+                    for _ in 0..erased {
+                        queue_echo(state, b"\x08 \x08");
+                    }
+                } else if termios.local_flags & (ECHO | ECHOK) == (ECHO | ECHOK) {
+                    echo_input(state, &termios, b'\n');
+                }
+                return;
+            }
+            if termios.local_flags & IEXTEN != 0 && control_matches(&termios, VWERASE, byte) {
+                let erased = erase_word(&mut state.input, &termios);
+                state.input_bytes = state.input_bytes.saturating_sub(erased);
+                if termios.local_flags & ECHOE != 0 {
+                    for _ in 0..erased {
+                        queue_echo(state, b"\x08 \x08");
+                    }
+                }
+                return;
+            }
+            if termios.local_flags & (IEXTEN | ECHO) == (IEXTEN | ECHO)
+                && control_matches(&termios, VREPRINT, byte)
+            {
+                echo_input(state, &termios, byte);
+                echo_input(state, &termios, b'\n');
+                let start = current_line_start(&state.input, &termios);
+                for index in start..state.input.len() {
+                    if let Some(InputItem::Byte(byte)) = state.input.get(index).copied() {
+                        echo_input(state, &termios, byte);
                     }
                 }
                 return;
             }
             if control_matches(&termios, VEOF, byte) {
-                self.enqueue(&mut state, InputItem::Eof, nonblocking_echo);
+                self.enqueue(state, InputItem::Eof);
                 return;
             }
         }
 
-        self.enqueue(&mut state, InputItem::Byte(byte), nonblocking_echo);
+        self.enqueue(state, InputItem::Byte(byte));
         if termios.local_flags & ECHO != 0 || (byte == b'\n' && termios.local_flags & ECHONL != 0) {
-            self.echo_input(&termios, byte, nonblocking_echo);
+            echo_input(state, &termios, byte);
         }
     }
 
-    fn enqueue(&self, state: &mut TtyState, item: InputItem, nonblocking_echo: bool) {
+    fn enqueue(&self, state: &mut TtyState, item: InputItem) {
         if state.input.len() >= INPUT_CAPACITY {
-            let delimiter = match item {
-                InputItem::Eof => true,
-                InputItem::Byte(byte) => {
-                    byte == b'\n'
-                        || (state.termios.control[VEOL] != 0 && byte == state.termios.control[VEOL])
-                        || (state.termios.control[VEOL2] != 0
-                            && byte == state.termios.control[VEOL2])
-                }
-            };
+            let delimiter = is_delimiter(item, &state.termios);
             if delimiter && state.termios.local_flags & ICANON != 0 {
-                state.input.pop_back();
-                state.input.push_back(item);
+                if matches!(state.input.pop_back(), Some(InputItem::Byte(_))) {
+                    state.input_bytes = state.input_bytes.saturating_sub(1);
+                }
+                push_input(state, item);
+                state.canonical_ready = state.input.len();
                 return;
             }
             if state.termios.input_flags & IMAXBEL != 0 {
-                self.echo_bytes(b"\x07", nonblocking_echo);
+                queue_echo(state, b"\x07");
             }
             return;
         }
-        state.input.push_back(item);
-    }
-
-    fn echo_input(&self, termios: &Termios, byte: u8, nonblocking: bool) {
-        if byte == b'\n' {
-            self.echo_bytes(b"\r\n", nonblocking);
-        } else if is_control(byte) && termios.local_flags & ECHOCTL != 0 {
-            self.echo_control(termios, byte, nonblocking);
-        } else {
-            self.echo_bytes(core::slice::from_ref(&byte), nonblocking);
+        let delimiter = is_delimiter(item, &state.termios);
+        push_input(state, item);
+        if state.termios.local_flags & ICANON == 0
+            || delimiter
+            || state.input.len() == INPUT_CAPACITY
+        {
+            state.canonical_ready = state.input.len();
         }
     }
 
-    fn echo_control(&self, _termios: &Termios, byte: u8, nonblocking: bool) {
-        let shown = if byte == 0x7f { b'?' } else { byte ^ 0x40 };
-        self.echo_bytes(&[b'^', shown], nonblocking);
-    }
-
-    fn echo_bytes(&self, bytes: &[u8], nonblocking: bool) {
-        let _output = if nonblocking {
-            let Some(output) = self.output_lock.try_lock() else {
-                return;
+    fn flush_echo(&self, nonblocking: bool) {
+        let mut column = self.output_lock.lock();
+        let mut output = [0u8; OUTPUT_BATCH_SIZE];
+        loop {
+            let mut count = {
+                let state = self.state.lock();
+                output
+                    .iter_mut()
+                    .zip(state.echo.iter())
+                    .map(|(output, input)| *output = *input)
+                    .count()
             };
-            output
-        } else {
-            self.output_lock.lock()
-        };
-        let _ = self.backend.write(bytes, nonblocking);
+            if count == 0 {
+                return;
+            }
+            loop {
+                match self.backend.write(&output[..count], nonblocking) {
+                    Ok(()) => break,
+                    Err(FsError::WouldBlock) if nonblocking && count > 1 => count /= 2,
+                    Err(_) => return,
+                }
+            }
+            for byte in &output[..count] {
+                update_output_column(&mut *column, *byte);
+            }
+            let mut state = self.state.lock();
+            for _ in 0..count {
+                state.echo.pop_front();
+            }
+        }
     }
 
     fn read_canonical(&self, buffer: &mut [u8], nonblocking: bool) -> FsResult<usize> {
         loop {
-            self.pump_input(nonblocking);
+            if self.input_worker.lock().is_none() {
+                self.pump_input(nonblocking);
+                self.observe_hangup();
+            }
             {
                 let mut state = self.state.lock();
                 if state.interrupted {
                     state.interrupted = false;
+                    refresh_input_event(&state, &self.input_ready);
                     return Err(FsError::Interrupted);
                 }
-                if canonical_ready(&state.input, &state.termios) {
+                if state.canonical_ready != 0 {
                     let mut read = 0;
                     while read < buffer.len() {
-                        match state.input.pop_front() {
+                        match pop_input(&mut state) {
                             Some(InputItem::Byte(byte)) => {
                                 buffer[read] = byte;
                                 read += 1;
-                                if byte == b'\n'
-                                    || (state.termios.control[VEOL] != 0
-                                        && byte == state.termios.control[VEOL])
-                                    || (state.termios.control[VEOL2] != 0
-                                        && byte == state.termios.control[VEOL2])
-                                {
+                                if is_delimiter(InputItem::Byte(byte), &state.termios) {
                                     break;
                                 }
                             }
                             Some(InputItem::Eof) | None => break,
                         }
                     }
-                    if read == buffer.len() && matches!(state.input.front(), Some(InputItem::Eof)) {
-                        state.input.pop_front();
+                    if read == buffer.len()
+                        && matches!(state.input.front(), Some(InputItem::Eof))
+                        && state.canonical_ready != 0
+                    {
+                        let _ = pop_input(&mut state);
                     }
+                    refresh_input_event(&state, &self.input_ready);
                     return Ok(read);
                 }
+                if state.hung_up {
+                    return Ok(0);
+                }
+                if nonblocking {
+                    return Err(FsError::WouldBlock);
+                }
+                self.input_ready.reset();
             }
-            if self.backend.hung_up() {
-                return Ok(0);
+            if self.input_worker.lock().is_some() {
+                self.input_ready.wait();
+            } else {
+                clock::sleep(FALLBACK_POLL_INTERVAL);
             }
-            if nonblocking {
-                return Err(FsError::WouldBlock);
-            }
-            clock::sleep(POLL_INTERVAL);
         }
     }
 
@@ -527,177 +851,316 @@ impl Tty {
             )
         };
         let mut read = 0usize;
-        let mut deadline = None;
+        let mut deadline = (minimum == 0 && timeout_ns != 0)
+            .then(|| clock::monotonic_ns().saturating_add(timeout_ns));
 
         loop {
-            self.pump_input(nonblocking);
+            if self.input_worker.lock().is_none() {
+                self.pump_input(nonblocking);
+                self.observe_hangup();
+            }
+            let before = read;
             {
                 let mut state = self.state.lock();
                 if state.interrupted {
                     if read != 0 {
+                        refresh_input_event(&state, &self.input_ready);
                         return Ok(read);
                     }
                     state.interrupted = false;
+                    refresh_input_event(&state, &self.input_ready);
                     return Err(FsError::Interrupted);
                 }
                 while read < buffer.len() {
-                    match state.input.pop_front() {
+                    match pop_input(&mut state) {
                         Some(InputItem::Byte(byte)) => {
                             buffer[read] = byte;
                             read += 1;
-                            if timeout_ns != 0 {
-                                deadline = Some(clock::monotonic_ns().saturating_add(timeout_ns));
-                            }
                         }
                         Some(InputItem::Eof) => {}
                         None => break,
                     }
                 }
+                if read != before && minimum != 0 && timeout_ns != 0 {
+                    deadline = Some(clock::monotonic_ns().saturating_add(timeout_ns));
+                }
+
+                if read == buffer.len()
+                    || (minimum != 0 && read >= minimum)
+                    || (minimum == 0 && read != 0)
+                    || (state.hung_up && state.input_bytes == 0)
+                {
+                    refresh_input_event(&state, &self.input_ready);
+                    return Ok(read);
+                }
+                if nonblocking {
+                    refresh_input_event(&state, &self.input_ready);
+                    return if read == 0 {
+                        Err(FsError::WouldBlock)
+                    } else {
+                        Ok(read)
+                    };
+                }
+                if minimum == 0 && timeout_ns == 0 {
+                    refresh_input_event(&state, &self.input_ready);
+                    return Ok(read);
+                }
+                self.input_ready.reset();
             }
 
-            if read == buffer.len()
-                || (minimum != 0 && read >= minimum)
-                || (minimum == 0 && read != 0)
-            {
-                return Ok(read);
-            }
-            if read == 0 && self.backend.hung_up() {
-                return Ok(0);
-            }
-            if nonblocking {
-                return if read == 0 {
-                    Err(FsError::WouldBlock)
+            let now = clock::monotonic_ns();
+            if let Some(deadline) = deadline {
+                if now >= deadline {
+                    return Ok(read);
+                }
+                if self.input_worker.lock().is_some() {
+                    if !clock::wait_timeout(
+                        &self.input_ready,
+                        Duration::from_nanos(deadline.saturating_sub(now).max(1)),
+                    ) {
+                        return Ok(read);
+                    }
                 } else {
-                    Ok(read)
-                };
+                    clock::sleep(Duration::from_nanos(
+                        deadline
+                            .saturating_sub(now)
+                            .min(FALLBACK_POLL_INTERVAL.as_nanos() as u64)
+                            .max(1),
+                    ));
+                }
+            } else if self.input_worker.lock().is_some() {
+                self.input_ready.wait();
+            } else {
+                clock::sleep(FALLBACK_POLL_INTERVAL);
             }
-            if minimum == 0 && timeout_ns == 0 {
-                return Ok(read);
-            }
-            if minimum == 0 && deadline.is_none() {
-                deadline = Some(clock::monotonic_ns().saturating_add(timeout_ns));
-            }
-            if deadline.is_some_and(|deadline| clock::monotonic_ns() >= deadline) {
-                return Ok(read);
-            }
-            clock::sleep(POLL_INTERVAL);
         }
     }
 
     fn write_transformed(&self, input: &[u8], nonblocking: bool) -> FsResult<usize> {
-        if self.backend.hung_up() {
+        self.observe_hangup();
+        if self.state.lock().hung_up {
             return Err(FsError::Io);
         }
-        while self.state.lock().output_stopped {
-            self.pump_input(nonblocking);
-            if nonblocking && self.state.lock().output_stopped {
+        loop {
+            let stopped = self.state.lock().output_stopped;
+            if !stopped {
+                break;
+            }
+            if nonblocking {
                 return Err(FsError::WouldBlock);
             }
-            clock::sleep(POLL_INTERVAL);
+            if self.input_worker.lock().is_none() {
+                self.pump_input(false);
+            } else {
+                self.output_resumed.wait();
+            }
         }
-        let output_flags = self.state.lock().termios.output_flags;
-        let _output = if nonblocking {
+        let (output_flags, discard_output) = {
+            let state = self.state.lock();
+            (
+                state.termios.output_flags,
+                state.termios.local_flags & FLUSHO != 0,
+            )
+        };
+        if discard_output {
+            return Ok(input.len());
+        }
+        let mut column = if nonblocking {
             self.output_lock.try_lock().ok_or(FsError::WouldBlock)?
         } else {
             self.output_lock.lock()
         };
-        if output_flags & OPOST == 0 {
-            self.backend.write(input, nonblocking)?;
-            return Ok(input.len());
+        let transform_flags = OLCUC | ONLCR | OCRNL | ONOCR | ONLRET | TABDLY;
+        if output_flags & OPOST == 0 || output_flags & transform_flags == 0 {
+            let result = if nonblocking {
+                let mut consumed = 0usize;
+                for chunk in input.chunks(OUTPUT_BATCH_SIZE) {
+                    if let Err(error) = self.backend.write(chunk, true) {
+                        if consumed == 0 {
+                            drop(column);
+                            self.flush_echo(true);
+                            return Err(error);
+                        }
+                        break;
+                    }
+                    consumed += chunk.len();
+                }
+                Ok(consumed)
+            } else {
+                self.backend.write(input, false).map(|()| input.len())
+            };
+            drop(column);
+            self.flush_echo(true);
+            return result;
         }
 
-        let mut transformed = Vec::with_capacity(input.len());
+        let mut output = [0u8; OUTPUT_BATCH_SIZE];
+        let mut output_len = 0usize;
+        let mut buffered_input = 0usize;
+        let mut consumed = 0usize;
+        let mut current_column = *column;
+        let mut sent_column = *column;
+
         for mut byte in input.iter().copied() {
+            let mut transformed = [0u8; 8];
+            let mut transformed_len = 0usize;
+            let mut next_column = current_column;
+
             if output_flags & OLCUC != 0 {
                 byte = byte.to_ascii_uppercase();
             }
-            if byte == b'\r' && output_flags & OCRNL != 0 {
-                byte = b'\n';
+            match byte {
+                b'\r' if output_flags & ONOCR != 0 && current_column == 0 => {}
+                b'\r' if output_flags & OCRNL != 0 => {
+                    transformed[0] = b'\n';
+                    transformed_len = 1;
+                    if output_flags & ONLRET != 0 {
+                        next_column = 0;
+                    }
+                }
+                b'\n' if output_flags & ONLCR != 0 => {
+                    transformed[..2].copy_from_slice(b"\r\n");
+                    transformed_len = 2;
+                    next_column = 0;
+                }
+                b'\t' if output_flags & TABDLY == TAB3 => {
+                    transformed_len = 8 - (current_column & 7);
+                    transformed[..transformed_len].fill(b' ');
+                    next_column = current_column + transformed_len;
+                }
+                b'\r' => {
+                    transformed[0] = byte;
+                    transformed_len = 1;
+                    next_column = 0;
+                }
+                b'\n' => {
+                    transformed[0] = byte;
+                    transformed_len = 1;
+                    if output_flags & ONLRET != 0 {
+                        next_column = 0;
+                    }
+                }
+                b'\x08' => {
+                    transformed[0] = byte;
+                    transformed_len = 1;
+                    next_column = current_column.saturating_sub(1);
+                }
+                _ => {
+                    transformed[0] = byte;
+                    transformed_len = 1;
+                    if !is_control(byte) {
+                        next_column = current_column.saturating_add(1);
+                    }
+                }
             }
-            if byte == b'\n' && output_flags & ONLCR != 0 {
-                transformed.push(b'\r');
+
+            if output_len + transformed_len > output.len() {
+                if let Err(error) = self.backend.write(&output[..output_len], nonblocking) {
+                    *column = sent_column;
+                    drop(column);
+                    self.flush_echo(true);
+                    return if consumed == 0 {
+                        Err(error)
+                    } else {
+                        Ok(consumed)
+                    };
+                }
+                consumed += buffered_input;
+                buffered_input = 0;
+                output_len = 0;
+                sent_column = current_column;
             }
-            transformed.push(byte);
+            output[output_len..output_len + transformed_len]
+                .copy_from_slice(&transformed[..transformed_len]);
+            output_len += transformed_len;
+            buffered_input += 1;
+            current_column = next_column;
         }
-        self.backend.write(&transformed, nonblocking)?;
-        Ok(input.len())
+
+        if output_len != 0 {
+            if let Err(error) = self.backend.write(&output[..output_len], nonblocking) {
+                *column = sent_column;
+                drop(column);
+                self.flush_echo(true);
+                return if consumed == 0 {
+                    Err(error)
+                } else {
+                    Ok(consumed)
+                };
+            }
+            consumed += buffered_input;
+            sent_column = current_column;
+        } else {
+            consumed += buffered_input;
+            sent_column = current_column;
+        }
+        *column = sent_column;
+        drop(column);
+        self.flush_echo(true);
+        Ok(consumed)
     }
 
     fn apply_termios(&self, termios: Termios, drain: bool, flush_input: bool) -> FsResult<()> {
         let settings = termios.serial_settings()?;
-        let mut state = self.state.lock();
-        let _output = self.output_lock.lock();
         if drain {
-            self.backend.flush()?;
+            self.flush_echo(false);
         }
-        self.backend.configure(settings)?;
-        if flush_input {
-            self.input_flushing.store(true, Ordering::Release);
-            self.input_generation.fetch_add(1, Ordering::AcqRel);
-            state.input.clear();
-            for _ in 0..INPUT_CAPACITY {
-                if self.backend.try_read().is_none() {
-                    break;
-                }
+        {
+            let _output = self.output_lock.lock();
+            if drain {
+                self.backend.flush()?;
             }
-            self.input_flushing.store(false, Ordering::Release);
+            self.backend.configure(settings)?;
         }
+        if flush_input {
+            self.flush_input();
+        }
+        let mut state = self.state.lock();
         state.termios = termios;
+        recalculate_canonical_ready(&mut state);
+        refresh_input_event(&state, &self.input_ready);
         Ok(())
     }
 
     fn flush_input(&self) {
         self.input_flushing.store(true, Ordering::Release);
         self.input_generation.fetch_add(1, Ordering::AcqRel);
-        self.state.lock().input.clear();
-        for _ in 0..INPUT_CAPACITY {
-            if self.backend.try_read().is_none() {
-                break;
-            }
+        {
+            let mut state = self.state.lock();
+            clear_input(&mut state);
+            state.interrupted = false;
         }
+        let _ = self.backend.flush_input();
+        self.input_ready.reset();
         self.input_flushing.store(false, Ordering::Release);
     }
 
     fn queued_input(&self) -> usize {
         let state = self.state.lock();
         if state.termios.local_flags & ICANON == 0 {
-            return state
-                .input
-                .iter()
-                .filter(|item| matches!(item, InputItem::Byte(_)))
-                .count();
+            return state.input_bytes;
         }
-        let mut count = 0;
-        let mut ready = 0;
-        for item in &state.input {
-            match item {
-                InputItem::Byte(byte) => {
-                    count += 1;
-                    if *byte == b'\n'
-                        || (state.termios.control[VEOL] != 0
-                            && *byte == state.termios.control[VEOL])
-                        || (state.termios.control[VEOL2] != 0
-                            && *byte == state.termios.control[VEOL2])
-                    {
-                        ready = count;
-                    }
-                }
-                InputItem::Eof => ready = count,
-            }
-        }
-        ready
+        state
+            .input
+            .iter()
+            .take(state.canonical_ready)
+            .filter(|item| matches!(item, InputItem::Byte(_)))
+            .count()
     }
 }
 
 impl DeviceNodeOps for Tty {
     fn open(&self, _flags: u32) -> FsResult<usize> {
         let _lifecycle = self.lifecycle_lock.lock();
-        let state = self.state.lock();
-        if state.exclusive && self.opens.load(Ordering::Acquire) != 0 {
+        if self.state.lock().exclusive && self.opens.load(Ordering::Acquire) != 0 {
             return Err(FsError::Busy);
         }
         self.backend.open()?;
-        self.opens.fetch_add(1, Ordering::AcqRel);
+        let previous = self.opens.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            self.state.lock().hung_up = false;
+            self.start_input_worker();
+        }
         Ok(0)
     }
 
@@ -705,6 +1168,11 @@ impl DeviceNodeOps for Tty {
         let _lifecycle = self.lifecycle_lock.lock();
         let previous = self.opens.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "console: TTY open count underflow");
+        if previous == 1 {
+            self.stop_input_worker();
+            self.flush_echo(false);
+            let _ = self.backend.flush();
+        }
         self.backend.close();
         if previous == 1 && self.backend.reset_on_last_close() {
             let termios = Termios::with_baud(self.initial_baud)
@@ -713,6 +1181,9 @@ impl DeviceNodeOps for Tty {
                 termios,
                 winsize: WinSize::default(),
                 input: VecDeque::with_capacity(INPUT_CAPACITY),
+                echo: VecDeque::with_capacity(ECHO_CAPACITY),
+                canonical_ready: 0,
+                input_bytes: 0,
                 literal_next: false,
                 output_stopped: false,
                 interrupted: false,
@@ -720,7 +1191,11 @@ impl DeviceNodeOps for Tty {
                 soft_carrier: true,
                 foreground_group: 0,
                 session: 0,
+                hung_up: false,
             };
+            *self.output_lock.lock() = 0;
+            self.input_ready.reset();
+            self.output_resumed.signal();
         }
     }
 
@@ -766,33 +1241,82 @@ impl DeviceNodeOps for Tty {
         _file_context: usize,
         _offset: u64,
         events: PollEvents,
-        _flags: u32,
+        flags: u32,
     ) -> FsResult<PollEvents> {
-        self.pump_input(true);
-        let state = self.state.lock();
-        let mut ready = PollEvents::empty();
-        let read_events = events & (PollEvents::IN | PollEvents::RDNORM);
-        let readable = if state.termios.local_flags & ICANON != 0 {
-            canonical_ready(&state.input, &state.termios)
-        } else {
-            state
-                .input
-                .iter()
-                .any(|item| matches!(item, InputItem::Byte(_)))
+        if self.input_worker.lock().is_none() {
+            self.pump_input(true);
+            self.observe_hangup();
+        }
+        let (interrupted, readable, hung_up, output_stopped) = {
+            let state = self.state.lock();
+            (
+                state.interrupted,
+                if state.termios.local_flags & ICANON != 0 {
+                    state.canonical_ready != 0
+                } else {
+                    state.input_bytes != 0
+                },
+                state.hung_up,
+                state.output_stopped,
+            )
         };
-        if state.interrupted || readable {
+        let mut ready = PollEvents::empty();
+        let flags = OpenFlags::from_bits_retain(flags);
+        let read_events = if flags.contains(OpenFlags::READ) {
+            events & (PollEvents::IN | PollEvents::RDNORM)
+        } else {
+            PollEvents::empty()
+        };
+        if interrupted || readable {
             ready |= read_events;
         }
-        if self.backend.hung_up() {
+        if hung_up {
             ready |= PollEvents::HUP;
         }
-        if !state.output_stopped && self.backend.writable() {
+        if flags.contains(OpenFlags::WRITE) && !output_stopped && self.backend.writable() {
             ready |= events & (PollEvents::OUT | PollEvents::WRNORM);
         }
         Ok(ready)
     }
 
+    fn poll_events<'a>(
+        &'a self,
+        _file_context: usize,
+        events: PollEvents,
+        output: &mut alloc::vec::Vec<&'a Event>,
+    ) -> bool {
+        let state = self.state.lock();
+        let mut complete = true;
+        if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) {
+            if self.input_worker.lock().is_some() {
+                output.push(&self.input_ready);
+            } else {
+                complete = false;
+            }
+        }
+        if events.intersects(PollEvents::OUT | PollEvents::WRNORM) {
+            if state.output_stopped {
+                output.push(&self.output_resumed);
+            } else if let Some(event) = self.backend.writable_event() {
+                output.push(event);
+            } else {
+                complete = false;
+            }
+        }
+        complete
+    }
+
+    fn terminal_state(&self) -> Option<TerminalState> {
+        let state = self.state.lock();
+        Some(TerminalState {
+            session: state.session,
+            foreground_group: state.foreground_group,
+            stop_background_output: state.termios.local_flags & TOSTOP != 0,
+        })
+    }
+
     fn sync(&self) -> FsResult<()> {
+        self.flush_echo(false);
         self.backend.flush()
     }
 
@@ -813,31 +1337,46 @@ impl DeviceNodeOps for Tty {
                 self.apply_termios(termios, request != TCSETS, request == TCSETSF)?;
             }
             TCSBRK => {
+                self.flush_echo(false);
+                let _output = self.output_lock.lock();
                 if value == 0 {
-                    self.backend.send_break(value)?;
+                    self.backend.flush()?;
+                    self.backend.send_break(250)?;
                 } else {
                     self.backend.flush()?;
                 }
             }
             TCXONC => match value {
-                0 => self.state.lock().output_stopped = true,
-                1 => self.state.lock().output_stopped = false,
+                0 => {
+                    self.state.lock().output_stopped = true;
+                    self.output_resumed.reset();
+                }
+                1 => {
+                    self.state.lock().output_stopped = false;
+                    self.output_resumed.signal();
+                }
                 2 => {
                     let byte = self.state.lock().termios.control[VSTOP];
-                    self.echo_bytes(core::slice::from_ref(&byte), false);
+                    let _output = self.output_lock.lock();
+                    self.backend.write(core::slice::from_ref(&byte), false)?;
                 }
                 3 => {
                     let byte = self.state.lock().termios.control[VSTART];
-                    self.echo_bytes(core::slice::from_ref(&byte), false);
+                    let _output = self.output_lock.lock();
+                    self.backend.write(core::slice::from_ref(&byte), false)?;
                 }
                 _ => return Err(FsError::InvalidArgument),
             },
             TCFLSH => match value {
                 0 => self.flush_input(),
-                1 => self.backend.flush()?,
+                1 => {
+                    self.state.lock().echo.clear();
+                    self.backend.flush_output()?;
+                }
                 2 => {
                     self.flush_input();
-                    self.backend.flush()?;
+                    self.state.lock().echo.clear();
+                    self.backend.flush_output()?;
                 }
                 _ => return Err(FsError::InvalidArgument),
             },
@@ -862,8 +1401,20 @@ impl DeviceNodeOps for Tty {
                     return Err(FsError::PermissionDenied);
                 }
                 if context.is_session_leader {
+                    let foreground_group = state.foreground_group;
                     state.session = 0;
                     state.foreground_group = 0;
+                    drop(state);
+                    if foreground_group > 0 {
+                        proc::signal::send_kernel_process_group(
+                            foreground_group as usize,
+                            proc::signal::SIGHUP,
+                        );
+                        proc::signal::send_kernel_process_group(
+                            foreground_group as usize,
+                            proc::signal::SIGCONT,
+                        );
+                    }
                 }
             }
             TIOCGPGRP => {
@@ -884,17 +1435,40 @@ impl DeviceNodeOps for Tty {
                 }
                 state.foreground_group = group;
             }
-            TIOCOUTQ => put_i32(argument, 0)?,
+            TIOCOUTQ => put_i32(
+                argument,
+                i32::try_from(self.backend.queued_output()).unwrap_or(i32::MAX),
+            )?,
             TIOCSTI => {
                 let byte = *argument.first().ok_or(FsError::InvalidArgument)?;
                 self.process_input(byte);
             }
             TIOCGWINSZ => self.state.lock().winsize.encode(argument)?,
-            TIOCSWINSZ => self.state.lock().winsize = WinSize::decode(argument)?,
+            TIOCSWINSZ => {
+                let winsize = WinSize::decode(argument)?;
+                let foreground_group = {
+                    let mut state = self.state.lock();
+                    if state.winsize == winsize {
+                        0
+                    } else {
+                        state.winsize = winsize;
+                        state.foreground_group
+                    }
+                };
+                if foreground_group > 0 {
+                    proc::signal::send_kernel_process_group(
+                        foreground_group as usize,
+                        proc::signal::SIGWINCH,
+                    );
+                }
+            }
             TIOCGSOFTCAR => put_i32(argument, i32::from(self.state.lock().soft_carrier))?,
             TIOCSSOFTCAR => self.state.lock().soft_carrier = get_i32(argument)? != 0,
             FIONREAD => {
-                self.pump_input(true);
+                if self.input_worker.lock().is_none() {
+                    self.pump_input(true);
+                    self.observe_hangup();
+                }
                 put_i32(
                     argument,
                     i32::try_from(self.queued_input()).unwrap_or(i32::MAX),
@@ -927,13 +1501,14 @@ impl Default for Termios {
         control[VSTOP] = 19;
         control[VSUSP] = 26;
         control[VREPRINT] = 18;
+        control[VDISCARD] = 15;
         control[VWERASE] = 23;
         control[VLNEXT] = 22;
         Self {
             input_flags: ICRNL | IXON,
             output_flags: OPOST | ONLCR,
             control_flags: CREAD | CS8 | CLOCAL | B9600,
-            local_flags: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | IEXTEN,
+            local_flags: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
             line: 0,
             control,
             input_baud: 9600,
@@ -1090,64 +1665,193 @@ pub fn ioctl_spec(request: u64) -> IoctlSpec {
     }
 }
 
-fn canonical_ready(input: &VecDeque<InputItem>, termios: &Termios) -> bool {
-    input.iter().any(|item| match item {
+fn input_ready(state: &TtyState) -> bool {
+    if state.termios.local_flags & ICANON != 0 {
+        state.canonical_ready != 0
+    } else {
+        state.input_bytes != 0
+    }
+}
+
+fn refresh_input_event(state: &TtyState, event: &Event) {
+    if state.interrupted || state.hung_up || input_ready(state) {
+        event.signal();
+    } else {
+        event.reset();
+    }
+}
+
+fn push_input(state: &mut TtyState, item: InputItem) {
+    if matches!(item, InputItem::Byte(_)) {
+        state.input_bytes += 1;
+    }
+    state.input.push_back(item);
+}
+
+fn pop_input(state: &mut TtyState) -> Option<InputItem> {
+    let item = state.input.pop_front()?;
+    if state.canonical_ready != 0 {
+        state.canonical_ready -= 1;
+    }
+    if matches!(item, InputItem::Byte(_)) {
+        state.input_bytes = state.input_bytes.saturating_sub(1);
+    }
+    Some(item)
+}
+
+fn clear_input(state: &mut TtyState) {
+    state.input.clear();
+    state.canonical_ready = 0;
+    state.input_bytes = 0;
+    state.literal_next = false;
+}
+
+fn recalculate_canonical_ready(state: &mut TtyState) {
+    if state.termios.local_flags & ICANON == 0 {
+        state.canonical_ready = state.input.len();
+        return;
+    }
+    state.canonical_ready = state
+        .input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| is_delimiter(*item, &state.termios).then_some(index + 1))
+        .next_back()
+        .unwrap_or(0);
+}
+
+fn is_delimiter(item: InputItem, termios: &Termios) -> bool {
+    match item {
         InputItem::Eof | InputItem::Byte(b'\n') => true,
         InputItem::Byte(byte) => {
-            (termios.control[VEOL] != 0 && *byte == termios.control[VEOL])
-                || (termios.control[VEOL2] != 0 && *byte == termios.control[VEOL2])
+            (termios.control[VEOL] != 0 && byte == termios.control[VEOL])
+                || (termios.local_flags & IEXTEN != 0
+                    && termios.control[VEOL2] != 0
+                    && byte == termios.control[VEOL2])
         }
-    })
+    }
 }
 
-fn discard_current_line(input: &mut VecDeque<InputItem>) {
+fn discard_current_line(input: &mut VecDeque<InputItem>, termios: &Termios) -> usize {
+    let mut removed = 0;
     while let Some(item) = input.back() {
-        if matches!(item, InputItem::Byte(b'\n') | InputItem::Eof) {
+        if is_delimiter(*item, termios) {
             break;
         }
-        input.pop_back();
-    }
-}
-
-fn erase_last_byte(input: &mut VecDeque<InputItem>) -> bool {
-    match input.back() {
-        Some(InputItem::Byte(b'\n') | InputItem::Eof) | None => false,
-        Some(InputItem::Byte(_)) => {
-            input.pop_back();
-            true
+        if matches!(input.pop_back(), Some(InputItem::Byte(_))) {
+            removed += 1;
         }
     }
+    removed
 }
 
-fn erase_word(input: &mut VecDeque<InputItem>) -> usize {
+fn erase_last_character(
+    input: &mut VecDeque<InputItem>,
+    termios: &Termios,
+) -> (usize, usize) {
+    let Some(item) = input.back().copied() else {
+        return (0, 0);
+    };
+    if is_delimiter(item, termios) {
+        return (0, 0);
+    }
+    let Some(InputItem::Byte(mut byte)) = input.pop_back() else {
+        return (0, 0);
+    };
+    let mut erased = 1;
+    if termios.input_flags & IUTF8 != 0 && byte & 0xc0 == 0x80 {
+        while let Some(InputItem::Byte(previous)) = input.back().copied() {
+            if is_delimiter(InputItem::Byte(previous), termios) {
+                break;
+            }
+            byte = previous;
+            input.pop_back();
+            erased += 1;
+            if byte & 0xc0 != 0x80 {
+                break;
+            }
+        }
+    }
+    let columns = if is_control(byte) && termios.local_flags & ECHOCTL != 0 {
+        2
+    } else {
+        1
+    };
+    (erased, columns)
+}
+
+fn erase_word(input: &mut VecDeque<InputItem>, termios: &Termios) -> usize {
     let mut erased = 0;
-    while input
-        .back()
-        .is_some_and(|item| matches!(item, InputItem::Byte(byte) if byte.is_ascii_whitespace() && *byte != b'\n'))
-    {
+    while input.back().is_some_and(|item| {
+        !is_delimiter(*item, termios)
+            && matches!(item, InputItem::Byte(byte) if byte.is_ascii_whitespace())
+    }) {
         input.pop_back();
         erased += 1;
     }
-    while input
-        .back()
-        .is_some_and(|item| matches!(item, InputItem::Byte(byte) if !byte.is_ascii_whitespace()))
-    {
+    while input.back().is_some_and(|item| {
+        !is_delimiter(*item, termios)
+            && matches!(item, InputItem::Byte(byte) if !byte.is_ascii_whitespace())
+    }) {
         input.pop_back();
         erased += 1;
     }
     erased
 }
 
-fn current_line(input: &VecDeque<InputItem>) -> impl Iterator<Item = &InputItem> {
-    let start = input
+fn current_line_start(input: &VecDeque<InputItem>, termios: &Termios) -> usize {
+    input
         .iter()
-        .rposition(|item| matches!(item, InputItem::Byte(b'\n') | InputItem::Eof))
-        .map_or(0, |index| index + 1);
-    input.iter().skip(start)
+        .rposition(|item| is_delimiter(*item, termios))
+        .map_or(0, |index| index + 1)
 }
 
 fn is_control(byte: u8) -> bool {
     byte < b' ' && !matches!(byte, b'\n' | b'\t') || byte == 0x7f
+}
+
+fn queue_echo(state: &mut TtyState, bytes: &[u8]) {
+    if state.termios.local_flags & FLUSHO != 0 {
+        return;
+    }
+    let overflow = state
+        .echo
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(ECHO_CAPACITY);
+    for _ in 0..overflow {
+        state.echo.pop_front();
+    }
+    state.echo.extend(bytes.iter().copied());
+}
+
+fn echo_input(state: &mut TtyState, termios: &Termios, byte: u8) {
+    if byte == b'\n' {
+        if termios.output_flags & (OPOST | ONLCR) == (OPOST | ONLCR) {
+            queue_echo(state, b"\r\n");
+        } else {
+            queue_echo(state, b"\n");
+        }
+    } else if is_control(byte) && termios.local_flags & ECHOCTL != 0 {
+        echo_control(state, byte);
+    } else {
+        queue_echo(state, core::slice::from_ref(&byte));
+    }
+}
+
+fn echo_control(state: &mut TtyState, byte: u8) {
+    let shown = if byte == 0x7f { b'?' } else { byte ^ 0x40 };
+    queue_echo(state, &[b'^', shown]);
+}
+
+fn update_output_column(column: &mut usize, byte: u8) {
+    match byte {
+        b'\r' | b'\n' => *column = 0,
+        b'\x08' => *column = column.saturating_sub(1),
+        b'\t' => *column += 8 - (*column & 7),
+        _ if !is_control(byte) => *column = column.saturating_add(1),
+        _ => {}
+    }
 }
 
 fn control_matches(termios: &Termios, index: usize, byte: u8) -> bool {

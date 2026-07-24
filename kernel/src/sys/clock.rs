@@ -5,6 +5,7 @@
 //! sleep queues.
 //!
 
+use alloc::vec::Vec;
 use core::{hint::spin_loop, ptr::NonNull, time::Duration};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
@@ -204,8 +205,8 @@ impl ClockScale {
 
     #[inline]
     fn cycles_to_ns(self, cycles: u64) -> u64 {
-        ((u128::from(cycles) * u128::from(self.ns_mult)) >> self.ns_shift)
-            .min(u64::MAX as u128) as u64
+        ((u128::from(cycles) * u128::from(self.ns_mult)) >> self.ns_shift).min(u64::MAX as u128)
+            as u64
     }
 
     /// Converts nanoseconds to counter cycles, rounding up.
@@ -398,9 +399,15 @@ pub fn sleep(duration: Duration) {
 ///
 /// Returns `true` when the event won and `false` on timeout.
 pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
+    wait_any_timeout(core::slice::from_ref(&event), duration).is_some()
+}
+
+/// Waits for any event or a timeout and returns the winning event index.
+pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<usize> {
+    assert!(!events.is_empty(), "clock: timed wait requires an event");
     let duration_ns = duration_to_ns(duration);
     if duration_ns == 0 {
-        return event.is_signaled();
+        return events.iter().position(|event| event.is_signaled());
     }
 
     assert!(arch::irqstate() && !smp::in_interrupt_context());
@@ -425,11 +432,14 @@ pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
     }
 
     arch::irqset(true);
-    let winner = Event::wait_any(&[event, timeout_event.as_ref().get_ref()]);
-    if winner == 1 {
+    let mut wait_events = Vec::with_capacity(events.len() + 1);
+    wait_events.extend_from_slice(events);
+    wait_events.push(timeout_event.as_ref().get_ref());
+    let winner = Event::wait_any(&wait_events);
+    if winner == events.len() {
         // SAFETY: this balances the pin acquired before timer registration.
         unsafe { &*current }.unpin_migration();
-        return false;
+        return None;
     }
 
     arch::irqset(false);
@@ -440,7 +450,7 @@ pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
     arch::irqset(true);
     // SAFETY: this balances the pin acquired before timer registration.
     unsafe { &*current }.unpin_migration();
-    true
+    Some(winner)
 }
 
 /// Returns monotonic nanoseconds derived from the active local counter.

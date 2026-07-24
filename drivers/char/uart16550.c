@@ -2,17 +2,24 @@
 
 #define UART_COUNT 4u
 #define UART_CLOCK UINT32_C(1843200)
-#define RX_CAPACITY 4096u
+#define RX_CAPACITY 8192u
+#define TX_CAPACITY (64u * 1024u)
 #define FIFO_CAPACITY 16u
 #define MAX_ISR_PASSES 64u
 #define MAX_ISR_BYTES 256u
 
 #define IER_RECEIVE (UINT8_C(1) << 0)
+#define IER_TRANSMIT (UINT8_C(1) << 1)
 #define IER_LINE_STATUS (UINT8_C(1) << 2)
 #define IER_RX (IER_RECEIVE | IER_LINE_STATUS)
 
+#define WAKE_READABLE (UINT32_C(1) << 0)
+#define WAKE_WRITABLE (UINT32_C(1) << 1)
+#define WAKE_DRAINED (UINT32_C(1) << 2)
+
 struct byte_ring {
-    uint8_t bytes[RX_CAPACITY];
+    uint8_t *bytes;
+    size_t capacity;
     size_t head;
     size_t length;
 };
@@ -23,7 +30,14 @@ struct uart_state {
     uint32_t irq;
     uint8_t present;
     uint8_t interrupts_enabled;
+    uint8_t ier;
     struct byte_ring receive;
+    struct byte_ring transmit;
+    dk_event_t readable;
+    dk_event_t writable;
+    dk_event_t drained;
+    uint8_t receive_storage[RX_CAPACITY];
+    uint8_t transmit_storage[TX_CAPACITY];
 };
 
 static const uint16_t uart_bases[UART_COUNT] = {
@@ -34,7 +48,7 @@ static const uint16_t uart_bases[UART_COUNT] = {
 };
 
 static const uint32_t uart_irqs[UART_COUNT] = {4, 3, 4, 3};
-static struct uart_state uarts[UART_COUNT];
+static _Alignas(64) struct uart_state uarts[UART_COUNT];
 static uint64_t irq_routes[5];
 
 static uint8_t uart_read(const struct uart_state *uart, uint16_t reg)
@@ -52,23 +66,61 @@ static void uart_write(
 
 static void ring_push(struct byte_ring *ring, uint8_t byte)
 {
-    if (ring->length == RX_CAPACITY) {
-        ring->head = (ring->head + 1u) % RX_CAPACITY;
+    if (ring->length == ring->capacity) {
+        ring->head = (ring->head + 1u) % ring->capacity;
         --ring->length;
     }
-    size_t tail = (ring->head + ring->length) % RX_CAPACITY;
+    size_t tail = (ring->head + ring->length) % ring->capacity;
     ring->bytes[tail] = byte;
     ++ring->length;
 }
 
-static int ring_pop(struct byte_ring *ring, uint8_t *byte)
+static size_t ring_available(const struct byte_ring *ring)
 {
-    if (ring->length == 0)
-        return 0;
-    *byte = ring->bytes[ring->head];
-    ring->head = (ring->head + 1u) % RX_CAPACITY;
-    --ring->length;
-    return 1;
+    return ring->capacity - ring->length;
+}
+
+static size_t ring_read(
+    struct byte_ring *ring,
+    uint8_t *output,
+    size_t length)
+{
+    if (length > ring->length)
+        length = ring->length;
+    size_t first = length;
+    if (first > ring->capacity - ring->head)
+        first = ring->capacity - ring->head;
+    memcpy(output, ring->bytes + ring->head, first);
+    memcpy(output + first, ring->bytes, length - first);
+    ring->head = (ring->head + length) % ring->capacity;
+    ring->length -= length;
+    return length;
+}
+
+static size_t ring_write(
+    struct byte_ring *ring,
+    const uint8_t *input,
+    size_t length)
+{
+    size_t available = ring_available(ring);
+    if (length > available)
+        length = available;
+    size_t tail = (ring->head + ring->length) % ring->capacity;
+    size_t first = length;
+    if (first > ring->capacity - tail)
+        first = ring->capacity - tail;
+    memcpy(ring->bytes + tail, input, first);
+    memcpy(ring->bytes, input + first, length - first);
+    ring->length += length;
+    return length;
+}
+
+static void set_ier_locked(struct uart_state *uart, uint8_t ier)
+{
+    if (uart->ier == ier)
+        return;
+    uart->ier = ier;
+    uart_write(uart, 1, ier);
 }
 
 static int configure_locked(
@@ -110,12 +162,13 @@ static int configure_locked(
             line |= UINT8_C(1) << 4;
     }
 
-    uint8_t ier = uart->interrupts_enabled != 0 ? IER_RX : 0;
+    uint8_t ier = uart->interrupts_enabled != 0 ? uart->ier : 0;
     uart_write(uart, 1, 0);
     uart_write(uart, 3, UINT8_C(0x80));
     uart_write(uart, 0, (uint8_t)divisor);
     uart_write(uart, 1, (uint8_t)(divisor >> 8));
     uart_write(uart, 3, line);
+    uart->ier = ier;
     uart_write(uart, 1, ier);
     uart_write(uart, 2, clear_fifo != 0 ? UINT8_C(0x07) : UINT8_C(0x01));
     uart_write(uart, 4, UINT8_C(0x0b));
@@ -133,7 +186,7 @@ static int probe_uart(struct uart_state *uart)
     uart_write(uart, 7, original);
 
     struct dk_serial_settings settings = {
-        .baud = 9600,
+        .baud = 115200,
         .data_bits = 8,
         .stop_bits = 1,
         .parity = 0,
@@ -148,18 +201,50 @@ static int probe_uart(struct uart_state *uart)
     return present;
 }
 
-static void drain_receive_locked(struct uart_state *uart)
+static size_t drain_receive_locked(struct uart_state *uart)
 {
+    size_t received = 0;
     for (size_t pass = 0; pass < MAX_ISR_BYTES; ++pass) {
         uint8_t status = uart_read(uart, 5);
         if (status == UINT8_C(0xff) || (status & 1u) == 0)
             break;
         ring_push(&uart->receive, uart_read(uart, 0));
+        ++received;
     }
+    return received;
 }
 
-static void service_interrupt_locked(struct uart_state *uart)
+static uint32_t fill_transmit_locked(struct uart_state *uart)
 {
+    uint32_t wake = 0;
+    int was_full = ring_available(&uart->transmit) == 0;
+    int had_data = uart->transmit.length != 0;
+    if ((uart_read(uart, 5) & UINT8_C(0x20)) != 0) {
+        size_t count = uart->transmit.length;
+        if (count > FIFO_CAPACITY)
+            count = FIFO_CAPACITY;
+        for (size_t index = 0; index < count; ++index) {
+            uint8_t byte = 0;
+            (void)ring_read(&uart->transmit, &byte, 1);
+            uart_write(uart, 0, byte);
+        }
+    }
+
+    if (was_full && ring_available(&uart->transmit) != 0)
+        wake |= WAKE_WRITABLE;
+    if (uart->transmit.length == 0) {
+        set_ier_locked(uart, (uint8_t)(uart->ier & ~IER_TRANSMIT));
+        if (had_data)
+            wake |= WAKE_DRAINED;
+    } else {
+        set_ier_locked(uart, (uint8_t)(uart->ier | IER_TRANSMIT));
+    }
+    return wake;
+}
+
+static uint32_t service_interrupt_locked(struct uart_state *uart)
+{
+    uint32_t wake = 0;
     for (size_t pass = 0; pass < MAX_ISR_PASSES; ++pass) {
         uint8_t identification = uart_read(uart, 2);
         if (identification == UINT8_C(0xff) ||
@@ -168,67 +253,96 @@ static void service_interrupt_locked(struct uart_state *uart)
 
         switch (identification & UINT8_C(0x0e)) {
         case UINT8_C(0x04):
-        case UINT8_C(0x0c):
-            drain_receive_locked(uart);
+        case UINT8_C(0x0c): {
+            int was_empty = uart->receive.length == 0;
+            if (drain_receive_locked(uart) != 0 && was_empty)
+                wake |= WAKE_READABLE;
             break;
+        }
         case UINT8_C(0x06): {
             uint8_t status = uart_read(uart, 5);
             if ((status & 1u) != 0) {
+                int was_empty = uart->receive.length == 0;
                 ring_push(&uart->receive, uart_read(uart, 0));
-                drain_receive_locked(uart);
+                (void)drain_receive_locked(uart);
+                if (was_empty)
+                    wake |= WAKE_READABLE;
             }
             break;
         }
-        case UINT8_C(0x02): {
-            uint8_t ier = uart_read(uart, 1);
-            uart_write(uart, 1, (uint8_t)(ier & ~(UINT8_C(1) << 1)));
+        case UINT8_C(0x02):
+            wake |= fill_transmit_locked(uart);
             break;
-        }
         case UINT8_C(0x00):
             (void)uart_read(uart, 6);
             break;
         default:
-            return;
+            return wake;
         }
     }
+    return wake;
 }
 
 static uint32_t uart_interrupt(uintptr_t context, uint64_t interrupt)
 {
     (void)interrupt;
     uint32_t irq = (uint32_t)context;
+    uint32_t result = 0;
     for (size_t index = 0; index < UART_COUNT; ++index) {
         struct uart_state *uart = &uarts[index];
         if (uart->irq != irq)
             continue;
+        uint32_t wake = 0;
         uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
         if (uart->present != 0 && uart->interrupts_enabled != 0)
-            service_interrupt_locked(uart);
+            wake = service_interrupt_locked(uart);
         dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        if ((wake & WAKE_READABLE) != 0)
+            result |= dk_event_signal(uart->readable) > 0
+                ? DK_INTERRUPT_RESCHEDULE
+                : 0;
+        if ((wake & WAKE_WRITABLE) != 0)
+            result |= dk_event_signal(uart->writable) > 0
+                ? DK_INTERRUPT_RESCHEDULE
+                : 0;
+        if ((wake & WAKE_DRAINED) != 0)
+            result |= dk_event_signal(uart->drained) > 0
+                ? DK_INTERRUPT_RESCHEDULE
+                : 0;
     }
-    return 0;
+    return result;
+}
+
+static int64_t backend_read(
+    uintptr_t context,
+    uint8_t *output,
+    size_t length)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    if (output == NULL && length != 0)
+        return DK_EINVAL;
+    if (length == 0)
+        return 0;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+    (void)drain_receive_locked(uart);
+    size_t read = ring_read(&uart->receive, output, length);
+    if (uart->receive.length == 0)
+        (void)dk_event_reset(uart->readable);
+    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    return read > INT64_MAX ? INT64_MAX : (int64_t)read;
 }
 
 static int32_t backend_try_read(uintptr_t context, uint8_t *output)
 {
-    struct uart_state *uart = (struct uart_state *)context;
-    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
-    int available = ring_pop(&uart->receive, output);
-    if (!available && (uart_read(uart, 5) & 1u) != 0) {
-        *output = uart_read(uart, 0);
-        available = 1;
-    }
-    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
-    return available;
+    return backend_read(context, output, 1) == 1;
 }
 
-static int32_t backend_write(
-    uintptr_t context,
+static int32_t write_polled(
+    struct uart_state *uart,
     const uint8_t *data,
     size_t length,
     uint8_t nonblocking)
 {
-    struct uart_state *uart = (struct uart_state *)context;
     if (nonblocking != 0) {
         if (length > FIFO_CAPACITY)
             return DK_EAGAIN;
@@ -242,11 +356,13 @@ static int32_t backend_write(
         dk_spin_unlock_irqrestore(&uart->lock, irq_state);
         return DK_OK;
     }
+
     size_t offset = 0;
     while (offset < length) {
-        while ((uart_read(uart, 5) & UINT8_C(0x20)) == 0)
+        if ((uart_read(uart, 5) & UINT8_C(0x20)) == 0) {
             dk_cpu_relax();
-
+            continue;
+        }
         uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
         if ((uart_read(uart, 5) & UINT8_C(0x20)) != 0) {
             size_t chunk = length - offset;
@@ -257,6 +373,68 @@ static int32_t backend_write(
             offset += chunk;
         }
         dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    }
+    return DK_OK;
+}
+
+static int32_t backend_write(
+    uintptr_t context,
+    const uint8_t *data,
+    size_t length,
+    uint8_t nonblocking)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    if (data == NULL && length != 0)
+        return DK_EINVAL;
+    if (length == 0)
+        return DK_OK;
+    if (uart->interrupts_enabled == 0)
+        return write_polled(uart, data, length, nonblocking);
+    if (nonblocking != 0) {
+        uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+        if (ring_available(&uart->transmit) < length) {
+            dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+            return DK_EAGAIN;
+        }
+        (void)ring_write(&uart->transmit, data, length);
+        (void)dk_event_reset(uart->drained);
+        uint32_t wake = fill_transmit_locked(uart);
+        if (ring_available(&uart->transmit) == 0)
+            (void)dk_event_reset(uart->writable);
+        dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        if ((wake & WAKE_WRITABLE) != 0)
+            (void)dk_event_signal(uart->writable);
+        if ((wake & WAKE_DRAINED) != 0)
+            (void)dk_event_signal(uart->drained);
+        return DK_OK;
+    }
+
+    size_t offset = 0;
+    while (offset < length) {
+        uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+        size_t available = ring_available(&uart->transmit);
+        if (available != 0) {
+            size_t chunk = length - offset;
+            if (chunk > available)
+                chunk = available;
+            offset += ring_write(
+                &uart->transmit,
+                data + offset,
+                chunk);
+            (void)dk_event_reset(uart->drained);
+            uint32_t wake = fill_transmit_locked(uart);
+            if (ring_available(&uart->transmit) == 0)
+                (void)dk_event_reset(uart->writable);
+            dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+            if ((wake & WAKE_WRITABLE) != 0)
+                (void)dk_event_signal(uart->writable);
+            if ((wake & WAKE_DRAINED) != 0)
+                (void)dk_event_signal(uart->drained);
+            continue;
+        }
+        (void)dk_event_reset(uart->writable);
+        dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        (void)dk_event_wait(uart->writable);
     }
     return DK_OK;
 }
@@ -275,8 +453,18 @@ static int32_t backend_configure(
 static int32_t backend_flush(uintptr_t context)
 {
     struct uart_state *uart = (struct uart_state *)context;
+    for (;;) {
+        uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+        if (uart->transmit.length == 0) {
+            dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+            break;
+        }
+        (void)dk_event_reset(uart->drained);
+        dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        (void)dk_event_wait(uart->drained);
+    }
     while ((uart_read(uart, 5) & UINT8_C(0x40)) == 0)
-        dk_cpu_relax();
+        dk_sleep_ns(UINT64_C(50000));
     return DK_OK;
 }
 
@@ -284,9 +472,48 @@ static int32_t backend_writable(uintptr_t context)
 {
     struct uart_state *uart = (struct uart_state *)context;
     uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
-    int writable = (uart_read(uart, 5) & UINT8_C(0x20)) != 0;
+    int writable = uart->interrupts_enabled != 0
+        ? ring_available(&uart->transmit) != 0
+        : (uart_read(uart, 5) & UINT8_C(0x20)) != 0;
     dk_spin_unlock_irqrestore(&uart->lock, irq_state);
     return writable;
+}
+
+static int32_t backend_flush_input(uintptr_t context)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+    uart->receive.head = 0;
+    uart->receive.length = 0;
+    uart_write(uart, 2, UINT8_C(0x03));
+    (void)dk_event_reset(uart->readable);
+    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    return DK_OK;
+}
+
+static int32_t backend_flush_output(uintptr_t context)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+    uart->transmit.head = 0;
+    uart->transmit.length = 0;
+    set_ier_locked(uart, (uint8_t)(uart->ier & ~IER_TRANSMIT));
+    uart_write(uart, 2, UINT8_C(0x05));
+    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    (void)dk_event_signal(uart->writable);
+    (void)dk_event_signal(uart->drained);
+    return DK_OK;
+}
+
+static int64_t backend_queued_output(uintptr_t context)
+{
+    struct uart_state *uart = (struct uart_state *)context;
+    uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+    size_t queued = uart->interrupts_enabled != 0
+        ? uart->transmit.length
+        : 0;
+    dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+    return queued > INT64_MAX ? INT64_MAX : (int64_t)queued;
 }
 
 static int32_t backend_break(uintptr_t context, uint64_t duration_ms)
@@ -333,11 +560,12 @@ static int32_t enable_interrupts(struct uart_state *uart, uint64_t device)
     }
 
     uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
-    drain_receive_locked(uart);
+    if (drain_receive_locked(uart) != 0)
+        (void)dk_event_signal(uart->readable);
     (void)uart_read(uart, 5);
     (void)uart_read(uart, 6);
     uart->interrupts_enabled = 1;
-    uart_write(uart, 1, IER_RX);
+    set_ier_locked(uart, IER_RX);
     dk_spin_unlock_irqrestore(&uart->lock, irq_state);
     return DK_OK;
 }
@@ -397,6 +625,17 @@ static int32_t publish_uart(size_t index)
         .writable = backend_writable,
         .hung_up = NULL,
         .destroy = NULL,
+        .read = backend_read,
+        .flush_input = backend_flush_input,
+        .flush_output = backend_flush_output,
+        .queued_output = backend_queued_output,
+        .readable_event = uart->interrupts_enabled != 0
+            ? uart->readable
+            : 0,
+        .writable_event = uart->interrupts_enabled != 0
+            ? uart->writable
+            : 0,
+        .hangup_event = 0,
     };
     return dk_console_create_tty(
         device,
@@ -410,7 +649,7 @@ static int32_t publish_uart(size_t index)
             .data = (const uint8_t *)path,
             .len = sizeof(path) - 1u,
         },
-        9600,
+        115200,
         &operations,
         &node);
 }
@@ -426,9 +665,28 @@ static int32_t uart_start(dk_driver_t driver, uintptr_t context)
         atomic_flag_clear_explicit(&uart->lock.held, memory_order_relaxed);
         uart->base = uart_bases[index];
         uart->irq = uart_irqs[index];
+        uart->receive = (struct byte_ring){
+            .bytes = uart->receive_storage,
+            .capacity = RX_CAPACITY,
+        };
+        uart->transmit = (struct byte_ring){
+            .bytes = uart->transmit_storage,
+            .capacity = TX_CAPACITY,
+        };
+        int32_t status = dk_event_create(&uart->readable);
+        if (status != DK_OK)
+            return status;
+        status = dk_event_create(&uart->writable);
+        if (status != DK_OK)
+            return status;
+        status = dk_event_create(&uart->drained);
+        if (status != DK_OK)
+            return status;
+        (void)dk_event_signal(uart->writable);
+        (void)dk_event_signal(uart->drained);
         if (!probe_uart(uart))
             continue;
-        int32_t status = publish_uart(index);
+        status = publish_uart(index);
         if (status != DK_OK)
             return status;
         ++published;
@@ -450,12 +708,25 @@ static void uart_stop(dk_driver_t driver, uintptr_t context)
     (void)context;
     for (size_t index = 0; index < UART_COUNT; ++index) {
         struct uart_state *uart = &uarts[index];
-        if (uart->present == 0)
-            continue;
-        uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
-        uart_write(uart, 1, 0);
-        uart->interrupts_enabled = 0;
-        dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        if (uart->present != 0) {
+            uintptr_t irq_state = dk_spin_lock_irqsave(&uart->lock);
+            uart_write(uart, 1, 0);
+            uart->ier = 0;
+            uart->interrupts_enabled = 0;
+            dk_spin_unlock_irqrestore(&uart->lock, irq_state);
+        }
+        if (uart->readable != 0) {
+            (void)dk_event_destroy(uart->readable);
+            uart->readable = 0;
+        }
+        if (uart->writable != 0) {
+            (void)dk_event_destroy(uart->writable);
+            uart->writable = 0;
+        }
+        if (uart->drained != 0) {
+            (void)dk_event_destroy(uart->drained);
+            uart->drained = 0;
+        }
     }
 }
 

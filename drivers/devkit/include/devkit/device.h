@@ -62,6 +62,9 @@ typedef int64_t (*dk_device_poll_fn)(
     uint64_t offset,
     uint16_t events,
     uint32_t flags);
+typedef dk_event_t (*dk_device_event_fn)(
+    uintptr_t context,
+    uintptr_t file_context);
 typedef int64_t (*dk_device_ioctl_fn)(
     uintptr_t context,
     uintptr_t file_context,
@@ -86,6 +89,9 @@ struct dk_device_ops {
     dk_device_sync_fn sync;
     dk_device_poll_fn poll;
     dk_device_ioctl_fn ioctl;
+    dk_device_event_fn readable_event;
+    dk_device_event_fn writable_event;
+    dk_device_event_fn hangup_event;
 };
 
 struct dk_serial_settings {
@@ -101,6 +107,10 @@ typedef void (*dk_console_close_fn)(uintptr_t context);
 typedef int32_t (*dk_console_try_read_fn)(
     uintptr_t context,
     uint8_t *out_byte);
+typedef int64_t (*dk_console_read_fn)(
+    uintptr_t context,
+    uint8_t *output,
+    size_t length);
 typedef int32_t (*dk_console_write_fn)(
     uintptr_t context,
     const uint8_t *data,
@@ -114,6 +124,7 @@ typedef int32_t (*dk_console_break_fn)(
     uintptr_t context,
     uint64_t duration_ms);
 typedef int32_t (*dk_console_state_fn)(uintptr_t context);
+typedef int64_t (*dk_console_queued_fn)(uintptr_t context);
 typedef void (*dk_console_destroy_fn)(uintptr_t context);
 
 struct dk_console_ops {
@@ -130,6 +141,13 @@ struct dk_console_ops {
     dk_console_state_fn writable;
     dk_console_state_fn hung_up;
     dk_console_destroy_fn destroy;
+    dk_console_read_fn read;
+    dk_console_simple_fn flush_input;
+    dk_console_simple_fn flush_output;
+    dk_console_queued_fn queued_output;
+    dk_event_t readable_event;
+    dk_event_t writable_event;
+    dk_event_t hangup_event;
 };
 
 int32_t dk_devfs_root(dk_devnode_t *out_node);

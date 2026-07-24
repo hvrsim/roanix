@@ -9,6 +9,7 @@ use crate::{
 };
 
 const PIPE_CAPACITY: usize = 64 * 1024;
+const PIPE_ATOMIC_LIMIT: usize = 4096;
 
 /// Pipe operation failure.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -58,6 +59,7 @@ impl PipeEnd {
             readable: Event::new(),
             writable: Event::new(),
         });
+        pipe.writable.signal();
         (
             Arc::new(Self {
                 pipe: pipe.clone(),
@@ -85,7 +87,13 @@ impl PipeEnd {
             if !state.buffer.is_empty() {
                 let count = output.len().min(state.buffer.len());
                 for byte in &mut output[..count] {
-                    *byte = state.buffer.pop_front().expect("pipe: buffer length changed");
+                    *byte = state
+                        .buffer
+                        .pop_front()
+                        .expect("pipe: buffer length changed");
+                }
+                if state.buffer.is_empty() {
+                    self.pipe.readable.reset();
                 }
                 self.pipe.writable.signal();
                 return Ok(count);
@@ -116,9 +124,13 @@ impl PipeEnd {
                 return Err(PipeError::BrokenPipe);
             }
             let available = PIPE_CAPACITY - state.buffer.len();
-            if available != 0 {
+            let atomic = input.len() <= PIPE_ATOMIC_LIMIT;
+            if available != 0 && (!atomic || available >= input.len()) {
                 let count = available.min(input.len());
                 state.buffer.extend(&input[..count]);
+                if state.buffer.len() == PIPE_CAPACITY {
+                    self.pipe.writable.reset();
+                }
                 self.pipe.readable.signal();
                 return Ok(count);
             }
@@ -173,6 +185,27 @@ impl PipeEnd {
                 }
             }
         }
+    }
+
+    pub(crate) fn poll_events<'a>(
+        &'a self,
+        events: PollEvents,
+        output: &mut alloc::vec::Vec<&'a Event>,
+    ) -> bool {
+        match self.direction {
+            Direction::Read
+                if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) =>
+            {
+                output.push(&self.pipe.readable);
+            }
+            Direction::Write
+                if events.intersects(PollEvents::OUT | PollEvents::WRNORM | PollEvents::ERR) =>
+            {
+                output.push(&self.pipe.writable);
+            }
+            _ => {}
+        }
+        true
     }
 }
 
