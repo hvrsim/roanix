@@ -72,8 +72,8 @@ struct LoadedElf {
     program_header_count: u16,
 }
 
-pub(super) fn load<A: AsRef<str>, E: AsRef<str>>(
-    path: &str,
+pub(super) fn load<A: AsRef<[u8]>, E: AsRef<[u8]>>(
+    path: &[u8],
     arguments: &[A],
     environment: &[E],
 ) -> Result<LoadedProgram> {
@@ -88,7 +88,7 @@ pub(super) fn load<A: AsRef<str>, E: AsRef<str>>(
     let main = map_elf(&address_space, &main_bytes, &main_spec, main_base)?;
 
     let (entry, interpreter_base) = if let Some(interpreter) = &main_spec.interpreter {
-        let interpreter_bytes = read_file(interpreter)?;
+        let interpreter_bytes = read_file(interpreter.as_bytes())?;
         let interpreter_spec = parse_elf(&interpreter_bytes)?;
         if interpreter_spec.image_type != ElfType::SharedObject {
             return Err(Error::UnsupportedElf);
@@ -121,14 +121,17 @@ pub(super) fn load<A: AsRef<str>, E: AsRef<str>>(
     })
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>> {
+fn read_file(path: &[u8]) -> Result<Vec<u8>> {
     let file = fs::open(path, OpenFlags::READ, 0)?;
     let size =
         usize::try_from(file.getattr()?.size).map_err(|_| Error::InvalidElf("file too large"))?;
     let mut bytes = vec![0u8; size];
     let mut offset = 0usize;
     while offset < bytes.len() {
-        let read = file.read_at(offset as u64, &mut bytes[offset..])?;
+        let read = file.read_at(
+            offset as u64,
+            &mut crate::mem::IoSink::kernel(&mut bytes[offset..]),
+        )?;
         if read == 0 {
             return Err(Error::InvalidElf("unexpected end of file"));
         }
@@ -353,9 +356,9 @@ fn derive_program_header_address(spec: &ElfSpec, bias: u64) -> Result<u64> {
 
 fn build_stack(
     space: &Arc<VmSpace>,
-    executable: &str,
-    arguments: &[&str],
-    environment: &[&str],
+    executable: &[u8],
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
     main: &LoadedElf,
     interpreter_base: u64,
 ) -> Result<u64> {
@@ -451,10 +454,16 @@ fn build_stack(
     Ok(stack_base + cursor as u64)
 }
 
-fn push_string(stack: &mut [u8], cursor: &mut usize, stack_base: u64, value: &str) -> Result<u64> {
+fn push_string(
+    stack: &mut [u8],
+    cursor: &mut usize,
+    stack_base: u64,
+    value: impl AsRef<[u8]>,
+) -> Result<u64> {
+    let value = value.as_ref();
     let size = value.len().checked_add(1).ok_or(Error::InvalidArgument)?;
     *cursor = cursor.checked_sub(size).ok_or(Error::InvalidArgument)?;
-    stack[*cursor..*cursor + value.len()].copy_from_slice(value.as_bytes());
+    stack[*cursor..*cursor + value.len()].copy_from_slice(value);
     stack[*cursor + value.len()] = 0;
     Ok(stack_base + *cursor as u64)
 }

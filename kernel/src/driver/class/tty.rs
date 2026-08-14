@@ -21,8 +21,10 @@ use super::super::error::{Error, Result};
 use crate::{
     fs::{
         Error as FsError, IoctlContext, OpenFlags, PollEvents, Result as FsResult,
-        devtempfs::DeviceNodeOps, vnode::TerminalState,
+        devtempfs::{DeviceNodeOps, read_windows, write_windows},
+        vnode::TerminalState,
     },
+    mem::{IoSink, IoSource},
     proc,
     sys::{clock, event::Event, sched, sync::Mutex},
 };
@@ -1218,38 +1220,43 @@ impl DeviceNodeOps for Tty {
     fn read_at_with_flags(
         &self,
         _file_context: usize,
-        _offset: u64,
-        buffer: &mut [u8],
+        offset: u64,
+        sink: &mut IoSink<'_>,
         flags: u32,
     ) -> FsResult<usize> {
-        if buffer.is_empty() {
+        if sink.is_empty() {
             return Ok(0);
         }
-        let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
-        if self.state.lock().termios.local_flags & ICANON != 0 {
-            self.read_canonical(buffer, nonblocking)
-        } else {
-            self.read_raw(buffer, nonblocking)
-        }
+        let canonical = self.state.lock().termios.local_flags & ICANON != 0;
+        read_windows(sink, offset, flags, |_, window, flags| {
+            let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
+            if canonical {
+                self.read_canonical(window, nonblocking)
+            } else {
+                self.read_raw(window, nonblocking)
+            }
+        })
     }
 
-    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> FsResult<usize> {
-        self.read_at_with_flags(0, offset, buffer, 0)
+    fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> FsResult<usize> {
+        self.read_at_with_flags(0, offset, sink, 0)
     }
 
-    fn write_at(&self, _offset: u64, buffer: &[u8]) -> FsResult<usize> {
-        self.write_transformed(buffer, false)
+    fn write_at(&self, offset: u64, source: &IoSource<'_>) -> FsResult<usize> {
+        self.write_at_with_flags(0, offset, source, 0)
     }
 
     fn write_at_with_flags(
         &self,
         _file_context: usize,
-        _offset: u64,
-        buffer: &[u8],
+        offset: u64,
+        source: &IoSource<'_>,
         flags: u32,
     ) -> FsResult<usize> {
-        let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
-        self.write_transformed(buffer, nonblocking)
+        write_windows(source, offset, flags, |_, window, flags| {
+            let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
+            self.write_transformed(window, nonblocking)
+        })
     }
 
     fn poll(

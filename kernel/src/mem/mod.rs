@@ -30,6 +30,7 @@ use crate::{
 pub mod addr;
 pub mod alloc;
 mod error;
+mod io;
 mod map;
 mod object;
 mod page;
@@ -45,6 +46,7 @@ pub use map::{
     VmMapEntry, VmProtection,
 };
 pub(crate) use alloc::HEAP_BASE;
+pub use io::{IoSink, IoSource};
 pub use object::{ObjectKind, PageAccount, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};
 pub use pmap::{Pmap, VmSpace};

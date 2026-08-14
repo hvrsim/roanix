@@ -12,7 +12,7 @@ use crate::{
     },
     syscall::{
         Errno, current_process, map_memory_error, map_process_error, read_user_i32,
-        read_user_string, read_user_string_array, read_user_timespec,
+        read_user_path, read_user_path_array, read_user_timespec,
     },
 };
 
@@ -130,10 +130,11 @@ crate::syscall_handler! {
 crate::syscall_handler! {
     syscall_process_exec(frame, path: u64 = 0, arguments: u64 = 1, environment: u64 = 2) {
         let process = current_process()?;
-        let path = read_user_string(&process, path)?;
-        let arguments = read_user_string_array(&process, arguments)?;
-        let environment = read_user_string_array(&process, environment)?;
-        proc::exec_current(frame, &path, &arguments, &environment).map_err(map_process_error)?;
+        let path = read_user_path(&process, path)?;
+        let arguments = read_user_path_array(&process, arguments)?;
+        let environment = read_user_path_array(&process, environment)?;
+        proc::exec_current(frame, &path, &arguments, &environment)
+            .map_err(map_process_error)?;
         Ok(0)
     }
 }

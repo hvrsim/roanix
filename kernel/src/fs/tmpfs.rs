@@ -13,7 +13,7 @@ use core::{
 };
 
 use crate::{
-    mem::{self, ObjectKind, PAGE_SIZE, PageAccount, VmObject},
+    mem::{self, IoSink, IoSource, ObjectKind, PAGE_SIZE, PageAccount, VmObject},
     sys::{
         clock,
         smp::IrqSpinLock,
@@ -31,6 +31,29 @@ use super::{
 };
 
 const TMPFS_NAME: &str = "tmpfs";
+
+/// Share of usable physical memory one tmpfs mount may commit.
+///
+/// An unbounded memory filesystem lets any process exhaust kernel memory, so
+/// every mount is capped like a conventional tmpfs default.
+const TMPFS_MEMORY_NUMERATOR: u64 = 1;
+const TMPFS_MEMORY_DENOMINATOR: u64 = 2;
+
+/// Fallback page limit when physical memory statistics are unavailable.
+const TMPFS_FALLBACK_PAGES: u64 = 4096;
+
+/// Bound on ancestor walks used by rename cycle detection.
+const MAX_DIRECTORY_DEPTH: usize = 4096;
+
+fn default_page_limit() -> u64 {
+    mem::phys::stats()
+        .map(|stats| {
+            (stats.total_pages as u64).saturating_mul(TMPFS_MEMORY_NUMERATOR)
+                / TMPFS_MEMORY_DENOMINATOR
+        })
+        .unwrap_or(0)
+        .max(TMPFS_FALLBACK_PAGES)
+}
 
 /// Memory-backed filesystem instance.
 pub struct Tmpfs {
@@ -70,8 +93,10 @@ struct TmpfsDirectory {
 }
 
 struct TmpfsDirectoryData {
-    entries: BTreeMap<Box<[u8]>, TmpfsDirEntry>,
-    cookies: BTreeMap<u64, Box<[u8]>>,
+    /// Name index. Names are shared with `cookies` so a directory entry costs
+    /// one name allocation rather than two.
+    entries: BTreeMap<Arc<[u8]>, TmpfsDirEntry>,
+    cookies: BTreeMap<u64, Arc<[u8]>>,
     next_cookie: u64,
 }
 
@@ -96,7 +121,7 @@ impl TmpfsDirectoryData {
         self.ensure_insert_capacity()?;
         let cookie = self.next_cookie;
         self.next_cookie += 1;
-        let name = Box::<[u8]>::from(name);
+        let name = Arc::<[u8]>::from(name);
         self.cookies.insert(cookie, name.clone());
         self.entries.insert(name, TmpfsDirEntry { vnode, cookie });
         Ok(())
@@ -116,7 +141,7 @@ impl TmpfsDirectoryData {
     fn rename_within(&mut self, source_name: &[u8], target_name: &[u8]) -> Result<Vnode> {
         let entry = self.entries.remove(source_name).ok_or(Error::NotFound)?;
         self.cookies.remove(&entry.cookie);
-        let target_name = Box::<[u8]>::from(target_name);
+        let target_name = Arc::<[u8]>::from(target_name);
         self.cookies.insert(entry.cookie, target_name.clone());
         let vnode = entry.vnode.clone();
         self.entries.insert(target_name, entry);
@@ -129,12 +154,17 @@ impl TmpfsDirectoryData {
 }
 
 impl Tmpfs {
-    /// Creates an empty tmpfs filesystem.
+    /// Creates an empty tmpfs filesystem limited to a share of physical memory.
     pub fn new() -> Result<Arc<Self>> {
+        Self::with_page_limit(default_page_limit())
+    }
+
+    /// Creates an empty tmpfs filesystem that may commit at most `pages`.
+    pub fn with_page_limit(pages: u64) -> Result<Arc<Self>> {
         let filesystem = Arc::new(Self {
             id: FilesystemId::allocate(),
             next_node: AtomicU64::new(1),
-            page_account: PageAccount::unlimited(),
+            page_account: PageAccount::new(pages),
             used_nodes: AtomicU64::new(0),
             rename_lock: Mutex::new(()),
             root: Once::new(),
@@ -233,7 +263,11 @@ impl FileSystem for Tmpfs {
 
     fn statfs(&self) -> StatFs {
         StatFs {
-            total_bytes: u64::MAX,
+            total_bytes: self
+                .page_account
+                .limit()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(PAGE_SIZE),
             used_bytes: self.page_account.used().saturating_mul(PAGE_SIZE),
             total_nodes: u64::MAX,
             used_nodes: self.used_nodes.load(Ordering::Acquire),
@@ -277,32 +311,18 @@ impl TmpfsNode {
             .store(clock::monotonic_ns(), Ordering::Release);
     }
 
-    fn write_locked(&self, file: &mut TmpfsFile, offset: u64, buffer: &[u8]) -> Result<usize> {
-        let end = offset
-            .checked_add(buffer.len() as u64)
+    fn write_locked(
+        &self,
+        file: &mut TmpfsFile,
+        offset: u64,
+        source: &IoSource<'_>,
+    ) -> Result<usize> {
+        offset
+            .checked_add(source.len() as u64)
             .ok_or(Error::FileTooLarge)?;
-        let mut written = 0usize;
-
-        while written < buffer.len() {
-            let position = offset + written as u64;
-            let page_offset = (position % PAGE_SIZE) as usize;
-            let count = cmp::min(PAGE_SIZE as usize - page_offset, buffer.len() - written);
-            match file
-                .object
-                .write_at(position, &buffer[written..written + count])
-            {
-                Ok(count) => written += count,
-                Err(_) if written != 0 => {
-                    self.size
-                        .fetch_max(offset + written as u64, Ordering::AcqRel);
-                    self.touch_modified();
-                    return Ok(written);
-                }
-                Err(error) => return Err(mem_error(error)),
-            }
-        }
-
-        self.size.fetch_max(end, Ordering::AcqRel);
+        let written = file.object.write_from(offset, source).map_err(mem_error)?;
+        self.size
+            .fetch_max(offset.saturating_add(written as u64), Ordering::AcqRel);
         self.touch_modified();
         Ok(written)
     }
@@ -329,13 +349,17 @@ impl TmpfsNode {
         Ok(())
     }
 
+    /// Rejects a directory move that would detach a cycle from the tree.
+    ///
+    /// The walk is bounded so that an unexpected parent cycle reports an error
+    /// instead of spinning forever while the rename lock is held.
     fn ensure_directory_move_is_acyclic(source: &Vnode, target_directory: &Vnode) -> Result<()> {
         if source.kind() != VnodeKind::Directory {
             return Ok(());
         }
 
         let mut ancestor = target_directory.clone();
-        loop {
+        for _ in 0..MAX_DIRECTORY_DEPTH {
             if ancestor == *source {
                 return Err(Error::InvalidArgument);
             }
@@ -345,6 +369,7 @@ impl TmpfsNode {
             }
             ancestor = parent;
         }
+        Err(Error::SymlinkLoop)
     }
 
     fn replace_target(target: Option<&Vnode>, source: &Vnode) -> Result<()> {
@@ -367,12 +392,29 @@ impl TmpfsNode {
         let node = Self::child_node(target)?;
         if target.kind() == VnodeKind::Directory {
             node.links.store(0, Ordering::Release);
-        } else {
-            let previous = node.links.fetch_sub(1, Ordering::AcqRel);
-            assert!(previous != 0, "tmpfs: link count underflow");
+        } else if node
+            .links
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |links| {
+                links.checked_sub(1)
+            })
+            .is_err()
+        {
+            return Err(Error::Io);
         }
         node.touch_changed();
         Ok(())
+    }
+
+    /// Drops one directory link from a parent, reporting corruption as an error
+    /// rather than panicking the kernel.
+    fn release_directory_link(parent: &TmpfsNode) -> Result<()> {
+        parent
+            .links
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |links| {
+                (links > 2).then(|| links - 1)
+            })
+            .map(|_| ())
+            .map_err(|_| Error::Io)
     }
 }
 
@@ -503,10 +545,9 @@ impl VnodeOps for TmpfsNode {
             (false, _) => None,
         };
 
-        entries.remove(name).expect("tmpfs: target vanished");
+        entries.remove(name).ok_or(Error::Io)?;
         if target.kind() == VnodeKind::Directory {
-            let previous = self.links.fetch_sub(1, Ordering::AcqRel);
-            assert!(previous > 2, "tmpfs: parent directory link count underflow");
+            Self::release_directory_link(self)?;
         }
         Self::remove_link(&target)?;
         drop(target_directory_guard);
@@ -562,13 +603,10 @@ impl VnodeOps for TmpfsNode {
             };
             if let Some(target) = target.as_ref() {
                 if target.kind() == VnodeKind::Directory {
-                    let previous = self.links.fetch_sub(1, Ordering::AcqRel);
-                    assert!(previous > 2, "tmpfs: parent directory link count underflow");
+                    Self::release_directory_link(self)?;
                 }
                 Self::remove_link(target)?;
-                entries
-                    .remove(target_name)
-                    .expect("tmpfs: rename target vanished");
+                entries.remove(target_name).ok_or(Error::Io)?;
             }
             entries.rename_within(source_name, target_name)?;
             drop(target_directory_guard);
@@ -586,6 +624,7 @@ impl VnodeOps for TmpfsNode {
                 .ok_or(Error::NotFound)?
         };
         Self::ensure_directory_move_is_acyclic(&source, target_directory)?;
+        drop(source);
 
         let (mut source_entries, mut target_entries) =
             if source_directory.key().node < target_directory.key().node {
@@ -606,6 +645,9 @@ impl VnodeOps for TmpfsNode {
             .get(source_name)
             .cloned()
             .ok_or(Error::NotFound)?;
+        // The entry may have been replaced between the first check and the
+        // locks above, so the vnode actually being moved is re-validated here.
+        Self::ensure_directory_move_is_acyclic(&source, target_directory)?;
         let target = target_entries.get(target_name).cloned();
         Self::replace_target(target.as_ref(), &source)?;
         if target.as_ref() == Some(&source) {
@@ -630,25 +672,19 @@ impl VnodeOps for TmpfsNode {
 
         if let Some(target) = target.as_ref() {
             if target.kind() == VnodeKind::Directory {
-                let previous = target_node.links.fetch_sub(1, Ordering::AcqRel);
-                assert!(previous > 2, "tmpfs: target directory link count underflow");
+                Self::release_directory_link(target_node)?;
             }
             Self::remove_link(target)?;
-            target_entries
-                .remove(target_name)
-                .expect("tmpfs: rename target vanished");
+            target_entries.remove(target_name).ok_or(Error::Io)?;
         }
-        let source = source_entries
-            .remove(source_name)
-            .expect("tmpfs: source vanished");
+        let source = source_entries.remove(source_name).ok_or(Error::Io)?;
         target_entries.insert(target_name, source.clone())?;
         drop(target_directory_guard);
 
         if source.kind() == VnodeKind::Directory {
             let source_node = Self::child_node(&source)?;
             *source_node.directory()?.parent.lock() = target_directory.downgrade();
-            let previous = self.links.fetch_sub(1, Ordering::AcqRel);
-            assert!(previous > 2, "tmpfs: source directory link count underflow");
+            Self::release_directory_link(self)?;
             target_node.links.fetch_add(1, Ordering::AcqRel);
         }
         Self::child_node(&source)?.touch_changed();
@@ -657,37 +693,38 @@ impl VnodeOps for TmpfsNode {
         Ok(())
     }
 
-    fn read_at(&self, _vnode: &Vnode, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+    fn read_at(&self, _vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
         let file = self.file()?.lock();
         let size = self.size.load(Ordering::Acquire);
-        if offset >= size || buffer.is_empty() {
+        if offset >= size || sink.is_empty() {
             return Ok(0);
         }
-        let count = cmp::min(buffer.len() as u64, size - offset) as usize;
+        let count = cmp::min(sink.len() as u64, size - offset) as usize;
+        let mut window = sink.slice(0, count).map_err(mem_error)?;
         let read = file
             .object
-            .read_at(offset, &mut buffer[..count])
+            .read_into(offset, &mut window)
             .map_err(mem_error)?;
         drop(file);
         self.touch_accessed();
         Ok(read)
     }
 
-    fn write_at(&self, _vnode: &Vnode, offset: u64, buffer: &[u8]) -> Result<usize> {
-        if buffer.is_empty() {
+    fn write_at(&self, _vnode: &Vnode, offset: u64, source: &IoSource<'_>) -> Result<usize> {
+        if source.is_empty() {
             return Ok(0);
         }
         let mut file = self.file()?.lock();
-        self.write_locked(&mut file, offset, buffer)
+        self.write_locked(&mut file, offset, source)
     }
 
-    fn append(&self, _vnode: &Vnode, buffer: &[u8]) -> Result<(usize, u64)> {
+    fn append(&self, _vnode: &Vnode, source: &IoSource<'_>) -> Result<(usize, u64)> {
         let mut file = self.file()?.lock();
-        if buffer.is_empty() {
+        if source.is_empty() {
             return Ok((0, self.size.load(Ordering::Acquire)));
         }
         let offset = self.size.load(Ordering::Acquire);
-        let written = self.write_locked(&mut file, offset, buffer)?;
+        let written = self.write_locked(&mut file, offset, source)?;
         Ok((written, offset.saturating_add(written as u64)))
     }
 
@@ -732,18 +769,20 @@ impl VnodeOps for TmpfsNode {
         let mut next = cursor;
         if next == 0 && entries.len() < maximum {
             entries.push(DirEntry {
-                name: Box::<[u8]>::from(&b"."[..]),
+                name: Arc::<[u8]>::from(&b"."[..]),
                 key: directory.key(),
                 kind: VnodeKind::Directory,
+                offset: 1,
             });
             next = 1;
         }
         if next == 1 && entries.len() < maximum {
             let parent = self.parent(directory)?;
             entries.push(DirEntry {
-                name: Box::<[u8]>::from(&b".."[..]),
+                name: Arc::<[u8]>::from(&b".."[..]),
                 key: parent.key(),
                 kind: VnodeKind::Directory,
+                offset: 2,
             });
             next = 2;
         }
@@ -753,15 +792,16 @@ impl VnodeOps for TmpfsNode {
             if entries.len() == maximum {
                 break;
             }
-            let vnode = stored
-                .get(name)
-                .expect("tmpfs: directory cookie index is inconsistent");
+            let Some(vnode) = stored.get(name) else {
+                return Err(Error::Io);
+            };
+            next = cookie.saturating_add(1);
             entries.push(DirEntry {
                 name: name.clone(),
                 key: vnode.key(),
                 kind: vnode.kind(),
+                offset: next,
             });
-            next = cookie.saturating_add(1);
         }
         drop(stored);
         self.touch_accessed();

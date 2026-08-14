@@ -458,6 +458,20 @@ impl VmSpace {
         Ok(())
     }
 
+    /// Validates that a user range is entirely inside the user address window.
+    pub fn validate_user(&self, address: VirtAddr, length: usize) -> Result<()> {
+        validate_user_range(address, length)
+    }
+
+    /// Faults a user address in for `access` and returns its physical address.
+    ///
+    /// The address-space lock is released before returning, so callers may
+    /// safely hold page-cache locks while using the resulting direct-map alias.
+    pub fn fault_and_extract(&self, address: VirtAddr, access: FaultAccess) -> Result<PhysAddr> {
+        self.fault(address, access)?;
+        self.pmap.extract(address).ok_or(Error::NotMapped)
+    }
+
     /// Copies bytes from this address space into a kernel buffer.
     pub fn read_user(&self, address: VirtAddr, output: &mut [u8]) -> Result<()> {
         validate_user_range(address, output.len())?;

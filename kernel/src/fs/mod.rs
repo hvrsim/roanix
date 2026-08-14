@@ -19,7 +19,7 @@ pub use error::{Error, Result};
 pub use file::{FileRef, OpenFile, OpenFlags, SeekFrom};
 pub use vfs::{
     create_dir, create_file, link, lookup, lookup_nofollow, mount, open, remove_dir, rename,
-    statfs, symlink, sync_all, unlink,
+    statfs, symlink, sync_all, unlink, unmount,
 };
 pub(crate) use vfs::{
     create_dir_at, link_at, open_at, rename_at, resolve_at, root_anchor, symlink_at, unlink_at,

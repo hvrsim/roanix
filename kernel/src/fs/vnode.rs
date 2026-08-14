@@ -13,7 +13,10 @@ use core::{
 
 use bitflags::bitflags;
 
-use crate::{mem::VmObject, sys::event::Event};
+use crate::{
+    mem::{IoSink, IoSource, VmObject},
+    sys::event::Event,
+};
 
 use super::error::{Error, Result};
 
@@ -175,11 +178,16 @@ pub enum CreateKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirEntry {
     /// Entry name, excluding `.` and `..` path separators.
-    pub name: Box<[u8]>,
+    ///
+    /// Shared with the filesystem's name index so listing a directory does not
+    /// copy every name.
+    pub name: Arc<[u8]>,
     /// Stable target identity.
     pub key: VnodeKey,
     /// Target vnode type.
     pub kind: VnodeKind,
+    /// Cursor that resumes iteration directly after this entry.
+    pub offset: u64,
 }
 
 /// Filesystem capacity and usage snapshot.
@@ -287,7 +295,7 @@ pub trait VnodeOps: Any + Send + Sync {
     }
 
     /// Reads file data at an explicit byte offset.
-    fn read_at(&self, _vnode: &Vnode, _offset: u64, _buffer: &mut [u8]) -> Result<usize> {
+    fn read_at(&self, _vnode: &Vnode, _offset: u64, _sink: &mut IoSink<'_>) -> Result<usize> {
         Err(Error::IsDirectory)
     }
 
@@ -297,14 +305,14 @@ pub trait VnodeOps: Any + Send + Sync {
         vnode: &Vnode,
         _file_context: usize,
         offset: u64,
-        buffer: &mut [u8],
+        sink: &mut IoSink<'_>,
         _flags: u32,
     ) -> Result<usize> {
-        self.read_at(vnode, offset, buffer)
+        self.read_at(vnode, offset, sink)
     }
 
     /// Writes file data at an explicit byte offset.
-    fn write_at(&self, _vnode: &Vnode, _offset: u64, _buffer: &[u8]) -> Result<usize> {
+    fn write_at(&self, _vnode: &Vnode, _offset: u64, _source: &IoSource<'_>) -> Result<usize> {
         Err(Error::IsDirectory)
     }
 
@@ -314,10 +322,10 @@ pub trait VnodeOps: Any + Send + Sync {
         vnode: &Vnode,
         _file_context: usize,
         offset: u64,
-        buffer: &[u8],
+        source: &IoSource<'_>,
         _flags: u32,
     ) -> Result<usize> {
-        self.write_at(vnode, offset, buffer)
+        self.write_at(vnode, offset, source)
     }
 
     /// Returns events that are immediately ready for this open file.
@@ -359,7 +367,7 @@ pub trait VnodeOps: Any + Send + Sync {
     }
 
     /// Appends bytes atomically and returns `(written, new_offset)`.
-    fn append(&self, _vnode: &Vnode, _buffer: &[u8]) -> Result<(usize, u64)> {
+    fn append(&self, _vnode: &Vnode, _source: &IoSource<'_>) -> Result<(usize, u64)> {
         Err(Error::Unsupported)
     }
 
@@ -520,8 +528,15 @@ impl Vnode {
 
     /// Removes one direct child.
     pub(super) fn unlink(&self, name: &[u8], remove_directory: bool) -> Result<()> {
-        let target = self.lookup(name)?;
+        // The target is resolved only to describe the event, so the extra
+        // lookup is skipped when nothing is watching.
+        let target = crate::proc::inotify::is_watching()
+            .then(|| self.lookup(name).ok())
+            .flatten();
         self.inner.operations.unlink(self, name, remove_directory)?;
+        let Some(target) = target else {
+            return Ok(());
+        };
         let directory_flag = if target.kind() == VnodeKind::Directory {
             crate::proc::inotify::IN_ISDIR
         } else {
@@ -549,11 +564,18 @@ impl Vnode {
         target_directory: &Self,
         target_name: &[u8],
     ) -> Result<()> {
-        let source = self.lookup(source_name)?;
-        let replaced = target_directory.lookup(target_name).ok();
+        // Both vnodes are resolved only to describe the event pair.
+        let watching = crate::proc::inotify::is_watching();
+        let source = watching.then(|| self.lookup(source_name).ok()).flatten();
+        let replaced = watching
+            .then(|| target_directory.lookup(target_name).ok())
+            .flatten();
         self.inner
             .operations
             .rename(self, source_name, target_directory, target_name)?;
+        let Some(source) = source else {
+            return Ok(());
+        };
         let cookie = crate::proc::inotify::next_cookie();
         let directory_flag = if source.kind() == VnodeKind::Directory {
             crate::proc::inotify::IN_ISDIR
@@ -595,8 +617,8 @@ impl Vnode {
     }
 
     /// Reads bytes at an explicit offset.
-    pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        let read = self.inner.operations.read_at(self, offset, buffer)?;
+    pub fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
+        let read = self.inner.operations.read_at(self, offset, sink)?;
         if read != 0 {
             crate::proc::inotify::notify(
                 self.key(),
@@ -612,13 +634,13 @@ impl Vnode {
         &self,
         file_context: usize,
         offset: u64,
-        buffer: &mut [u8],
+        sink: &mut IoSink<'_>,
         flags: u32,
     ) -> Result<usize> {
         let read =
             self.inner
                 .operations
-                .read_at_with_flags(self, file_context, offset, buffer, flags)?;
+                .read_at_with_flags(self, file_context, offset, sink, flags)?;
         if read != 0 {
             crate::proc::inotify::notify(
                 self.key(),
@@ -631,8 +653,8 @@ impl Vnode {
     }
 
     /// Writes bytes at an explicit offset.
-    pub fn write_at(&self, offset: u64, buffer: &[u8]) -> Result<usize> {
-        let written = self.inner.operations.write_at(self, offset, buffer)?;
+    pub fn write_at(&self, offset: u64, source: &IoSource<'_>) -> Result<usize> {
+        let written = self.inner.operations.write_at(self, offset, source)?;
         if written != 0 {
             crate::proc::inotify::notify(
                 self.key(),
@@ -648,13 +670,13 @@ impl Vnode {
         &self,
         file_context: usize,
         offset: u64,
-        buffer: &[u8],
+        source: &IoSource<'_>,
         flags: u32,
     ) -> Result<usize> {
         let written =
             self.inner
                 .operations
-                .write_at_with_flags(self, file_context, offset, buffer, flags)?;
+                .write_at_with_flags(self, file_context, offset, source, flags)?;
         if written != 0 {
             crate::proc::inotify::notify(
                 self.key(),
@@ -694,8 +716,8 @@ impl Vnode {
     }
 
     /// Atomically appends bytes.
-    pub fn append(&self, buffer: &[u8]) -> Result<(usize, u64)> {
-        let result = self.inner.operations.append(self, buffer)?;
+    pub fn append(&self, source: &IoSource<'_>) -> Result<(usize, u64)> {
+        let result = self.inner.operations.append(self, source)?;
         if result.0 != 0 {
             crate::proc::inotify::notify(
                 self.key(),
@@ -780,7 +802,7 @@ impl Vnode {
 
     pub(crate) fn close(&self, file_context: usize, flags: u32) {
         self.inner.operations.close(self, file_context, flags);
-        let mask = if flags & (1 << 1) != 0 {
+        let mask = if flags & super::file::OpenFlags::WRITE.bits() != 0 {
             crate::proc::inotify::IN_CLOSE_WRITE
         } else {
             crate::proc::inotify::IN_CLOSE_NOWRITE

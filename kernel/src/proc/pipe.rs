@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     fs::PollEvents,
+    mem::{IoSink, IoSource},
     sys::{event::Event, sync::Mutex},
 };
 
@@ -20,6 +21,8 @@ pub(crate) enum PipeError {
     TryAgain,
     /// No reader remains attached to the pipe.
     BrokenPipe,
+    /// The caller buffer could not be accessed.
+    Fault,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -75,28 +78,34 @@ impl PipeEnd {
     }
 
     /// Reads bytes, blocking until data or writer closure is observable.
-    pub(crate) fn read(&self, output: &mut [u8]) -> Result<usize, PipeError> {
+    pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> Result<usize, PipeError> {
         if self.direction != Direction::Read {
             return Err(PipeError::BadDescriptor);
         }
-        if output.is_empty() {
+        if sink.is_empty() {
             return Ok(0);
         }
         loop {
             let mut state = self.pipe.state.lock();
             if !state.buffer.is_empty() {
-                let count = output.len().min(state.buffer.len());
-                for byte in &mut output[..count] {
-                    *byte = state
-                        .buffer
-                        .pop_front()
-                        .expect("pipe: buffer length changed");
-                }
+                let count = sink.len().min(state.buffer.len());
+                let copied = {
+                    let (front, back) = state.buffer.as_slices();
+                    let from_front = front.len().min(count);
+                    sink.store(0, &front[..from_front])
+                        .map_err(|_| PipeError::Fault)?;
+                    if from_front < count {
+                        sink.store(from_front, &back[..count - from_front])
+                            .map_err(|_| PipeError::Fault)?;
+                    }
+                    count
+                };
+                state.buffer.drain(..copied);
                 if state.buffer.is_empty() {
                     self.pipe.readable.reset();
                 }
                 self.pipe.writable.signal();
-                return Ok(count);
+                return Ok(copied);
             }
             if !state.writer_open {
                 return Ok(0);
@@ -111,11 +120,11 @@ impl PipeEnd {
     }
 
     /// Writes bytes, blocking only while the pipe buffer is full.
-    pub(crate) fn write(&self, input: &[u8]) -> Result<usize, PipeError> {
+    pub(crate) fn write(&self, source: &IoSource<'_>) -> Result<usize, PipeError> {
         if self.direction != Direction::Write {
             return Err(PipeError::BadDescriptor);
         }
-        if input.is_empty() {
+        if source.is_empty() {
             return Ok(0);
         }
         loop {
@@ -124,15 +133,27 @@ impl PipeEnd {
                 return Err(PipeError::BrokenPipe);
             }
             let available = PIPE_CAPACITY - state.buffer.len();
-            let atomic = input.len() <= PIPE_ATOMIC_LIMIT;
-            if available != 0 && (!atomic || available >= input.len()) {
-                let count = available.min(input.len());
-                state.buffer.extend(&input[..count]);
+            let atomic = source.len() <= PIPE_ATOMIC_LIMIT;
+            if available != 0 && (!atomic || available >= source.len()) {
+                let count = available.min(source.len());
+                let mut copied = 0usize;
+                while copied < count {
+                    let window = match source.window(copied, count - copied) {
+                        Ok(window) => window,
+                        Err(_) if copied != 0 => break,
+                        Err(_) => return Err(PipeError::Fault),
+                    };
+                    if window.is_empty() {
+                        break;
+                    }
+                    state.buffer.extend(window);
+                    copied += window.len();
+                }
                 if state.buffer.len() == PIPE_CAPACITY {
                     self.pipe.writable.reset();
                 }
                 self.pipe.readable.signal();
-                return Ok(count);
+                return Ok(copied);
             }
             if self.nonblocking.load(Ordering::Acquire) {
                 return Err(PipeError::TryAgain);

@@ -6,16 +6,17 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use crate::{
+    mem::IoSink,
     fs::{self, PollEvents, VnodeKey, VnodeKind},
     proc::Descriptor,
     sys::{
         event::Event,
         sync::{Mutex, Once},
     },
-    syscall::{Errno, Result, current_process, map_fs_error, map_process_error, read_user_string},
+    syscall::{Errno, Result, current_process, map_fs_error, map_process_error, read_user_path},
 };
 
 pub(crate) const IN_ACCESS: u32 = 0x0000_0001;
@@ -59,6 +60,11 @@ const EVENT_HEADER_SIZE: usize = 16;
 const MAX_QUEUE_BYTES: usize = 1024 * 1024;
 
 static WATCHERS: Once<Mutex<BTreeMap<VnodeKey, Vec<Weak<Inotify>>>>> = Once::new();
+/// Number of vnodes with at least one registered watcher.
+///
+/// Every VFS data and metadata operation reports to [`notify`], so the common
+/// case of no inotify watches at all must not touch the global registry lock.
+static WATCHED_KEYS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy)]
@@ -136,6 +142,7 @@ impl Inotify {
         if !entries.iter().any(|entry| entry.ptr_eq(&weak)) {
             entries.push(weak);
         }
+        WATCHED_KEYS.store(watchers.len(), Ordering::Release);
         Ok(watch_descriptor)
     }
 
@@ -175,21 +182,29 @@ impl Inotify {
         self.event.signal();
     }
 
-    pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<usize> {
+    pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> Result<usize> {
+        let capacity = sink.len();
         loop {
             let mut state = self.state.lock();
             if let Some(first) = state.queue.front() {
-                if first.len() > buffer.len() {
+                if first.len() > capacity {
                     return Err(Errno::Invalid);
                 }
                 let mut written = 0usize;
                 while let Some(record) = state.queue.front() {
-                    if written + record.len() > buffer.len() {
+                    if written + record.len() > capacity {
                         break;
+                    }
+                    // The event is dequeued only after it has reached user
+                    // memory, so a faulting copy cannot drop an event.
+                    if sink.store(written, record).is_err() {
+                        if written != 0 {
+                            return Ok(written);
+                        }
+                        return Err(Errno::Fault);
                     }
                     let record = state.queue.pop_front().expect("inotify: event vanished");
                     let length = record.len();
-                    buffer[written..written + length].copy_from_slice(&record);
                     written += length;
                     state.queued_bytes = state.queued_bytes.saturating_sub(length);
                     if event_mask(&record) & IN_Q_OVERFLOW != 0 {
@@ -248,8 +263,18 @@ pub(crate) fn next_cookie() -> u32 {
     }
 }
 
+/// Returns whether any vnode currently has a watcher.
+///
+/// Callers use this to skip work that only exists to describe an event.
+pub(crate) fn is_watching() -> bool {
+    WATCHED_KEYS.load(Ordering::Acquire) != 0
+}
+
 /// Emits an inotify event for one watched vnode.
 pub(crate) fn notify(key: VnodeKey, mask: u32, cookie: u32, name: Option<&[u8]>) {
+    if WATCHED_KEYS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let instances = {
         let mut watchers = watchers().lock();
         let Some(entries) = watchers.get_mut(&key) else {
@@ -260,6 +285,7 @@ pub(crate) fn notify(key: VnodeKey, mask: u32, cookie: u32, name: Option<&[u8]>)
         if entries.is_empty() {
             watchers.remove(&key);
         }
+        WATCHED_KEYS.store(watchers.len(), Ordering::Release);
         instances
     };
     for instance in instances {
@@ -298,7 +324,7 @@ crate::syscall_handler! {
             return Err(Errno::Invalid);
         };
         validate_mask(mask)?;
-        let path = read_user_string(&process, path)?;
+        let path = read_user_path(&process, path)?;
         let anchor = fs::resolve_at(
             &process.cwd_anchor(),
             &path,

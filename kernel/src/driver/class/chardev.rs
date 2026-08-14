@@ -23,8 +23,12 @@ use core::{
 use crate::{
     fs::{
         self, Error as FsError, IoctlContext, PollEvents, Result as FsResult,
-        devtempfs::{self, DevNodeId, DeviceNodeKind, DeviceNodeOps, Devtempfs, OwnerId},
+        devtempfs::{
+            self, DevNodeId, DeviceNodeKind, DeviceNodeOps, Devtempfs, OwnerId, read_windows,
+            write_windows,
+        },
     },
+    mem::{IoSink, IoSource},
     sys::{event::Event, sync::Mutex},
 };
 
@@ -203,64 +207,62 @@ impl DeviceNodeOps for Node {
         &self,
         file_context: usize,
         offset: u64,
-        buffer: &mut [u8],
+        sink: &mut IoSink<'_>,
         flags: u32,
     ) -> FsResult<usize> {
         let callback = self.ops.read.ok_or(FsError::Unsupported)?;
         let _pin = self.pin()?;
-        // SAFETY: registration validated the callback, and the buffer pointer
-        // and length describe memory owned by the caller for this call.
-        let value = unsafe {
-            callback(
-                self.ops.context,
-                file_context,
-                offset,
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                flags,
-            )
-        };
-        let read = signed_result(value)?;
-        if read > buffer.len() {
-            return Err(FsError::Io);
-        }
-        Ok(read)
+        read_windows(sink, offset, flags, |offset, window, flags| {
+            // SAFETY: registration validated the callback, and the window
+            // pointer and length describe memory owned by the caller for the
+            // duration of this call.
+            let value = unsafe {
+                callback(
+                    self.ops.context,
+                    file_context,
+                    offset,
+                    window.as_mut_ptr(),
+                    window.len(),
+                    flags,
+                )
+            };
+            signed_result(value)
+        })
     }
 
-    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> FsResult<usize> {
-        self.read_at_with_flags(0, offset, buffer, 0)
+    fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> FsResult<usize> {
+        self.read_at_with_flags(0, offset, sink, 0)
     }
 
     fn write_at_with_flags(
         &self,
         file_context: usize,
         offset: u64,
-        buffer: &[u8],
+        source: &IoSource<'_>,
         flags: u32,
     ) -> FsResult<usize> {
         let callback = self.ops.write.ok_or(FsError::Unsupported)?;
         let _pin = self.pin()?;
-        // SAFETY: registration validated the callback, and the buffer pointer
-        // and length describe memory owned by the caller for this call.
-        let value = unsafe {
-            callback(
-                self.ops.context,
-                file_context,
-                offset,
-                buffer.as_ptr(),
-                buffer.len(),
-                flags,
-            )
-        };
-        let written = signed_result(value)?;
-        if written > buffer.len() {
-            return Err(FsError::Io);
-        }
-        Ok(written)
+        write_windows(source, offset, flags, |offset, window, flags| {
+            // SAFETY: registration validated the callback, and the window
+            // pointer and length describe memory owned by the caller for the
+            // duration of this call.
+            let value = unsafe {
+                callback(
+                    self.ops.context,
+                    file_context,
+                    offset,
+                    window.as_ptr(),
+                    window.len(),
+                    flags,
+                )
+            };
+            signed_result(value)
+        })
     }
 
-    fn write_at(&self, offset: u64, buffer: &[u8]) -> FsResult<usize> {
-        self.write_at_with_flags(0, offset, buffer, 0)
+    fn write_at(&self, offset: u64, source: &IoSource<'_>) -> FsResult<usize> {
+        self.write_at_with_flags(0, offset, source, 0)
     }
 
     fn poll(

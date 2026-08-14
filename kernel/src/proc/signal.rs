@@ -11,6 +11,7 @@ use core::{
 };
 
 use crate::{
+    mem::IoSink,
     arch::cpu::TrapFrame,
     fs::PollEvents,
     mem::{USER_ADDRESS_MAX, USER_ADDRESS_MIN, VirtAddr},
@@ -264,11 +265,20 @@ impl SignalManager {
         state.mask = mask & !unblockable_mask();
     }
 
+    /// Returns the event signalled when a signal becomes pending.
+    pub(crate) fn interrupt_event(&self) -> &Event {
+        &self.event
+    }
+
     fn take_suspend_restore_mask(&self) -> Option<u64> {
         self.state.lock().suspend_restore_mask.take()
     }
 
-    fn prepare_interrupt_wait(&self) -> bool {
+    /// Arms interruption for a blocking wait.
+    ///
+    /// Returns whether a pending signal should abort the wait immediately;
+    /// otherwise the interrupt event is reset so the caller can wait on it.
+    pub(crate) fn prepare_interrupt_wait(&self) -> bool {
         let state = self.state.lock();
         if state
             .pending
@@ -357,20 +367,29 @@ impl SignalManager {
         Some(info)
     }
 
-    fn take_matching(&self, mask: u64) -> Option<SignalInfo> {
+    /// Delivers the next signal matching `mask` and consumes it on success.
+    ///
+    /// Selection and removal happen under one lock, and the signal stays
+    /// pending if `deliver` fails, so a faulting copy to user memory can never
+    /// discard a signal.
+    fn take_matching_with<F>(&self, mask: u64, deliver: F) -> Option<core::result::Result<(), ()>>
+    where
+        F: FnOnce(SignalInfo) -> core::result::Result<(), ()>,
+    {
         let mut state = self.state.lock();
         let index = state
             .pending
             .iter()
             .position(|pending| mask & signal_bit(pending.signal) != 0)?;
-        let info = state
-            .pending
-            .remove(index)
-            .expect("signalfd: selected pending signal vanished");
+        let info = *state.pending.get(index)?;
+        if deliver(info).is_err() {
+            return Some(Err(()));
+        }
+        state.pending.remove(index);
         if state.pending.is_empty() {
             self.event.reset();
         }
-        Some(info)
+        Some(Ok(()))
     }
 
     fn has_matching(&self, mask: u64) -> bool {
@@ -414,8 +433,8 @@ impl SignalFd {
         self.nonblocking.store(nonblocking, Ordering::Release);
     }
 
-    pub(crate) fn read(&self, buffer: &mut [u8]) -> SyscallResult<usize> {
-        let records = buffer.len() / SIGNALFD_RECORD_SIZE;
+    pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> SyscallResult<usize> {
+        let records = sink.len() / SIGNALFD_RECORD_SIZE;
         if records == 0 {
             return Err(Errno::Invalid);
         }
@@ -425,12 +444,16 @@ impl SignalFd {
         loop {
             let mut written = 0usize;
             while written < records {
-                let Some(info) = process.signals.take_matching(mask) else {
-                    break;
-                };
-                let record = &mut buffer[written * SIGNALFD_RECORD_SIZE..][..SIGNALFD_RECORD_SIZE];
-                encode_signalfd_info(record, info);
-                written += 1;
+                let offset = written * SIGNALFD_RECORD_SIZE;
+                let delivered = process.signals.take_matching_with(mask, |info| {
+                    sink.store(offset, &signalfd_info(info)).map_err(|_| ())
+                });
+                match delivered {
+                    None => break,
+                    Some(Ok(())) => written += 1,
+                    Some(Err(())) if written != 0 => return Ok(offset),
+                    Some(Err(())) => return Err(Errno::Fault),
+                }
             }
             if written != 0 {
                 return Ok(written * SIGNALFD_RECORD_SIZE);

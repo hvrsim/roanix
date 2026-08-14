@@ -1,11 +1,11 @@
 //! Shared userspace syscall ABI helpers.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{mem::size_of, time::Duration};
 
 use crate::{
     fs,
-    mem::{self, VirtAddr},
+    mem::{self, PAGE_SIZE, VirtAddr},
     proc::{self, Process},
 };
 
@@ -135,24 +135,42 @@ pub(crate) fn current_process() -> Result<Arc<Process>> {
     proc::current().ok_or(Errno::Invalid)
 }
 
-pub(crate) fn read_user_string(process: &Process, address: u64) -> Result<String> {
+/// Reads a NUL-terminated byte string from user memory.
+///
+/// The copy is page-bounded so that a string ending near a page boundary never
+/// faults the following page, and chunked so that a path costs a handful of
+/// address-space walks instead of one per byte.
+pub(crate) fn read_user_bytes(process: &Process, address: u64, limit: usize) -> Result<Vec<u8>> {
+    const CHUNK: usize = 128;
+
+    let address_space = process.address_space();
     let mut bytes = Vec::new();
-    for offset in 0..fs::path::MAX_PATH_LEN {
-        let mut byte = [0u8; 1];
-        let address = address.checked_add(offset as u64).ok_or(Errno::Fault)?;
-        process
-            .address_space()
-            .read_user(VirtAddr::new(address), &mut byte)
+    let mut chunk = [0u8; CHUNK];
+    let mut offset = 0usize;
+    while offset < limit {
+        let start = address.checked_add(offset as u64).ok_or(Errno::Fault)?;
+        let page_remaining = (PAGE_SIZE - (start % PAGE_SIZE)) as usize;
+        let count = page_remaining.min(CHUNK).min(limit - offset);
+        address_space
+            .read_user(VirtAddr::new(start), &mut chunk[..count])
             .map_err(map_memory_error)?;
-        if byte[0] == 0 {
-            return String::from_utf8(bytes).map_err(|_| Errno::Invalid);
+        if let Some(index) = chunk[..count].iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..index]);
+            return Ok(bytes);
         }
-        bytes.push(byte[0]);
+        bytes.extend_from_slice(&chunk[..count]);
+        offset += count;
     }
     Err(Errno::NameTooLong)
 }
 
-pub(crate) fn read_user_string_array(process: &Process, address: u64) -> Result<Vec<String>> {
+/// Reads a filesystem path from user memory without imposing UTF-8 semantics.
+pub(crate) fn read_user_path(process: &Process, address: u64) -> Result<Vec<u8>> {
+    read_user_bytes(process, address, fs::path::MAX_PATH_LEN)
+}
+
+/// Reads a NULL-terminated array of byte strings from user memory.
+pub(crate) fn read_user_path_array(process: &Process, address: u64) -> Result<Vec<Vec<u8>>> {
     if address == 0 {
         return Ok(Vec::new());
     }
@@ -166,7 +184,7 @@ pub(crate) fn read_user_string_array(process: &Process, address: u64) -> Result<
         if pointer == 0 {
             return Ok(strings);
         }
-        let string = read_user_string(process, pointer)?;
+        let string = read_user_path(process, pointer)?;
         total_bytes = total_bytes
             .checked_add(string.len() + 1)
             .ok_or(Errno::Overflow)?;

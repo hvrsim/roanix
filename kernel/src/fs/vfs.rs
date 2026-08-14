@@ -1,10 +1,12 @@
 //! Global mount namespace, path traversal, and convenience VFS operations.
 
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
+    vec::Vec,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sys::sync::{Mutex, Once};
 
@@ -17,6 +19,12 @@ use super::{
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 static NAMESPACE: Once<Namespace> = Once::new();
+
+/// Number of filesystems mounted over a directory.
+///
+/// Path traversal consults this before locking the namespace, so a namespace
+/// without submounts resolves every component lock-free.
+static COVERED_MOUNTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Stable identifier for one namespace mount.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -102,7 +110,17 @@ impl Namespace {
     }
 
     fn mounted_at(&self, key: VnodeKey) -> Option<MountRef> {
+        if COVERED_MOUNTS.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         self.state.lock().mounted_at.get(&key).cloned()
+    }
+
+    fn is_mount_point(&self, key: VnodeKey) -> bool {
+        if COVERED_MOUNTS.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.state.lock().mounted_at.contains_key(&key)
     }
 }
 
@@ -117,18 +135,13 @@ pub(crate) fn init_root(filesystem: FileSystemRef) -> Result<()> {
 }
 
 /// Looks up a path from the global root namespace.
-pub fn lookup(path: &str) -> Result<Vnode> {
-    lookup_bytes(path.as_bytes())
+pub fn lookup(path: &[u8]) -> Result<Vnode> {
+    Ok(resolve(None, path, true)?.vnode)
 }
 
 /// Looks up a path without following a final symbolic link.
-pub fn lookup_nofollow(path: &str) -> Result<Vnode> {
-    Ok(resolve(None, path.as_bytes(), false)?.vnode)
-}
-
-/// Looks up a byte path from the global root namespace.
-pub fn lookup_bytes(path: &[u8]) -> Result<Vnode> {
-    Ok(resolve(None, path, true)?.vnode)
+pub fn lookup_nofollow(path: &[u8]) -> Result<Vnode> {
+    Ok(resolve(None, path, false)?.vnode)
 }
 
 /// Returns an anchor for the namespace root.
@@ -141,12 +154,12 @@ pub(crate) fn root_anchor() -> Result<PathAnchor> {
 }
 
 /// Resolves a path relative to a stable directory anchor.
-pub(crate) fn resolve_at(base: &PathAnchor, path: &str, follow_final: bool) -> Result<PathAnchor> {
-    resolve(Some(base), path.as_bytes(), follow_final)
+pub(crate) fn resolve_at(base: &PathAnchor, path: &[u8], follow_final: bool) -> Result<PathAnchor> {
+    resolve(Some(base), path, follow_final)
 }
 
 /// Opens or creates a vnode and returns a shared open file description.
-pub fn open(path: &str, flags: OpenFlags, mode: u16) -> Result<FileRef> {
+pub fn open(path: &[u8], flags: OpenFlags, mode: u16) -> Result<FileRef> {
     let root = root_anchor()?;
     open_at(&root, path, flags, mode)
 }
@@ -154,7 +167,7 @@ pub fn open(path: &str, flags: OpenFlags, mode: u16) -> Result<FileRef> {
 /// Opens or creates a vnode relative to a stable directory anchor.
 pub(crate) fn open_at(
     base: &PathAnchor,
-    path: &str,
+    path: &[u8],
     flags: OpenFlags,
     mode: u16,
 ) -> Result<FileRef> {
@@ -166,24 +179,38 @@ pub(crate) fn open_at(
     }
 
     let follow_final = !flags.contains(OpenFlags::NOFOLLOW);
-    let anchor = match resolve(Some(base), path.as_bytes(), follow_final) {
+    let (anchor, created) = match resolve(Some(base), path, follow_final) {
         Ok(resolved) => {
             if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
                 return Err(Error::AlreadyExists);
             }
-            resolved
+            (resolved, false)
         }
         Err(Error::NotFound) if flags.contains(OpenFlags::CREATE) => {
-            let (directory, name) = resolve_parent(Some(base), path.as_bytes())?;
-            match directory.vnode.create(name, CreateKind::Regular, mode) {
-                Ok(vnode) => PathAnchor {
-                    vnode,
-                    mount: directory.mount,
-                },
-                Err(Error::AlreadyExists) if !flags.contains(OpenFlags::EXCLUSIVE) => PathAnchor {
-                    vnode: directory.vnode.lookup(name)?,
-                    mount: directory.mount,
-                },
+            let (directory, parent) = resolve_parent(Some(base), path)?;
+            // A trailing separator names a directory, so it can never create a
+            // regular file.
+            if parent.trailing_slash {
+                return Err(Error::IsDirectory);
+            }
+            match directory
+                .vnode
+                .create(parent.name, CreateKind::Regular, mode)
+            {
+                Ok(vnode) => (
+                    PathAnchor {
+                        vnode,
+                        mount: directory.mount,
+                    },
+                    true,
+                ),
+                Err(Error::AlreadyExists) if !flags.contains(OpenFlags::EXCLUSIVE) => (
+                    PathAnchor {
+                        vnode: directory.vnode.lookup(parent.name)?,
+                        mount: directory.mount,
+                    },
+                    false,
+                ),
                 Err(error) => return Err(error),
             }
         }
@@ -200,50 +227,65 @@ pub(crate) fn open_at(
     if vnode.kind() == VnodeKind::Directory && flags.contains(OpenFlags::WRITE) {
         return Err(Error::IsDirectory);
     }
-    if flags.contains(OpenFlags::TRUNCATE) && vnode.kind() == VnodeKind::Regular {
-        vnode.truncate(0)?;
+    // A file created by this call is accessible regardless of the mode it was
+    // created with, matching the POSIX open description.
+    if !created {
+        check_access(&vnode, flags)?;
     }
 
     OpenFile::new(anchor, flags)
 }
 
 /// Creates an empty regular file.
-pub fn create_file(path: &str, mode: u16) -> Result<Vnode> {
-    let (directory, name) = resolve_parent(None, path.as_bytes())?;
-    directory.vnode.create(name, CreateKind::Regular, mode)
+pub fn create_file(path: &[u8], mode: u16) -> Result<Vnode> {
+    let root = root_anchor()?;
+    let (directory, parent) = resolve_parent(Some(&root), path)?;
+    if parent.trailing_slash {
+        return Err(Error::IsDirectory);
+    }
+    directory
+        .vnode
+        .create(parent.name, CreateKind::Regular, mode)
 }
 
 /// Creates an empty directory.
-pub fn create_dir(path: &str, mode: u16) -> Result<Vnode> {
+pub fn create_dir(path: &[u8], mode: u16) -> Result<Vnode> {
     let root = root_anchor()?;
     create_dir_at(&root, path, mode)
 }
 
 /// Creates an empty directory relative to a stable directory anchor.
-pub(crate) fn create_dir_at(base: &PathAnchor, path: &str, mode: u16) -> Result<Vnode> {
-    let (directory, name) = resolve_parent(Some(base), path.as_bytes())?;
-    directory.vnode.create(name, CreateKind::Directory, mode)
+pub(crate) fn create_dir_at(base: &PathAnchor, path: &[u8], mode: u16) -> Result<Vnode> {
+    let (directory, parent) = resolve_parent(Some(base), path)?;
+    directory
+        .vnode
+        .create(parent.name, CreateKind::Directory, mode)
 }
 
 /// Creates a symbolic link.
-pub fn symlink(target: &str, path: &str) -> Result<Vnode> {
+pub fn symlink(target: &[u8], path: &[u8]) -> Result<Vnode> {
     let root = root_anchor()?;
     symlink_at(target, &root, path)
 }
 
 /// Creates a symbolic link relative to a stable directory anchor.
-pub(crate) fn symlink_at(target: &str, base: &PathAnchor, path: &str) -> Result<Vnode> {
-    let (directory, name) = resolve_parent(Some(base), path.as_bytes())?;
-    path::validate_symlink_target(target.as_bytes())?;
+pub(crate) fn symlink_at(target: &[u8], base: &PathAnchor, path: &[u8]) -> Result<Vnode> {
+    let (directory, parent) = resolve_parent(Some(base), path)?;
+    // A symbolic link is not a directory, so a trailing separator cannot name
+    // the object being created.
+    if parent.trailing_slash {
+        return Err(Error::NotDirectory);
+    }
+    path::validate_symlink_target(target)?;
     directory.vnode.create(
-        name,
-        CreateKind::Symlink(alloc::boxed::Box::<[u8]>::from(target.as_bytes())),
+        parent.name,
+        CreateKind::Symlink(Box::<[u8]>::from(target)),
         0o777,
     )
 }
 
 /// Adds a hard link to an existing non-directory vnode.
-pub fn link(existing: &str, new_path: &str) -> Result<()> {
+pub fn link(existing: &[u8], new_path: &[u8]) -> Result<()> {
     let root = root_anchor()?;
     link_at(&root, existing, true, &root, new_path)
 }
@@ -251,50 +293,62 @@ pub fn link(existing: &str, new_path: &str) -> Result<()> {
 /// Adds a hard link using independently anchored source and destination paths.
 pub(crate) fn link_at(
     existing_base: &PathAnchor,
-    existing: &str,
+    existing: &[u8],
     follow_existing: bool,
     new_base: &PathAnchor,
-    new_path: &str,
+    new_path: &[u8],
 ) -> Result<()> {
-    let target = resolve(Some(existing_base), existing.as_bytes(), follow_existing)?;
+    let target = resolve(Some(existing_base), existing, follow_existing)?;
     if target.vnode.kind() == VnodeKind::Directory {
         return Err(Error::PermissionDenied);
     }
-    let (directory, name) = resolve_parent(Some(new_base), new_path.as_bytes())?;
+    let (directory, parent) = resolve_parent(Some(new_base), new_path)?;
+    if parent.trailing_slash {
+        return Err(Error::NotDirectory);
+    }
     if target.mount.id != directory.mount.id {
         return Err(Error::CrossDevice);
     }
-    directory.vnode.link(name, &target.vnode)
+    directory.vnode.link(parent.name, &target.vnode)
 }
 
 /// Removes a non-directory path.
-pub fn unlink(path: &str) -> Result<()> {
+pub fn unlink(path: &[u8]) -> Result<()> {
     let root = root_anchor()?;
     unlink_at(&root, path, false)
 }
 
 /// Removes a path relative to a stable directory anchor.
-pub(crate) fn unlink_at(base: &PathAnchor, path: &str, remove_directory: bool) -> Result<()> {
+pub(crate) fn unlink_at(base: &PathAnchor, path: &[u8], remove_directory: bool) -> Result<()> {
     let namespace = namespace()?;
-    let (directory, name) = resolve_parent(Some(base), path.as_bytes())?;
-    let state = namespace.state.lock();
-    let target = directory.vnode.lookup(name)?;
-    if state.mounted_at.contains_key(&target.key()) {
-        return Err(Error::Busy);
+    let (directory, parent) = resolve_parent(Some(base), path)?;
+    // The target is resolved only when a check needs it, so an ordinary removal
+    // costs a single directory lookup inside the filesystem.
+    if parent.trailing_slash || COVERED_MOUNTS.load(Ordering::Acquire) != 0 {
+        let target = directory.vnode.lookup(parent.name)?;
+        // A trailing separator names a directory; removing a non-directory
+        // through such a path is a type mismatch rather than a missing entry.
+        if parent.trailing_slash && target.kind() != VnodeKind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        // The namespace lock guards only the mount table. Holding it across the
+        // filesystem operation would serialise every removal in the system and
+        // invert the namespace/filesystem lock order.
+        if namespace.is_mount_point(target.key()) {
+            return Err(Error::Busy);
+        }
     }
-    let result = directory.vnode.unlink(name, remove_directory);
-    drop(state);
-    result
+    directory.vnode.unlink(parent.name, remove_directory)
 }
 
 /// Removes an empty directory.
-pub fn remove_dir(path: &str) -> Result<()> {
+pub fn remove_dir(path: &[u8]) -> Result<()> {
     let root = root_anchor()?;
     unlink_at(&root, path, true)
 }
 
 /// Atomically renames or replaces a path within one filesystem.
-pub fn rename(source: &str, target: &str) -> Result<()> {
+pub fn rename(source: &[u8], target: &[u8]) -> Result<()> {
     let root = root_anchor()?;
     rename_at(&root, source, &root, target)
 }
@@ -302,57 +356,111 @@ pub fn rename(source: &str, target: &str) -> Result<()> {
 /// Atomically renames paths using independently anchored directories.
 pub(crate) fn rename_at(
     source_base: &PathAnchor,
-    source: &str,
+    source: &[u8],
     target_base: &PathAnchor,
-    target: &str,
+    target: &[u8],
 ) -> Result<()> {
     let namespace = namespace()?;
-    let (source_directory, source_name) = resolve_parent(Some(source_base), source.as_bytes())?;
-    let (target_directory, target_name) = resolve_parent(Some(target_base), target.as_bytes())?;
+    let (source_directory, source_parent) = resolve_parent(Some(source_base), source)?;
+    let (target_directory, target_parent) = resolve_parent(Some(target_base), target)?;
     if source_directory.mount.id != target_directory.mount.id {
         return Err(Error::CrossDevice);
     }
-    let state = namespace.state.lock();
-    let source_vnode = source_directory.vnode.lookup(source_name)?;
-    let target_vnode = target_directory.vnode.lookup(target_name).ok();
-    if state.mounted_at.contains_key(&source_vnode.key())
-        || target_vnode
-            .as_ref()
-            .is_some_and(|vnode| state.mounted_at.contains_key(&vnode.key()))
+
+    // As with removal, the endpoints are resolved only when a check needs them.
+    if source_parent.trailing_slash
+        || target_parent.trailing_slash
+        || COVERED_MOUNTS.load(Ordering::Acquire) != 0
     {
-        return Err(Error::Busy);
+        let source_vnode = source_directory.vnode.lookup(source_parent.name)?;
+        let target_vnode = target_directory.vnode.lookup(target_parent.name).ok();
+        if source_parent.trailing_slash && source_vnode.kind() != VnodeKind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        // A trailing separator on the destination requires a directory, whether
+        // it already exists or is about to be created by the rename.
+        if target_parent.trailing_slash {
+            let directory = target_vnode
+                .as_ref()
+                .map_or_else(|| source_vnode.kind(), Vnode::kind);
+            if directory != VnodeKind::Directory {
+                return Err(Error::NotDirectory);
+            }
+        }
+        if namespace.is_mount_point(source_vnode.key())
+            || target_vnode
+                .as_ref()
+                .is_some_and(|vnode| namespace.is_mount_point(vnode.key()))
+        {
+            return Err(Error::Busy);
+        }
     }
-    let result = source_directory
-        .vnode
-        .rename(source_name, &target_directory.vnode, target_name);
-    drop(state);
-    result
+
+    source_directory.vnode.rename(
+        source_parent.name,
+        &target_directory.vnode,
+        target_parent.name,
+    )
 }
 
 /// Mounts a filesystem over an existing directory.
-pub fn mount(path: &str, filesystem: FileSystemRef) -> Result<MountId> {
+pub fn mount(path: &[u8], filesystem: FileSystemRef) -> Result<MountId> {
     let namespace = namespace()?;
-    let (parent, name) = resolve_parent(None, path.as_bytes())?;
-    let mut state = namespace.state.lock();
-    let covered = parent.vnode.lookup(name)?;
+    let (parent, split) = resolve_parent(None, path)?;
+    let covered = parent.vnode.lookup(split.name)?;
     if covered.kind() != VnodeKind::Directory {
         return Err(Error::NotDirectory);
     }
+
+    let mut state = namespace.state.lock();
     if state.mounted_at.contains_key(&covered.key()) {
         return Err(Error::Busy);
     }
     let mount = Mount::child(filesystem, covered.clone(), &parent.mount)?;
     let id = mount.id;
     state.mounted_at.insert(covered.key(), mount);
+    COVERED_MOUNTS.store(state.mounted_at.len(), Ordering::Release);
     Ok(id)
 }
 
+/// Detaches the filesystem mounted at `path`.
+pub fn unmount(path: &[u8]) -> Result<()> {
+    let namespace = namespace()?;
+    let anchor = resolve(None, path, true)?;
+    let mut state = namespace.state.lock();
+    // Only the root of a covering mount is a mount point; anything else is not
+    // something that can be detached.
+    if anchor.vnode.key() != anchor.mount.root.key() {
+        return Err(Error::InvalidArgument);
+    }
+    let Some(covered) = anchor.mount.covered.as_ref() else {
+        // The root mount covers nothing and cannot be detached.
+        return Err(Error::InvalidArgument);
+    };
+    // A mount covered by another mount must be detached from the top down.
+    if state.mounted_at.contains_key(&anchor.mount.root.key()) {
+        return Err(Error::Busy);
+    }
+    let key = covered.key();
+    let Some(mount) = state.mounted_at.get(&key) else {
+        return Err(Error::InvalidArgument);
+    };
+    if mount.id != anchor.mount.id {
+        return Err(Error::InvalidArgument);
+    }
+    // The traversal above holds one reference in `anchor`, and the table holds
+    // the other. Anything else means the mount is still in use.
+    if Arc::strong_count(mount) > 2 {
+        return Err(Error::Busy);
+    }
+    state.mounted_at.remove(&key);
+    COVERED_MOUNTS.store(state.mounted_at.len(), Ordering::Release);
+    Ok(())
+}
+
 /// Returns filesystem statistics for the mount containing `path`.
-pub fn statfs(path: &str) -> Result<StatFs> {
-    Ok(resolve(None, path.as_bytes(), true)?
-        .mount
-        .filesystem
-        .statfs())
+pub fn statfs(path: &[u8]) -> Result<StatFs> {
+    Ok(resolve(None, path, true)?.mount.filesystem.statfs())
 }
 
 /// Flushes every filesystem currently present in the namespace.
@@ -379,9 +487,35 @@ fn namespace() -> Result<&'static Namespace> {
     NAMESPACE.get().ok_or(Error::Io)
 }
 
-fn resolve_parent<'a>(base: Option<&PathAnchor>, path: &'a [u8]) -> Result<(PathAnchor, &'a [u8])> {
-    let (parent, name) = path::split_parent(path)?;
-    Ok((resolve(base, parent, true)?, name))
+/// Rejects an access mode the vnode permission bits do not grant.
+///
+/// There is no per-process credential, so a mode bit set in any of the three
+/// permission triads grants the corresponding access.
+fn check_access(vnode: &Vnode, flags: OpenFlags) -> Result<()> {
+    let mode = vnode.getattr()?.mode;
+    if flags.contains(OpenFlags::READ) && mode & 0o444 == 0 {
+        return Err(Error::PermissionDenied);
+    }
+    if flags.contains(OpenFlags::WRITE) && mode & 0o222 == 0 {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(())
+}
+
+/// Rejects traversal through a directory that grants no search permission.
+fn check_search(directory: &Vnode) -> Result<()> {
+    if directory.getattr()?.mode & 0o111 == 0 {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(())
+}
+
+fn resolve_parent<'a>(
+    base: Option<&PathAnchor>,
+    path: &'a [u8],
+) -> Result<(PathAnchor, path::ParentPath<'a>)> {
+    let parent = path::split_parent(path)?;
+    Ok((resolve(base, parent.parent, true)?, parent))
 }
 
 fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result<PathAnchor> {
@@ -395,13 +529,30 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
         root_anchor()?
     };
     let mut components = parsed.components;
+    // A path that ends with a separator resolves as though a trailing `.` were
+    // appended, so the final component is always followed and must be a
+    // directory.
+    let mut require_directory = parsed.trailing_slash;
+    let follow_final = follow_final || parsed.trailing_slash;
+    // Only symbolic-link expansion needs owned components; an ordinary lookup
+    // never allocates.
+    let mut pending: VecDeque<Box<[u8]>> = VecDeque::new();
     let mut symlink_depth = 0usize;
 
-    while let Some(component) = components.pop_front() {
-        if component.as_ref() == b"." {
+    loop {
+        let owned = pending.pop_front();
+        let component: &[u8] = match &owned {
+            Some(value) => value,
+            None => match components.next() {
+                Some(value) => value,
+                None => break,
+            },
+        };
+
+        if component == b"." {
             continue;
         }
-        if component.as_ref() == b".." {
+        if component == b".." {
             current = ascend(current)?;
             continue;
         }
@@ -409,22 +560,28 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
         if current.vnode.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
+        check_search(&current.vnode)?;
         let parent = current.vnode.clone();
-        let child = parent.lookup(&component)?;
-        let final_component = components.is_empty();
+        let child = parent.lookup(component)?;
+        let final_component = pending.is_empty() && components.peek().is_none();
 
         if child.kind() == VnodeKind::Symlink && (follow_final || !final_component) {
             symlink_depth += 1;
             if symlink_depth > MAX_SYMLINK_DEPTH {
                 return Err(Error::SymlinkLoop);
             }
-            let target = path::parse(&child.readlink()?)?;
+            let link = child.readlink()?;
+            let target = path::parse(&link)?;
+            require_directory |= target.trailing_slash && final_component;
             if target.absolute {
                 current = root_anchor()?;
             } else {
                 current.vnode = parent;
             }
-            prepend(&mut components, target.components);
+            let expanded: Vec<Box<[u8]>> = target.components.map(Box::<[u8]>::from).collect();
+            for component in expanded.into_iter().rev() {
+                pending.push_front(component);
+            }
             continue;
         }
 
@@ -435,6 +592,9 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
         }
     }
 
+    if require_directory && current.vnode.kind() != VnodeKind::Directory {
+        return Err(Error::NotDirectory);
+    }
     Ok(current)
 }
 
@@ -453,13 +613,4 @@ fn ascend(mut current: PathAnchor) -> Result<PathAnchor> {
 
     current.vnode = current.vnode.parent()?;
     Ok(current)
-}
-
-fn prepend(
-    target: &mut VecDeque<alloc::boxed::Box<[u8]>>,
-    mut prefix: VecDeque<alloc::boxed::Box<[u8]>>,
-) {
-    while let Some(component) = prefix.pop_back() {
-        target.push_front(component);
-    }
 }

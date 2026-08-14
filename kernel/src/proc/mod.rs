@@ -10,14 +10,12 @@ pub(crate) mod timerfd;
 
 use alloc::{
     collections::BTreeMap,
-    format,
-    string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicUsize, Ordering},
 };
 
 use log::info;
@@ -42,7 +40,10 @@ pub(crate) use timerfd::TimerFd;
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 static PROCESSES: Once<Mutex<ProcessRegistry>> = Once::new();
-const MAX_FILES: usize = 1024;
+pub(crate) const MAX_FILES: usize = 1024;
+
+/// Permission bits cleared from newly created filesystem objects by default.
+const DEFAULT_UMASK: u16 = 0o022;
 
 /// Process creation or executable loading failure.
 #[derive(Debug)]
@@ -189,7 +190,7 @@ struct DescriptorEntry {
 
 #[derive(Clone)]
 struct WorkingDirectory {
-    path: String,
+    path: Vec<u8>,
     anchor: PathAnchor,
 }
 
@@ -211,6 +212,7 @@ pub(crate) struct Process {
     process_group: AtomicUsize,
     controlling_tty: Mutex<Option<FileRef>>,
     signals: signal::SignalManager,
+    umask: AtomicU16,
     active_threads: AtomicUsize,
     exited: AtomicBool,
     exit_status: AtomicI32,
@@ -229,7 +231,7 @@ impl Process {
     fn new_root(address_space: Arc<VmSpace>) -> Arc<Self> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         let cwd = WorkingDirectory {
-            path: "/".to_string(),
+            path: b"/".to_vec(),
             anchor: crate::fs::root_anchor().expect("proc: root filesystem unavailable"),
         };
         let process = Arc::new(Self {
@@ -244,6 +246,7 @@ impl Process {
             process_group: AtomicUsize::new(pid),
             controlling_tty: Mutex::new(None),
             signals: signal::SignalManager::new(),
+            umask: AtomicU16::new(DEFAULT_UMASK),
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
@@ -268,6 +271,7 @@ impl Process {
             process_group: AtomicUsize::new(parent.process_group()),
             controlling_tty: Mutex::new(parent.controlling_tty.lock().clone()),
             signals: signal::SignalManager::fork_from(&parent.signals),
+            umask: AtomicU16::new(parent.umask()),
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
@@ -295,36 +299,43 @@ impl Process {
     }
 
     /// Resolves a process-relative path into the global VFS namespace.
-    pub(crate) fn resolve_path(&self, path: &str) -> String {
-        let combined = if path.starts_with('/') {
-            path.to_string()
+    pub(crate) fn resolve_path(&self, path: &[u8]) -> Vec<u8> {
+        let mut combined = Vec::with_capacity(path.len() + 1);
+        if path.first() == Some(&b'/') {
+            combined.extend_from_slice(path);
         } else {
             let cwd = self.cwd.lock();
-            if cwd.path.as_str() == "/" {
-                format!("/{path}")
-            } else {
-                format!("{}/{path}", cwd.path.as_str())
+            combined.extend_from_slice(&cwd.path);
+            if cwd.path.as_slice() != b"/" {
+                combined.push(b'/');
             }
-        };
-        let mut components = Vec::new();
-        for component in combined.split('/') {
+            drop(cwd);
+            combined.extend_from_slice(path);
+        }
+
+        let mut components: Vec<&[u8]> = Vec::new();
+        for component in combined.split(|byte| *byte == b'/') {
             match component {
-                "" | "." => {}
-                ".." => {
+                b"" | b"." => {}
+                b".." => {
                     components.pop();
                 }
                 value => components.push(value),
             }
         }
         if components.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", components.join("/"))
+            return b"/".to_vec();
         }
+        let mut resolved = Vec::new();
+        for component in components {
+            resolved.push(b'/');
+            resolved.extend_from_slice(component);
+        }
+        resolved
     }
 
     /// Changes the process working directory.
-    pub(crate) fn set_cwd(&self, path: &str) -> Result<()> {
+    pub(crate) fn set_cwd(&self, path: &[u8]) -> Result<()> {
         let current = self.cwd.lock().clone();
         let anchor = crate::fs::resolve_at(&current.anchor, path, true)?;
         if anchor.vnode().kind() != VnodeKind::Directory {
@@ -339,8 +350,35 @@ impl Process {
     }
 
     /// Returns the process working directory.
-    pub(crate) fn cwd(&self) -> String {
+    pub(crate) fn cwd(&self) -> Vec<u8> {
         self.cwd.lock().path.clone()
+    }
+
+    /// Returns the file mode creation mask.
+    pub(crate) fn umask(&self) -> u16 {
+        self.umask.load(Ordering::Acquire)
+    }
+
+    /// Replaces the file mode creation mask and returns the previous value.
+    pub(crate) fn set_umask(&self, mask: u16) -> u16 {
+        self.umask.swap(mask & 0o777, Ordering::AcqRel)
+    }
+
+    /// Applies the creation mask to a requested permission mode.
+    pub(crate) fn apply_umask(&self, mode: u16) -> u16 {
+        mode & 0o7777 & !self.umask()
+    }
+
+    /// Arms signal interruption for a blocking syscall.
+    ///
+    /// Returns whether a pending signal should abort the operation now.
+    pub(crate) fn prepare_interrupt_wait(&self) -> bool {
+        self.signals.prepare_interrupt_wait()
+    }
+
+    /// Returns the event signalled when a signal becomes pending.
+    pub(crate) fn interrupt_event(&self) -> &crate::sys::event::Event {
+        self.signals.interrupt_event()
     }
 
     /// Returns the stable namespace location of the process working directory.
@@ -407,6 +445,23 @@ impl Process {
             .get(index)?
             .as_ref()
             .map(|entry| entry.descriptor.clone())
+    }
+
+    /// Resolves several descriptors under one descriptor-table lock.
+    ///
+    /// Readiness scans revisit the whole set on every pass, so acquiring the
+    /// lock once per pass avoids one acquisition per descriptor.
+    pub(crate) fn descriptors(&self, fds: &[i32]) -> Vec<Option<Descriptor>> {
+        let files = self.files.lock();
+        fds.iter()
+            .map(|fd| {
+                let index = usize::try_from(*fd).ok()?;
+                files
+                    .get(index)?
+                    .as_ref()
+                    .map(|entry| entry.descriptor.clone())
+            })
+            .collect()
     }
 
     /// Returns whether this process still owns a descriptor description.
@@ -670,9 +725,9 @@ pub(crate) fn find(pid: usize) -> Option<Arc<Process>> {
 /// Loads and schedules `/sbin/init`.
 pub fn spawn_init() -> Result<usize> {
     let image = elf::load(
-        "/sbin/init",
-        &["/sbin/init"],
-        &["PATH=/usr/bin:/bin", "HOME=/"],
+        b"/sbin/init",
+        &[b"/sbin/init".as_slice()],
+        &[b"PATH=/usr/bin:/bin".as_slice(), b"HOME=/".as_slice()],
     )?;
     let process = Process::new_root(image.address_space);
     let pid = process.pid();
@@ -744,9 +799,9 @@ pub(crate) fn create_thread(entry: u64, stack: u64, thread_pointer: u64) -> Resu
 /// Replaces the current process image.
 pub(crate) fn exec_current(
     frame: &mut TrapFrame,
-    path: &str,
-    arguments: &[String],
-    environment: &[String],
+    path: &[u8],
+    arguments: &[Vec<u8>],
+    environment: &[Vec<u8>],
 ) -> Result<()> {
     let process = current().ok_or(Error::InvalidArgument)?;
     if process.thread_count() != 1 {

@@ -5,7 +5,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
 
-use crate::sys::{event::Event, sync::Mutex};
+use crate::{
+    mem::{IoSink, IoSource},
+    sys::{event::Event, sync::Mutex},
+};
 
 use super::{
     error::{Error, Result},
@@ -125,7 +128,16 @@ impl OpenFile {
     pub(crate) fn new(anchor: PathAnchor, flags: OpenFlags) -> Result<FileRef> {
         let vnode = anchor.vnode().clone();
         let file_context = vnode.open(flags.bits())?;
-        let offset = match vnode.initial_offset(file_context, flags.bits()) {
+        // Truncation happens only once the filesystem has accepted the open, so
+        // a rejected open never destroys file contents.
+        let prepared = if flags.contains(OpenFlags::TRUNCATE) && vnode.kind() == VnodeKind::Regular
+        {
+            vnode.truncate(0)
+        } else {
+            Ok(())
+        };
+        let offset = match prepared.and_then(|()| vnode.initial_offset(file_context, flags.bits()))
+        {
             Ok(offset) => offset,
             Err(error) => {
                 vnode.close(file_context, flags.bits());
@@ -165,56 +177,54 @@ impl OpenFile {
     }
 
     /// Reads from and advances the shared offset.
-    pub fn read(&self, buffer: &mut [u8]) -> Result<usize> {
-        if !self.flags().contains(OpenFlags::READ) {
+    pub fn read(&self, sink: &mut IoSink<'_>) -> Result<usize> {
+        let flags = self.flags();
+        if !flags.contains(OpenFlags::READ) {
             return Err(Error::BadFileDescriptor);
         }
         let mut offset = self.offset.read().lock();
-        let read = self.vnode.read_at_with_flags(
-            self.file_context,
-            *offset,
-            buffer,
-            self.flags().bits(),
-        )?;
+        let read =
+            self.vnode
+                .read_at_with_flags(self.file_context, *offset, sink, flags.bits())?;
         *offset = offset.saturating_add(read as u64);
         self.offset.publish_read(*offset);
         Ok(read)
     }
 
     /// Writes to and advances the shared offset.
-    pub fn write(&self, buffer: &[u8]) -> Result<usize> {
+    pub fn write(&self, source: &IoSource<'_>) -> Result<usize> {
         let flags = self.flags();
         if !flags.contains(OpenFlags::WRITE) {
             return Err(Error::BadFileDescriptor);
         }
         let mut offset = self.offset.write().lock();
         if flags.contains(OpenFlags::APPEND) && self.vnode.kind() == VnodeKind::Regular {
-            let (written, new_offset) = self.vnode.append(buffer)?;
+            let (written, new_offset) = self.vnode.append(source)?;
             *offset = new_offset;
             return Ok(written);
         }
 
         let written =
             self.vnode
-                .write_at_with_flags(self.file_context, *offset, buffer, flags.bits())?;
+                .write_at_with_flags(self.file_context, *offset, source, flags.bits())?;
         *offset = offset.saturating_add(written as u64);
         Ok(written)
     }
 
     /// Reads without changing the shared offset.
-    pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+    pub fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
         if !self.flags().contains(OpenFlags::READ) {
             return Err(Error::BadFileDescriptor);
         }
-        self.vnode.read_at(offset, buffer)
+        self.vnode.read_at(offset, sink)
     }
 
     /// Writes without changing the shared offset.
-    pub fn write_at(&self, offset: u64, buffer: &[u8]) -> Result<usize> {
+    pub fn write_at(&self, offset: u64, source: &IoSource<'_>) -> Result<usize> {
         if !self.flags().contains(OpenFlags::WRITE) {
             return Err(Error::BadFileDescriptor);
         }
-        self.vnode.write_at(offset, buffer)
+        self.vnode.write_at(offset, source)
     }
 
     /// Changes and returns the shared offset.

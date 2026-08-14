@@ -8,6 +8,7 @@ use core::{
 };
 
 use crate::{
+    mem::IoSink,
     fs::PollEvents,
     mem::VirtAddr,
     proc::Descriptor,
@@ -95,8 +96,8 @@ impl TimerFd {
         }
     }
 
-    pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<usize> {
-        if buffer.len() < size_of::<u64>() {
+    pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> Result<usize> {
+        if sink.len() < size_of::<u64>() {
             return Err(Errno::Invalid);
         }
 
@@ -106,8 +107,11 @@ impl TimerFd {
                 let mut state = self.state.lock();
                 refresh(&mut state, now);
                 if state.expirations != 0 {
-                    let expirations = core::mem::take(&mut state.expirations);
-                    buffer[..8].copy_from_slice(&expirations.to_ne_bytes());
+                    // The count is cleared only once it has reached user
+                    // memory, so a faulting copy cannot lose expirations.
+                    sink.store(0, &state.expirations.to_ne_bytes())
+                        .map_err(|_| Errno::Fault)?;
+                    state.expirations = 0;
                     return Ok(8);
                 }
                 if self.nonblocking.load(Ordering::Acquire) {

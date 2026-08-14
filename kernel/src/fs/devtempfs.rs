@@ -12,6 +12,7 @@ use core::{
 };
 
 use crate::{
+    mem::{IoSink, IoSource},
     sys::{
         clock,
         event::Event,
@@ -23,8 +24,8 @@ use super::{
     error::{Error, Result},
     path,
     vnode::{
-        DirEntry, FileSystem, FilesystemId, IoctlContext, NodeId, PollEvents, SetAttr, StatFs,
-        TerminalState, Vnode, VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
+        CreateKind, DirEntry, FileSystem, FilesystemId, IoctlContext, NodeId, PollEvents, SetAttr,
+        StatFs, TerminalState, Vnode, VnodeAttr, VnodeKey, VnodeKind, VnodeOps,
     },
 };
 
@@ -34,6 +35,9 @@ const NODE_REVOKED: u64 = 1 << 63;
 const NODE_OPEN_ONE: u64 = 1 << 32;
 const NODE_OPEN_MASK: u64 = ((1 << 31) - 1) << 32;
 const NODE_ACTIVE_MASK: u64 = u32::MAX as u64;
+
+/// First readdir cursor value that refers to a real directory entry.
+const DIRECTORY_CURSOR_BASE: u64 = 2;
 
 /// Opaque token identifying the code that owns a devtempfs node.
 ///
@@ -97,9 +101,98 @@ impl DeviceNodeKind {
     }
 }
 
+/// Drives a contiguous-buffer read across every page window of `sink`.
+///
+/// Device ABIs that require one flat buffer cannot see a segmented user range,
+/// so the transfer is issued once per page window. The first window keeps the
+/// caller's flags so blocking devices behave normally; later windows add
+/// `O_NONBLOCK` so a partially satisfied multi-page transfer never blocks
+/// waiting for data the device does not have.
+pub fn read_windows<F>(
+    sink: &mut IoSink<'_>,
+    offset: u64,
+    flags: u32,
+    mut transfer: F,
+) -> Result<usize>
+where
+    F: FnMut(u64, &mut [u8], u32) -> Result<usize>,
+{
+    let total = sink.len();
+    let mut done = 0usize;
+    while done < total {
+        let window_flags = if done == 0 {
+            flags
+        } else {
+            flags | crate::fs::OpenFlags::NONBLOCK.bits()
+        };
+        let window = sink
+            .window(done, total - done)
+            .map_err(|_| Error::InvalidArgument)?;
+        if window.is_empty() {
+            break;
+        }
+        let capacity = window.len();
+        let count = match transfer(offset.saturating_add(done as u64), window, window_flags) {
+            Ok(count) => count,
+            Err(_) if done != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if count > capacity {
+            return Err(Error::Io);
+        }
+        done += count;
+        if count < capacity {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// Drives a contiguous-buffer write across every page window of `source`.
+///
+/// Follows the same window and blocking rules as [`read_windows`].
+pub fn write_windows<F>(
+    source: &IoSource<'_>,
+    offset: u64,
+    flags: u32,
+    mut transfer: F,
+) -> Result<usize>
+where
+    F: FnMut(u64, &[u8], u32) -> Result<usize>,
+{
+    let total = source.len();
+    let mut done = 0usize;
+    while done < total {
+        let window_flags = if done == 0 {
+            flags
+        } else {
+            flags | crate::fs::OpenFlags::NONBLOCK.bits()
+        };
+        let window = source
+            .window(done, total - done)
+            .map_err(|_| Error::InvalidArgument)?;
+        if window.is_empty() {
+            break;
+        }
+        let capacity = window.len();
+        let count = match transfer(offset.saturating_add(done as u64), window, window_flags) {
+            Ok(count) => count,
+            Err(_) if done != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if count > capacity {
+            return Err(Error::Io);
+        }
+        done += count;
+        if count < capacity {
+            break;
+        }
+    }
+    Ok(done)
+}
+
 /// File operations implemented by a driver-owned device node.
-pub trait DeviceNodeOps: Send + Sync {
-    /// Returns the initial byte offset for a new open file description.
+pub trait DeviceNodeOps: Send + Sync {    /// Returns the initial byte offset for a new open file description.
     fn initial_offset(&self, _file_context: usize, _flags: u32) -> Result<u64> {
         Ok(0)
     }
@@ -113,7 +206,7 @@ pub trait DeviceNodeOps: Send + Sync {
     fn close(&self, _file_context: usize, _flags: u32) {}
 
     /// Reads bytes at an explicit offset.
-    fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> Result<usize> {
+    fn read_at(&self, _offset: u64, _sink: &mut IoSink<'_>) -> Result<usize> {
         Err(Error::Unsupported)
     }
 
@@ -122,14 +215,14 @@ pub trait DeviceNodeOps: Send + Sync {
         &self,
         _file_context: usize,
         offset: u64,
-        buffer: &mut [u8],
+        sink: &mut IoSink<'_>,
         _flags: u32,
     ) -> Result<usize> {
-        self.read_at(offset, buffer)
+        self.read_at(offset, sink)
     }
 
     /// Writes bytes at an explicit offset.
-    fn write_at(&self, _offset: u64, _buffer: &[u8]) -> Result<usize> {
+    fn write_at(&self, _offset: u64, _source: &IoSource<'_>) -> Result<usize> {
         Err(Error::Unsupported)
     }
 
@@ -138,10 +231,10 @@ pub trait DeviceNodeOps: Send + Sync {
         &self,
         _file_context: usize,
         offset: u64,
-        buffer: &[u8],
+        source: &IoSource<'_>,
         _flags: u32,
     ) -> Result<usize> {
-        self.write_at(offset, buffer)
+        self.write_at(offset, source)
     }
 
     /// Returns requested events that are immediately ready.
@@ -210,7 +303,12 @@ struct DevRecord {
     owner: OwnerId,
     parent: DevNodeId,
     vnode: Vnode,
-    children: BTreeMap<Box<[u8]>, DevNodeId>,
+    /// Name index used by lookup.
+    children: BTreeMap<Arc<[u8]>, DevNodeId>,
+    /// Identifier index used by readdir. Names are shared with `children`, and
+    /// the ordering lets a batch resume from a cursor without scanning the
+    /// whole directory.
+    ordered: BTreeMap<DevNodeId, Arc<[u8]>>,
 }
 
 struct DevtempfsNode {
@@ -238,11 +336,11 @@ enum DevtempfsData {
 
 impl Drop for NodeActivity<'_> {
     fn drop(&mut self) {
-        let previous = self.lifecycle.fetch_sub(1, Ordering::Release);
-        assert!(
-            previous & NODE_ACTIVE_MASK != 0,
-            "devtempfs: active operation count underflow"
-        );
+        let _ = self
+            .lifecycle
+            .try_update(Ordering::Release, Ordering::Relaxed, |state| {
+                (state & NODE_ACTIVE_MASK != 0).then(|| state - 1)
+            });
     }
 }
 
@@ -275,6 +373,7 @@ impl Devtempfs {
                 parent: root_id,
                 vnode: root.clone(),
                 children: BTreeMap::new(),
+                ordered: BTreeMap::new(),
             },
         );
         filesystem.used_nodes.store(1, Ordering::Release);
@@ -368,7 +467,7 @@ impl Devtempfs {
     }
 
     /// Returns the names of every entry directly below `parent`.
-    pub fn child_names(&self, parent: DevNodeId) -> Result<Vec<Box<[u8]>>> {
+    pub fn child_names(&self, parent: DevNodeId) -> Result<Vec<Arc<[u8]>>> {
         Ok(self
             .state
             .lock()
@@ -415,25 +514,33 @@ impl Devtempfs {
         data: DevtempfsData,
     ) -> Result<DevNodeId> {
         path::validate_leaf_name(name)?;
-        let id = DevNodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
-        assert!(id.get() != 0, "devtempfs: node identifier wrapped");
-        let vnode = self.make_node(id, owner, kind, mode, data);
 
         let mut state = self.state.lock();
-        let parent_record = state.records.get_mut(&parent).ok_or(Error::NotFound)?;
+        // The parent is validated before an identifier is consumed so that a
+        // rejected request does not burn node numbers or build a vnode.
+        let parent_record = state.records.get(&parent).ok_or(Error::NotFound)?;
         if parent_record.vnode.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
         if parent_record.children.contains_key(name) {
             return Err(Error::AlreadyExists);
         }
-        let name = Box::<[u8]>::from(name);
-        parent_record.children.insert(name, id);
+
+        let id = DevNodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
+        if id.get() == 0 {
+            return Err(Error::NoSpace);
+        }
+        let vnode = self.make_node(id, owner, kind, mode, data);
         if kind == VnodeKind::Directory {
             node_operations(&parent_record.vnode)?
                 .links
                 .fetch_add(1, Ordering::AcqRel);
         }
+
+        let parent_record = state.records.get_mut(&parent).ok_or(Error::NotFound)?;
+        let name = Arc::<[u8]>::from(name);
+        parent_record.children.insert(name.clone(), id);
+        parent_record.ordered.insert(id, name);
         state.records.insert(
             id,
             DevRecord {
@@ -441,6 +548,7 @@ impl Devtempfs {
                 parent,
                 vnode,
                 children: BTreeMap::new(),
+                ordered: BTreeMap::new(),
             },
         );
         self.used_nodes.fetch_add(1, Ordering::AcqRel);
@@ -548,6 +656,18 @@ impl DevtempfsNode {
         self.changed_ns.store(now, Ordering::Release);
     }
 
+    /// Reports why a namespace mutation cannot be performed.
+    ///
+    /// Only drivers may change this namespace, so a directory here rejects the
+    /// request rather than claiming it is not a directory.
+    fn reject_mutation<T>(&self) -> Result<T> {
+        self.ensure_live()?;
+        if self.kind != VnodeKind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        Err(Error::PermissionDenied)
+    }
+
     fn ensure_live(&self) -> Result<()> {
         if self.lifecycle.load(Ordering::Acquire) & NODE_REVOKED != 0 {
             return Err(Error::NotFound);
@@ -595,11 +715,11 @@ impl DevtempfsNode {
     }
 
     fn mark_closed(&self) {
-        let previous = self.lifecycle.fetch_sub(NODE_OPEN_ONE, Ordering::AcqRel);
-        assert!(
-            previous & NODE_OPEN_MASK != 0,
-            "devtempfs: open count underflow"
-        );
+        let _ = self
+            .lifecycle
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & NODE_OPEN_MASK != 0).then(|| state - NODE_OPEN_ONE)
+            });
     }
 
     fn is_idle(&self) -> bool {
@@ -662,16 +782,43 @@ impl VnodeOps for DevtempfsNode {
             self.mark_closed();
             return;
         }
-        let Ok(_activity) = self.begin_activity() else {
-            self.mark_closed();
-            return;
-        };
-        let Ok(operations) = self.device_operations() else {
-            self.mark_closed();
-            return;
-        };
-        operations.close(file_context, flags);
+        // A revoked node still owes the driver its close callback, otherwise a
+        // forced driver removal leaks whatever the open reserved. The activity
+        // count is raised directly so revocation cannot block the release.
+        self.lifecycle.fetch_add(1, Ordering::AcqRel);
+        if let Ok(operations) = self.device_operations() {
+            operations.close(file_context, flags);
+        }
+        self.lifecycle.fetch_sub(1, Ordering::AcqRel);
         self.mark_closed();
+    }
+
+    fn create(
+        &self,
+        _directory: &Vnode,
+        _name: &[u8],
+        _kind: CreateKind,
+        _mode: u16,
+    ) -> Result<Vnode> {
+        self.reject_mutation()
+    }
+
+    fn link(&self, _directory: &Vnode, _name: &[u8], _target: &Vnode) -> Result<()> {
+        self.reject_mutation()
+    }
+
+    fn unlink(&self, _directory: &Vnode, _name: &[u8], _remove_directory: bool) -> Result<()> {
+        self.reject_mutation()
+    }
+
+    fn rename(
+        &self,
+        _source_directory: &Vnode,
+        _source_name: &[u8],
+        _target_directory: &Vnode,
+        _target_name: &[u8],
+    ) -> Result<()> {
+        self.reject_mutation()
     }
 
     fn getattr(&self, vnode: &Vnode) -> Result<VnodeAttr> {
@@ -748,8 +895,8 @@ impl VnodeOps for DevtempfsNode {
             .unwrap_or_else(|| directory.clone()))
     }
 
-    fn read_at(&self, _vnode: &Vnode, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        self.read_at_with_flags(_vnode, 0, offset, buffer, 0)
+    fn read_at(&self, vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
+        self.read_at_with_flags(vnode, 0, offset, sink, 0)
     }
 
     fn read_at_with_flags(
@@ -757,22 +904,23 @@ impl VnodeOps for DevtempfsNode {
         _vnode: &Vnode,
         file_context: usize,
         offset: u64,
-        buffer: &mut [u8],
+        sink: &mut IoSink<'_>,
         flags: u32,
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
-        let read =
-            self.device_operations()?
-                .read_at_with_flags(file_context, offset, buffer, flags)?;
-        if read > buffer.len() {
+        let capacity = sink.len();
+        let read = self
+            .device_operations()?
+            .read_at_with_flags(file_context, offset, sink, flags)?;
+        if read > capacity {
             return Err(Error::Io);
         }
         self.touch_accessed();
         Ok(read)
     }
 
-    fn write_at(&self, _vnode: &Vnode, offset: u64, buffer: &[u8]) -> Result<usize> {
-        self.write_at_with_flags(_vnode, 0, offset, buffer, 0)
+    fn write_at(&self, vnode: &Vnode, offset: u64, source: &IoSource<'_>) -> Result<usize> {
+        self.write_at_with_flags(vnode, 0, offset, source, 0)
     }
 
     fn write_at_with_flags(
@@ -780,14 +928,15 @@ impl VnodeOps for DevtempfsNode {
         _vnode: &Vnode,
         file_context: usize,
         offset: u64,
-        buffer: &[u8],
+        source: &IoSource<'_>,
         flags: u32,
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
-        let written =
-            self.device_operations()?
-                .write_at_with_flags(file_context, offset, buffer, flags)?;
-        if written > buffer.len() {
+        let capacity = source.len();
+        let written = self
+            .device_operations()?
+            .write_at_with_flags(file_context, offset, source, flags)?;
+        if written > capacity {
             return Err(Error::Io);
         }
         self.touch_modified();
@@ -846,7 +995,7 @@ impl VnodeOps for DevtempfsNode {
 
     fn readdir(
         &self,
-        _directory: &Vnode,
+        directory: &Vnode,
         cursor: u64,
         maximum: usize,
     ) -> Result<(Vec<DirEntry>, u64)> {
@@ -854,32 +1003,57 @@ impl VnodeOps for DevtempfsNode {
         if self.kind != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
+        let mut entries = Vec::new();
+        if maximum == 0 {
+            return Ok((entries, cursor));
+        }
+
+        // Cursor values below `DIRECTORY_CURSOR_BASE` are reserved for the two
+        // synthetic entries, matching the ordering tmpfs uses.
+        let mut next = cursor;
+        if next == 0 {
+            entries.push(DirEntry {
+                name: Arc::<[u8]>::from(&b"."[..]),
+                key: directory.key(),
+                kind: VnodeKind::Directory,
+                offset: 1,
+            });
+            next = 1;
+        }
+        if next == 1 && entries.len() < maximum {
+            let parent = self.parent(directory)?;
+            entries.push(DirEntry {
+                name: Arc::<[u8]>::from(&b".."[..]),
+                key: parent.key(),
+                kind: VnodeKind::Directory,
+                offset: DIRECTORY_CURSOR_BASE,
+            });
+            next = DIRECTORY_CURSOR_BASE;
+        }
+        if entries.len() == maximum {
+            return Ok((entries, next));
+        }
+
         let filesystem = self.filesystem()?;
         let state = filesystem.state.lock();
         let record = state.records.get(&self.id).ok_or(Error::NotFound)?;
-        let mut children: Vec<_> = record
-            .children
-            .iter()
-            .filter_map(|(name, id)| {
-                if id.get() <= cursor {
-                    return None;
-                }
-                state.records.get(id).map(|child| {
-                    (
-                        id.get(),
-                        DirEntry {
-                            name: name.clone(),
-                            key: child.vnode.key(),
-                            kind: child.vnode.kind(),
-                        },
-                    )
-                })
-            })
-            .collect();
-        children.sort_unstable_by_key(|(id, _)| *id);
-        children.truncate(maximum);
-        let next = children.last().map_or(cursor, |(id, _)| *id);
-        Ok((children.into_iter().map(|(_, entry)| entry).collect(), next))
+        let first = DevNodeId::new(next.max(DIRECTORY_CURSOR_BASE));
+        for (id, name) in record.ordered.range(first..) {
+            if entries.len() == maximum {
+                break;
+            }
+            let Some(child) = state.records.get(id) else {
+                continue;
+            };
+            next = id.get().saturating_add(1);
+            entries.push(DirEntry {
+                name: name.clone(),
+                key: child.vnode.key(),
+                kind: child.vnode.kind(),
+                offset: next,
+            });
+        }
+        Ok((entries, next))
     }
 
     fn fsync(&self, _vnode: &Vnode) -> Result<()> {
@@ -914,12 +1088,12 @@ pub fn global() -> Result<&'static Arc<Devtempfs>> {
 
 pub(crate) fn mount_global() -> Result<()> {
     let filesystem = Devtempfs::new()?;
-    match super::create_dir("/dev", 0o755) {
+    match super::create_dir(b"/dev", 0o755) {
         Ok(_) | Err(Error::AlreadyExists) => {}
         Err(error) => return Err(error),
     }
     let mounted: Arc<dyn FileSystem> = filesystem.clone();
-    super::mount("/dev", mounted)?;
+    super::mount(b"/dev", mounted)?;
     DEVTEMPFS.call_once(|| filesystem);
     Ok(())
 }
@@ -933,14 +1107,19 @@ fn node_operations(vnode: &Vnode) -> Result<&DevtempfsNode> {
 fn remove_record(state: &mut DevtempfsState, node: DevNodeId) -> Result<()> {
     let record = state.records.remove(&node).ok_or(Error::NotFound)?;
     if let Some(parent) = state.records.get_mut(&record.parent) {
-        parent.children.retain(|_, child| *child != node);
+        if let Some(name) = parent.ordered.remove(&node) {
+            parent.children.remove(&name);
+        } else {
+            parent.children.retain(|_, child| *child != node);
+        }
         if record.vnode.kind() == VnodeKind::Directory {
             let operations = node_operations(&parent.vnode)?;
-            let previous = operations.links.fetch_sub(1, Ordering::AcqRel);
-            assert!(
-                previous > 2,
-                "devtempfs: parent directory link count underflow"
-            );
+            operations
+                .links
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |links| {
+                    (links > 2).then(|| links - 1)
+                })
+                .map_err(|_| Error::Io)?;
         }
     }
     Ok(())

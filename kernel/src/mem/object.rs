@@ -8,7 +8,7 @@ use core::{
 
 use crate::{mem::PAGE_SIZE, sys::sync::Mutex};
 
-use super::{Error, Result, VmPage};
+use super::{Error, IoSink, IoSource, Result, VmPage};
 
 /// Memory object's semantic owner.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -157,39 +157,66 @@ impl VmObject {
         self.get_or_create_page(index)
     }
 
-    /// Reads bytes, returning zeros for holes.
-    pub fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize> {
+    /// Reads bytes into a sink, returning zeros for holes.
+    pub fn read_into(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
+        let total = sink.len();
         let mut read = 0usize;
-        while read < output.len() {
+        while read < total {
             let position = offset
                 .checked_add(read as u64)
                 .ok_or(Error::InvalidAddress)?;
             let page_index = position / PAGE_SIZE;
             let page_offset = (position % PAGE_SIZE) as usize;
-            let count = cmp::min(PAGE_SIZE as usize - page_offset, output.len() - read);
-            if let Some(page) = self.page(page_index) {
-                page.read(page_offset, &mut output[read..read + count])?;
-            } else {
-                output[read..read + count].fill(0);
+            let limit = cmp::min(PAGE_SIZE as usize - page_offset, total - read);
+
+            // The page reference is taken before the sink window is resolved so
+            // that no page backing lock is held across a user page fault.
+            let page = self.page(page_index);
+            let window = sink.window(read, limit)?;
+            if window.is_empty() {
+                return Err(Error::InvalidAddress);
+            }
+            let count = window.len();
+            match page {
+                Some(page) => page.read(page_offset, window)?,
+                None => window.fill(0),
             }
             read += count;
         }
         Ok(read)
     }
 
-    /// Writes bytes and returns the number accepted.
-    pub fn write_at(&self, offset: u64, input: &[u8]) -> Result<usize> {
+    /// Reads bytes into a kernel buffer, returning zeros for holes.
+    pub fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize> {
+        self.read_into(offset, &mut IoSink::kernel(output))
+    }
+
+    /// Writes bytes from a source and returns the number accepted.
+    pub fn write_from(&self, offset: u64, source: &IoSource<'_>) -> Result<usize> {
+        let total = source.len();
         let mut written = 0usize;
-        while written < input.len() {
+        while written < total {
             let position = offset
                 .checked_add(written as u64)
                 .ok_or(Error::InvalidAddress)?;
             let page_index = position / PAGE_SIZE;
             let page_offset = (position % PAGE_SIZE) as usize;
-            let count = cmp::min(PAGE_SIZE as usize - page_offset, input.len() - written);
+            let limit = cmp::min(PAGE_SIZE as usize - page_offset, total - written);
+
+            // The source window is resolved before any page backing lock is
+            // taken so that a user page fault never nests inside one.
+            let window = match source.window(written, limit) {
+                Ok(window) => window,
+                Err(_) if written != 0 => return Ok(written),
+                Err(error) => return Err(error),
+            };
+            if window.is_empty() {
+                return Err(Error::InvalidAddress);
+            }
+            let count = window.len();
             let existing = self.pages.lock().get(&page_index).cloned();
             if let Some(page) = existing {
-                if let Err(error) = page.write(page_offset, &input[written..written + count]) {
+                if let Err(error) = page.write(page_offset, window) {
                     if written != 0 {
                         return Ok(written);
                     }
@@ -206,7 +233,7 @@ impl VmObject {
                 }
                 let page =
                     VmPage::new_zero(page_index, super::page::owner_kind_for_object(self.kind));
-                if let Err(error) = page.write(page_offset, &input[written..written + count]) {
+                if let Err(error) = page.write(page_offset, window) {
                     if let Some(account) = &self.account {
                         account.release(1);
                     }
@@ -220,7 +247,7 @@ impl VmObject {
                     if let Some(account) = &self.account {
                         account.release(1);
                     }
-                    existing.write(page_offset, &input[written..written + count])?;
+                    existing.write(page_offset, window)?;
                 } else {
                     pages.insert(page_index, page);
                 }
@@ -228,6 +255,11 @@ impl VmObject {
             written += count;
         }
         Ok(written)
+    }
+
+    /// Writes bytes from a kernel buffer and returns the number accepted.
+    pub fn write_at(&self, offset: u64, input: &[u8]) -> Result<usize> {
+        self.write_from(offset, &IoSource::kernel(input))
     }
 
     /// Removes pages beyond `size` and zeroes a retained partial tail.

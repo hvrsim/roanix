@@ -66,5 +66,5 @@ pub fn init() {
 
 /// Loads the modules packaged in the initial filesystem.
 pub fn load_packaged_modules() -> Result<usize> {
-    abi::loader::load_directory("/usr/lib/roanix/drivers")
+    abi::loader::load_directory(b"/usr/lib/roanix/drivers")
 }

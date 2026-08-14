@@ -235,7 +235,7 @@ pub(crate) fn populate() -> Result<usize> {
 
         match entry.kind {
             EntryKind::Regular(data) => {
-                let vnode = fs::create_file(&path, entry.mode)?;
+                let vnode = fs::create_file(path.as_bytes(), entry.mode)?;
                 write_all(&vnode, data)?;
                 vnode.setattr(SetAttr {
                     size: None,
@@ -243,11 +243,11 @@ pub(crate) fn populate() -> Result<usize> {
                 })?;
             }
             EntryKind::Directory => {
-                let vnode = match fs::create_dir(&path, entry.mode) {
+                let vnode = match fs::create_dir(path.as_bytes(), entry.mode) {
                     Ok(vnode) => vnode,
                     Err(fs::Error::AlreadyExists) => {
                         let file = fs::open(
-                            &path,
+                            path.as_bytes(),
                             OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
                             0,
                         )?;
@@ -261,7 +261,7 @@ pub(crate) fn populate() -> Result<usize> {
                 })?;
             }
             EntryKind::Symlink(target) => {
-                fs::symlink(&target, &path)?;
+                fs::symlink(target.as_bytes(), path.as_bytes())?;
             }
             EntryKind::HardLink(target) => {
                 pending_links.push((absolute_path(&target), path));
@@ -381,13 +381,13 @@ fn ensure_parent_directories(path: &str) -> Result<()> {
         current.push('/');
         current.push_str(component);
         match fs::open(
-            &current,
+            current.as_bytes(),
             OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
             0,
         ) {
             Ok(_) => {}
             Err(fs::Error::NotFound) => {
-                fs::create_dir(&current, 0o755)?;
+                fs::create_dir(current.as_bytes(), 0o755)?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -398,7 +398,7 @@ fn ensure_parent_directories(path: &str) -> Result<()> {
 fn write_all(vnode: &fs::Vnode, mut data: &[u8]) -> Result<()> {
     let mut offset = 0u64;
     while !data.is_empty() {
-        let written = vnode.write_at(offset, data)?;
+        let written = vnode.write_at(offset, &crate::mem::IoSource::kernel(data))?;
         if written == 0 {
             return Err(fs::Error::Io.into());
         }
@@ -416,7 +416,7 @@ fn resolve_hard_links(mut pending: Vec<(String, String)>) -> Result<()> {
         let mut progress = false;
 
         for (target, path) in pending {
-            match fs::link(&target, &path) {
+            match fs::link(target.as_bytes(), path.as_bytes()) {
                 Ok(()) => progress = true,
                 Err(fs::Error::NotFound) => unresolved.push((target, path)),
                 Err(error) => return Err(error.into()),

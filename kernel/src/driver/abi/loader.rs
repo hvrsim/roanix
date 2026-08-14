@@ -13,7 +13,6 @@
 use alloc::{
     alloc::{alloc_zeroed, dealloc},
     boxed::Box,
-    format,
     string::String,
     sync::Arc,
     vec,
@@ -166,7 +165,7 @@ impl Drop for Image {
 ///
 /// A module that fails to load is reported and skipped: one broken driver must
 /// not stop the rest of the system from coming up.
-pub fn load_directory(path: &str) -> Result<usize> {
+pub fn load_directory(path: &[u8]) -> Result<usize> {
     let directory = fs::open(
         path,
         OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
@@ -188,10 +187,16 @@ pub fn load_directory(path: &str) -> Result<usize> {
     }
     names.sort_unstable();
 
-    let directory = path.trim_end_matches('/');
+    let mut directory = path;
+    while directory.len() > 1 && directory.last() == Some(&b'/') {
+        directory = &directory[..directory.len() - 1];
+    }
     let mut loaded = 0usize;
     for name in &names {
-        match load_file(&format!("{directory}/{name}")) {
+        let mut full = directory.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(name.as_bytes());
+        match load_file(&full) {
             Ok(module) => {
                 info!("driver: loaded module {}", module.name());
                 loaded += 1;
@@ -204,14 +209,14 @@ pub fn load_directory(path: &str) -> Result<usize> {
 }
 
 /// Loads and starts one module image.
-pub fn load_file(path: &str) -> Result<Arc<Module>> {
+pub fn load_file(path: &[u8]) -> Result<Arc<Module>> {
     let definition = prepare(path)?;
     // SAFETY: `prepare` validated that both callbacks lie inside the image, and
     // the image is owned by the module for as long as it stays loaded.
     unsafe { module::load(definition) }
 }
 
-fn prepare(path: &str) -> Result<ModuleDefinition> {
+fn prepare(path: &[u8]) -> Result<ModuleDefinition> {
     let bytes = read_file(path)?;
     let elf = ElfFile::new(&bytes).map_err(|_| Error::InvalidArgument)?;
     validate_header(&elf)?;
@@ -290,7 +295,7 @@ fn validate_descriptor(image: &Image, descriptor: &ModuleDef) -> Result<ModuleDe
     })
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>> {
+fn read_file(path: &[u8]) -> Result<Vec<u8>> {
     let file = fs::open(path, OpenFlags::READ, 0)?;
     let size = usize::try_from(file.getattr()?.size).map_err(|_| Error::InvalidArgument)?;
     if size == 0 || size > MAX_FILE_SIZE {
@@ -299,7 +304,10 @@ fn read_file(path: &str) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; size];
     let mut offset = 0usize;
     while offset < bytes.len() {
-        let read = file.read_at(offset as u64, &mut bytes[offset..])?;
+        let read = file.read_at(
+            offset as u64,
+            &mut crate::mem::IoSink::kernel(&mut bytes[offset..]),
+        )?;
         if read == 0 {
             return Err(Error::InvalidArgument);
         }

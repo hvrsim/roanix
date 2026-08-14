@@ -1,6 +1,6 @@
 //! Filesystem syscall implementations.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use core::{mem::size_of, time::Duration};
 
 use crate::{
@@ -8,18 +8,17 @@ use crate::{
         self, IoctlContext, OpenFlags, PathAnchor, PollEvents, SeekFrom, Vnode, VnodeAttr,
         VnodeKind,
     },
-    mem::VirtAddr,
+    mem::{IoSink, IoSource, VirtAddr},
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
     sys::{clock, event::Event},
     syscall::{
         Errno, Result, current_process, map_fs_error, map_memory_error, map_process_error,
-        read_user_string,
+        read_user_path,
     },
 };
 
 const MAX_IO_SIZE: usize = 16 * 1024 * 1024;
 const MAX_IOCTL_SIZE: usize = 4096;
-const STACK_IO_SIZE: usize = 4096;
 
 const O_ACCMODE: u64 = 0o3;
 const O_WRONLY: u64 = 0o1;
@@ -58,6 +57,37 @@ const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
+/// Userspace `stat` record layout.
+#[derive(Clone, Copy)]
+struct UserStat {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    kind: u32,
+    links: u64,
+    size: u64,
+    accessed_ns: u64,
+    modified_ns: u64,
+    changed_ns: u64,
+}
+
+impl UserStat {
+    /// Builds the record reported for a descriptor with no filesystem identity.
+    fn anonymous(mode: u32, kind: u32) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
+            mode,
+            kind,
+            links: 1,
+            size: 0,
+            accessed_ns: 0,
+            modified_ns: 0,
+            changed_ns: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct UserPollFd {
     fd: i32,
@@ -66,7 +96,7 @@ struct UserPollFd {
 }
 
 enum AtPath {
-    Vfs { base: PathAnchor, path: String },
+    Vfs { base: PathAnchor, path: Vec<u8> },
     Pipe,
     Anonymous,
 }
@@ -110,7 +140,7 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_read(_frame, fd: i32 = 0, buffer: u64 = 1, size: u64 = 2) {
-        let size = checked_io_size(size)?;
+        let size = clamped_io_size(size)?;
         if size == 0 {
             return Ok(0);
         }
@@ -118,28 +148,16 @@ crate::syscall_handler! {
         let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         check_terminal_job_control(&process, &descriptor, false)?;
         let address_space = process.address_space();
-        let read = if size <= STACK_IO_SIZE {
-            let mut bytes = [0u8; STACK_IO_SIZE];
-            let read = descriptor_read(&descriptor, &mut bytes[..size])?;
-            address_space
-                .write_user(VirtAddr::new(buffer), &bytes[..read])
-                .map_err(map_memory_error)?;
-            read
-        } else {
-            let mut bytes = vec![0u8; size];
-            let read = descriptor_read(&descriptor, &mut bytes)?;
-            address_space
-                .write_user(VirtAddr::new(buffer), &bytes[..read])
-                .map_err(map_memory_error)?;
-            read
-        };
+        let mut sink = IoSink::user(&address_space, VirtAddr::new(buffer), size)
+            .map_err(map_memory_error)?;
+        let read = descriptor_read(&descriptor, &mut sink)?;
         Ok(read as u64)
     }
 }
 
 crate::syscall_handler! {
     syscall_file_write(_frame, fd: i32 = 0, buffer: u64 = 1, size: u64 = 2) {
-        let size = checked_io_size(size)?;
+        let size = clamped_io_size(size)?;
         if size == 0 {
             return Ok(0);
         }
@@ -147,19 +165,9 @@ crate::syscall_handler! {
         let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         check_terminal_job_control(&process, &descriptor, true)?;
         let address_space = process.address_space();
-        let written = if size <= STACK_IO_SIZE {
-            let mut bytes = [0u8; STACK_IO_SIZE];
-            address_space
-                .read_user(VirtAddr::new(buffer), &mut bytes[..size])
-                .map_err(map_memory_error)?;
-            descriptor_write(&descriptor, &bytes[..size])?
-        } else {
-            let mut bytes = vec![0u8; size];
-            address_space
-                .read_user(VirtAddr::new(buffer), &mut bytes)
-                .map_err(map_memory_error)?;
-            descriptor_write(&descriptor, &bytes)?
-        };
+        let source = IoSource::user(&address_space, VirtAddr::new(buffer), size)
+            .map_err(map_memory_error)?;
+        let written = descriptor_write(&descriptor, &source)?;
         Ok(written as u64)
     }
 }
@@ -261,9 +269,25 @@ crate::syscall_handler! {
 }
 
 crate::syscall_handler! {
+    syscall_file_umask(_frame, mask: u64 = 0) {
+        let process = current_process()?;
+        Ok(u64::from(process.set_umask(mask as u16)))
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_umount(_frame, path: u64 = 0) {
+        let process = current_process()?;
+        let path = read_user_path(&process, path)?;
+        fs::unmount(&path).map_err(map_fs_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
     syscall_file_chdir(_frame, path: u64 = 0) {
         let process = current_process()?;
-        let path = read_user_string(&process, path)?;
+        let path = read_user_path(&process, path)?;
         process.set_cwd(&path).map_err(map_process_error)?;
         Ok(0)
     }
@@ -278,7 +302,7 @@ crate::syscall_handler! {
         if size < required {
             return Err(Errno::Range);
         }
-        let mut bytes = cwd.into_bytes();
+        let mut bytes = cwd;
         bytes.push(0);
         process
             .address_space()
@@ -337,13 +361,13 @@ crate::syscall_handler! {
                 write_user_stat(&process, output, file.getattr().map_err(map_fs_error)?)
             }
             Descriptor::Pipe(_) => {
-                write_user_stat_values(&process, output, 0, 0, 0o666, 6, 1, 0)
+                write_user_stat_record(&process, output, UserStat::anonymous(0o666, 6))
             }
             Descriptor::SignalFd(_) => {
-                write_user_stat_values(&process, output, 0, 0, 0o600, 1, 1, 0)
+                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
             }
             Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) => {
-                write_user_stat_values(&process, output, 0, 0, 0o600, 1, 1, 0)
+                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
             }
         }
     }
@@ -486,7 +510,7 @@ crate::syscall_handler! {
         for (index, entry) in entries.iter().enumerate() {
             let record = &mut output[index * USER_DIRENT_SIZE..][..USER_DIRENT_SIZE];
             record[..8].copy_from_slice(&entry.key.node.get().to_ne_bytes());
-            record[8..16].copy_from_slice(&0i64.to_ne_bytes());
+            record[8..16].copy_from_slice(&entry.offset.to_ne_bytes());
             record[16..18].copy_from_slice(&(USER_DIRENT_SIZE as u16).to_ne_bytes());
             record[18] = dirent_kind(entry.kind);
             let length = entry.name.len().min(255);
@@ -632,10 +656,14 @@ crate::syscall_handler! {
         const POLL_FD_SIZE: usize = size_of::<i32>() + size_of::<i16>() * 2;
         const POLL_INTERVAL_NS: u64 = 1_000_000;
 
+        // A process cannot hold more descriptors than the table allows, so a
+        // larger set is always a malformed request rather than a huge wait.
         let count = usize::try_from(count).map_err(|_| Errno::Invalid)?;
+        if count > proc::MAX_FILES {
+            return Err(Errno::Invalid);
+        }
         let byte_len = count
             .checked_mul(POLL_FD_SIZE)
-            .filter(|length| *length <= MAX_IO_SIZE)
             .ok_or(Errno::Invalid)?;
         let process = current_process()?;
         let mut bytes = vec![0u8; byte_len];
@@ -659,22 +687,21 @@ crate::syscall_handler! {
             clock::monotonic_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
         });
 
+        let fds: Vec<i32> = entries.iter().map(|entry| entry.fd).collect();
+
         loop {
             let mut ready = 0usize;
-            let mut descriptors = Vec::with_capacity(entries.len());
-            for entry in &mut entries {
+            let descriptors = process.descriptors(&fds);
+            for (entry, descriptor) in entries.iter_mut().zip(&descriptors) {
                 entry.revents = 0;
                 if entry.fd < 0 {
-                    descriptors.push(None);
                     continue;
                 }
                 let requested = PollEvents::from_bits_retain(entry.events as u16);
-                let descriptor = process.descriptor(entry.fd);
-                let events = match &descriptor {
+                let events = match descriptor {
                     Some(descriptor) => descriptor.poll(requested),
                     None => PollEvents::NVAL,
                 };
-                descriptors.push(descriptor);
                 entry.revents = events.bits() as i16;
                 if !events.is_empty() {
                     ready += 1;
@@ -697,7 +724,12 @@ crate::syscall_handler! {
                 return Ok(ready as u64);
             }
 
-            let mut wait_events = Vec::<&Event>::new();
+            // Arm signal interruption before sleeping so a blocked poll can be
+            // aborted by a signal instead of waiting forever.
+            if process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            let mut wait_events = alloc::vec![process.interrupt_event()];
             let mut event_driven = true;
             for (entry, descriptor) in entries.iter().zip(&descriptors) {
                 if entry.fd < 0 {
@@ -714,7 +746,7 @@ crate::syscall_handler! {
             wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
             wait_events.dedup_by_key(|event| *event as *const Event as usize);
 
-            if event_driven && !wait_events.is_empty() {
+            if event_driven && wait_events.len() > 1 {
                 if let Some(deadline) = deadline {
                     let remaining = deadline.saturating_sub(now).max(1);
                     let _ = clock::wait_any_timeout(
@@ -740,7 +772,8 @@ fn file_open_at(process: &Process, dirfd: i32, path: u64, flags: u64, mode: u64)
         unreachable!("non-empty paths cannot resolve to pipes");
     };
     let open_flags = parse_open_flags(flags)?;
-    let file = fs::open_at(&base, &path, open_flags, mode as u16).map_err(map_fs_error)?;
+    let mode = process.apply_umask(mode as u16);
+    let file = fs::open_at(&base, &path, open_flags, mode).map_err(map_fs_error)?;
     let fd = process
         .install_file(file.clone(), flags & O_CLOEXEC != 0)
         .map_err(map_process_error)?;
@@ -798,8 +831,10 @@ fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u6
             let vnode = lookup_at(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
             write_user_stat(process, output, vnode.getattr().map_err(map_fs_error)?)
         }
-        AtPath::Pipe => write_user_stat_values(process, output, 0, 0, 0o666, 6, 1, 0),
-        AtPath::Anonymous => write_user_stat_values(process, output, 0, 0, 0o600, 1, 1, 0),
+        AtPath::Pipe => write_user_stat_record(process, output, UserStat::anonymous(0o666, 6)),
+        AtPath::Anonymous => {
+            write_user_stat_record(process, output, UserStat::anonymous(0o600, 1))
+        }
     }
 }
 
@@ -810,7 +845,10 @@ fn file_readlink_at(
     buffer: u64,
     size: u64,
 ) -> Result<u64> {
-    let size = checked_io_size(size)?;
+    let size = clamped_io_size(size)?;
+    if size == 0 {
+        return Err(Errno::Invalid);
+    }
     let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::AllowVfs)?
     else {
         unreachable!("pipe paths are rejected by the resolver");
@@ -843,7 +881,7 @@ fn file_mkdir_at(process: &Process, dirfd: i32, path: u64, mode: u64) -> Result<
     else {
         unreachable!("non-empty paths cannot resolve to pipes");
     };
-    fs::create_dir_at(&base, &path, mode as u16).map_err(map_fs_error)?;
+    fs::create_dir_at(&base, &path, process.apply_umask(mode as u16)).map_err(map_fs_error)?;
     Ok(0)
 }
 
@@ -939,7 +977,7 @@ fn file_link_at(
 }
 
 fn file_symlink_at(process: &Process, target: u64, dirfd: i32, path: u64) -> Result<u64> {
-    let target = read_user_string(process, target)?;
+    let target = read_user_path(process, target)?;
     let AtPath::Vfs { base, path } = resolve_at_path(process, dirfd, path, EmptyPath::Reject)?
     else {
         unreachable!("non-empty paths cannot resolve to pipes");
@@ -954,8 +992,8 @@ fn resolve_at_path(
     address: u64,
     empty: EmptyPath,
 ) -> Result<AtPath> {
-    let path = read_user_string(process, address)?;
-    if path.starts_with('/') {
+    let path = read_user_path(process, address)?;
+    if path.first() == Some(&b'/') {
         return Ok(AtPath::Vfs {
             base: fs::root_anchor().map_err(map_fs_error)?,
             path,
@@ -968,7 +1006,7 @@ fn resolve_at_path(
     if dirfd == AT_FDCWD {
         return Ok(AtPath::Vfs {
             base: process.cwd_anchor(),
-            path: if path.is_empty() { ".".into() } else { path },
+            path: if path.is_empty() { b".".to_vec() } else { path },
         });
     }
 
@@ -979,7 +1017,7 @@ fn resolve_at_path(
             }
             Ok(AtPath::Vfs {
                 base: file.path_anchor(),
-                path: if path.is_empty() { ".".into() } else { path },
+                path: if path.is_empty() { b".".to_vec() } else { path },
             })
         }
         Descriptor::Pipe(_) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
@@ -1008,7 +1046,7 @@ fn resolve_at_path(
     }
 }
 
-fn lookup_at(base: &PathAnchor, path: &str, follow_final: bool) -> Result<Vnode> {
+fn lookup_at(base: &PathAnchor, path: &[u8], follow_final: bool) -> Result<Vnode> {
     fs::resolve_at(base, path, follow_final)
         .map(|anchor| anchor.vnode().clone())
         .map_err(map_fs_error)
@@ -1070,46 +1108,36 @@ fn ioctl_context(process: &Process) -> Result<IoctlContext> {
 }
 
 fn write_user_stat(process: &Process, output: u64, attributes: VnodeAttr) -> Result<u64> {
-    write_user_stat_values(
+    write_user_stat_record(
         process,
         output,
-        attributes.key.filesystem.get(),
-        attributes.key.node.get(),
-        u32::from(attributes.mode),
-        vnode_kind(attributes.kind),
-        attributes.links,
-        attributes.size,
-    )?;
-    let mut times = [0u8; 24];
-    times[0..8].copy_from_slice(&attributes.accessed_ns.to_ne_bytes());
-    times[8..16].copy_from_slice(&attributes.modified_ns.to_ne_bytes());
-    times[16..24].copy_from_slice(&attributes.changed_ns.to_ne_bytes());
-    let times_output = output.checked_add(40).ok_or(Errno::Fault)?;
-    process
-        .address_space()
-        .write_user(VirtAddr::new(times_output), &times)
-        .map_err(map_memory_error)?;
-    Ok(0)
+        UserStat {
+            device: attributes.key.filesystem.get(),
+            inode: attributes.key.node.get(),
+            mode: u32::from(attributes.mode),
+            kind: vnode_kind(attributes.kind),
+            links: attributes.links,
+            size: attributes.size,
+            accessed_ns: attributes.accessed_ns,
+            modified_ns: attributes.modified_ns,
+            changed_ns: attributes.changed_ns,
+        },
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_user_stat_values(
-    process: &Process,
-    output: u64,
-    device: u64,
-    inode: u64,
-    mode: u32,
-    kind: u32,
-    links: u64,
-    size: u64,
-) -> Result<u64> {
+/// The complete record is assembled once and copied to user memory in a single
+/// transfer, so a partially written structure can never be observed.
+fn write_user_stat_record(process: &Process, output: u64, stat: UserStat) -> Result<u64> {
     let mut bytes = [0u8; 64];
-    bytes[0..8].copy_from_slice(&device.to_ne_bytes());
-    bytes[8..16].copy_from_slice(&inode.to_ne_bytes());
-    bytes[16..20].copy_from_slice(&mode.to_ne_bytes());
-    bytes[20..24].copy_from_slice(&kind.to_ne_bytes());
-    bytes[24..32].copy_from_slice(&links.to_ne_bytes());
-    bytes[32..40].copy_from_slice(&size.to_ne_bytes());
+    bytes[0..8].copy_from_slice(&stat.device.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&stat.inode.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&stat.mode.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&stat.kind.to_ne_bytes());
+    bytes[24..32].copy_from_slice(&stat.links.to_ne_bytes());
+    bytes[32..40].copy_from_slice(&stat.size.to_ne_bytes());
+    bytes[40..48].copy_from_slice(&stat.accessed_ns.to_ne_bytes());
+    bytes[48..56].copy_from_slice(&stat.modified_ns.to_ne_bytes());
+    bytes[56..64].copy_from_slice(&stat.changed_ns.to_ne_bytes());
     process
         .address_space()
         .write_user(VirtAddr::new(output), &bytes)
@@ -1159,21 +1187,21 @@ fn open_flags_to_user(flags: OpenFlags) -> u64 {
     result
 }
 
-fn descriptor_read(descriptor: &Descriptor, buffer: &mut [u8]) -> Result<usize> {
+fn descriptor_read(descriptor: &Descriptor, sink: &mut IoSink<'_>) -> Result<usize> {
     match descriptor {
-        Descriptor::File(file) => file.read(buffer).map_err(map_fs_error),
-        Descriptor::Pipe(pipe) => pipe.read(buffer).map_err(map_pipe_error),
-        Descriptor::SignalFd(signal_fd) => signal_fd.read(buffer),
+        Descriptor::File(file) => file.read(sink).map_err(map_fs_error),
+        Descriptor::Pipe(pipe) => pipe.read(sink).map_err(map_pipe_error),
+        Descriptor::SignalFd(signal_fd) => signal_fd.read(sink),
         Descriptor::Epoll(_) => Err(Errno::BadFileDescriptor),
-        Descriptor::Inotify(inotify) => inotify.read(buffer),
-        Descriptor::TimerFd(timer) => timer.read(buffer),
+        Descriptor::Inotify(inotify) => inotify.read(sink),
+        Descriptor::TimerFd(timer) => timer.read(sink),
     }
 }
 
-fn descriptor_write(descriptor: &Descriptor, buffer: &[u8]) -> Result<usize> {
+fn descriptor_write(descriptor: &Descriptor, source: &IoSource<'_>) -> Result<usize> {
     match descriptor {
-        Descriptor::File(file) => file.write(buffer).map_err(map_fs_error),
-        Descriptor::Pipe(pipe) => pipe.write(buffer).map_err(map_pipe_error),
+        Descriptor::File(file) => file.write(source).map_err(map_fs_error),
+        Descriptor::Pipe(pipe) => pipe.write(source).map_err(map_pipe_error),
         Descriptor::SignalFd(_)
         | Descriptor::Epoll(_)
         | Descriptor::Inotify(_)
@@ -1213,6 +1241,16 @@ fn check_terminal_job_control(
     Err(Errno::Interrupted)
 }
 
+/// Clamps a user-supplied transfer length to the per-call maximum.
+///
+/// POSIX allows a short transfer, so an oversized request is truncated rather
+/// than rejected.
+fn clamped_io_size(size: u64) -> Result<usize> {
+    Ok(usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .min(MAX_IO_SIZE))
+}
+
 fn checked_io_size(size: u64) -> Result<usize> {
     let size = usize::try_from(size).map_err(|_| Errno::Overflow)?;
     if size > MAX_IO_SIZE {
@@ -1225,6 +1263,7 @@ fn map_pipe_error(error: PipeError) -> Errno {
     match error {
         PipeError::BadDescriptor => Errno::BadFileDescriptor,
         PipeError::TryAgain => Errno::TryAgain,
+        PipeError::Fault => Errno::Fault,
         PipeError::BrokenPipe => {
             if let Some(process) = proc::current() {
                 proc::signal::send_kernel(&process, proc::signal::SIGPIPE);
