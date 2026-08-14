@@ -10,14 +10,13 @@ use core::{
     mem::size_of,
     ops::{Deref, DerefMut},
     ptr::{self, null_mut},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use log::info;
 
 use crate::{
     arch,
-    mem::{self, PAGE_SIZE, PhysAddr, VirtAddr, VmFlags, pages_for_len, phys},
+    mem::{self, PAGE_SIZE, PhysAddr, VirtAddr, VmFlags, pages_for_len, phys, tlb},
     sys::{self, sync::Mutex},
 };
 
@@ -27,20 +26,17 @@ pub(crate) const HEAP_BASE: u64 = 0xFFFF_A000_0000_0000;
 const HEAP_SIZE: u64 = 1 << 32;
 /// Number of heap pages inside the reserved window.
 const HEAP_PAGES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
-/// Bit width needed to encode a heap page index.
-const HEAP_PAGE_INDEX_BITS: u32 = 20;
-/// Mask used to decode a heap page index from a retired-page entry.
-const HEAP_PAGE_INDEX_MASK: u64 = (1u64 << HEAP_PAGE_INDEX_BITS) - 1;
 /// Sentinel value representing an invalid page index.
 const NONE_PAGE: u32 = u32::MAX;
 /// Slab size classes used for hot-path allocations.
-const SIZE_CLASSES: [usize; 8] = [8, 16, 32, 64, 128, 256, 512, 1024];
-/// Maximum CPUs tracked by heap TLB shootdown state.
-const MAX_TLB_CPUS: usize = 256;
+///
+/// The largest class is half a page, so every request the slab layer accepts
+/// leaves room for the slab header without wasting a whole page.
+const SIZE_CLASSES: [usize; 9] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 /// Maximum number of unmapped heap pages quarantined awaiting remote TLB flush.
-const TLB_RETIRE_CAPACITY: usize = 1 << 16;
+const TLB_RETIRE_CAPACITY: usize = 1 << 12;
 /// Maximum retired pages reclaimed in one heap-lock critical section.
-const RETIRED_RECLAIM_BATCH: u64 = 256;
+const RETIRED_RECLAIM_BATCH: usize = 256;
 
 /// Marker stored inside freed slab objects.
 #[repr(C)]
@@ -97,15 +93,65 @@ struct HeapState {
     partial: [u32; SIZE_CLASSES.len()],
     empty_cache: [u32; SIZE_CLASSES.len()],
     pages: [HeapPageMeta; HEAP_PAGES],
+    retired: RetireQueue,
 }
 
-struct TlbShootdownState {
-    reserved_seq: AtomicU64,
-    published_seq: AtomicU64,
-    reclaimed_seq: AtomicU64,
-    peak_pending: AtomicU64,
-    entries: [AtomicU64; TLB_RETIRE_CAPACITY],
-    seen: [AtomicU64; MAX_TLB_CPUS],
+/// One heap page awaiting the invalidation that makes its frame reusable.
+#[derive(Copy, Clone)]
+struct RetiredPage {
+    page_idx: u32,
+    paddr: u64,
+    /// Shootdown sequence that must be applied on every CPU first.
+    sequence: u64,
+}
+
+/// Bounded queue of heap pages whose frames cannot be reused yet.
+///
+/// Unmapping a heap page only invalidates the local translation, so a frame
+/// stays quarantined until every CPU has acknowledged the invalidation. The
+/// queue is drained opportunistically from allocation and deallocation, which
+/// keeps those paths free of inter-processor round trips.
+struct RetireQueue {
+    entries: [RetiredPage; TLB_RETIRE_CAPACITY],
+    head: usize,
+    len: usize,
+    peak: usize,
+}
+
+impl RetireQueue {
+    const fn new() -> Self {
+        Self {
+            entries: [RetiredPage {
+                page_idx: 0,
+                paddr: 0,
+                sequence: 0,
+            }; TLB_RETIRE_CAPACITY],
+            head: 0,
+            len: 0,
+            peak: 0,
+        }
+    }
+
+    fn push(&mut self, entry: RetiredPage) -> bool {
+        if self.len == TLB_RETIRE_CAPACITY {
+            return false;
+        }
+        self.entries[(self.head + self.len) % TLB_RETIRE_CAPACITY] = entry;
+        self.len += 1;
+        self.peak = self.peak.max(self.len);
+        true
+    }
+
+    fn peek(&self) -> Option<RetiredPage> {
+        (self.len != 0).then(|| self.entries[self.head])
+    }
+
+    fn pop(&mut self) -> Option<RetiredPage> {
+        let entry = self.peek()?;
+        self.head = (self.head + 1) % TLB_RETIRE_CAPACITY;
+        self.len -= 1;
+        Some(entry)
+    }
 }
 
 impl HeapState {
@@ -116,6 +162,7 @@ impl HeapState {
             partial: [NONE_PAGE; SIZE_CLASSES.len()],
             empty_cache: [NONE_PAGE; SIZE_CLASSES.len()],
             pages: [HeapPageMeta::FREE; HEAP_PAGES],
+            retired: RetireQueue::new(),
         }
     }
 
@@ -145,11 +192,11 @@ impl HeapState {
         self.alloc_large(layout).unwrap_or(null_mut())
     }
 
-    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) -> Option<u64> {
+    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
         self.collect_retired();
 
         if layout.size() == 0 {
-            return None;
+            return;
         }
 
         let page_idx = ptr_page_index(ptr).expect("mem/alloc: pointer outside heap window");
@@ -204,7 +251,7 @@ impl HeapState {
         Some(node.cast::<u8>())
     }
 
-    fn dealloc_slab(&mut self, page_idx: usize, ptr: *mut u8) -> Option<u64> {
+    fn dealloc_slab(&mut self, page_idx: usize, ptr: *mut u8) {
         let class = self.pages[page_idx].class as usize;
         // SAFETY: `page_idx` was derived from an allocation owned by this slab
         // and the heap lock gives unique access.
@@ -224,17 +271,17 @@ impl HeapState {
         }
 
         if slab.free_count != slab.capacity {
-            return None;
+            return;
         }
 
         let cache = self.empty_cache[class];
         if cache == NONE_PAGE || cache == page_idx as u32 {
             self.empty_cache[class] = page_idx as u32;
-            return None;
+            return;
         }
 
         self.remove_partial(class, page_idx as u32);
-        self.release_page(page_idx)
+        self.release_page(page_idx);
     }
 
     fn grow_slab(&mut self, class: usize) -> Option<u32> {
@@ -319,18 +366,16 @@ impl HeapState {
         Some(heap_page_virt(start).as_mut_ptr())
     }
 
-    fn dealloc_large(&mut self, start: usize) -> Option<u64> {
+    fn dealloc_large(&mut self, start: usize) {
         let pages = self.pages[start].aux as usize;
         let root = arch::paging::active_root();
-        let mut last_retired = None;
 
         for idx in start..(start + pages) {
             let page = self.take_mapped_page(root, idx, "large");
-            last_retired = self.retire_page(idx, page, start + pages - idx);
+            self.retire_page(idx, page, start + pages - idx);
         }
 
         self.search_hint = self.search_hint.min(start);
-        last_retired
     }
 
     fn reserve_run(&mut self, pages: usize, align_pages: usize) -> Option<usize> {
@@ -434,12 +479,11 @@ impl HeapState {
         slab.prev = NONE_PAGE;
     }
 
-    fn release_page(&mut self, page_idx: usize) -> Option<u64> {
+    fn release_page(&mut self, page_idx: usize) {
         let root = arch::paging::active_root();
         let page = self.take_mapped_page(root, page_idx, "slab");
-        let seq = self.retire_page(page_idx, page, 1);
+        self.retire_page(page_idx, page, 1);
         self.search_hint = self.search_hint.min(page_idx);
-        seq
     }
 
     fn rollback_large(&mut self, root: PhysAddr, start: usize, mapped: usize) {
@@ -466,72 +510,89 @@ impl HeapState {
             .unwrap_or_else(|| panic!("mem/alloc: {context} heap page missing PFN metadata"))
     }
 
-    fn retire_page(
-        &mut self,
-        page_idx: usize,
-        page: &'static phys::Page,
-        span: usize,
-    ) -> Option<u64> {
+    /// Quarantines an unmapped heap page until its frame can be reused.
+    ///
+    /// Returns the virtual address whose invalidation must be published once
+    /// the heap lock is released.
+    fn retire_page(&mut self, page_idx: usize, page: &'static phys::Page, span: usize) {
         if sys::smp::online_cpus() <= 1 {
             // SAFETY: the page was unmapped above and no remote TLB can retain
             // an alias in the single-CPU case.
             unsafe { phys::free_page(page) };
             self.pages[page_idx] = HeapPageMeta::FREE;
-            return None;
+            return;
         }
 
-        let seq = queue_retired_page(page_idx, page.paddr());
         self.pages[page_idx] = HeapPageMeta {
             kind: PageKind::Retired,
             class: 0,
             _reserved: 0,
             aux: span as u32,
         };
-        Some(seq)
-    }
 
-    fn collect_retired(&mut self) {
-        let shootdown = &HEAP_TLB_SHOOTDOWN;
-        let published = shootdown.published_seq.load(Ordering::Acquire);
-        let mut reclaimed = shootdown.reclaimed_seq.load(Ordering::Relaxed);
-        if reclaimed >= published {
+        let sequence = tlb::publish_async(heap_page_virt(page_idx));
+        if self.enqueue_retired(page_idx, page.paddr(), sequence) {
             return;
         }
 
-        let mut safe_seq = shootdown.seen[0].load(Ordering::Acquire).min(published);
-        if sys::smp::online_cpus() > 1 {
-            let cpu_count = tracked_cpu_count();
-            safe_seq = published;
-
-            for cpu_id in 0..cpu_count {
-                if sys::smp::is_online(cpu_id) {
-                    safe_seq = safe_seq.min(shootdown.seen[cpu_id].load(Ordering::Acquire));
-                }
-            }
-        }
-
-        let reclaim_target = safe_seq.min(reclaimed.saturating_add(RETIRED_RECLAIM_BATCH));
-        while reclaimed < reclaim_target {
-            reclaimed += 1;
-            self.reclaim_retired_page(load_retired_entry(reclaimed));
-        }
-
-        shootdown.reclaimed_seq.store(reclaimed, Ordering::Release);
+        // A saturated queue means some CPU is far behind. Forcing every CPU to
+        // discard its translations makes the whole quarantine reclaimable at
+        // once, which is preferable to failing a deallocation.
+        let sequence = tlb::flush_everything();
+        self.drain_retired();
+        assert!(
+            self.enqueue_retired(page_idx, page.paddr(), sequence),
+            "mem/alloc: heap retire queue still full after a global flush"
+        );
     }
 
-    fn reclaim_retired_page(&mut self, entry: u64) {
-        let (page_idx, paddr) = decode_retired_entry(entry);
+    /// Records the sequence that makes a quarantined page reclaimable.
+    fn enqueue_retired(&mut self, page_idx: usize, paddr: PhysAddr, sequence: u64) -> bool {
+        self.retired.push(RetiredPage {
+            page_idx: page_idx as u32,
+            paddr: paddr.as_u64(),
+            sequence,
+        })
+    }
+
+    /// Releases quarantined pages whose invalidation every CPU has applied.
+    fn collect_retired(&mut self) {
+        if self.retired.len == 0 {
+            return;
+        }
+        let applied = tlb::acknowledged_through();
+        for _ in 0..RETIRED_RECLAIM_BATCH {
+            let Some(entry) = self.retired.peek() else {
+                break;
+            };
+            if entry.sequence > applied {
+                break;
+            }
+            self.retired.pop();
+            self.reclaim_retired_page(entry);
+        }
+    }
+
+    /// Releases every quarantined page after a synchronous global flush.
+    fn drain_retired(&mut self) {
+        while let Some(entry) = self.retired.pop() {
+            self.reclaim_retired_page(entry);
+        }
+    }
+
+    fn reclaim_retired_page(&mut self, entry: RetiredPage) {
+        let page_idx = entry.page_idx as usize;
         assert_eq!(
             self.pages[page_idx].kind,
             PageKind::Retired,
-            "mem/alloc: reclaim encountered non-retired page {}",
-            page_idx
+            "mem/alloc: reclaim encountered non-retired page {page_idx}"
         );
 
-        let page = phys::phys_to_page(paddr)
+        let page = phys::phys_to_page(PhysAddr::new(entry.paddr))
             .unwrap_or_else(|| panic!("mem/alloc: retired heap page missing PFN metadata"));
-        // SAFETY: every tracked CPU acknowledged the TLB invalidation before
-        // this retired page became reclaimable.
+        // SAFETY: every online CPU acknowledged the invalidation of this heap
+        // address before the entry became reclaimable, so no stale alias can
+        // reach the frame.
         unsafe { phys::free_page(page) };
         self.pages[page_idx] = HeapPageMeta::FREE;
         self.search_hint = self.search_hint.min(page_idx);
@@ -546,7 +607,6 @@ impl HeapState {
 pub struct KernelAllocator;
 
 static HEAP: Mutex<HeapState> = Mutex::new(HeapState::new());
-static HEAP_TLB_SHOOTDOWN: TlbShootdownState = TlbShootdownState::new();
 
 struct HeapGuard<'a> {
     guard: crate::sys::sync::MutexGuard<'a, HeapState>,
@@ -563,13 +623,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let retire_seq = {
-            let mut heap = heap_lock();
-            heap.dealloc(ptr, layout)
-        };
-        if let Some(seq) = retire_seq {
-            publish_retired_page(seq);
-        }
+        heap_lock().dealloc(ptr, layout);
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -699,44 +753,6 @@ unsafe fn slab_header(page_idx: usize) -> &'static mut SlabHeader {
     unsafe { &mut *heap_page_virt(page_idx).as_mut_ptr::<SlabHeader>() }
 }
 
-/// Flushes allocator-requested heap TLB invalidations on the current CPU.
-pub(crate) fn flush_remote_tlb_shootdown() {
-    let Some(cpu) = arch::thiscpu_opt() else {
-        return;
-    };
-    let cpu_id = cpu.id;
-    if cpu_id >= MAX_TLB_CPUS {
-        return;
-    }
-
-    let shootdown = &HEAP_TLB_SHOOTDOWN;
-    let published = shootdown.published_seq.load(Ordering::Acquire);
-    let seen = shootdown.seen[cpu_id].load(Ordering::Acquire);
-    if published <= seen {
-        return;
-    }
-
-    for seq in (seen + 1)..=published {
-        let (page_idx, _) = decode_retired_entry(load_retired_entry(seq));
-        arch::paging::flush_page(heap_page_virt(page_idx));
-    }
-
-    shootdown.seen[cpu_id].store(published, Ordering::Release);
-}
-
-/// Marks `cpu_id` online for allocator shootdown tracking.
-pub(super) fn register_tlb_cpu(cpu_id: usize) {
-    if cpu_id >= MAX_TLB_CPUS {
-        panic!(
-            "mem/alloc: cpu {} exceeds heap TLB tracking capacity {}",
-            cpu_id, MAX_TLB_CPUS
-        );
-    }
-
-    let published = HEAP_TLB_SHOOTDOWN.published_seq.load(Ordering::Acquire);
-    HEAP_TLB_SHOOTDOWN.seen[cpu_id].store(published, Ordering::Release);
-}
-
 unsafe fn init_slab_page(page_idx: usize, class: usize) {
     let base = heap_page_virt(page_idx).as_mut_ptr::<u8>();
     let slot_size = SIZE_CLASSES[class];
@@ -776,93 +792,6 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
     }
 }
 
-impl TlbShootdownState {
-    const fn new() -> Self {
-        Self {
-            reserved_seq: AtomicU64::new(0),
-            published_seq: AtomicU64::new(0),
-            reclaimed_seq: AtomicU64::new(0),
-            peak_pending: AtomicU64::new(0),
-            entries: [const { AtomicU64::new(0) }; TLB_RETIRE_CAPACITY],
-            seen: [const { AtomicU64::new(0) }; MAX_TLB_CPUS],
-        }
-    }
-}
-
-fn tracked_cpu_count() -> usize {
-    let cpu_count = sys::smp::cpu_count();
-    assert!(
-        cpu_count <= MAX_TLB_CPUS,
-        "mem/alloc: cpu count {} exceeds heap TLB tracking capacity {}",
-        cpu_count,
-        MAX_TLB_CPUS
-    );
-    cpu_count
-}
-
-fn tracked_cpu_id() -> usize {
-    let cpu_id = arch::thiscpu().id;
-    assert!(
-        cpu_id < MAX_TLB_CPUS,
-        "mem/alloc: cpu {} exceeds heap TLB tracking capacity {}",
-        cpu_id,
-        MAX_TLB_CPUS
-    );
-    cpu_id
-}
-
-fn queue_retired_page(page_idx: usize, paddr: PhysAddr) -> u64 {
-    let shootdown = &HEAP_TLB_SHOOTDOWN;
-    let this_cpu = tracked_cpu_id();
-    let reclaimed = shootdown.reclaimed_seq.load(Ordering::Acquire);
-    let reserved = shootdown.reserved_seq.load(Ordering::Relaxed);
-    let pending = reserved.saturating_sub(reclaimed).saturating_add(1);
-
-    if reserved.saturating_sub(reclaimed) >= TLB_RETIRE_CAPACITY as u64 {
-        panic!("mem/alloc: heap TLB retire queue exhausted");
-    }
-
-    let seq = shootdown
-        .reserved_seq
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
-    if seq == 0 {
-        panic!("mem/alloc: heap TLB retire sequence wrapped");
-    }
-
-    shootdown.entries[retire_slot(seq)]
-        .store(encode_retired_entry(page_idx, paddr), Ordering::Relaxed);
-    shootdown.seen[this_cpu].store(seq, Ordering::Release);
-    update_peak_pending(&shootdown.peak_pending, pending);
-    seq
-}
-
-fn publish_retired_page(seq: u64) {
-    let shootdown = &HEAP_TLB_SHOOTDOWN;
-    shootdown.published_seq.store(seq, Ordering::Release);
-    let _ = sys::smp::send_ipi(flush_remote_tlb_shootdown, sys::smp::IpiTarget::All);
-}
-
-#[inline(always)]
-fn retire_slot(seq: u64) -> usize {
-    (seq as usize - 1) % TLB_RETIRE_CAPACITY
-}
-
-#[inline(always)]
-fn load_retired_entry(seq: u64) -> u64 {
-    HEAP_TLB_SHOOTDOWN.entries[retire_slot(seq)].load(Ordering::Relaxed)
-}
-
-fn update_peak_pending(peak: &AtomicU64, current: u64) {
-    let mut observed = peak.load(Ordering::Relaxed);
-    while current > observed {
-        match peak.compare_exchange_weak(observed, current, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(next) => observed = next,
-        }
-    }
-}
-
 #[inline]
 fn heap_lock() -> HeapGuard<'static> {
     HeapGuard::new(HEAP.lock())
@@ -887,27 +816,4 @@ impl DerefMut for HeapGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
     }
-}
-
-#[inline(always)]
-fn encode_retired_entry(page_idx: usize, paddr: PhysAddr) -> u64 {
-    assert!(
-        page_idx < HEAP_PAGES,
-        "mem/alloc: invalid heap page index {page_idx}"
-    );
-    let pfn = paddr.as_u64() / PAGE_SIZE;
-    assert!(
-        pfn < (1u64 << (64 - HEAP_PAGE_INDEX_BITS)),
-        "mem/alloc: PFN 0x{:x} exceeds heap shootdown encoding",
-        pfn
-    );
-
-    (pfn << HEAP_PAGE_INDEX_BITS) | page_idx as u64
-}
-
-#[inline(always)]
-fn decode_retired_entry(entry: u64) -> (usize, PhysAddr) {
-    let page_idx = (entry & HEAP_PAGE_INDEX_MASK) as usize;
-    let pfn = entry >> HEAP_PAGE_INDEX_BITS;
-    (page_idx, PhysAddr::new(pfn * PAGE_SIZE))
 }

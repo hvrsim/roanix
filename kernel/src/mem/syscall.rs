@@ -2,12 +2,19 @@
 
 use crate::{
     fs::OpenFlags,
-    mem::{self, PAGE_SIZE, USER_ADDRESS_MIN, VirtAddr, VmInheritance, VmProtection},
+    mem::{
+        self, PAGE_SIZE, USER_ADDRESS_MIN, VirtAddr, VmAdvice, VmInheritance, VmPlacement,
+        VmProtection,
+    },
     proc::Descriptor,
     syscall::{Errno, current_process, map_fs_error, map_memory_error},
 };
 
-const MMAP_BASE: u64 = 0x1000_0000;
+const MADV_NORMAL: u64 = 0;
+const MADV_RANDOM: u64 = 1;
+const MADV_SEQUENTIAL: u64 = 2;
+const MADV_WILLNEED: u64 = 3;
+const MADV_DONTNEED: u64 = 4;
 
 const PROT_READ: u64 = 0x01;
 const PROT_WRITE: u64 = 0x02;
@@ -35,6 +42,11 @@ crate::syscall_handler! {
         if size == 0 || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
             return Err(Errno::Invalid);
         }
+        // Simultaneously writable and executable mappings are refused so that
+        // no user page can be rewritten and then run.
+        if protection & PROT_WRITE != 0 && protection & PROT_EXEC != 0 {
+            return Err(Errno::Access);
+        }
         let allowed_flags = MAP_SHARED
             | MAP_PRIVATE
             | MAP_FIXED
@@ -51,22 +63,21 @@ crate::syscall_handler! {
 
         let process = current_process()?;
         let space = process.address_space();
-        let start = if flags & MAP_FIXED != 0 {
+        let placement = if flags & MAP_FIXED != 0 {
             if hint < USER_ADDRESS_MIN || !hint.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::Invalid);
             }
+            // A fixed mapping replaces whatever occupies the range, so the
+            // range is cleared before it is reserved again.
             match space.unmap(VirtAddr::new(hint), size) {
                 Ok(()) | Err(mem::Error::NotMapped) => {}
                 Err(error) => return Err(map_memory_error(error)),
             }
-            VirtAddr::new(hint)
+            VmPlacement::Fixed(VirtAddr::new(hint))
+        } else if hint == 0 {
+            VmPlacement::Any
         } else {
-            space
-                .find_space(
-                    VirtAddr::new(if hint == 0 { MMAP_BASE } else { hint }),
-                    size,
-                )
-                .map_err(map_memory_error)?
+            VmPlacement::Hint(VirtAddr::new(hint))
         };
         let protection = vm_protection(protection);
         let inheritance = if flags & MAP_SHARED != 0 {
@@ -75,10 +86,10 @@ crate::syscall_handler! {
             VmInheritance::Copy
         };
 
-        if flags & MAP_ANONYMOUS != 0 {
+        let start = if flags & MAP_ANONYMOUS != 0 {
             space
-                .map_anonymous(start, size, protection, protection, inheritance)
-                .map_err(map_memory_error)?;
+                .map_anonymous(placement, size, protection, protection, inheritance)
+                .map_err(map_memory_error)?
         } else {
             let offset = offset as i64;
             if offset < 0 || !(offset as u64).is_multiple_of(PAGE_SIZE) {
@@ -98,7 +109,7 @@ crate::syscall_handler! {
             let object = file.vnode().memory_object().map_err(map_fs_error)?;
             space
                 .map_object(
-                    start,
+                    placement,
                     size,
                     object,
                     offset as u64,
@@ -107,8 +118,8 @@ crate::syscall_handler! {
                     inheritance,
                     flags & MAP_PRIVATE != 0,
                 )
-                .map_err(map_memory_error)?;
-        }
+                .map_err(map_memory_error)?
+        };
         Ok(start.as_u64())
     }
 }
@@ -118,9 +129,54 @@ crate::syscall_handler! {
         if size == 0 || !address.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::Invalid);
         }
-        current_process()?
+        // Unmapping a range that holds no mapping succeeds, matching the
+        // behaviour every portable allocator depends on.
+        match current_process()?
             .address_space()
             .unmap(VirtAddr::new(address), size)
+        {
+            Ok(()) | Err(mem::Error::NotMapped) => Ok(0),
+            Err(error) => Err(map_memory_error(error)),
+        }
+    }
+}
+
+crate::syscall_handler! {
+    syscall_memory_protect(_frame, address: u64 = 0, size: u64 = 1, protection: u64 = 2) {
+        if size == 0
+            || !address.is_multiple_of(PAGE_SIZE)
+            || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0
+        {
+            return Err(Errno::Invalid);
+        }
+        let protection = vm_protection(protection);
+        if protection.contains(VmProtection::WRITE | VmProtection::EXECUTE) {
+            return Err(Errno::Access);
+        }
+        current_process()?
+            .address_space()
+            .protect(VirtAddr::new(address), size, protection)
+            .map_err(map_memory_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_memory_advise(_frame, address: u64 = 0, size: u64 = 1, advice: u64 = 2) {
+        if size == 0 || !address.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::Invalid);
+        }
+        let advice = match advice {
+            MADV_NORMAL => VmAdvice::Normal,
+            MADV_RANDOM => VmAdvice::Random,
+            MADV_SEQUENTIAL => VmAdvice::Sequential,
+            MADV_WILLNEED => VmAdvice::WillNeed,
+            MADV_DONTNEED => VmAdvice::DontNeed,
+            _ => return Err(Errno::Invalid),
+        };
+        current_process()?
+            .address_space()
+            .advise(VirtAddr::new(address), size, advice)
             .map_err(map_memory_error)?;
         Ok(0)
     }

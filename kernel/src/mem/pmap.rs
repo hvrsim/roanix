@@ -10,13 +10,19 @@ use crate::{
 };
 
 use super::{
-    Error, FaultAccess, ObjectKind, Result, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmInheritance,
-    VmMap, VmObject, VmPage, VmProtection,
+    Error, FaultAccess, ObjectKind, Result, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice,
+    VmInheritance, VmMap, VmObject, VmPage, VmPlacement, VmProtection, tlb::Shootdown,
 };
 
 struct Mapping {
     page: Arc<VmPage>,
     protection: VmProtection,
+}
+
+/// One hardware mapping of a logical page, recorded on the page itself.
+pub(super) struct ReverseMapping {
+    pub(super) pmap: alloc::sync::Weak<PmapInner>,
+    pub(super) address: u64,
 }
 
 /// Hardware page map owned by one virtual address space.
@@ -57,6 +63,10 @@ impl Pmap {
     }
 
     /// Enters or replaces one user mapping.
+    ///
+    /// Re-entering an identical mapping is the common case when a fault races
+    /// another CPU or when a syscall walks user memory, so it is detected
+    /// before any page-table write and costs no invalidation.
     pub fn enter(
         &self,
         address: VirtAddr,
@@ -64,11 +74,22 @@ impl Pmap {
         protection: VmProtection,
     ) -> Result<()> {
         let address = address.align_down();
+        {
+            let mappings = self.inner.mappings.lock();
+            if let Some(current) = mappings.get(&address.as_u64())
+                && current.protection == protection
+                && Arc::ptr_eq(&current.page, &page)
+            {
+                return Ok(());
+            }
+        }
+
         let paddr = page.acquire_mapping()?;
         let flags = pmap_flags(protection);
         let mut mappings = self.inner.mappings.lock();
 
-        let result = if mappings.contains_key(&address.as_u64()) {
+        let existing = mappings.contains_key(&address.as_u64());
+        let result = if existing {
             // SAFETY: the pmap lock serializes leaf changes and `paddr` remains
             // wired by the new mapping reference.
             unsafe { arch::paging::remap_page(self.inner.root, address, paddr, flags) }
@@ -78,6 +99,7 @@ impl Pmap {
             unsafe { arch::paging::map_page(self.inner.root, address, paddr, flags) }
         };
         if result.is_err() {
+            drop(mappings);
             page.release_mapping();
             return Err(Error::Pmap);
         }
@@ -92,30 +114,36 @@ impl Pmap {
         let same_page = previous
             .as_ref()
             .is_some_and(|previous| Arc::ptr_eq(&previous.page, &page));
-        if let Some(previous) = &previous
-            && !same_page
-        {
-            previous
-                .page
-                .remove_reverse_mapping(Arc::as_ptr(&self.inner), address.as_u64());
-            page.add_reverse_mapping(&self.inner, address.as_u64());
-        } else if previous.is_none() {
+        if !same_page {
+            if let Some(previous) = &previous {
+                previous
+                    .page
+                    .remove_reverse_mapping(Arc::as_ptr(&self.inner), address.as_u64());
+            }
             page.add_reverse_mapping(&self.inner, address.as_u64());
         }
         drop(mappings);
 
-        if let Some(previous) = previous {
-            if Arc::ptr_eq(&previous.page, &page) {
-                page.release_mapping();
-                super::publish_permission_shootdown();
-            } else {
-                super::retire_mapping(previous.page);
-            }
+        let Some(previous) = previous else {
+            // A newly present leaf cannot be cached anywhere, so no remote
+            // invalidation is required.
+            return Ok(());
+        };
+        let mut shootdown = Shootdown::for_root(self.inner.root);
+        shootdown.push(address);
+        shootdown.commit();
+        if same_page {
+            page.release_mapping();
+        } else {
+            previous.page.release_mapping();
         }
         Ok(())
     }
 
     /// Removes a virtual range.
+    ///
+    /// Leaves that were already removed are always retired, even when a later
+    /// leaf fails, so no page keeps a mapping reference it no longer has.
     pub fn remove(&self, start: VirtAddr, length: u64) -> Result<()> {
         let start = start.align_down().as_u64();
         let end = start
@@ -124,132 +152,108 @@ impl Pmap {
         let mut mappings = self.inner.mappings.lock();
         let keys: Vec<u64> = mappings.range(start..end).map(|(key, _)| *key).collect();
         let mut retired = Vec::with_capacity(keys.len());
+        let mut shootdown = Shootdown::for_root(self.inner.root);
+        let mut failure = None;
+
         for key in keys {
             // SAFETY: the pmap lock excludes concurrent changes to this leaf.
-            unsafe { arch::paging::unmap_page(self.inner.root, VirtAddr::new(key)) }
-                .map_err(|_| Error::Pmap)?;
+            if unsafe { arch::paging::unmap_page(self.inner.root, VirtAddr::new(key)) }.is_err() {
+                failure = Some(Error::Pmap);
+                break;
+            }
             let mapping = mappings
                 .remove(&key)
                 .expect("mem/pmap: removed mapping vanished");
             mapping
                 .page
                 .remove_reverse_mapping(Arc::as_ptr(&self.inner), key);
+            shootdown.push(VirtAddr::new(key));
             retired.push(mapping.page);
         }
         drop(mappings);
-        super::retire_mappings(retired);
-        Ok(())
+        super::retire_mappings(shootdown, retired);
+        failure.map_or(Ok(()), Err)
     }
 
     /// Downgrades mappings in a virtual range.
+    ///
+    /// Permissions are rewritten in place, which keeps the frame untouched and
+    /// avoids resolving a physical address. That matters because resolving one
+    /// can allocate, and allocation may reclaim, which reenters this lock.
     pub fn protect(&self, start: VirtAddr, length: u64, protection: VmProtection) -> Result<()> {
         let start = start.align_down().as_u64();
         let end = start
             .checked_add(align_up(length, PAGE_SIZE))
             .ok_or(Error::InvalidAddress)?;
+        let flags = pmap_flags(protection);
         let mut mappings = self.inner.mappings.lock();
+        let mut shootdown = Shootdown::for_root(self.inner.root);
+        let mut failure = None;
+
         for (address, mapping) in mappings.range_mut(start..end) {
             if mapping.protection == protection {
                 continue;
             }
-            let paddr = mapping.page.acquire_mapping()?;
-            // SAFETY: the existing mapping pins the page and the pmap lock
-            // serializes the leaf update.
+            // SAFETY: the pmap lock serializes this leaf update and the entry
+            // keeps its frame pinned through the mapping reference.
             let result = unsafe {
-                arch::paging::remap_page(
-                    self.inner.root,
-                    VirtAddr::new(*address),
-                    paddr,
-                    pmap_flags(protection),
-                )
+                arch::paging::protect_page(self.inner.root, VirtAddr::new(*address), flags)
             };
-            mapping.page.release_mapping();
-            result.map_err(|_| Error::Pmap)?;
+            if result.is_err() {
+                failure = Some(Error::Pmap);
+                break;
+            }
             mapping.protection = protection;
+            shootdown.push(VirtAddr::new(*address));
         }
         drop(mappings);
-        super::publish_permission_shootdown();
-        Ok(())
+        shootdown.commit();
+        failure.map_or(Ok(()), Err)
     }
 
-    /// Write-protects every writable mapping before a COW fork.
+    /// Write-protects every writable mapping before a copy-on-write fork.
+    ///
+    /// Leaves are downgraded in place, so the pass needs no side table and
+    /// cannot fail part way through for want of memory.
     pub fn write_protect_all(&self) -> Result<()> {
         let mut mappings = self.inner.mappings.lock();
-        let mut pending: Vec<(u64, Arc<VmPage>, PhysAddr, VmProtection, VmProtection)> =
-            Vec::new();
-        for (address, mapping) in mappings.iter() {
+        let mut shootdown = Shootdown::for_root(self.inner.root);
+        let mut failure = None;
+
+        for (address, mapping) in mappings.iter_mut() {
             if !mapping.protection.contains(VmProtection::WRITE) {
                 continue;
             }
             let mut protection = mapping.protection;
             protection.remove(VmProtection::WRITE);
-            let paddr = match mapping.page.acquire_mapping() {
-                Ok(paddr) => paddr,
-                Err(error) => {
-                    for (_, page, _, _, _) in pending {
-                        page.release_mapping();
-                    }
-                    return Err(error);
-                }
-            };
-            pending.push((
-                *address,
-                mapping.page.clone(),
-                paddr,
-                mapping.protection,
-                protection,
-            ));
-        }
-
-        let mut applied = 0usize;
-        for (address, _, paddr, _, protection) in &pending {
-            // SAFETY: the existing mapping pins the page and the pmap lock
-            // serializes the leaf update.
+            // SAFETY: the pmap lock serializes this leaf update and the entry
+            // keeps its frame pinned through the mapping reference.
             let result = unsafe {
-                arch::paging::remap_page(
+                arch::paging::protect_page(
                     self.inner.root,
                     VirtAddr::new(*address),
-                    *paddr,
-                    pmap_flags(*protection),
+                    pmap_flags(protection),
                 )
             };
             if result.is_err() {
-                for (address, _, paddr, original, _) in &pending[..applied] {
-                    // SAFETY: these leaves were changed above while this lock
-                    // remained held and their pages are still pinned.
-                    unsafe {
-                        arch::paging::remap_page(
-                            self.inner.root,
-                            VirtAddr::new(*address),
-                            *paddr,
-                            pmap_flags(*original),
-                        )
-                    }
-                    .expect("mem/pmap: failed to roll back fork protection");
-                    mappings
-                        .get_mut(address)
-                        .expect("mem/pmap: rollback mapping vanished")
-                        .protection = *original;
-                }
-                for (_, page, _, _, _) in pending {
-                    page.release_mapping();
-                }
-                return Err(Error::Pmap);
+                failure = Some(Error::Pmap);
+                break;
             }
-            mappings
-                .get_mut(address)
-                .expect("mem/pmap: fork mapping vanished")
-                .protection = *protection;
-            applied += 1;
-        }
-        for (_, page, _, _, _) in pending {
-            page.release_mapping();
+            mapping.protection = protection;
+            shootdown.push(VirtAddr::new(*address));
         }
         drop(mappings);
-        if applied != 0 {
-            super::publish_permission_shootdown();
-        }
-        Ok(())
+        shootdown.commit();
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Returns the logical page and permissions currently mapped at `address`.
+    pub(super) fn mapped_page(&self, address: VirtAddr) -> Option<(Arc<VmPage>, VmProtection)> {
+        self.inner
+            .mappings
+            .lock()
+            .get(&address.as_u64())
+            .map(|mapping| (mapping.page.clone(), mapping.protection))
     }
 
     /// Returns the physical address currently mapped at `address`.
@@ -267,16 +271,16 @@ impl Pmap {
 impl Drop for PmapInner {
     fn drop(&mut self) {
         let mappings = core::mem::take(self.mappings.get_mut());
+        let mut shootdown = Shootdown::for_root(self.root);
         for (address, mapping) in &mappings {
             // SAFETY: `&mut self` excludes concurrent pmap operations.
             let _ = unsafe { arch::paging::unmap_page(self.root, VirtAddr::new(*address)) };
             mapping
                 .page
-                .remove_reverse_mapping(self as *const PmapInner, *address);
+                .remove_reverse_mapping(ptr::from_ref(self), *address);
+            shootdown.push(VirtAddr::new(*address));
         }
-        if !mappings.is_empty() {
-            super::publish_permission_shootdown();
-        }
+        shootdown.commit();
         for (_, mapping) in mappings {
             mapping.page.release_mapping();
         }
@@ -291,19 +295,23 @@ pub(super) fn remove_all_mappings(page: &Arc<VmPage>) {
     remove_mappings_for_pages(core::slice::from_ref(page));
 }
 
+/// Folds hardware accessed and dirty bits back into logical page state.
+///
+/// The reverse-mapping list is detached once per page rather than sampled per
+/// index, so no mapping is skipped when the list is rearranged concurrently.
 pub(super) fn harvest_page_states(pages: &[Option<Arc<VmPage>>]) {
-    let mut cleared = false;
+    let mut shootdown = Shootdown::global();
     for page in pages.iter().flatten() {
         let mut referenced = false;
         let mut dirty = false;
-        let mut index = 0usize;
-        while let Some(mapping) = page.reverse_mapping(index) {
-            index += 1;
+        let mappings = page.take_reverse_mappings();
+
+        for mapping in &mappings {
             let Some(pmap) = mapping.pmap.upgrade() else {
                 continue;
             };
-            let mappings = pmap.mappings.lock();
-            let Some(current) = mappings.get(&mapping.address) else {
+            let locked = pmap.mappings.lock();
+            let Some(current) = locked.get(&mapping.address) else {
                 continue;
             };
             if !Arc::ptr_eq(&current.page, page) {
@@ -316,48 +324,64 @@ pub(super) fn harvest_page_states(pages: &[Option<Arc<VmPage>>]) {
             } {
                 referenced |= was_referenced;
                 dirty |= was_dirty;
-                cleared |= was_referenced || was_dirty;
+                if was_referenced || was_dirty {
+                    shootdown.push(VirtAddr::new(mapping.address));
+                }
             }
         }
+
+        page.restore_reverse_mappings(mappings);
         page.record_hardware_state(referenced, dirty);
     }
-    if cleared {
-        super::publish_permission_shootdown();
-    }
+    shootdown.commit();
 }
 
+/// Tears down every hardware mapping of each page.
+///
+/// The reverse-mapping list is taken by value, which bounds the work to the
+/// mappings that existed on entry and cannot loop on an entry that refuses to
+/// be removed. Entries that could not be torn down are restored for a later
+/// pass.
 pub(super) fn remove_mappings_for_pages(pages: &[Arc<VmPage>]) {
     for page in pages {
-        let mut removed = 0u32;
-        while let Some(mapping) = page.first_reverse_mapping() {
+        let mappings = page.take_reverse_mappings();
+        if mappings.is_empty() {
+            continue;
+        }
+        let mut shootdown = Shootdown::global();
+        let mut removed = 0usize;
+        let mut retained = Vec::new();
+
+        for mapping in mappings {
             let Some(pmap) = mapping.pmap.upgrade() else {
-                page.remove_reverse_mapping(mapping.pmap.as_ptr(), mapping.address);
                 continue;
             };
-            let mut mappings = pmap.mappings.lock();
-            let Some(current) = mappings.get(&mapping.address) else {
-                page.remove_reverse_mapping(Arc::as_ptr(&pmap), mapping.address);
+            let mut locked = pmap.mappings.lock();
+            let Some(current) = locked.get(&mapping.address) else {
                 continue;
             };
             if !Arc::ptr_eq(&current.page, page) {
-                page.remove_reverse_mapping(Arc::as_ptr(&pmap), mapping.address);
                 continue;
             }
             // SAFETY: the pmap lock serializes leaf removal.
             if unsafe { arch::paging::unmap_page(pmap.root, VirtAddr::new(mapping.address)) }
                 .is_err()
             {
-                break;
+                drop(locked);
+                retained.push(mapping);
+                continue;
             }
-            let removed_mapping = mappings
+            locked
                 .remove(&mapping.address)
                 .expect("mem/pmap: reverse mapping vanished");
-            debug_assert!(Arc::ptr_eq(&removed_mapping.page, page));
-            page.remove_reverse_mapping(Arc::as_ptr(&pmap), mapping.address);
-            removed = removed.saturating_add(1);
+            drop(locked);
+            shootdown.push(VirtAddr::new(mapping.address));
+            removed += 1;
         }
+
+        page.restore_reverse_mappings(retained);
         if removed != 0 {
-            super::publish_permission_shootdown();
+            shootdown.commit();
             for _ in 0..removed {
                 page.release_mapping();
             }
@@ -390,30 +414,39 @@ impl VmSpace {
         &self.pmap
     }
 
-    /// Finds a free page-aligned user range using first fit.
-    pub fn find_space(&self, hint: VirtAddr, length: u64) -> Result<VirtAddr> {
-        self.map.lock().find_space(hint, length)
+    /// Returns whether a user range is entirely unmapped.
+    pub fn is_free(&self, start: VirtAddr, length: u64) -> bool {
+        self.map.lock().is_free(start, length)
     }
 
-    /// Maps private anonymous zero-fill memory.
+    /// Returns the user address space not covered by any mapping.
+    pub fn available(&self) -> u64 {
+        self.map.lock().available()
+    }
+
+    /// Maps private anonymous zero-fill memory and returns its base.
     pub fn map_anonymous(
         &self,
-        start: VirtAddr,
+        placement: VmPlacement,
         length: u64,
         protection: VmProtection,
         maximum_protection: VmProtection,
         inheritance: VmInheritance,
-    ) -> Result<()> {
-        self.map
-            .lock()
-            .map_anonymous(start, length, protection, maximum_protection, inheritance)
+    ) -> Result<VirtAddr> {
+        self.map.lock().map_anonymous(
+            placement,
+            length,
+            protection,
+            maximum_protection,
+            inheritance,
+        )
     }
 
-    /// Maps an object into the address space.
+    /// Maps an object into the address space and returns its base.
     #[allow(clippy::too_many_arguments)]
     pub fn map_object(
         &self,
-        start: VirtAddr,
+        placement: VmPlacement,
         length: u64,
         object: Arc<VmObject>,
         object_offset: u64,
@@ -421,9 +454,9 @@ impl VmSpace {
         maximum_protection: VmProtection,
         inheritance: VmInheritance,
         private: bool,
-    ) -> Result<()> {
+    ) -> Result<VirtAddr> {
         self.map.lock().map_object(
-            start,
+            placement,
             length,
             object,
             object_offset,
@@ -434,6 +467,11 @@ impl VmSpace {
         )
     }
 
+    /// Updates the access-pattern hint for a range.
+    pub fn advise(&self, start: VirtAddr, length: u64, advice: VmAdvice) -> Result<()> {
+        self.map.lock().advise(start, length, advice)
+    }
+
     /// Removes a range from both the map and pmap.
     pub fn unmap(&self, start: VirtAddr, length: u64) -> Result<()> {
         let mut map = self.map.lock();
@@ -442,10 +480,13 @@ impl VmSpace {
     }
 
     /// Changes map and pmap permissions.
+    ///
+    /// Existing leaves are downgraded in place so that established mappings
+    /// survive the change and do not have to be faulted back in.
     pub fn protect(&self, start: VirtAddr, length: u64, protection: VmProtection) -> Result<()> {
         let mut map = self.map.lock();
         map.protect(start, length, protection)?;
-        self.pmap.remove(start, length)
+        self.pmap.protect(start, length, protection)
     }
 
     /// Resolves and enters one page fault.
@@ -473,53 +514,77 @@ impl VmSpace {
     }
 
     /// Copies bytes from this address space into a kernel buffer.
+    ///
+    /// Each page is resolved to its logical page and copied through it, so the
+    /// frame stays owned for the whole copy. Reaching for the direct-map alias
+    /// of a translation instead would race an unmap that recycles the frame
+    /// between the lookup and the copy.
     pub fn read_user(&self, address: VirtAddr, output: &mut [u8]) -> Result<()> {
-        validate_user_range(address, output.len())?;
-        let mut copied = 0usize;
-        while copied < output.len() {
-            let current = address
-                .checked_add(copied as u64)
-                .ok_or(Error::InvalidAddress)?;
-            self.fault(current, FaultAccess::Read)?;
-            let physical = self.pmap.extract(current).ok_or(Error::NotMapped)?;
-            let count =
-                ((PAGE_SIZE - (current.as_u64() % PAGE_SIZE)) as usize).min(output.len() - copied);
-            let source = super::phys_to_virt(physical).as_ptr::<u8>();
-
-            // SAFETY: the fault above established a readable resident mapping,
-            // the HHDM aliases that physical range, and `count` stays within
-            // the current page and the live output slice.
-            unsafe {
-                ptr::copy_nonoverlapping(source, output.as_mut_ptr().add(copied), count);
-            }
-            copied += count;
-        }
-        Ok(())
+        self.copy_user(
+            address,
+            output.len(),
+            FaultAccess::Read,
+            |page, page_offset, span, copied| {
+                page.read(page_offset, &mut output[copied..copied + span])
+            },
+        )
     }
 
     /// Copies bytes from a kernel buffer into this address space.
     pub fn write_user(&self, address: VirtAddr, input: &[u8]) -> Result<()> {
-        validate_user_range(address, input.len())?;
+        self.copy_user(
+            address,
+            input.len(),
+            FaultAccess::Write,
+            |page, page_offset, span, copied| {
+                page.write(page_offset, &input[copied..copied + span])
+            },
+        )
+    }
+
+    /// Walks a user range one page at a time, faulting each page in first.
+    fn copy_user(
+        &self,
+        address: VirtAddr,
+        length: usize,
+        access: FaultAccess,
+        mut transfer: impl FnMut(&Arc<VmPage>, usize, usize, usize) -> Result<()>,
+    ) -> Result<()> {
+        validate_user_range(address, length)?;
         let mut copied = 0usize;
-        while copied < input.len() {
+        while copied < length {
             let current = address
                 .checked_add(copied as u64)
                 .ok_or(Error::InvalidAddress)?;
-            self.fault(current, FaultAccess::Write)?;
-            let physical = self.pmap.extract(current).ok_or(Error::NotMapped)?;
-            let count =
-                ((PAGE_SIZE - (current.as_u64() % PAGE_SIZE)) as usize).min(input.len() - copied);
-            let destination = super::phys_to_virt(physical).as_mut_ptr::<u8>();
-
-            // SAFETY: the write fault above established an exclusively
-            // writable resident page for this mapping. The HHDM aliases that
-            // physical range and `count` remains within both source and page.
-            unsafe {
-                ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, count);
-            }
-            copied += count;
+            let page_offset = (current.as_u64() % PAGE_SIZE) as usize;
+            let span = ((PAGE_SIZE as usize) - page_offset).min(length - copied);
+            let page = self.resolve_user_page(current, access)?;
+            transfer(&page, page_offset, span, copied)?;
+            copied += span;
         }
         Ok(())
+    }
+
+    /// Resolves one user address to the logical page currently mapped there.
+    ///
+    /// A mapping already granting `access` is used directly. Anything else is
+    /// faulted first, which is what performs copy-on-write promotion; writing
+    /// through a mapping that only permits reads would corrupt a page shared
+    /// with another address space.
+    fn resolve_user_page(&self, address: VirtAddr, access: FaultAccess) -> Result<Arc<VmPage>> {
+        let aligned = address.align_down();
+        let required = required_protection(access);
+        if let Some((page, protection)) = self.pmap.mapped_page(aligned)
+            && protection.contains(required)
+        {
+            return Ok(page);
+        }
+        self.fault(address, access)?;
+        let (page, protection) = self.pmap.mapped_page(aligned).ok_or(Error::NotMapped)?;
+        if !protection.contains(required) {
+            return Err(Error::Protection);
+        }
+        Ok(page)
     }
 
     /// Forks the map with lazy anonymous-overlay COW.
@@ -553,6 +618,15 @@ fn validate_user_range(address: VirtAddr, length: usize) -> Result<()> {
         return Err(Error::InvalidAddress);
     }
     Ok(())
+}
+
+/// Returns the permission a fault of `access` requires.
+fn required_protection(access: FaultAccess) -> VmProtection {
+    match access {
+        FaultAccess::Read => VmProtection::READ,
+        FaultAccess::Write => VmProtection::WRITE,
+        FaultAccess::Execute => VmProtection::EXECUTE,
+    }
 }
 
 fn pmap_flags(protection: VmProtection) -> VmFlags {

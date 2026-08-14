@@ -12,8 +12,8 @@ use xmas_elf::{
 use crate::{
     fs::{self, OpenFlags},
     mem::{
-        ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmInheritance, VmObject, VmProtection,
-        VmSpace, align_down,
+        ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmInheritance, VmObject, VmPlacement,
+        VmProtection, VmSpace, align_down,
     },
 };
 
@@ -303,8 +303,8 @@ fn map_elf(
         if object.write_at(page_offset, payload)? != payload.len() {
             return Err(Error::Memory(crate::mem::Error::OutOfMemory));
         }
-        space.map_object(
-            VirtAddr::new(start),
+        let _ = space.map_object(
+            VmPlacement::Fixed(VirtAddr::new(start)),
             length,
             object,
             0,
@@ -441,8 +441,8 @@ fn build_stack(
         return Err(Error::Memory(crate::mem::Error::OutOfMemory));
     }
     let protection = VmProtection::READ | VmProtection::WRITE;
-    space.map_object(
-        VirtAddr::new(stack_base),
+    let _ = space.map_object(
+        VmPlacement::Fixed(VirtAddr::new(stack_base)),
         STACK_SIZE,
         object,
         0,

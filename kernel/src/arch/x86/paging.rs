@@ -7,7 +7,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::{
-    PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr, instructions::tlb, registers::control::Cr3,
+    PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr,
+    instructions::tlb,
+    registers::control::{Cr3, Cr4, Cr4Flags},
     structures::paging::PhysFrame,
 };
 
@@ -221,21 +223,9 @@ pub unsafe fn remap_page(
     if !root.is_page_aligned() || !virt.is_page_aligned() || !phys.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
-    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
-    let mut table = root;
     // SAFETY: the caller guarantees exclusive page-table mutation.
     unsafe {
-        for idx in [idx_l4, idx_l3, idx_l2] {
-            let entry = entry_ptr(table, idx).read_volatile();
-            if entry & PTE_PRESENT == 0 {
-                return Err(PagingError::NotMapped);
-            }
-            if entry & PTE_HUGE != 0 {
-                return Err(PagingError::HugePageConflict);
-            }
-            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
-        }
-        let leaf_ptr = entry_ptr(table, idx_l1);
+        let leaf_ptr = walk_to_leaf(root, virt)?;
         if leaf_ptr.read_volatile() & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
         }
@@ -255,21 +245,9 @@ pub unsafe fn take_accessed_dirty(root: PhysAddr, virt: VirtAddr) -> Result<(boo
     if !root.is_page_aligned() || !virt.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
-    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
-    let mut table = root;
     // SAFETY: the caller guarantees a stable, writable hierarchy.
     unsafe {
-        for idx in [idx_l4, idx_l3, idx_l2] {
-            let entry = entry_ptr(table, idx).read_volatile();
-            if entry & PTE_PRESENT == 0 {
-                return Err(PagingError::NotMapped);
-            }
-            if entry & PTE_HUGE != 0 {
-                return Err(PagingError::HugePageConflict);
-            }
-            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
-        }
-        let leaf_ptr = entry_ptr(table, idx_l1);
+        let leaf_ptr = walk_to_leaf(root, virt)?;
         let leaf = &*leaf_ptr.cast::<AtomicU64>();
         let value = leaf.load(Ordering::Acquire);
         if value & PTE_PRESENT == 0 {
@@ -301,29 +279,17 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
         return Err(PagingError::UnalignedAddress);
     }
 
-    let v = virt.as_u64();
-    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(v);
-    let mut table = root;
-
     // SAFETY: the caller guarantees the hierarchy remains valid and
     // exclusively writable during the removal.
     unsafe {
-        for idx in [idx_l4, idx_l3, idx_l2] {
-            let entry = entry_ptr(table, idx).read_volatile();
-            if entry & PTE_PRESENT == 0 || entry & PTE_HUGE != 0 {
-                return Err(PagingError::NotMapped);
-            }
-            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
-        }
-
-        let leaf_ptr = entry_ptr(table, idx_l1);
+        let leaf_ptr = walk_to_leaf(root, virt)?;
         let leaf = leaf_ptr.read_volatile();
         if leaf & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
         }
 
         leaf_ptr.write_volatile(0);
-        tlb::flush(X86VirtAddr::new(v));
+        tlb::flush(X86VirtAddr::new(virt.as_u64()));
         Ok(Some(PhysAddr::new(leaf & ENTRY_ADDR_MASK)))
     }
 }
@@ -338,6 +304,74 @@ pub fn flush_all() {
     tlb::flush_all();
 }
 
+/// Flushes every translation on the current CPU, including global entries.
+///
+/// A plain `CR3` reload preserves entries marked `PTE_GLOBAL`, so kernel
+/// mappings must be invalidated by briefly clearing `CR4.PGE`.
+pub fn flush_all_global() {
+    let cr4 = Cr4::read();
+    if !cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+        tlb::flush_all();
+        return;
+    }
+    // SAFETY: clearing and restoring `CR4.PGE` only invalidates cached
+    // translations; the surrounding paging configuration is unchanged.
+    unsafe {
+        Cr4::write(cr4 & !Cr4Flags::PAGE_GLOBAL);
+        Cr4::write(cr4);
+    }
+}
+
+/// Replaces the permissions of one existing leaf without changing its frame.
+///
+/// # Safety
+///
+/// `root` must own a valid hierarchy and the caller must serialize leaf
+/// updates for `virt`.
+pub unsafe fn protect_page(root: PhysAddr, virt: VirtAddr, flags: VmFlags) -> Result<PhysAddr> {
+    if !root.is_page_aligned() || !virt.is_page_aligned() {
+        return Err(PagingError::UnalignedAddress);
+    }
+    // SAFETY: the caller guarantees a stable, exclusively writable hierarchy.
+    unsafe {
+        let leaf_ptr = walk_to_leaf(root, virt)?;
+        let leaf = leaf_ptr.read_volatile();
+        if leaf & PTE_PRESENT == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        let frame = leaf & ENTRY_ADDR_MASK;
+        leaf_ptr.write_volatile(frame | leaf_bits(flags));
+        tlb::flush(X86VirtAddr::new(virt.as_u64()));
+        Ok(PhysAddr::new(frame))
+    }
+}
+
+/// Pre-allocates every kernel-half top-level entry of `root`.
+///
+/// User roots copy the kernel half by value, so all shared next-level tables
+/// must exist before the first user root is created. Once present, later
+/// kernel mappings mutate the shared tables and are visible in every space.
+///
+/// # Safety
+///
+/// `root` must be the permanent kernel top-level table.
+pub unsafe fn populate_kernel_tables(root: PhysAddr) -> Result<()> {
+    // SAFETY: the caller guarantees `root` is the kernel hierarchy, which is
+    // exclusively mutated during early initialization.
+    unsafe {
+        for index in 256..512 {
+            let entry_ptr = entry_ptr(root, index);
+            if entry_ptr.read_volatile() & PTE_PRESENT != 0 {
+                continue;
+            }
+            let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
+                .ok_or(PagingError::OutOfMemory)?;
+            entry_ptr.write_volatile(frame.as_u64() | PTE_PRESENT | PTE_WRITE);
+        }
+    }
+    Ok(())
+}
+
 /// Creates an empty user root sharing the kernel half of `kernel_root`.
 ///
 /// # Safety
@@ -346,7 +380,8 @@ pub fn flush_all() {
 pub unsafe fn create_user_root(kernel_root: PhysAddr) -> Result<PhysAddr> {
     let root = phys::alloc_zeroed_phys(phys::PageUse::PageTable).ok_or(PagingError::OutOfMemory)?;
     // SAFETY: both roots are valid, page-aligned top-level tables and the new
-    // root is exclusively owned.
+    // root is exclusively owned. `populate_kernel_tables` guarantees every
+    // copied entry points at a shared table that outlives this root.
     unsafe {
         for index in 256..512 {
             let entry = entry_ptr(kernel_root, index).read_volatile();
@@ -436,6 +471,30 @@ fn page_table_indexes(virt: u64) -> [usize; 4] {
         ((virt >> 21) & 0x1ff) as usize,
         ((virt >> 12) & 0x1ff) as usize,
     ]
+}
+
+/// Walks an existing hierarchy and returns the leaf entry pointer for `virt`.
+///
+/// # Safety
+///
+/// `root` must own a valid hierarchy that stays mapped for the walk.
+unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
+    let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
+    let mut table = root;
+    // SAFETY: the caller guarantees every present table remains mapped.
+    unsafe {
+        for idx in [idx_l4, idx_l3, idx_l2] {
+            let entry = entry_ptr(table, idx).read_volatile();
+            if entry & PTE_PRESENT == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if entry & PTE_HUGE != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
+        }
+        Ok(entry_ptr(table, idx_l1))
+    }
 }
 
 unsafe fn entry_ptr(table: PhysAddr, idx: usize) -> *mut u64 {

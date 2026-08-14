@@ -78,6 +78,8 @@ syscall_table:
     .quad syscall_file_umount
     .quad syscall_process_setpriority
     .quad syscall_process_getpriority
+    .quad syscall_memory_protect
+    .quad syscall_memory_advise
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

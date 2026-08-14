@@ -5,14 +5,11 @@
 //! and managed-page queues.
 //!
 
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::sync::{Arc, Weak};
 use core::{
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 use bitflags::bitflags;
@@ -26,9 +23,8 @@ use crate::{
         self, PhysAddr, VirtAddr, VmFlags,
         addr::{PAGE_SIZE, align_down, align_up, pages_for_len},
         page::VmPage,
-        pmap::PmapInner,
     },
-    sys::{smp::IrqSpinLock, sync::Mutex},
+    sys::smp::IrqSpinLock,
 };
 
 /// Virtual base address where the PFN database is mapped.
@@ -130,95 +126,104 @@ pub enum PageQueue {
 }
 
 /// Authoritative metadata for one physical page frame.
+///
+/// The database holds one entry per frame of usable memory, so its size is a
+/// fixed fraction of RAM. The layout is packed into a single cache line and
+/// deliberately holds no owning collections: reverse mappings belong to the
+/// logical page, and the physical address is derived from the entry's own
+/// position in the database.
 #[repr(C, align(64))]
 pub struct Page {
-    free_link: LinkedListLink,
-    pageq_link: LinkedListLink,
-    paddr: u64,
-    state: AtomicU8,
-    usage: AtomicU8,
-    queue: AtomicU8,
-    owner_kind: AtomicU8,
+    /// Free-list or page-queue membership.
+    ///
+    /// A frame is either available to the allocator or owned by a subsystem,
+    /// never both, so the two roles share one link.
+    link: LinkedListLink,
     flags: AtomicU32,
+    /// Packed [`PageState`], [`PageUse`], [`PageQueue`] and [`PageOwnerKind`].
+    status: AtomicU32,
     wire_count: AtomicU32,
     loan_count: AtomicU32,
     map_count: AtomicU32,
-    owner_id: AtomicU64,
-    offset: AtomicU64,
     owner: IrqSpinLock<Option<Weak<VmPage>>>,
-    // Growing this vector can allocate, so its lock must not mask interrupts.
-    reverse_mappings: Mutex<Vec<ReverseMapping>>,
 }
 
-pub(super) struct ReverseMapping {
-    pub(super) pmap: Weak<PmapInner>,
-    pub(super) address: u64,
+/// Bit position of each packed status field.
+const STATE_SHIFT: u32 = 0;
+const USAGE_SHIFT: u32 = 8;
+const QUEUE_SHIFT: u32 = 16;
+const OWNER_KIND_SHIFT: u32 = 24;
+const FIELD_MASK: u32 = 0xff;
+
+// The database holds one entry per frame, so its footprint is a fixed
+// proportion of installed memory. Keeping an entry within a single cache line
+// bounds that overhead and keeps page-daemon scans to one line per frame.
+const _: () = assert!(
+    size_of::<Page>() == 64,
+    "mem/phys: a frame database entry must occupy exactly one cache line"
+);
+
+const fn pack_status(state: PageState, usage: PageUse, queue: PageQueue, owner: PageOwnerKind) -> u32 {
+    (state as u32) << STATE_SHIFT
+        | (usage as u32) << USAGE_SHIFT
+        | (queue as u32) << QUEUE_SHIFT
+        | (owner as u32) << OWNER_KIND_SHIFT
 }
 
 impl Page {
-    fn new(paddr: u64) -> Self {
+    fn new() -> Self {
         Self {
-            free_link: LinkedListLink::new(),
-            pageq_link: LinkedListLink::new(),
-            paddr,
-            state: AtomicU8::new(PageState::Reserved as u8),
-            usage: AtomicU8::new(PageUse::Reserved as u8),
-            queue: AtomicU8::new(PageQueue::None as u8),
-            owner_kind: AtomicU8::new(PageOwnerKind::None as u8),
+            link: LinkedListLink::new(),
             flags: AtomicU32::new(0),
+            status: AtomicU32::new(pack_status(
+                PageState::Reserved,
+                PageUse::Reserved,
+                PageQueue::None,
+                PageOwnerKind::None,
+            )),
             wire_count: AtomicU32::new(0),
             loan_count: AtomicU32::new(0),
             map_count: AtomicU32::new(0),
-            owner_id: AtomicU64::new(0),
-            offset: AtomicU64::new(0),
             owner: IrqSpinLock::new(None),
-            reverse_mappings: Mutex::new(Vec::new()),
         }
     }
 
     /// Returns the physical base address.
     pub fn paddr(&self) -> PhysAddr {
-        PhysAddr::new(self.paddr)
+        PhysAddr::new(self.pfn() as u64 * PAGE_SIZE)
     }
 
     /// Returns the PFN index.
+    ///
+    /// Entries are stored contiguously from [`PAGEDB_ADDR`] in frame order, so
+    /// an entry's index — and therefore its frame — follows from its address.
     pub fn pfn(&self) -> usize {
-        (self.paddr / PAGE_SIZE) as usize
+        (ptr::from_ref(self).addr() - PAGEDB_ADDR as usize) / size_of::<Page>()
     }
 
     /// Returns allocator state.
     pub fn state(&self) -> PageState {
-        decode_page_state(self.state.load(Ordering::Acquire))
+        decode_page_state(self.status_field(STATE_SHIFT))
     }
 
     /// Returns the current allocation consumer.
     pub fn usage(&self) -> PageUse {
-        decode_page_use(self.usage.load(Ordering::Acquire))
+        decode_page_use(self.status_field(USAGE_SHIFT))
     }
 
     /// Returns page-daemon queue membership.
     pub fn queue(&self) -> PageQueue {
-        decode_page_queue(self.queue.load(Ordering::Acquire))
+        decode_page_queue(self.status_field(QUEUE_SHIFT))
     }
 
     /// Returns managed owner category.
     pub fn owner_kind(&self) -> PageOwnerKind {
-        decode_owner_kind(self.owner_kind.load(Ordering::Acquire))
+        decode_owner_kind(self.status_field(OWNER_KIND_SHIFT))
     }
 
     /// Returns current page flags.
     pub fn flags(&self) -> PageFlags {
         PageFlags::from_bits_retain(self.flags.load(Ordering::Acquire))
-    }
-
-    /// Returns the managed owner identifier, or zero if unowned.
-    pub fn owner_id(&self) -> u64 {
-        self.owner_id.load(Ordering::Acquire)
-    }
-
-    /// Returns the page index within its owner.
-    pub fn offset(&self) -> u64 {
-        self.offset.load(Ordering::Acquire)
     }
 
     /// Returns the current wire count.
@@ -236,19 +241,33 @@ impl Page {
         self.map_count.load(Ordering::Acquire)
     }
 
-    pub(crate) fn bind_owner(
-        &'static self,
-        owner: &Arc<VmPage>,
-        kind: PageOwnerKind,
-        owner_id: u64,
-        offset: u64,
-    ) {
+    #[inline]
+    fn status_field(&self, shift: u32) -> u8 {
+        ((self.status.load(Ordering::Acquire) >> shift) & FIELD_MASK) as u8
+    }
+
+    fn set_status_field(&self, shift: u32, value: u8) {
+        let cleared = !(FIELD_MASK << shift);
+        let inserted = (value as u32) << shift;
+        let mut current = self.status.load(Ordering::Relaxed);
+        loop {
+            match self.status.compare_exchange_weak(
+                current,
+                (current & cleared) | inserted,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn bind_owner(&'static self, owner: &Arc<VmPage>, kind: PageOwnerKind) {
         assert_eq!(self.usage(), PageUse::Managed);
         assert_eq!(self.owner_kind(), PageOwnerKind::None);
         *self.owner.lock() = Some(Arc::downgrade(owner));
-        self.owner_id.store(owner_id, Ordering::Release);
-        self.offset.store(offset, Ordering::Release);
-        self.owner_kind.store(kind as u8, Ordering::Release);
+        self.set_status_field(OWNER_KIND_SHIFT, kind as u8);
         let owner_flag = match kind {
             PageOwnerKind::Anonymous => PageFlags::ANON,
             PageOwnerKind::File => PageFlags::FILE,
@@ -264,10 +283,7 @@ impl Page {
             MANAGED_PAGES.fetch_sub(1, Ordering::AcqRel);
         }
         *self.owner.lock() = None;
-        self.owner_id.store(0, Ordering::Release);
-        self.offset.store(0, Ordering::Release);
-        self.owner_kind
-            .store(PageOwnerKind::None as u8, Ordering::Release);
+        self.set_status_field(OWNER_KIND_SHIFT, PageOwnerKind::None as u8);
         self.flags.fetch_and(
             !(PageFlags::TABLED | PageFlags::ANON | PageFlags::FILE).bits(),
             Ordering::AcqRel,
@@ -303,32 +319,6 @@ impl Page {
     pub(crate) fn remove_mapping(&self) {
         let previous = self.map_count.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "mem/phys: page mapping count underflow");
-    }
-
-    pub(super) fn add_reverse_mapping(&self, pmap: &Arc<PmapInner>, address: u64) {
-        self.reverse_mappings.lock().push(ReverseMapping {
-            pmap: Arc::downgrade(pmap),
-            address,
-        });
-    }
-
-    pub(super) fn remove_reverse_mapping(&self, pmap: *const PmapInner, address: u64) {
-        let mut mappings = self.reverse_mappings.lock();
-        if let Some(index) = mappings
-            .iter()
-            .position(|mapping| mapping.pmap.as_ptr() == pmap && mapping.address == address)
-        {
-            mappings.swap_remove(index);
-        }
-    }
-
-    pub(super) fn reverse_mapping(&self, index: usize) -> Option<ReverseMapping> {
-        let mappings = self.reverse_mappings.lock();
-        let mapping = mappings.get(index)?;
-        Some(ReverseMapping {
-            pmap: mapping.pmap.clone(),
-            address: mapping.address,
-        })
     }
 
     pub(crate) fn mark_dirty(&self) {
@@ -392,24 +382,27 @@ impl Page {
         self.owner.lock().as_ref()?.upgrade()
     }
 
+    /// Claims a free frame for `usage`.
+    ///
+    /// The frame is unreachable by any other subsystem at this point, so the
+    /// whole status word is published in one store.
     fn prepare_allocation(&self, usage: PageUse) {
         assert!(matches!(self.state(), PageState::Free | PageState::Zero));
-        assert!(!self.free_link.is_linked());
-        assert!(!self.pageq_link.is_linked());
-        self.flags.store(0, Ordering::Release);
-        self.wire_count.store(0, Ordering::Release);
-        self.loan_count.store(0, Ordering::Release);
-        self.map_count.store(0, Ordering::Release);
-        self.owner_id.store(0, Ordering::Release);
-        self.offset.store(0, Ordering::Release);
-        self.owner_kind
-            .store(PageOwnerKind::None as u8, Ordering::Release);
+        assert!(!self.link.is_linked());
+        self.flags.store(0, Ordering::Relaxed);
+        self.wire_count.store(0, Ordering::Relaxed);
+        self.loan_count.store(0, Ordering::Relaxed);
+        self.map_count.store(0, Ordering::Relaxed);
         *self.owner.lock() = None;
-        assert!(self.reverse_mappings.lock().is_empty());
-        self.queue.store(PageQueue::None as u8, Ordering::Release);
-        self.usage.store(usage as u8, Ordering::Release);
-        self.state
-            .store(PageState::Allocated as u8, Ordering::Release);
+        self.status.store(
+            pack_status(
+                PageState::Allocated,
+                usage,
+                PageQueue::None,
+                PageOwnerKind::None,
+            ),
+            Ordering::Release,
+        );
     }
 
     fn prepare_free(&self, zeroed: bool) {
@@ -418,22 +411,19 @@ impl Page {
         assert_eq!(self.wire_count(), 0);
         assert_eq!(self.loan_count(), 0);
         assert_eq!(self.map_count(), 0);
-        let stale_capacity = {
-            let mut mappings = self.reverse_mappings.lock();
-            assert!(mappings.is_empty());
-            core::mem::take(&mut *mappings)
-        };
-        drop(stale_capacity);
-        assert!(!self.pageq_link.is_linked());
-        self.flags.store(0, Ordering::Release);
-        self.usage.store(PageUse::None as u8, Ordering::Release);
-        self.queue.store(PageQueue::None as u8, Ordering::Release);
-        self.state.store(
-            if zeroed {
-                PageState::Zero
-            } else {
-                PageState::Free
-            } as u8,
+        assert!(!self.link.is_linked());
+        self.flags.store(0, Ordering::Relaxed);
+        self.status.store(
+            pack_status(
+                if zeroed {
+                    PageState::Zero
+                } else {
+                    PageState::Free
+                },
+                PageUse::None,
+                PageQueue::None,
+                PageOwnerKind::None,
+            ),
             Ordering::Release,
         );
     }
@@ -445,8 +435,10 @@ unsafe impl Send for Page {}
 // SAFETY: shared access observes atomic fields or lock-protected owner state.
 unsafe impl Sync for Page {}
 
-intrusive_adapter!(FreePageAdapter = &'static Page: Page { free_link: LinkedListLink });
-intrusive_adapter!(ManagedPageAdapter = &'static Page: Page { pageq_link: LinkedListLink });
+// Both adapters project the same link because free lists and page-daemon
+// queues hold disjoint sets of frames.
+intrusive_adapter!(FreePageAdapter = &'static Page: Page { link: LinkedListLink });
+intrusive_adapter!(ManagedPageAdapter = &'static Page: Page { link: LinkedListLink });
 
 struct PmmState {
     free: LinkedList<FreePageAdapter>,
@@ -607,7 +599,7 @@ pub fn init() {
                 .unwrap_or_else(|error| panic!("mem/phys: map PFNDB page {i}: {error:?}"));
         }
         for index in 0..database_entries {
-            ptr::write(PAGEDB.add(index), Page::new(index as u64 * PAGE_SIZE));
+            ptr::write(PAGEDB.add(index), Page::new());
         }
     }
 
@@ -629,14 +621,26 @@ pub fn init() {
             // SAFETY: every usable page is covered by the initialized PFN DB.
             let page = unsafe { &*PAGEDB.add((pa / PAGE_SIZE) as usize) };
             if pa >= pagedb_phys_base && pa < bootstrap_end {
-                page.state
-                    .store(PageState::Allocated as u8, Ordering::Relaxed);
-                page.usage
-                    .store(PageUse::PfnDatabase as u8, Ordering::Relaxed);
+                page.status.store(
+                    pack_status(
+                        PageState::Allocated,
+                        PageUse::PfnDatabase,
+                        PageQueue::None,
+                        PageOwnerKind::None,
+                    ),
+                    Ordering::Relaxed,
+                );
                 used_pages += 1;
             } else {
-                page.state.store(PageState::Free as u8, Ordering::Relaxed);
-                page.usage.store(PageUse::None as u8, Ordering::Relaxed);
+                page.status.store(
+                    pack_status(
+                        PageState::Free,
+                        PageUse::None,
+                        PageQueue::None,
+                        PageOwnerKind::None,
+                    ),
+                    Ordering::Relaxed,
+                );
                 state.free.push_back(page);
                 free_pages += 1;
             }
@@ -823,8 +827,8 @@ pub fn alloc_contiguous(
     }
     drop(guard);
 
-    // `prepare_allocation` takes a sleeping lock, so it must run with the
-    // allocator's interrupt-safe lock released.
+    // Claiming the run happens with the allocator lock released so that the
+    // per-frame assertions and the owner lock run without interrupts masked.
     let (base, zeroed) = claimed?;
     for offset in 0..count {
         let Some(page) = page_by_index(base + offset) else {
@@ -862,7 +866,7 @@ const fn align_index(index: usize, align: usize) -> usize {
 }
 
 fn is_linked_free(page: &'static Page) -> bool {
-    matches!(page.state(), PageState::Free | PageState::Zero) && page.free_link.is_linked()
+    matches!(page.state(), PageState::Free | PageState::Zero) && page.link.is_linked()
 }
 
 /// Returns every per-CPU cached frame to the shared free lists.
@@ -940,7 +944,7 @@ pub fn zero_free_pages(maximum: usize) -> usize {
 
     for page in pages[..count].iter().flatten() {
         zero_page(page.paddr());
-        page.state.store(PageState::Zero as u8, Ordering::Release);
+        page.set_status_field(STATE_SHIFT, PageState::Zero as u8);
     }
     if count != 0 {
         let mut guard = PMM.lock();
@@ -971,8 +975,14 @@ pub(crate) fn activate_managed(page: &'static Page, owner: &Arc<VmPage>) {
     let mut guard = PMM.lock();
     let state = guard.as_mut().expect("mem/phys: not initialized");
     if page.queue() == PageQueue::None {
-        *page.owner.lock() = Some(Arc::downgrade(owner));
-        page.queue.store(PageQueue::Active as u8, Ordering::Release);
+        debug_assert!(
+            page.owner
+                .lock()
+                .as_ref()
+                .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
+            "mem/phys: queueing a frame for a page that does not own it"
+        );
+        page.set_status_field(QUEUE_SHIFT, PageQueue::Active as u8);
         state.active.push_back(page);
     }
 }
@@ -1001,7 +1011,7 @@ pub(crate) fn remove_managed(page: &'static Page) {
             }
         }
     }
-    page.queue.store(PageQueue::None as u8, Ordering::Release);
+    page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
 }
 
 pub(crate) fn age_active(maximum: usize) {
@@ -1012,8 +1022,7 @@ pub(crate) fn age_active(maximum: usize) {
             break;
         };
         let _ = page.take_referenced();
-        page.queue
-            .store(PageQueue::Inactive as u8, Ordering::Release);
+        page.set_status_field(QUEUE_SHIFT, PageQueue::Inactive as u8);
         state.inactive.push_back(page);
     }
 }
@@ -1024,7 +1033,7 @@ pub(crate) fn next_inactive_owner() -> Option<Arc<VmPage>> {
             let mut guard = PMM.lock();
             let state = guard.as_mut().expect("mem/phys: not initialized");
             let page = state.inactive.pop_front()?;
-            page.queue.store(PageQueue::None as u8, Ordering::Release);
+            page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
             let owner = page.owner();
             (page, owner)
         };

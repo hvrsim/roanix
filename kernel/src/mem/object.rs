@@ -10,6 +10,9 @@ use crate::{mem::PAGE_SIZE, sys::sync::Mutex};
 
 use super::{Error, IoSink, IoSource, Result, VmPage};
 
+/// Pages resolved per index acquisition during bulk transfers.
+const LOOKUP_BATCH: usize = 16;
+
 /// Memory object's semantic owner.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ObjectKind {
@@ -161,6 +164,9 @@ impl VmObject {
     pub fn read_into(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
         let total = sink.len();
         let mut read = 0usize;
+        let mut batch: [Option<Arc<VmPage>>; LOOKUP_BATCH] = [const { None }; LOOKUP_BATCH];
+        let mut batch_index = u64::MAX;
+
         while read < total {
             let position = offset
                 .checked_add(read as u64)
@@ -169,9 +175,20 @@ impl VmObject {
             let page_offset = (position % PAGE_SIZE) as usize;
             let limit = cmp::min(PAGE_SIZE as usize - page_offset, total - read);
 
+            // Pages are resolved a batch at a time so a bulk transfer takes one
+            // index acquisition per batch instead of one per page.
+            if batch_index == u64::MAX || page_index < batch_index || page_index - batch_index >= LOOKUP_BATCH as u64
+            {
+                batch_index = page_index;
+                let pages = self.pages.lock();
+                for (slot, entry) in batch.iter_mut().enumerate() {
+                    *entry = pages.get(&(batch_index + slot as u64)).cloned();
+                }
+            }
+
             // The page reference is taken before the sink window is resolved so
             // that no page backing lock is held across a user page fault.
-            let page = self.page(page_index);
+            let page = batch[(page_index - batch_index) as usize].clone();
             let window = sink.window(read, limit)?;
             if window.is_empty() {
                 return Err(Error::InvalidAddress);

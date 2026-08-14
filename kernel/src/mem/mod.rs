@@ -7,7 +7,6 @@
 
 use ::alloc::{sync::Arc, vec::Vec};
 use core::{
-    hint::spin_loop,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
@@ -23,7 +22,7 @@ use crate::{
     arch,
     sys::{
         clock, sched, smp,
-        sync::{Mutex, Once},
+        sync::Once,
     },
 };
 
@@ -39,12 +38,14 @@ pub mod phys;
 mod pmap;
 pub mod swap;
 mod syscall;
+mod tlb;
+pub mod vmem;
 
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 pub use error::{Error, Result};
 pub use map::{
     FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmInheritance, VmMap,
-    VmMapEntry, VmProtection,
+    VmMapEntry, VmPlacement, VmProtection,
 };
 pub(crate) use alloc::HEAP_BASE;
 pub use io::{IoSink, IoSource};
@@ -55,7 +56,6 @@ pub use swap::{SwapBackend, SwapError, SwapStats};
 
 const PAGE_SCAN_BATCH: usize = 128;
 const PAGE_DAEMON_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_TLB_CPUS: usize = 256;
 
 bitflags! {
     /// Virtual memory mapping permissions and attributes used by low-level paging.
@@ -79,12 +79,6 @@ bitflags! {
     }
 }
 
-struct TlbShootdown {
-    published: AtomicU64,
-    seen: [AtomicU64; MAX_TLB_CPUS],
-    sequence: Mutex<u64>,
-}
-
 struct MemoryState {
     kernel_root: PhysAddr,
     low_watermark: u64,
@@ -96,7 +90,6 @@ struct MemoryState {
     promotions: AtomicU64,
     daemon_started: AtomicBool,
     zero_page: Once<Arc<VmPage>>,
-    tlb: TlbShootdown,
 }
 
 struct MigrationPin {
@@ -136,6 +129,8 @@ pub struct VmStats {
     pub faults: u64,
     /// COW promotions completed.
     pub promotions: u64,
+    /// Full TLB flushes forced by a CPU falling behind the shootdown ring.
+    pub tlb_overflow_flushes: u64,
     /// Current compressed/external swap counters.
     pub swap: SwapStats,
 }
@@ -185,12 +180,13 @@ fn init_state() {
         promotions: AtomicU64::new(0),
         daemon_started: AtomicBool::new(false),
         zero_page: Once::new(),
-        tlb: TlbShootdown {
-            published: AtomicU64::new(0),
-            seen: [const { AtomicU64::new(0) }; MAX_TLB_CPUS],
-            sequence: Mutex::new(0),
-        },
     });
+    // Kernel-half tables must exist before any user root copies them, so that
+    // later kernel mappings are shared rather than missed.
+    // SAFETY: the captured root is the permanent kernel hierarchy and no user
+    // address space exists yet.
+    unsafe { arch::paging::populate_kernel_tables(state().kernel_root) }
+        .expect("mem: failed to reserve kernel page-table entries");
     swap::init(compressed_limit, physical.total_pages / 4);
     let zero = VmPage::new_shared_zero().expect("mem: failed to allocate shared zero page");
     state().zero_page.call_once(|| zero);
@@ -225,6 +221,7 @@ pub fn stats() -> VmStats {
         reclaimed_pages: state.reclaimed_pages.load(Ordering::Relaxed),
         faults: state.faults.load(Ordering::Relaxed),
         promotions: state.promotions.load(Ordering::Relaxed),
+        tlb_overflow_flushes: tlb::overflow_flushes() as u64,
         swap: swap::stats(),
     }
 }
@@ -245,23 +242,13 @@ pub fn reclaim_now(target: usize) -> usize {
     reclaimed
 }
 
-/// Registers the current CPU with allocator and pmap TLB tracking.
+/// Registers the current CPU with TLB shootdown tracking.
 pub(crate) fn register_cpu() {
     let cpu_id = arch::thiscpu().id;
-    alloc::register_tlb_cpu(cpu_id);
-    register_tlb_cpu(cpu_id);
     arch::thiscpu()
         .active_address_root
         .store(arch::paging::active_root().as_u64(), Ordering::Release);
-}
-
-fn register_tlb_cpu(cpu_id: usize) {
-    assert!(
-        cpu_id < MAX_TLB_CPUS,
-        "mem: cpu {cpu_id} exceeds TLB tracking capacity"
-    );
-    let published = state().tlb.published.load(Ordering::Acquire);
-    state().tlb.seen[cpu_id].store(published, Ordering::Release);
+    tlb::register_cpu(cpu_id);
 }
 
 /// Resolves a fault in the current thread's address space.
@@ -311,14 +298,22 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
         return;
     }
 
+    // The advertised root is published before the hardware switch and cleared
+    // after it, so it always covers the interval during which this CPU can
+    // hold translations for the space. Shootdown initiators rely on that to
+    // decide which CPUs must acknowledge an invalidation.
+    arch::thiscpu()
+        .active_address_root
+        .store(root.as_u64(), Ordering::Release);
+    core::sync::atomic::fence(Ordering::SeqCst);
     if arch::paging::active_root() != root {
         space
             .activate()
             .expect("mem: failed to activate scheduled address space");
     }
-    arch::thiscpu()
-        .active_address_root
-        .store(root.as_u64(), Ordering::Release);
+    // Entries published while this CPU ran another space must be applied
+    // before user code observes the new one.
+    tlb::poll();
 }
 
 /// Returns whether any CPU still has `root` installed.
@@ -409,11 +404,13 @@ pub fn kernel_page_root() -> PhysAddr {
 
 /// Invalidates `length` bytes of kernel virtual address space on every CPU.
 pub fn flush_tlb_range(base: VirtAddr, length: u64) {
-    let pages = length.div_ceil(PAGE_SIZE);
-    for index in 0..pages {
-        arch::paging::flush_page(VirtAddr::new(base.as_u64() + index * PAGE_SIZE));
+    let mut shootdown = tlb::Shootdown::global();
+    for index in 0..length.div_ceil(PAGE_SIZE) {
+        let address = VirtAddr::new(base.as_u64() + index * PAGE_SIZE);
+        arch::paging::flush_page(address);
+        shootdown.push(address);
     }
-    synchronize_remote_tlbs();
+    shootdown.commit();
 }
 
 /// Returns whether the boot protocol's direct map covers `pa`.
@@ -425,42 +422,22 @@ pub fn is_direct_mapped(pa: PhysAddr) -> bool {
     })
 }
 
-pub(super) fn retire_mapping(page: Arc<VmPage>) {
-    retire_mappings(::alloc::vec![page]);
-}
-
-pub(super) fn retire_mappings(pages: Vec<Arc<VmPage>>) {
-    if pages.is_empty() {
-        return;
-    }
-    synchronize_remote_tlbs();
+/// Publishes `shootdown` and then drops the retired mapping references.
+///
+/// The references outlive the invalidation so a frame cannot be recycled while
+/// another CPU still holds a translation for it.
+fn retire_mappings(shootdown: tlb::Shootdown, pages: Vec<Arc<VmPage>>) {
+    shootdown.commit();
     for page in pages {
         page.release_mapping();
     }
 }
 
-pub(super) fn publish_permission_shootdown() {
-    synchronize_remote_tlbs();
-}
-
 /// Publishes kernel mapping or permission changes to every online CPU.
 pub(crate) fn synchronize_kernel_mappings() {
-    synchronize_remote_tlbs();
-}
-
-pub(crate) fn flush_remote_tlb_shootdown() {
-    let Some(cpu) = arch::thiscpu_opt() else {
-        return;
-    };
-    if cpu.id >= MAX_TLB_CPUS {
-        return;
-    }
-    let published = state().tlb.published.load(Ordering::Acquire);
-    let seen = state().tlb.seen[cpu.id].load(Ordering::Acquire);
-    if published > seen {
-        arch::paging::flush_all();
-        state().tlb.seen[cpu.id].store(published, Ordering::Release);
-    }
+    let mut shootdown = tlb::Shootdown::global();
+    shootdown.saturate();
+    shootdown.commit();
 }
 
 /// Returns Limine memory-map entries by reference.
@@ -539,61 +516,19 @@ fn scan_inactive(maximum: usize, target: usize) -> usize {
     reclaimed
 }
 
-fn synchronize_remote_tlbs() {
-    if smp::online_cpus() <= 1 {
-        return;
-    }
-    let _migration = MigrationPin::current();
-    let cpu_id = arch::thiscpu().id;
-    let tlb = &state().tlb;
-    let (sequence, targets) = {
-        let mut next = tlb.sequence.lock();
-        let previous = tlb.published.load(Ordering::Acquire);
-        if tlb.seen[cpu_id].load(Ordering::Acquire) < previous {
-            arch::paging::flush_all();
-            tlb.seen[cpu_id].store(previous, Ordering::Release);
-        }
-        let mut targets = [0u64; MAX_TLB_CPUS.div_ceil(64)];
-        for target in 0..smp::cpu_count().min(MAX_TLB_CPUS) {
-            if smp::is_online(target) {
-                targets[target / 64] |= 1u64 << (target % 64);
-            }
-        }
-        *next = next.checked_add(1).expect("mem: TLB sequence wrapped");
-        tlb.published.store(*next, Ordering::Release);
-        tlb.seen[cpu_id].store(*next, Ordering::Release);
-        (*next, targets)
-    };
-    let _ = smp::send_ipi(flush_remote_tlb_shootdown, smp::IpiTarget::All);
-
-    loop {
-        let complete = (0..smp::cpu_count().min(MAX_TLB_CPUS)).all(|target| {
-            let included = targets[target / 64] & (1u64 << (target % 64)) != 0;
-            !included
-                || !smp::is_online(target)
-                || tlb.seen[target].load(Ordering::Acquire) >= sequence
-        });
-        if complete {
-            return;
-        }
-        spin_loop();
-    }
-}
-
 fn activate_kernel_space() {
-    if arch::paging::active_root() == kernel_root() {
-        arch::thiscpu()
-            .active_address_root
-            .store(kernel_root().as_u64(), Ordering::Release);
-        return;
+    if arch::paging::active_root() != kernel_root() {
+        // SAFETY: the root was captured from the bootloader-provided kernel
+        // page table and remains live for the kernel lifetime.
+        unsafe { arch::paging::activate_root(kernel_root()) }
+            .expect("mem: failed to restore kernel pmap");
     }
-    // SAFETY: the root was captured from the bootloader-provided kernel page
-    // table and remains live for the kernel lifetime.
-    unsafe { arch::paging::activate_root(kernel_root()) }
-        .expect("mem: failed to restore kernel pmap");
+    // Clearing the advertised root after the switch keeps the advertised
+    // interval a superset of the real one.
     arch::thiscpu()
         .active_address_root
         .store(kernel_root().as_u64(), Ordering::Release);
+    tlb::poll();
 }
 
 fn state() -> &'static MemoryState {

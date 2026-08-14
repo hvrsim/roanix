@@ -186,21 +186,9 @@ pub unsafe fn remap_page(
     if !root.is_page_aligned() || !virt.is_page_aligned() || !phys.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
-    let levels = paging_levels(read_satp());
-    let mut table = root;
     // SAFETY: the caller guarantees exclusive page-table mutation.
     unsafe {
-        for level in (1..levels).rev() {
-            let pte = pte_ptr(table, table_index(virt.as_u64(), level)).read_volatile();
-            if pte & PTE_V == 0 {
-                return Err(PagingError::NotMapped);
-            }
-            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                return Err(PagingError::HugePageConflict);
-            }
-            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
-        }
-        let leaf = pte_ptr(table, table_index(virt.as_u64(), 0));
+        let leaf = walk_to_leaf(root, virt)?;
         if leaf.read_volatile() & PTE_V == 0 {
             return Err(PagingError::NotMapped);
         }
@@ -220,21 +208,9 @@ pub unsafe fn take_accessed_dirty(root: PhysAddr, virt: VirtAddr) -> Result<(boo
     if !root.is_page_aligned() || !virt.is_page_aligned() {
         return Err(PagingError::UnalignedAddress);
     }
-    let levels = paging_levels(read_satp());
-    let mut table = root;
     // SAFETY: the caller guarantees a stable, writable hierarchy.
     unsafe {
-        for level in (1..levels).rev() {
-            let pte = pte_ptr(table, table_index(virt.as_u64(), level)).read_volatile();
-            if pte & PTE_V == 0 {
-                return Err(PagingError::NotMapped);
-            }
-            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                return Err(PagingError::HugePageConflict);
-            }
-            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
-        }
-        let leaf_ptr = pte_ptr(table, table_index(virt.as_u64(), 0));
+        let leaf_ptr = walk_to_leaf(root, virt)?;
         let leaf = &*leaf_ptr.cast::<AtomicU64>();
         let value = leaf.load(Ordering::Acquire);
         if value & PTE_V == 0 || value & (PTE_R | PTE_W | PTE_X) == 0 {
@@ -266,32 +242,10 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
         return Err(PagingError::UnalignedAddress);
     }
 
-    let levels = paging_levels(read_satp());
-
-    let v = virt.as_u64();
-    let mut table = root;
-
     // SAFETY: the caller guarantees the hierarchy remains valid and
     // exclusively writable during the removal.
     unsafe {
-        for level in (1..levels).rev() {
-            let idx = table_index(v, level);
-            debug_assert!(idx < ENTRIES_PER_TABLE);
-            let pte = pte_ptr(table, idx).read_volatile();
-
-            if pte & PTE_V == 0 {
-                return Err(PagingError::NotMapped);
-            }
-            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                return Err(PagingError::HugePageConflict);
-            }
-
-            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
-        }
-
-        let leaf_idx = table_index(v, 0);
-        debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-        let leaf_ptr = pte_ptr(table, leaf_idx);
+        let leaf_ptr = walk_to_leaf(root, virt)?;
         let pte = leaf_ptr.read_volatile();
         if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) == 0 {
             return Err(PagingError::NotMapped);
@@ -311,6 +265,64 @@ pub fn flush_page(virt: VirtAddr) {
 /// Flushes every translation on the current hart.
 pub fn flush_all() {
     sfence_vma(None);
+}
+
+/// Flushes every translation on the current hart, including global entries.
+///
+/// A full `sfence.vma` already invalidates global mappings on RISC-V, so this
+/// matches [`flush_all`].
+pub fn flush_all_global() {
+    sfence_vma(None);
+}
+
+/// Replaces the permissions of one existing leaf without changing its frame.
+///
+/// # Safety
+///
+/// `root` must own a valid hierarchy and the caller must serialize leaf
+/// updates for `virt`.
+pub unsafe fn protect_page(root: PhysAddr, virt: VirtAddr, flags: VmFlags) -> Result<PhysAddr> {
+    if !root.is_page_aligned() || !virt.is_page_aligned() {
+        return Err(PagingError::UnalignedAddress);
+    }
+    // SAFETY: the caller guarantees a stable, exclusively writable hierarchy.
+    let frame = unsafe {
+        let leaf_ptr = walk_to_leaf(root, virt)?;
+        let pte = leaf_ptr.read_volatile();
+        if pte & PTE_V == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        let ppn = (pte >> 10) & SATP_PPN_MASK;
+        leaf_ptr.write_volatile((ppn << 10) | leaf_bits(flags));
+        PhysAddr::new(ppn << 12)
+    };
+    sfence_vma(Some(virt));
+    Ok(frame)
+}
+
+/// Pre-allocates every kernel-half top-level entry of `root`.
+///
+/// User roots copy the kernel half by value, so all shared next-level tables
+/// must exist before the first user root is created.
+///
+/// # Safety
+///
+/// `root` must be the permanent kernel top-level table.
+pub unsafe fn populate_kernel_tables(root: PhysAddr) -> Result<()> {
+    // SAFETY: the caller guarantees `root` is the kernel hierarchy, which is
+    // exclusively mutated during early initialization.
+    unsafe {
+        for index in 256..ENTRIES_PER_TABLE {
+            let entry_ptr = pte_ptr(root, index);
+            if entry_ptr.read_volatile() & PTE_V != 0 {
+                continue;
+            }
+            let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
+                .ok_or(PagingError::OutOfMemory)?;
+            entry_ptr.write_volatile(((frame.as_u64() >> 12) << 10) | PTE_V);
+        }
+    }
+    Ok(())
 }
 
 /// Creates an empty user root sharing the kernel half of `kernel_root`.
@@ -429,6 +441,34 @@ fn paging_levels(satp: u64) -> usize {
 
 fn table_index(virt: u64, level: usize) -> usize {
     ((virt >> (12 + level * 9)) & 0x1ff) as usize
+}
+
+/// Walks an existing hierarchy and returns the leaf entry pointer for `virt`.
+///
+/// # Safety
+///
+/// `root` must own a valid hierarchy that stays mapped for the walk.
+unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
+    let levels = paging_levels(read_satp());
+    let mut table = root;
+    // SAFETY: the caller guarantees every valid table remains mapped.
+    unsafe {
+        for level in (1..levels).rev() {
+            let idx = table_index(virt.as_u64(), level);
+            debug_assert!(idx < ENTRIES_PER_TABLE);
+            let pte = pte_ptr(table, idx).read_volatile();
+            if pte & PTE_V == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
+        }
+        let leaf_idx = table_index(virt.as_u64(), 0);
+        debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
+        Ok(pte_ptr(table, leaf_idx))
+    }
 }
 
 unsafe fn pte_ptr(table: PhysAddr, idx: usize) -> *mut u64 {

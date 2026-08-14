@@ -3,7 +3,10 @@
 use alloc::{collections::BTreeMap, sync::Arc};
 use bitflags::bitflags;
 
-use crate::mem::{PAGE_SIZE, VirtAddr, align_up};
+use crate::mem::{
+    PAGE_SIZE, VirtAddr, align_up,
+    vmem::{Vmem, VmemError, VmemFit},
+};
 
 use super::{Error, Result, VmObject, VmPage};
 
@@ -49,6 +52,17 @@ pub enum VmInheritance {
     Copy,
     /// Mapping is omitted from the child.
     None,
+}
+
+/// Where a new mapping should be placed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VmPlacement {
+    /// Anywhere with room, chosen at random.
+    Any,
+    /// At or above the given address, falling back to anywhere.
+    Hint(VirtAddr),
+    /// Exactly at the given address; the range must already be free.
+    Fixed(VirtAddr),
 }
 
 /// Access-pattern hint associated with a mapping.
@@ -211,8 +225,15 @@ pub struct ResolvedPage {
 }
 
 /// Ordered set of virtual mappings for one address space.
+///
+/// Entries are indexed by address for fault resolution, while free address
+/// space is tracked by a vmem arena. The arena answers placement queries in
+/// constant time and is the authority on which ranges are available, so the
+/// two structures are kept in exact correspondence: every entry owns one arena
+/// allocation with the same base and length.
 pub struct VmMap {
     entries: BTreeMap<u64, VmMapEntry>,
+    space: Vmem,
     size: u64,
     timestamp: u64,
 }
@@ -220,11 +241,52 @@ pub struct VmMap {
 impl VmMap {
     /// Creates an empty user address map.
     pub fn new() -> Self {
+        let mut space = Vmem::new(PAGE_SIZE);
+        space
+            .add_span(USER_ADDRESS_MIN, USER_ADDRESS_MAX - USER_ADDRESS_MIN)
+            .expect("mem/map: user address span is malformed");
         Self {
             entries: BTreeMap::new(),
+            space,
             size: 0,
             timestamp: 1,
         }
+    }
+
+    /// Reserves `length` bytes of address space according to `placement`.
+    fn reserve(&mut self, placement: VmPlacement, length: u64) -> Result<u64> {
+        let length = checked_page_length(length)?;
+        let result = match placement {
+            VmPlacement::Any => {
+                let mut entropy = [0u8; 8];
+                crate::sys::random::fill_bytes(&mut entropy);
+                self.space
+                    .alloc_random(length, PAGE_SIZE, u64::from_ne_bytes(entropy))
+            }
+            VmPlacement::Hint(hint) => {
+                let hint = align_up(hint.as_u64().max(USER_ADDRESS_MIN), PAGE_SIZE);
+                self.space
+                    .xalloc(length, PAGE_SIZE, hint, USER_ADDRESS_MAX, VmemFit::Instant)
+                    .or_else(|_| self.space.alloc(length, PAGE_SIZE, VmemFit::Instant))
+            }
+            VmPlacement::Fixed(start) => {
+                validate_range(start.as_u64(), start.as_u64().saturating_add(length))?;
+                self.space
+                    .alloc_fixed(start.as_u64(), length)
+                    .map(|()| start.as_u64())
+            }
+        };
+        result.map_err(placement_error)
+    }
+
+    /// Returns a reservation to the arena.
+    fn release(&mut self, start: u64) {
+        self.space.free(start);
+    }
+
+    /// Returns the address space not covered by any mapping.
+    pub fn available(&self) -> u64 {
+        self.space.available()
     }
 
     /// Returns bytes covered by entries.
@@ -237,41 +299,25 @@ impl VmMap {
         self.timestamp
     }
 
-    /// Finds a page-aligned free range using first fit.
-    pub fn find_space(&self, hint: VirtAddr, length: u64) -> Result<VirtAddr> {
-        let length = checked_page_length(length)?;
-        let mut candidate = align_up(hint.as_u64().max(USER_ADDRESS_MIN), PAGE_SIZE);
-        for entry in self.entries.values() {
-            if candidate
-                .checked_add(length)
-                .is_some_and(|end| end <= entry.start)
-            {
-                return Ok(VirtAddr::new(candidate));
-            }
-            candidate = candidate.max(entry.end);
-        }
-        if candidate
-            .checked_add(length)
-            .is_some_and(|end| end <= USER_ADDRESS_MAX)
-        {
-            Ok(VirtAddr::new(candidate))
-        } else {
-            Err(Error::OutOfMemory)
-        }
+    /// Returns whether `[start, start + length)` is entirely unmapped.
+    pub fn is_free(&self, start: VirtAddr, length: u64) -> bool {
+        checked_page_length(length)
+            .is_ok_and(|length| self.space.is_free(start.as_u64(), length))
     }
 
     /// Inserts a private zero-fill anonymous mapping.
     pub fn map_anonymous(
         &mut self,
-        start: VirtAddr,
+        placement: VmPlacement,
         length: u64,
         protection: VmProtection,
         maximum_protection: VmProtection,
         inheritance: VmInheritance,
-    ) -> Result<()> {
+    ) -> Result<VirtAddr> {
+        let start = self.reserve(placement, length)?;
         self.insert(VmMapEntry {
-            start: start.as_u64(),
-            end: checked_end(start.as_u64(), length)?,
+            start,
+            end: start + checked_page_length(length)?,
             object: None,
             object_offset: 0,
             amap: Some(AnonMap::new()),
@@ -290,7 +336,7 @@ impl VmMap {
     #[allow(clippy::too_many_arguments)]
     pub fn map_object(
         &mut self,
-        start: VirtAddr,
+        placement: VmPlacement,
         length: u64,
         object: Arc<VmObject>,
         object_offset: u64,
@@ -298,13 +344,14 @@ impl VmMap {
         maximum_protection: VmProtection,
         inheritance: VmInheritance,
         private: bool,
-    ) -> Result<()> {
+    ) -> Result<VirtAddr> {
         if !object_offset.is_multiple_of(PAGE_SIZE) {
             return Err(Error::InvalidAddress);
         }
+        let start = self.reserve(placement, length)?;
         self.insert(VmMapEntry {
-            start: start.as_u64(),
-            end: checked_end(start.as_u64(), length)?,
+            start,
+            end: start + checked_page_length(length)?,
             object: Some(object),
             object_offset: object_offset / PAGE_SIZE,
             amap: private.then(AnonMap::new),
@@ -334,6 +381,19 @@ impl VmMap {
                 .remove(&key)
                 .expect("mem/map: overlapping entry vanished");
             self.size -= entry.end - entry.start;
+
+            let mut pieces = [(0u64, 0u64); 2];
+            let mut count = 0;
+            if entry.start < start {
+                pieces[count] = (entry.start, start);
+                count += 1;
+            }
+            if entry.end > end {
+                pieces[count] = (end, entry.end);
+                count += 1;
+            }
+            self.reserve_clipped(entry.start, &pieces[..count]);
+
             if entry.start < start {
                 let left = entry.clipped(entry.start, start);
                 self.size += left.end - left.start;
@@ -385,12 +445,27 @@ impl VmMap {
                 .entries
                 .remove(&key)
                 .expect("mem/map: overlapping entry vanished");
+            let middle_start = entry.start.max(start);
+            let middle_end = entry.end.min(end);
+
+            let mut pieces = [(0u64, 0u64); 3];
+            let mut count = 0;
+            if entry.start < start {
+                pieces[count] = (entry.start, start);
+                count += 1;
+            }
+            pieces[count] = (middle_start, middle_end);
+            count += 1;
+            if entry.end > end {
+                pieces[count] = (end, entry.end);
+                count += 1;
+            }
+            self.reserve_clipped(entry.start, &pieces[..count]);
+
             if entry.start < start {
                 let left = entry.clipped(entry.start, start);
                 self.entries.insert(left.start, left);
             }
-            let middle_start = entry.start.max(start);
-            let middle_end = entry.end.min(end);
             let mut middle = entry.clipped(middle_start, middle_end);
             middle.protection = protection;
             self.entries.insert(middle.start, middle);
@@ -527,6 +602,10 @@ impl VmMap {
             if child_entry.inheritance == VmInheritance::Copy && child_entry.private {
                 child_entry.needs_copy = true;
             }
+            child
+                .space
+                .alloc_fixed(child_entry.start, child_entry.end - child_entry.start)
+                .expect("mem/map: inherited range is not free in a fresh map");
             child.size += child_entry.end - child_entry.start;
             child.entries.insert(child_entry.start, child_entry);
         }
@@ -543,26 +622,45 @@ impl VmMap {
             .and_then(|(_, entry)| entry.contains(address.as_u64()).then(|| entry.clone()))
     }
 
-    fn insert(&mut self, entry: VmMapEntry) -> Result<()> {
-        validate_range(entry.start, entry.end)?;
+    /// Publishes an entry whose range is already reserved in the arena.
+    ///
+    /// The reservation is returned if the entry is rejected, so a failed
+    /// mapping never strands address space.
+    fn insert(&mut self, entry: VmMapEntry) -> Result<VirtAddr> {
+        if let Err(error) = validate_range(entry.start, entry.end) {
+            self.release(entry.start);
+            return Err(error);
+        }
         if !entry.maximum_protection.contains(entry.protection) {
+            self.release(entry.start);
             return Err(Error::Protection);
         }
-        if self
-            .entries
-            .range(..entry.end)
-            .next_back()
-            .is_some_and(|(_, previous)| previous.end > entry.start)
-        {
-            return Err(Error::AlreadyMapped);
-        }
-        self.size = self
-            .size
-            .checked_add(entry.end - entry.start)
-            .ok_or(Error::InvalidAddress)?;
+        debug_assert!(
+            self.entries
+                .range(..entry.end)
+                .next_back()
+                .is_none_or(|(_, previous)| previous.end <= entry.start),
+            "mem/map: the arena handed out a range that is already mapped"
+        );
+
+        let start = VirtAddr::new(entry.start);
+        self.size += entry.end - entry.start;
         self.entries.insert(entry.start, entry);
         self.bump_timestamp();
-        Ok(())
+        Ok(start)
+    }
+
+    /// Replaces one entry's reservation with the ranges it was clipped into.
+    ///
+    /// The whole original allocation is released first so the surviving pieces
+    /// can be reserved back at their exact addresses.
+    fn reserve_clipped(&mut self, original: u64, pieces: &[(u64, u64)]) {
+        self.release(original);
+        for (start, end) in pieces {
+            self.space
+                .alloc_fixed(*start, end - start)
+                .expect("mem/map: reclaiming a just-released range must succeed");
+        }
     }
 
     fn overlapping_keys(&self, start: u64, end: u64) -> alloc::vec::Vec<u64> {
@@ -606,6 +704,14 @@ fn checked_end(start: u64, length: u64) -> Result<u64> {
         .ok_or(Error::InvalidAddress)?;
     validate_range(start, end)?;
     Ok(end)
+}
+
+/// Maps an arena failure onto the corresponding mapping error.
+fn placement_error(error: VmemError) -> Error {
+    match error {
+        VmemError::NoSpace => Error::OutOfMemory,
+        VmemError::Invalid => Error::InvalidAddress,
+    }
 }
 
 fn validate_range(start: u64, end: u64) -> Result<()> {

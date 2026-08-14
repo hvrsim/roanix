@@ -1,6 +1,6 @@
 //! Compressed front-swap and optional external swap backend.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use lz4_flex::block::{compress_into, decompress_into};
@@ -13,10 +13,10 @@ use crate::{
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 const MAX_COMPRESSED_PAGE_BYTES: usize = PAGE_BYTES + PAGE_BYTES / 255 + 16;
 
-// The kernel allocator serves requests above 1024 bytes from whole pages.
+// The kernel allocator serves requests above half a page from whole pages.
 // Rejecting larger compressed payloads guarantees that front-swap frees more
 // physical memory than its payload allocation consumes.
-const MAX_USEFUL_COMPRESSED_BYTES: usize = 1024;
+const MAX_USEFUL_COMPRESSED_BYTES: usize = PAGE_BYTES / 2;
 
 /// Opaque slot allocated by an external swap backend.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -63,15 +63,43 @@ pub trait SwapBackend: Send + Sync {
 }
 
 struct CompressedSlot {
-    data: Option<Box<[u8]>>,
+    /// Reference counted so a page-in can decompress without holding the lock.
+    data: Option<Arc<[u8]>>,
     checksum: u64,
 }
 
 struct SwapState {
-    compressed: Box<[CompressedSlot]>,
+    /// Grown on demand; a full table would otherwise be allocated at boot for
+    /// capacity that most systems never use.
+    compressed: Vec<CompressedSlot>,
     free_slots: Vec<u32>,
+    maximum_slots: usize,
     backend: Option<Arc<dyn SwapBackend>>,
     external_ops: usize,
+}
+
+impl SwapState {
+    /// Reserves a slot, extending the table only when none is recycled.
+    ///
+    /// Room to recycle the slot is reserved at the same time. Releasing a slot
+    /// therefore never has to allocate, which matters because releases happen
+    /// under memory pressure and a failed release would shrink swap capacity
+    /// exactly when it is needed most.
+    fn take_slot(&mut self) -> Option<u32> {
+        if let Some(slot) = self.free_slots.pop() {
+            return Some(slot);
+        }
+        if self.compressed.len() >= self.maximum_slots {
+            return None;
+        }
+        self.compressed.try_reserve(1).ok()?;
+        self.free_slots.try_reserve(1).ok()?;
+        self.compressed.push(CompressedSlot {
+            data: None,
+            checksum: 0,
+        });
+        Some((self.compressed.len() - 1) as u32)
+    }
 }
 
 struct SwapManager {
@@ -112,14 +140,7 @@ static SWAP: Once<SwapManager> = Once::new();
 /// Initializes compressed swap with a payload-byte limit.
 pub(super) fn init(maximum_compressed_bytes: u64, maximum_slots: usize) {
     SWAP.call_once(|| {
-        let maximum_slots = maximum_slots.max(64).min(u32::MAX as usize);
-        let mut compressed = Vec::with_capacity(maximum_slots);
-        compressed.resize_with(maximum_slots, || CompressedSlot {
-            data: None,
-            checksum: 0,
-        });
-        let mut free_slots = Vec::with_capacity(maximum_slots);
-        free_slots.extend((0..maximum_slots as u32).rev());
+        let maximum_slots = maximum_slots.clamp(64, u32::MAX as usize);
         SwapManager {
             maximum_compressed_bytes,
             compressed_bytes: AtomicU64::new(0),
@@ -130,8 +151,9 @@ pub(super) fn init(maximum_compressed_bytes: u64, maximum_slots: usize) {
             pageouts: AtomicU64::new(0),
             rejected_pages: AtomicU64::new(0),
             state: Mutex::new(SwapState {
-                compressed: compressed.into_boxed_slice(),
-                free_slots,
+                compressed: Vec::new(),
+                free_slots: Vec::new(),
+                maximum_slots,
                 backend: None,
                 external_ops: 0,
             }),
@@ -183,7 +205,8 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
             .try_reserve_exact(compressed_len)
             .map_err(|_| SwapError::Full)?;
         payload.extend_from_slice(&output[..compressed_len]);
-        let payload = payload.into_boxed_slice();
+        let checksum = page_checksum(page);
+        let payload: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
         let mut state = manager.state.lock();
         let current = manager.compressed_bytes.load(Ordering::Acquire);
         let next = current
@@ -191,12 +214,12 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
             .ok_or(SwapError::Full)?;
 
         if next <= manager.maximum_compressed_bytes
-            && let Some(slot) = state.free_slots.pop()
+            && let Some(slot) = state.take_slot()
         {
             let entry = &mut state.compressed[slot as usize];
             debug_assert!(entry.data.is_none());
             entry.data = Some(payload);
-            entry.checksum = page_checksum(page);
+            entry.checksum = checksum;
             manager.compressed_bytes.store(next, Ordering::Release);
             manager.compressed_pages.fetch_add(1, Ordering::AcqRel);
             manager.pageouts.fetch_add(1, Ordering::Relaxed);
@@ -238,14 +261,19 @@ pub(super) fn load(
             }
         }
         SwapHandle::Compressed(slot) => {
-            let state = manager.state.lock();
-            let entry = state
-                .compressed
-                .get(slot as usize)
-                .ok_or(SwapError::Corrupt)?;
-            let data = entry.data.as_ref().ok_or(SwapError::Corrupt)?;
-            let written = decompress_into(data, page).map_err(|_| SwapError::Corrupt)?;
-            if written != PAGE_BYTES || page_checksum(page) != entry.checksum {
+            // Decompression is the expensive part of a page-in, so the payload
+            // is claimed by reference and expanded with the lock released.
+            let (data, checksum) = {
+                let state = manager.state.lock();
+                let entry = state
+                    .compressed
+                    .get(slot as usize)
+                    .ok_or(SwapError::Corrupt)?;
+                let data = entry.data.clone().ok_or(SwapError::Corrupt)?;
+                (data, entry.checksum)
+            };
+            let written = decompress_into(&data, page).map_err(|_| SwapError::Corrupt)?;
+            if written != PAGE_BYTES || page_checksum(page) != checksum {
                 return Err(SwapError::Corrupt);
             }
         }
@@ -271,10 +299,14 @@ pub(super) fn free(handle: SwapHandle) {
             };
             if let Some(data) = entry.data.take() {
                 entry.checksum = 0;
+                let length = data.len() as u64;
+                drop(data);
                 manager
                     .compressed_bytes
-                    .fetch_sub(data.len() as u64, Ordering::AcqRel);
+                    .fetch_sub(length, Ordering::AcqRel);
                 manager.compressed_pages.fetch_sub(1, Ordering::AcqRel);
+                // Capacity was reserved when the slot was created, so this
+                // cannot allocate and the slot can never be stranded.
                 debug_assert!(state.free_slots.len() < state.free_slots.capacity());
                 state.free_slots.push(slot as u32);
             }
@@ -315,11 +347,17 @@ fn manager() -> &'static SwapManager {
     SWAP.get().expect("mem/swap: initialized before use")
 }
 
+/// Returns an integrity digest over one page.
+///
+/// The digest runs on every page-out and page-in, so it consumes eight bytes
+/// per round rather than one; a byte-at-a-time hash would cost more than the
+/// compression it protects.
 fn page_checksum(page: &[u8; PAGE_BYTES]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in page {
-        hash ^= u64::from(byte);
+    for word in page.as_chunks::<8>().0 {
+        hash ^= u64::from_ne_bytes(*word);
         hash = hash.wrapping_mul(0x100_0000_01b3);
+        hash ^= hash >> 29;
     }
     hash
 }

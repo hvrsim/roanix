@@ -1,6 +1,6 @@
 //! Logical memory pages backed by authoritative PFN database entries.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::ptr;
 
 use crate::{
@@ -10,6 +10,7 @@ use crate::{
 
 use super::{
     Error, Result,
+    pmap::{PmapInner, ReverseMapping},
     swap::{self, SwapHandle},
 };
 
@@ -57,6 +58,12 @@ pub struct VmPage {
     index: u64,
     owner_kind: PageOwnerKind,
     backing: Mutex<PageBacking>,
+    /// Every hardware mapping of this page.
+    ///
+    /// The list belongs to the logical page rather than the frame so that it
+    /// survives eviction and so that per-frame metadata stays free of owning
+    /// collections.
+    mappings: Mutex<Vec<ReverseMapping>>,
     permanent: bool,
 }
 
@@ -67,6 +74,7 @@ impl VmPage {
             index,
             owner_kind,
             backing: Mutex::new(PageBacking::Zero),
+            mappings: Mutex::new(Vec::new()),
             permanent: false,
         })
     }
@@ -78,9 +86,10 @@ impl VmPage {
             index: 0,
             owner_kind: PageOwnerKind::Kernel,
             backing: Mutex::new(PageBacking::Resident(frame)),
+            mappings: Mutex::new(Vec::new()),
             permanent: true,
         });
-        frame.bind_owner(&page, PageOwnerKind::Kernel, page.id, 0);
+        frame.bind_owner(&page, PageOwnerKind::Kernel);
         frame.wire();
         frame.mark_referenced();
         Ok(page)
@@ -234,11 +243,43 @@ impl VmPage {
     }
 
     /// Creates an independent anonymous page containing the same bytes.
+    ///
+    /// The copy is performed frame to frame through the direct map, so no
+    /// page-sized buffer is placed on the kernel stack.
     pub fn copy_to(self: &Arc<Self>, index: u64) -> Result<Arc<Self>> {
-        let mut bytes = [0u8; PAGE_BYTES];
-        self.read(0, &mut bytes)?;
         let copy = Self::new_zero(index, PageOwnerKind::Anonymous);
-        copy.write(0, &bytes)?;
+        // The destination is unreachable by any other CPU until it is
+        // published, so its frame can be materialized up front.
+        let destination = {
+            let mut backing = copy.backing.lock();
+            copy.ensure_resident_locked(&mut backing)?;
+            let PageBacking::Resident(frame) = &*backing else {
+                unreachable!("mem/page: fresh page is not resident");
+            };
+            *frame
+        };
+
+        loop {
+            let backing = self.backing.lock();
+            if let PageBacking::Resident(source) = &*backing {
+                source.mark_referenced();
+                // SAFETY: both frames are distinct, permanently direct-mapped,
+                // and the source lock prevents its reclamation for the copy.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        mem::phys_to_virt(source.paddr()).as_ptr::<u8>(),
+                        mem::phys_to_virt(destination.paddr()).as_mut_ptr::<u8>(),
+                        PAGE_BYTES,
+                    );
+                }
+                break;
+            }
+            drop(backing);
+            self.ensure_resident()?;
+        }
+
+        destination.mark_dirty();
+        phys::activate_managed(destination, &copy);
         Ok(copy)
     }
 
@@ -268,48 +309,63 @@ impl VmPage {
             return;
         }
         let backing = self.backing.lock();
-        let PageBacking::Resident(frame) = &*backing else {
-            panic!("mem/page: releasing mapping from nonresident page");
-        };
-        frame.remove_mapping();
+        if let PageBacking::Resident(frame) = &*backing {
+            frame.remove_mapping();
+        }
     }
 
-    pub(super) fn add_reverse_mapping(&self, pmap: &Arc<super::pmap::PmapInner>, address: u64) {
+    pub(super) fn add_reverse_mapping(&self, pmap: &Arc<PmapInner>, address: u64) {
         if self.permanent {
             return;
         }
-        let backing = self.backing.lock();
-        let PageBacking::Resident(frame) = &*backing else {
-            panic!("mem/page: adding reverse mapping to nonresident page");
-        };
-        frame.add_reverse_mapping(pmap, address);
+        self.mappings.lock().push(ReverseMapping {
+            pmap: Arc::downgrade(pmap),
+            address,
+        });
     }
 
-    pub(super) fn remove_reverse_mapping(&self, pmap: *const super::pmap::PmapInner, address: u64) {
+    pub(super) fn remove_reverse_mapping(&self, pmap: *const PmapInner, address: u64) {
         if self.permanent {
             return;
         }
-        let backing = self.backing.lock();
-        let PageBacking::Resident(frame) = &*backing else {
-            panic!("mem/page: removing reverse mapping from nonresident page");
-        };
-        frame.remove_reverse_mapping(pmap, address);
-    }
-
-    pub(super) fn reverse_mapping(&self, index: usize) -> Option<phys::ReverseMapping> {
-        if self.permanent {
-            return None;
+        let mut mappings = self.mappings.lock();
+        if let Some(index) = mappings
+            .iter()
+            .position(|mapping| mapping.pmap.as_ptr() == pmap && mapping.address == address)
+        {
+            mappings.swap_remove(index);
         }
-        let backing = self.backing.lock();
-        let PageBacking::Resident(frame) = &*backing else {
-            return None;
-        };
-        frame.reverse_mapping(index)
     }
 
-    pub(super) fn first_reverse_mapping(&self) -> Option<phys::ReverseMapping> {
-        self.reverse_mapping(0)
+    /// Detaches the reverse-mapping list for traversal.
+    ///
+    /// Callers must lock individual pmaps, and the pmap lock is ordered before
+    /// this list, so the list cannot be held across that acquisition. Moving
+    /// it out costs nothing and lets the traversal run unlocked.
+    pub(super) fn take_reverse_mappings(&self) -> Vec<ReverseMapping> {
+        if self.permanent {
+            return Vec::new();
+        }
+        core::mem::take(&mut *self.mappings.lock())
     }
+
+    /// Returns unprocessed mappings to the page.
+    ///
+    /// Entries recorded while the list was detached are preserved. A restored
+    /// entry may have become stale, which every consumer already tolerates by
+    /// revalidating against the pmap before acting on it.
+    pub(super) fn restore_reverse_mappings(&self, mappings: Vec<ReverseMapping>) {
+        if mappings.is_empty() {
+            return;
+        }
+        let mut current = self.mappings.lock();
+        if current.is_empty() {
+            *current = mappings;
+        } else {
+            current.extend(mappings);
+        }
+    }
+
 
     pub(super) fn try_reclaim(self: &Arc<Self>) -> bool {
         if self.permanent {
@@ -403,7 +459,7 @@ impl VmPage {
             PageBacking::Resident(_) => Ok(false),
             PageBacking::Zero => {
                 let frame = super::allocate_physical_page()?;
-                frame.bind_owner(self, self.owner_kind, self.id, self.index);
+                frame.bind_owner(self, self.owner_kind);
                 frame.mark_referenced();
                 *backing = PageBacking::Resident(frame);
                 Ok(true)
@@ -421,7 +477,7 @@ impl VmPage {
                     return Err(Error::CorruptSwap);
                 }
                 swap::free(handle);
-                frame.bind_owner(self, self.owner_kind, self.id, self.index);
+                frame.bind_owner(self, self.owner_kind);
                 frame.mark_referenced();
                 *backing = PageBacking::Resident(frame);
                 Ok(true)
