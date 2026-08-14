@@ -1,9 +1,8 @@
 //!
 //! # Core kernel modules.
 //!
-//! Kernel components required by the rest of the kernel.
-//! Modules present here should not depend on anything
-//! else besides [`arch`](`crate::arch`)!
+//! Kernel components required by the rest of the kernel: scheduling, threads,
+//! timekeeping, synchronization, SMP bring-up, logging, and panic handling.
 //!
 
 pub mod clock;

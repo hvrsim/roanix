@@ -15,7 +15,7 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU16, AtomicUsize, Ordering},
 };
 
 use log::info;
@@ -213,6 +213,7 @@ pub(crate) struct Process {
     controlling_tty: Mutex<Option<FileRef>>,
     signals: signal::SignalManager,
     umask: AtomicU16,
+    nice: AtomicI8,
     active_threads: AtomicUsize,
     exited: AtomicBool,
     exit_status: AtomicI32,
@@ -247,6 +248,7 @@ impl Process {
             controlling_tty: Mutex::new(None),
             signals: signal::SignalManager::new(),
             umask: AtomicU16::new(DEFAULT_UMASK),
+            nice: AtomicI8::new(0),
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
@@ -272,6 +274,7 @@ impl Process {
             controlling_tty: Mutex::new(parent.controlling_tty.lock().clone()),
             signals: signal::SignalManager::fork_from(&parent.signals),
             umask: AtomicU16::new(parent.umask()),
+            nice: AtomicI8::new(parent.nice()),
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
@@ -282,6 +285,16 @@ impl Process {
             .processes
             .insert(pid, Arc::downgrade(&process));
         process
+    }
+
+    /// Returns this process's scheduler nice value.
+    pub(crate) fn nice(&self) -> i8 {
+        self.nice.load(Ordering::Relaxed)
+    }
+
+    /// Records a new scheduler nice value for this process.
+    pub(crate) fn set_nice(&self, nice: i8) {
+        self.nice.store(nice, Ordering::Relaxed);
     }
 
     /// Returns this process's identifier.
@@ -915,6 +928,95 @@ pub(crate) fn set_process_group(pid: usize, group: usize) -> Result<()> {
     let group = if group == 0 { target.pid() } else { group };
     target.set_process_group(group);
     Ok(())
+}
+
+/// Selector for the `setpriority`/`getpriority` target set.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum PriorityWhich {
+    /// A single process.
+    Process,
+    /// Every process in a process group.
+    ProcessGroup,
+    /// Every process owned by a user.
+    User,
+}
+
+/// Collects the live processes selected by `which` and `who`.
+///
+/// A `who` of zero selects the caller's own process, group, or user, matching
+/// POSIX. The kernel is single-user, so the only valid user id is zero.
+fn priority_targets(which: PriorityWhich, who: u64) -> Result<Vec<Arc<Process>>> {
+    let current = current().ok_or(Error::InvalidArgument)?;
+
+    let targets: Vec<Arc<Process>> = match which {
+        PriorityWhich::Process => {
+            let pid = if who == 0 {
+                current.pid()
+            } else {
+                usize::try_from(who).map_err(|_| Error::NoSuchProcess)?
+            };
+            find(pid).into_iter().collect()
+        }
+        PriorityWhich::ProcessGroup => {
+            let group = if who == 0 {
+                current.process_group()
+            } else {
+                usize::try_from(who).map_err(|_| Error::NoSuchProcess)?
+            };
+            process_registry()
+                .lock()
+                .processes
+                .values()
+                .filter_map(Weak::upgrade)
+                .filter(|process| process.process_group() == group)
+                .collect()
+        }
+        PriorityWhich::User => {
+            if who != 0 {
+                return Err(Error::NoSuchProcess);
+            }
+            process_registry()
+                .lock()
+                .processes
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect()
+        }
+    };
+
+    let live: Vec<Arc<Process>> = targets
+        .into_iter()
+        .filter(|process| !process.is_exited())
+        .collect();
+    if live.is_empty() {
+        return Err(Error::NoSuchProcess);
+    }
+    Ok(live)
+}
+
+/// Applies `nice` to every process selected by `which` and `who`.
+pub(crate) fn set_priority(which: PriorityWhich, who: u64, nice: i8) -> Result<()> {
+    let nice = nice.clamp(sched::NICE_MIN, sched::NICE_MAX);
+    for process in priority_targets(which, who)? {
+        process.set_nice(nice);
+        sched::set_process_nice(process.pid(), nice);
+    }
+    Ok(())
+}
+
+/// Returns the most favourable nice value among the selected processes.
+///
+/// POSIX specifies the lowest (most favourable) value when several processes
+/// match.
+pub(crate) fn get_priority(which: PriorityWhich, who: u64) -> Result<i8> {
+    let mut best = sched::NICE_MAX;
+    for process in priority_targets(which, who)? {
+        // Prefer the live scheduler value; fall back to the process record for
+        // a process whose threads have not started yet.
+        let nice = sched::process_nice(process.pid()).unwrap_or_else(|| process.nice());
+        best = best.min(nice);
+    }
+    Ok(best)
 }
 
 /// Returns whether a live process group belongs to `session`.

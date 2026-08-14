@@ -26,7 +26,7 @@ const RECORD_CAPACITY: usize = 256;
 pub const MAX_SINKS: usize = 8;
 
 /// Callback invoked for every formatted log message.
-pub type LogSink = fn(*const u8, usize);
+pub type LogSink = fn(&[u8]);
 
 /// Contains data to reconstruct a single kernel log message.
 #[derive(Clone, Copy)]
@@ -57,17 +57,27 @@ struct LogRing {
     next_offset: u64,
 }
 
-/// Shared debug subsystem state.
+/// Shared log ring state.
 struct DebugState {
     ring: LogRing,
+}
+
+/// Registered output sinks.
+///
+/// Sinks are slow, polled devices (a serial UART, or one SBI call per byte on
+/// RISC-V). They get their own lock so a multi-millisecond console write never
+/// blocks readers of the log ring or other CPUs appending records.
+struct ConsoleState {
     sinks: [Option<LogSink>; MAX_SINKS],
 }
 
 /// Global logger instance, [`log`] crate invokes this.
 static LOGGER: KLog = KLog;
 
-/// Global debug state protected by an IRQ-safe spinlock.
+/// Global log ring protected by an IRQ-safe spinlock.
 static DEBUG_STATE: IrqSpinLock<DebugState> = IrqSpinLock::new(DebugState::new());
+/// Console sink registry, held only while writing to output devices.
+static CONSOLE: IrqSpinLock<ConsoleState> = IrqSpinLock::new(ConsoleState::new());
 static PANIC_MODE: AtomicBool = AtomicBool::new(false);
 static REGULAR_SINK_OUTPUT: AtomicBool = AtomicBool::new(true);
 static LOG_EVENT: Event = Event::new();
@@ -137,8 +147,13 @@ impl Record {
         rec
     }
 
-    fn stream_len(self) -> u64 {
+    fn stream_len(&self) -> u64 {
         self.buflen as u64 + 1
+    }
+
+    /// Returns the formatted message bytes for this record.
+    fn message(&self) -> &[u8] {
+        &self.buf[..self.buflen]
     }
 }
 
@@ -169,13 +184,14 @@ impl LogRing {
     }
 
     /// Pushes a record into the ring, overwriting oldest entries when full.
-    fn push(&mut self, mut rec: Record) {
-        rec.stream_offset = self.next_offset;
+    fn push(&mut self, rec: &Record) {
+        let slot = &mut self.records[self.write];
+        *slot = *rec;
+        slot.stream_offset = self.next_offset;
         self.next_offset = self
             .next_offset
-            .checked_add(rec.stream_len())
+            .checked_add(slot.stream_len())
             .expect("debug: kernel log offset overflow");
-        self.records[self.write] = rec;
 
         if self.len == RING_CAPACITY {
             self.read = (self.read + 1) % RING_CAPACITY;
@@ -200,7 +216,7 @@ impl LogRing {
         let mut index = self.read;
 
         for _ in 0..self.len {
-            let rec = self.records[index];
+            let rec = &self.records[index];
             let body_end = rec.stream_offset + rec.buflen as u64;
             let record_end = body_end + 1;
             index = (index + 1) % RING_CAPACITY;
@@ -236,11 +252,25 @@ impl LogRing {
 }
 
 impl DebugState {
-    /// Creates empty debug state.
+    /// Creates empty ring state.
     const fn new() -> Self {
         Self {
             ring: LogRing::new(),
+        }
+    }
+}
+
+impl ConsoleState {
+    /// Creates an empty sink registry.
+    const fn new() -> Self {
+        Self {
             sinks: [const { None }; MAX_SINKS],
+        }
+    }
+
+    fn dispatch(&self, message: &[u8]) {
+        for sink in self.sinks.iter().flatten() {
+            sink(message);
         }
     }
 }
@@ -258,66 +288,47 @@ impl log::Log for KLog {
         }
 
         let rec = Record::from_log_record(record);
-        let mut state = DEBUG_STATE.lock();
-        append_record_locked(&mut state, rec);
-        drop(state);
+        DEBUG_STATE.lock().ring.push(&rec);
+        // Console output happens outside the ring lock so slow serial writes
+        // cannot stall readers or other CPUs appending records.
+        write_to_sinks(rec.message());
         LOG_EVENT.signal();
     }
 
     fn flush(&self) {}
 }
 
-/// Dispatches a preformatted message buffer to all currently registered sinks.
-///
-/// Expects the caller to hold the debug state lock. Sink writes remain under
-/// that lock so each log record stays byte-serialized on text consoles.
-#[inline]
-fn dispatch_sinks_locked(buf: *const u8, buflen: usize, sinks: &[Option<LogSink>; MAX_SINKS]) {
-    if sinks.iter().all(|slot| slot.is_none()) {
-        return;
-    }
-
-    for sink in sinks.iter().flatten() {
-        sink(buf, buflen);
-    }
-}
-
-fn append_record_locked(state: &mut DebugState, rec: Record) {
-    state.ring.push(rec);
-    if REGULAR_SINK_OUTPUT.load(Ordering::Acquire) {
-        dispatch_sinks_locked(rec.buf.as_ptr(), rec.buflen, &state.sinks);
-    }
-}
-
 /// Registers a log sink callback.
 ///
 /// Fails silently if a sink is unable to be registered.
 pub fn register_sink(sink: LogSink) {
-    let mut state = DEBUG_STATE.lock();
+    let mut console = CONSOLE.lock();
 
-    for slot in &mut state.sinks {
-        if slot.is_none() {
-            *slot = Some(sink);
-            if !REGULAR_SINK_OUTPUT.load(Ordering::Acquire) {
-                return;
-            }
-            let mut idx = state.ring.read;
-            for _ in 0..state.ring.len {
-                let rec = state.ring.records[idx];
-                sink(rec.buf.as_ptr(), rec.buflen);
-                idx = (idx + 1) % RING_CAPACITY;
-            }
+    let Some(slot) = console.sinks.iter_mut().find(|slot| slot.is_none()) else {
+        return;
+    };
+    *slot = Some(sink);
 
-            return;
-        }
+    if !REGULAR_SINK_OUTPUT.load(Ordering::Acquire) {
+        return;
+    }
+
+    // Replay the backlog under the ring lock so the new sink observes a
+    // consistent snapshot. Sinks are registered once during boot, so briefly
+    // holding both locks here does not affect steady-state logging.
+    let state = DEBUG_STATE.lock();
+    let mut index = state.ring.read;
+    for _ in 0..state.ring.len {
+        sink(state.ring.records[index].message());
+        index = (index + 1) % RING_CAPACITY;
     }
 }
 
 /// Unregisters the first matching sink callback.
 pub fn unregister_sink(sink: LogSink) -> bool {
-    let mut state = DEBUG_STATE.lock();
+    let mut console = CONSOLE.lock();
 
-    for slot in &mut state.sinks {
+    for slot in &mut console.sinks {
         if slot
             .as_ref()
             .map(|registered| core::ptr::fn_addr_eq(*registered, sink))
@@ -333,21 +344,20 @@ pub fn unregister_sink(sink: LogSink) -> bool {
 
 /// Removes all currently registered sinks.
 pub fn clear_sinks() {
-    let mut state = DEBUG_STATE.lock();
-    state.sinks.fill(None);
+    CONSOLE.lock().sinks.fill(None);
 }
 
 /// Stops ordinary log records from being mirrored to registered debug sinks.
 ///
 /// Panic-time output still writes directly to the registered sinks.
 pub(crate) fn disable_regular_sink_output() {
-    let _state = DEBUG_STATE.lock();
+    let _console = CONSOLE.lock();
     REGULAR_SINK_OUTPUT.store(false, Ordering::Release);
 }
 
 /// Restores ordinary log mirroring to registered debug sinks.
 pub(crate) fn enable_regular_sink_output() {
-    let _state = DEBUG_STATE.lock();
+    let _console = CONSOLE.lock();
     REGULAR_SINK_OUTPUT.store(true, Ordering::Release);
 }
 
@@ -395,7 +405,6 @@ pub(crate) fn append_kernel_message(bytes: &[u8]) {
         return;
     }
 
-    let mut state = DEBUG_STATE.lock();
     let mut remaining = bytes;
     while !remaining.is_empty() {
         let newline = remaining.iter().position(|byte| *byte == b'\n');
@@ -403,10 +412,10 @@ pub(crate) fn append_kernel_message(bytes: &[u8]) {
         let line = &remaining[..line_len];
 
         if line.is_empty() {
-            append_record_locked(&mut state, Record::from_bytes(&[]));
+            append_message(&[]);
         } else {
             for chunk in line.chunks(RECORD_CAPACITY) {
-                append_record_locked(&mut state, Record::from_bytes(chunk));
+                append_message(chunk);
             }
         }
 
@@ -415,8 +424,13 @@ pub(crate) fn append_kernel_message(bytes: &[u8]) {
             None => &[],
         };
     }
-    drop(state);
     LOG_EVENT.signal();
+}
+
+fn append_message(bytes: &[u8]) {
+    let rec = Record::from_bytes(bytes);
+    DEBUG_STATE.lock().ring.push(&rec);
+    write_to_sinks(rec.message());
 }
 
 /// Prevents regular logs from competing with panic output.
@@ -435,13 +449,20 @@ pub(crate) unsafe fn force_unlock_for_panic() {
         // SAFETY: upheld by this function's panic-only caller contract.
         unsafe { DEBUG_STATE.force_unlock() };
     }
+    if CONSOLE.is_locked() {
+        // SAFETY: upheld by this function's panic-only caller contract.
+        unsafe { CONSOLE.force_unlock() };
+    }
 }
 
-/// Writes a preformatted string buffer directly to all registered sinks
-/// without appending a new record to the ring buffer.
-pub(crate) fn write_to_sinks(buf: *const u8, buflen: usize) {
-    let state = DEBUG_STATE.lock();
-    dispatch_sinks_locked(buf, buflen, &state.sinks);
+/// Writes a preformatted message directly to all registered sinks without
+/// appending a new record to the ring buffer.
+pub(crate) fn write_to_sinks(message: &[u8]) {
+    if !REGULAR_SINK_OUTPUT.load(Ordering::Acquire) && !PANIC_MODE.load(Ordering::Acquire) {
+        return;
+    }
+
+    CONSOLE.lock().dispatch(message);
 }
 
 /// Connects kernel logging infra to the log crate.

@@ -624,6 +624,9 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
         let (cpu_id, tid) = crate::arch::thiscpu_opt()
             .map(|cpu| (cpu.id, cpu.current_thread))
             .unwrap_or((usize::MAX, 0));
+        if frame.vec == 14 {
+            crate::mem::kstack::report_guard_fault(Cr2::read_raw(), cpu_id, tid);
+        }
         log::error!(
             "x86/trap: exception ip=0x{:X} vec=0x{:X} ec=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
             frame.ip,

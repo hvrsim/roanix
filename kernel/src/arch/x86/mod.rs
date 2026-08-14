@@ -46,10 +46,7 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 /// $ QEMUFLAGS="... -debugcon stdio" make run-bios
 /// ```
 ///
-fn dbgcon_write(buf: *const u8, buflen: usize) {
-    // SAFETY: the debug subsystem only calls sinks with a live buffer for the
-    // duration of the callback.
-    let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
+fn dbgcon_write(line: &[u8]) {
     console_write(line);
     console_write(b"\n");
 }
@@ -217,6 +214,11 @@ pub fn wfi() {
 pub fn send_ipi(cpu_id: usize) {
     let lapic_id = crate::sys::smp::platform_id(cpu_id).expect("x86: invalid CPU ID for IPI");
     lapic::send_ipi(lapic_id as u32);
+}
+
+/// Sends a reschedule IPI to every CPU except the current one.
+pub fn send_ipi_all_excluding_self() {
+    lapic::send_ipi_all_excluding_self();
 }
 
 /// Forces the current CPU through the scheduler trap path.

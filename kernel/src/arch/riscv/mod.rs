@@ -52,10 +52,7 @@ pub(crate) struct SbiRet {
 /// Writes debug messages to the current debug sink.
 ///
 /// On all riscv64 platforms, we use the SBI debug console API.
-fn dbgcon_write(buf: *const u8, buflen: usize) {
-    // SAFETY: the debug subsystem only calls sinks with a live buffer for the
-    // duration of the callback.
-    let line = unsafe { core::slice::from_raw_parts(buf, buflen) };
+fn dbgcon_write(line: &[u8]) {
     console_write(line);
     console_write(b"\n");
 }
@@ -302,6 +299,52 @@ pub fn send_ipi(cpu_id: usize) {
         0,
     );
     assert_eq!(legacy_error.error, 0, "riscv: SBI send_ipi failed");
+}
+
+/// Sends a reschedule IPI to every CPU except the current one.
+pub fn send_ipi_all_excluding_self() {
+    let this_hart = thiscpu_opt()
+        .and_then(|cpu| crate::sys::smp::platform_id(cpu.id))
+        .unwrap_or(u64::MAX);
+
+    // SBI takes a base hart id plus a mask, so a single call only covers a
+    // usize-sized window. Walk the hart space in windows and skip empty ones.
+    let mut base = 0usize;
+    let total = crate::sys::smp::cpu_count();
+    let mut remaining = total;
+    while remaining > 0 {
+        let mut mask = 0usize;
+        for cpu_id in 0..total {
+            let Some(hartid) = crate::sys::smp::platform_id(cpu_id) else {
+                continue;
+            };
+            if hartid == this_hart || !crate::sys::smp::is_online(cpu_id) {
+                continue;
+            }
+            let hartid = hartid as usize;
+            if hartid >= base && hartid - base < usize::BITS as usize {
+                mask |= 1usize << (hartid - base);
+            }
+        }
+
+        if mask != 0
+            && sbi_call3(mask, base, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND).error != 0
+        {
+            // Fall back to unicast delivery when the SBI IPI extension is
+            // unavailable on this platform.
+            for cpu_id in 0..total {
+                if crate::sys::smp::platform_id(cpu_id) != Some(this_hart)
+                    && crate::sys::smp::is_online(cpu_id)
+                {
+                    send_ipi(cpu_id);
+                }
+            }
+            return;
+        }
+
+        base += usize::BITS as usize;
+        remaining = remaining.saturating_sub(usize::BITS as usize);
+    }
 }
 
 /// Forces the current CPU through the scheduler trap path.

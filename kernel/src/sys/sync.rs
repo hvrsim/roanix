@@ -11,7 +11,7 @@ use core::{
     marker::PhantomData,
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
 };
 
 use intrusive_collections::{LinkedList, LinkedListLink, UnsafeRef, intrusive_adapter};
@@ -42,6 +42,10 @@ const ONCE_STATE_POISONED: u8 = 3;
 /// Readers use an Acquire load on the completed state, while the initializing
 /// CPU publishes the value with a Release store. Concurrent initializers spin
 /// with bounded exponential backoff until the winning initializer completes.
+///
+/// Waiters spin rather than block, so this is intended for boot-time and
+/// short initializers. A long-running initializer will burn CPU on every
+/// other core that races with it.
 pub struct Once<T> {
     state: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,
@@ -194,6 +198,11 @@ impl Drop for OnceInitGuard<'_> {
 /// [`IrqSpinLock`] instead.
 pub struct Mutex<T: ?Sized> {
     state: AtomicU8,
+    /// Thread currently holding the lock, for priority inheritance.
+    ///
+    /// Written with a relaxed store on the uncontended path so acquiring stays
+    /// a single compare-exchange plus one store.
+    owner: AtomicPtr<Thread>,
     waiters: IrqSpinLock<Option<WaitQueue>>,
     value: UnsafeCell<T>,
 }
@@ -217,6 +226,13 @@ struct MutexWaiter {
     link: LinkedListLink,
     thread: *mut Thread,
     park_seq: u64,
+    /// Priority lent to the lock holder while this waiter is queued.
+    priority: u8,
+    /// Thread this waiter is currently boosting, or null when not boosting.
+    ///
+    /// Ownership can transfer while this waiter sleeps, so the boost has to be
+    /// released against whichever thread actually received it.
+    boosted: AtomicPtr<Thread>,
     granted: AtomicBool,
 }
 
@@ -279,6 +295,13 @@ impl WaitQueue {
         }
         true
     }
+
+    /// Re-points every queued waiter's boost at the new lock holder.
+    fn transfer_boosts(&self, owner: *mut Thread) {
+        for waiter in self.list.iter() {
+            waiter.boost(owner);
+        }
+    }
 }
 
 // SAFETY: wait queues are only manipulated while holding `waiters`.
@@ -294,6 +317,7 @@ impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicU8::new(0),
+            owner: AtomicPtr::new(core::ptr::null_mut()),
             waiters: IrqSpinLock::new(None),
             value: UnsafeCell::new(value),
         }
@@ -316,6 +340,7 @@ impl<T: ?Sized> Mutex<T> {
             return MutexGuard::new(self);
         }
 
+        smp::assert_blockable("sync: mutex");
         self.lock_slow()
     }
 
@@ -339,9 +364,29 @@ impl<T: ?Sized> Mutex<T> {
 
     #[inline]
     fn try_lock_fast(&self) -> bool {
-        self.state
+        let acquired = self
+            .state
             .compare_exchange(0, STATE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .is_ok();
+        if acquired {
+            self.publish_owner();
+        }
+        acquired
+    }
+
+    /// Records the acquiring thread so waiters can lend it their priority.
+    #[inline]
+    fn publish_owner(&self) {
+        let owner = sched::current_thread_opt().unwrap_or(core::ptr::null_mut());
+        self.owner.store(owner, Ordering::Relaxed);
+    }
+
+    /// Lends the queued waiter's priority to the current lock holder.
+    fn lend_to_owner(&self, waiter: &MutexWaiter) {
+        let owner = self.owner.load(Ordering::Relaxed);
+        if !owner.is_null() {
+            waiter.boost(owner);
+        }
     }
 
     #[cold]
@@ -379,6 +424,7 @@ impl<T: ?Sized> Mutex<T> {
                     .is_ok()
                 {
                     *waiters_guard = None;
+                    self.publish_owner();
                     drop(waiters_guard);
                     return MutexGuard::new(self);
                 }
@@ -402,7 +448,8 @@ impl<T: ?Sized> Mutex<T> {
             // SAFETY: the scheduler keeps the current thread allocation live
             // while it is executing.
             let seq = unsafe { (&*current).prepare_park() };
-            let waiter = core::pin::pin!(MutexWaiter::new(current, seq));
+            let priority = sched::thread_priority(current);
+            let waiter = core::pin::pin!(MutexWaiter::new(current, seq, priority));
             let waiters = waiters_guard.get_or_insert_with(WaitQueue::new);
             waiters.push(waiter.as_ref().get_ref());
 
@@ -422,6 +469,7 @@ impl<T: ?Sized> Mutex<T> {
                 );
                 *waiters_guard = None;
                 self.state.store(STATE_LOCKED, Ordering::Relaxed);
+                self.owner.store(current, Ordering::Relaxed);
 
                 let restore_irqs = waiters_guard.unlock_keep_irqs_disabled();
                 assert!(
@@ -433,6 +481,10 @@ impl<T: ?Sized> Mutex<T> {
                 }
                 return MutexGuard::new(self);
             }
+
+            // Lend this waiter's priority to the holder so it can finish and
+            // release instead of being preempted by unrelated work.
+            self.lend_to_owner(waiter.as_ref().get_ref());
 
             let restore_irqs = waiters_guard.unlock_keep_irqs_disabled();
             assert!(
@@ -455,6 +507,8 @@ impl<T: ?Sized> Mutex<T> {
                 *waiters_guard = None;
                 self.state.fetch_and(!STATE_QUEUED, Ordering::AcqRel);
             }
+            // This waiter is no longer queued, so it stops lending.
+            waiter.as_ref().get_ref().release_boost();
         }
     }
 
@@ -466,6 +520,8 @@ impl<T: ?Sized> Mutex<T> {
             .compare_exchange(STATE_LOCKED, 0, Ordering::Release, Ordering::Relaxed)
             .is_ok()
         {
+            // Uncontended release: no waiter ever lent anything.
+            self.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
             return;
         }
 
@@ -478,9 +534,6 @@ impl<T: ?Sized> Mutex<T> {
                 .pop()
                 .expect("sync: queued mutex has no waiting thread");
             let queued = !waiters.is_empty();
-            if !queued {
-                *waiters_guard = None;
-            }
 
             // Snapshot the wake target before releasing the queue lock. The
             // granted waiter may immediately return and destroy its stack node
@@ -489,12 +542,23 @@ impl<T: ?Sized> Mutex<T> {
                 thread: waiter.thread,
                 park_seq: waiter.park_seq,
             };
+
+            // Ownership transfers directly to the granted waiter, so move the
+            // remaining waiters' boosts onto it and drop the granted waiter's
+            // own boost. Doing this under the queue lock keeps the transfer
+            // atomic with respect to a new waiter arriving.
+            self.owner.store(target.thread, Ordering::Relaxed);
+            waiter.release_boost();
+            waiters.transfer_boosts(target.thread);
+
             waiter.granted.store(true, Ordering::Release);
             self.state.store(
                 STATE_LOCKED | if queued { STATE_QUEUED } else { 0 },
                 Ordering::Release,
             );
-            drop(waiter);
+            if !queued {
+                *waiters_guard = None;
+            }
 
             let restore_irqs = waiters_guard.unlock_keep_irqs_disabled();
             (target, restore_irqs)
@@ -531,12 +595,33 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
 }
 
 impl MutexWaiter {
-    fn new(thread: *mut Thread, park_seq: u64) -> Self {
+    fn new(thread: *mut Thread, park_seq: u64, priority: u8) -> Self {
         Self {
             link: LinkedListLink::new(),
             thread,
             park_seq,
+            priority,
+            boosted: AtomicPtr::new(core::ptr::null_mut()),
             granted: AtomicBool::new(false),
+        }
+    }
+
+    /// Boosts `owner` on this waiter's behalf, replacing any previous boost.
+    fn boost(&self, owner: *mut Thread) {
+        let previous = self.boosted.swap(owner, Ordering::Relaxed);
+        if !owner.is_null() {
+            sched::boost_priority(owner, self.priority);
+        }
+        if !previous.is_null() {
+            sched::unboost_priority(previous);
+        }
+    }
+
+    /// Releases this waiter's boost, if it holds one.
+    fn release_boost(&self) {
+        let previous = self.boosted.swap(core::ptr::null_mut(), Ordering::Relaxed);
+        if !previous.is_null() {
+            sched::unboost_priority(previous);
         }
     }
 }

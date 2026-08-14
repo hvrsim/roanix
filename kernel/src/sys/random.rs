@@ -1,17 +1,31 @@
 //! Kernel pseudorandom byte generator.
+//!
+//! Each CPU owns a ChaCha20 generator behind an IRQ-safe spinlock, so random
+//! bytes are available from interrupt context and CPUs do not contend on a
+//! single global lock. After every generated block the key is replaced with
+//! fresh keystream, giving forward secrecy: recovering the current state does
+//! not reveal previously returned bytes.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     arch,
-    sys::{
-        clock,
-        sync::{Mutex, Once},
-    },
+    sys::{clock, smp::IrqSpinLock, sync::Once},
 };
 
 const BLOCK_SIZE: usize = 64;
 const CHACHA_CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
-static GENERATOR: Once<Mutex<Generator>> = Once::new();
+/// Maximum CPUs with a dedicated generator. Higher CPU ids share the last slot.
+const MAX_GENERATORS: usize = 64;
+
+/// Bytes produced before the generator folds in fresh runtime entropy.
+const RESEED_INTERVAL_BYTES: u64 = 1 << 20;
+
+static GENERATORS: [IrqSpinLock<Option<Generator>>; MAX_GENERATORS] =
+    [const { IrqSpinLock::new(None) }; MAX_GENERATORS];
+static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static INITIALIZED: Once<()> = Once::new();
 
 struct Generator {
     key: [u32; 8],
@@ -19,11 +33,15 @@ struct Generator {
     nonce: [u32; 2],
     block: [u8; BLOCK_SIZE],
     used: usize,
+    since_reseed: u64,
 }
 
 /// Initializes the kernel random generator.
 pub(crate) fn init() {
-    let _ = generator();
+    INITIALIZED.call_once(|| {
+        let mut slot = GENERATORS[0].lock();
+        *slot = Some(Generator::seeded());
+    });
 }
 
 /// Fills `output` with pseudorandom bytes.
@@ -32,8 +50,9 @@ pub(crate) fn fill_bytes(output: &mut [u8]) {
         return;
     }
 
-    let mut generator = generator().lock();
-    generator.stir_runtime();
+    let mut generator = local_generator().lock();
+    let generator = generator.get_or_insert_with(Generator::seeded);
+    generator.maybe_reseed(output.len() as u64);
     generator.fill(output);
 }
 
@@ -43,25 +62,31 @@ pub(crate) fn mix_bytes(input: &[u8]) {
         return;
     }
 
-    let mut generator = generator().lock();
+    let mut generator = local_generator().lock();
+    let generator = generator.get_or_insert_with(Generator::seeded);
     for (index, chunk) in input.chunks(8).enumerate() {
         let mut word = [0u8; 8];
         word[..chunk.len()].copy_from_slice(chunk);
         generator.mix_word(u64::from_le_bytes(word) ^ index as u64);
     }
+    // Caller-supplied entropy should affect subsequent output immediately.
+    generator.discard_block();
 }
 
-fn generator() -> &'static Mutex<Generator> {
-    GENERATOR.call_once(|| Mutex::new(Generator::seeded()))
+fn local_generator() -> &'static IrqSpinLock<Option<Generator>> {
+    let cpu_id = arch::thiscpu_opt().map_or(0, |cpu| cpu.id);
+    &GENERATORS[cpu_id.min(MAX_GENERATORS - 1)]
 }
 
 impl Generator {
     fn seeded() -> Self {
         let marker = 0u8;
+        let unique = SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut seed = clock::monotonic_ns()
             ^ (&marker as *const u8 as usize as u64).rotate_left(17)
-            ^ (&GENERATOR as *const Once<Mutex<Generator>> as usize as u64).rotate_left(41)
-            ^ (arch::thiscpu_opt().map_or(0, |cpu| cpu.id) as u64).rotate_left(29);
+            ^ (GENERATORS.as_ptr() as usize as u64).rotate_left(41)
+            ^ (arch::thiscpu_opt().map_or(0, |cpu| cpu.id) as u64).rotate_left(29)
+            ^ unique.rotate_left(11);
 
         let mut key = [0u32; 8];
         for word in &mut key {
@@ -80,10 +105,21 @@ impl Generator {
             nonce: [nonce_seed as u32, (nonce_seed >> 32) as u32],
             block: [0; BLOCK_SIZE],
             used: BLOCK_SIZE,
+            since_reseed: 0,
         }
     }
 
-    fn stir_runtime(&mut self) {
+    /// Folds fresh runtime entropy in once enough output has been produced.
+    ///
+    /// Stirring on every call would throw away the rest of the current block
+    /// and force a full ChaCha20 permutation for even a single byte.
+    fn maybe_reseed(&mut self, requested: u64) {
+        self.since_reseed = self.since_reseed.saturating_add(requested);
+        if self.since_reseed < RESEED_INTERVAL_BYTES {
+            return;
+        }
+        self.since_reseed = 0;
+
         let marker = 0u8;
         let timing = clock::monotonic_ns()
             ^ (&marker as *const u8 as usize as u64).rotate_left(23)
@@ -92,6 +128,7 @@ impl Generator {
         if let Some(entropy) = arch::entropy_word() {
             self.mix_word(entropy);
         }
+        self.discard_block();
     }
 
     fn mix_word(&mut self, word: u64) {
@@ -103,6 +140,11 @@ impl Generator {
         self.nonce[0] ^= mixer as u32;
         self.nonce[1] ^= (mixer >> 32) as u32;
         self.counter = self.counter.wrapping_add(splitmix64(mixer));
+    }
+
+    /// Drops any buffered keystream so the next request re-derives a block.
+    fn discard_block(&mut self) {
+        self.block.fill(0);
         self.used = BLOCK_SIZE;
     }
 
@@ -115,6 +157,8 @@ impl Generator {
             let count = (BLOCK_SIZE - self.used).min(output.len() - written);
             output[written..written + count]
                 .copy_from_slice(&self.block[self.used..self.used + count]);
+            // Consumed keystream must never be handed out twice.
+            self.block[self.used..self.used + count].fill(0);
             self.used += count;
             written += count;
         }
@@ -158,6 +202,18 @@ impl Generator {
         }
         self.counter = self.counter.wrapping_add(1);
         self.used = 0;
+
+        // Rekey from the first half of the fresh keystream and withhold those
+        // bytes from callers, so the state cannot reproduce earlier output.
+        for index in 0..8 {
+            self.key[index] = u32::from_le_bytes(
+                self.block[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("random: malformed keystream chunk"),
+            );
+        }
+        self.block[..32].fill(0);
+        self.used = 32;
     }
 }
 

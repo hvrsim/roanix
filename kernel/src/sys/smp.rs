@@ -28,14 +28,18 @@ use core::{
 };
 
 use limine::{mp, request::MpRequest};
-use log::info;
+use log::{info, warn};
 
 #[cfg(target_arch = "x86_64")]
 use limine::mp::RequestFlags;
 
 use crate::{
     arch,
-    sys::{clock::PerCpuClock, sched::PerCpuScheduler, sync::Once},
+    sys::{
+        clock::PerCpuClock,
+        sched::{CpuSummary, PerCpuScheduler},
+        sync::Once,
+    },
 };
 
 #[used]
@@ -72,7 +76,11 @@ pub struct PlatformFields {
 /// Kernel context unique to each CPU core.
 ///
 /// The RISC-V trap entry assembly indexes the leading fields by fixed offsets.
-#[repr(C)]
+///
+/// Records are cache-line aligned and padded so that one CPU's frequently
+/// written trap fields never share a line with another CPU's record or with
+/// the locks that remote CPUs hammer.
+#[repr(C, align(128))]
 pub struct CoreLocal {
     /// Stack used by the kernel on IRQs.
     pub kernel_stack: u64,
@@ -89,17 +97,25 @@ pub struct CoreLocal {
     /// Page-table root currently active on this CPU.
     pub(crate) active_address_root: AtomicU64,
 
+    /// Nesting depth for trap/interrupt handling on this CPU.
+    pub interrupt_depth: usize,
+
+    /// Number of IRQ spinlocks held by this CPU.
+    ///
+    /// Used to catch code that tries to sleep while holding a spinlock.
+    pub(crate) spinlock_depth: AtomicUsize,
+
     /// Timer state owned by this CPU.
     pub(crate) clock: Once<PerCpuClock>,
 
     /// Scheduler state owned by this CPU.
     pub(crate) scheduler: Once<PerCpuScheduler>,
 
-    /// Deferred IPI work queued for this CPU.
-    pub(crate) ipi: Once<PerCpuIpi>,
+    /// Lock-free scheduler load summary published for remote CPUs.
+    pub(crate) sched_summary: CpuSummary,
 
-    /// Nesting depth for trap/interrupt handling on this CPU.
-    pub interrupt_depth: usize,
+    /// Deferred IPI work queued for this CPU.
+    pub(crate) ipi: PerCpuIpi,
 
     /// Platform specific context.
     #[allow(dead_code)]
@@ -139,10 +155,12 @@ impl CoreLocal {
             user_stack: 0,
             current_thread: 0,
             active_address_root: AtomicU64::new(0),
+            interrupt_depth: 0,
+            spinlock_depth: AtomicUsize::new(0),
             clock: Once::new(),
             scheduler: Once::new(),
-            ipi: Once::new(),
-            interrupt_depth: 0,
+            sched_summary: CpuSummary::new(),
+            ipi: PerCpuIpi::new(),
             platform: PlatformFields::new(),
         }
     }
@@ -156,7 +174,7 @@ pub struct InterruptContextGuard {
 struct CpuRecord {
     logical_id: usize,
     platform_id: u64,
-    core_local_addr: usize,
+    core_local: &'static CoreLocal,
     online: AtomicBool,
 }
 
@@ -164,21 +182,26 @@ struct SmpState {
     cpus: Box<[CpuRecord]>,
 }
 
-const IPI_QUEUE_CAPACITY: usize = 32;
+const IPI_MAX_CALLBACKS: usize = 64;
 const IRQ_SPIN_BACKOFF_MAX: u32 = 64;
 
-struct IpiJob {
-    callback: fn(),
+/// How long the BSP waits for application processors before giving up on them.
+const AP_STARTUP_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// Registry of distinct IPI callbacks.
+///
+/// Callbacks are `'static` function items and the registry is append-only, so
+/// a slot's address never changes once published. That lets both `send_ipi`
+/// and the drain path work from a lock-free pending bitmask instead of a
+/// per-CPU queue with its own spinlock on the trap-return path.
+struct IpiRegistry {
+    slots: [AtomicUsize; IPI_MAX_CALLBACKS],
+    len: AtomicUsize,
 }
 
-struct IpiQueue {
-    head: usize,
-    len: usize,
-    jobs: [Option<IpiJob>; IPI_QUEUE_CAPACITY],
-}
-
+/// Pending IPI callbacks for one CPU, one bit per registry slot.
 pub(crate) struct PerCpuIpi {
-    queue: IrqSpinLock<IpiQueue>,
+    pending: AtomicU64,
 }
 
 /// Broadcast selector used by [`send_ipi`].
@@ -190,16 +213,84 @@ pub enum IpiTarget {
     Single(usize),
 }
 
+static IPI_REGISTRY: IpiRegistry = IpiRegistry::new();
+static IPI_REGISTRATION: IrqSpinLock<()> = IrqSpinLock::new(());
 static SMP_STATE: Once<SmpState> = Once::new();
 static TOTAL_CPUS: AtomicUsize = AtomicUsize::new(1);
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 
+impl IpiRegistry {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicUsize::new(0) }; IPI_MAX_CALLBACKS],
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn find(&self, address: usize) -> Option<usize> {
+        let len = self.len.load(Ordering::Acquire);
+        (0..len).find(|slot| self.slots[*slot].load(Ordering::Relaxed) == address)
+    }
+
+    /// Returns the stable slot index for `callback`, registering it if needed.
+    fn slot_for(&self, callback: fn()) -> usize {
+        let address = callback as usize;
+        if let Some(slot) = self.find(address) {
+            return slot;
+        }
+
+        let _registration = IPI_REGISTRATION.lock();
+        if let Some(slot) = self.find(address) {
+            return slot;
+        }
+
+        let slot = self.len.load(Ordering::Relaxed);
+        assert!(
+            slot < IPI_MAX_CALLBACKS,
+            "smp: too many distinct IPI callbacks"
+        );
+        self.slots[slot].store(address, Ordering::Relaxed);
+        self.len.store(slot + 1, Ordering::Release);
+        slot
+    }
+
+    fn callback(&self, slot: usize) -> fn() {
+        let address = self.slots[slot].load(Ordering::Relaxed);
+        assert!(address != 0, "smp: unregistered IPI slot {slot}");
+        // SAFETY: every published slot address comes from a `fn()` item that
+        // lives for the whole kernel lifetime, and the registry is
+        // append-only so a published address is never reused or invalidated.
+        unsafe { core::mem::transmute::<usize, fn()>(address) }
+    }
+}
+
+impl PerCpuIpi {
+    const fn new() -> Self {
+        Self {
+            pending: AtomicU64::new(0),
+        }
+    }
+
+    /// Marks `slot` pending and reports whether it was newly queued.
+    fn post(&self, slot: usize) -> bool {
+        let bit = 1u64 << slot;
+        self.pending.fetch_or(bit, Ordering::AcqRel) & bit == 0
+    }
+
+    fn take(&self) -> u64 {
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        self.pending.swap(0, Ordering::AcqRel)
+    }
+}
+
 impl CpuRecord {
-    fn new_bsp(platform_id: u64, core_local: *const CoreLocal) -> Self {
+    fn new_bsp(platform_id: u64, core_local: &'static CoreLocal) -> Self {
         Self {
             logical_id: 0,
             platform_id,
-            core_local_addr: core_local as usize,
+            core_local,
             online: AtomicBool::new(true),
         }
     }
@@ -208,8 +299,7 @@ impl CpuRecord {
         Self {
             logical_id,
             platform_id,
-            core_local_addr: Box::leak(Box::new(CoreLocal::new(logical_id))) as *mut CoreLocal
-                as usize,
+            core_local: Box::leak(Box::new(CoreLocal::new(logical_id))),
             online: AtomicBool::new(false),
         }
     }
@@ -218,8 +308,12 @@ impl CpuRecord {
         self.online.load(Ordering::Acquire)
     }
 
+    fn core_local(&self) -> &'static CoreLocal {
+        self.core_local
+    }
+
     fn core_local_ptr(&self) -> *const CoreLocal {
-        self.core_local_addr as *const CoreLocal
+        self.core_local as *const CoreLocal
     }
 
     fn mark_online(&self) -> usize {
@@ -242,80 +336,16 @@ impl SmpState {
         self.cpus.iter().find(|cpu| cpu.platform_id == platform_id)
     }
 
+    /// Returns the record for `logical_id`.
+    ///
+    /// Records are stored in logical order, so this is a direct index rather
+    /// than a scan. Scheduler locking resolves core-local state through this
+    /// path on every acquisition.
+    #[inline]
     fn by_logical_id(&self, logical_id: usize) -> Option<&CpuRecord> {
-        self.cpus.iter().find(|cpu| cpu.logical_id == logical_id)
-    }
-}
-
-impl IpiJob {
-    fn new(callback: fn()) -> Self {
-        Self { callback }
-    }
-
-    fn is_equivalent(&self, other: &Self) -> bool {
-        self.callback as usize == other.callback as usize
-    }
-
-    fn run(self) {
-        (self.callback)();
-    }
-}
-
-impl IpiQueue {
-    const fn new() -> Self {
-        Self {
-            head: 0,
-            len: 0,
-            jobs: [const { None }; IPI_QUEUE_CAPACITY],
-        }
-    }
-
-    fn push(&mut self, job: IpiJob) -> bool {
-        if self.contains_equivalent(&job) {
-            return false;
-        }
-
-        assert!(self.len < IPI_QUEUE_CAPACITY, "smp: cpu IPI queue overflow");
-
-        let slot = (self.head + self.len) % IPI_QUEUE_CAPACITY;
-        self.jobs[slot] = Some(job);
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<IpiJob> {
-        if self.len == 0 {
-            return None;
-        }
-
-        let slot = self.head;
-        let job = self.jobs[slot].take();
-        self.head = (self.head + 1) % IPI_QUEUE_CAPACITY;
-        self.len -= 1;
-        job
-    }
-
-    fn contains_equivalent(&self, needle: &IpiJob) -> bool {
-        for offset in 0..self.len {
-            let slot = (self.head + offset) % IPI_QUEUE_CAPACITY;
-            if self.jobs[slot]
-                .as_ref()
-                .map(|job| job.is_equivalent(needle))
-                .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-}
-
-impl PerCpuIpi {
-    fn new() -> Self {
-        Self {
-            queue: IrqSpinLock::new(IpiQueue::new()),
-        }
+        let record = self.cpus.get(logical_id)?;
+        debug_assert_eq!(record.logical_id, logical_id);
+        Some(record)
     }
 }
 
@@ -368,6 +398,7 @@ impl<T: ?Sized> IrqSpinLock<T> {
         let restore_irqs = arch::irqstate();
         arch::irqset(false);
         self.acquire();
+        enter_spinlock();
 
         IrqSpinLockGuard {
             lock: self,
@@ -384,6 +415,7 @@ impl<T: ?Sized> IrqSpinLock<T> {
         arch::irqset(false);
 
         if self.try_acquire() {
+            enter_spinlock();
             return Some(IrqSpinLockGuard {
                 lock: self,
                 restore_irqs,
@@ -500,6 +532,7 @@ impl<T: ?Sized> IrqSpinLockGuard<'_, T> {
         if self.held {
             self.lock.release();
             self.held = false;
+            leave_spinlock();
         }
     }
 }
@@ -547,16 +580,12 @@ pub fn discover() {
     TOTAL_CPUS.store(total, Ordering::Release);
     ONLINE_CPUS.store(1, Ordering::Release);
     SMP_STATE.call_once(|| SmpState { cpus });
-
-    for cpu_id in 0..total {
-        core_local(cpu_id)
-            .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
-            .ipi
-            .call_once(PerCpuIpi::new);
-    }
 }
 
 /// Starts every application processor found by [`discover`].
+///
+/// Application processors that fail to report in are abandoned rather than
+/// treated as fatal: the kernel keeps running on the CPUs that did come up.
 pub(crate) fn start_secondary_cpus() {
     let response = match SMP_REQUEST.get_response() {
         Some(response) => response,
@@ -580,14 +609,21 @@ pub(crate) fn start_secondary_cpus() {
         cpu.goto_address.write(ap_entry);
     }
 
-    let deadline = crate::sys::clock::monotonic_ns().saturating_add(1_000_000_000);
+    let deadline = crate::sys::clock::monotonic_ns().saturating_add(AP_STARTUP_TIMEOUT_NS);
     while online_cpus() < state.cpu_count() {
         if crate::sys::clock::monotonic_ns() >= deadline {
-            panic!(
-                "smp: timed out waiting for APs ({}/{})",
-                online_cpus(),
+            let online = online_cpus();
+            warn!(
+                "smp: {} of {} CPU(s) came online; continuing without the rest",
+                online,
                 state.cpu_count()
             );
+            for cpu_id in 0..state.cpu_count() {
+                if !is_online(cpu_id) {
+                    warn!("smp: cpu{cpu_id} did not report in and stays offline");
+                }
+            }
+            return;
         }
         spin_loop();
     }
@@ -625,10 +661,7 @@ pub fn platform_id(cpu_id: usize) -> Option<u64> {
 
 /// Returns the immutable core-local record for `cpu_id`.
 pub(crate) fn core_local(cpu_id: usize) -> Option<&'static CoreLocal> {
-    let cpu = smp_state().by_logical_id(cpu_id)?;
-    // SAFETY: each record stores a stable, leaked `CoreLocal` allocation that
-    // remains valid for the kernel lifetime.
-    Some(unsafe { &*cpu.core_local_ptr() })
+    smp_state().by_logical_id(cpu_id).map(CpuRecord::core_local)
 }
 
 /// Returns whether `cpu_id` is currently online.
@@ -673,6 +706,49 @@ pub fn in_interrupt_context() -> bool {
         .unwrap_or(false)
 }
 
+#[inline]
+fn enter_spinlock() {
+    if let Some(cpu) = arch::thiscpu_opt() {
+        cpu.spinlock_depth.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn leave_spinlock() {
+    if let Some(cpu) = arch::thiscpu_opt() {
+        let previous = cpu.spinlock_depth.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous != 0, "smp: spinlock depth underflow");
+    }
+}
+
+/// Returns the number of IRQ spinlocks held by the current CPU.
+///
+/// Sleeping while holding one deadlocks, so blocking primitives assert on this
+/// in debug builds.
+#[inline]
+pub(crate) fn spinlock_depth() -> usize {
+    arch::thiscpu_opt()
+        .map(|cpu| cpu.spinlock_depth.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Asserts that the caller may block on the current CPU.
+///
+/// Blocking requires interrupts to be deliverable, so no IRQ spinlock may be
+/// held and the CPU must not be inside a trap handler.
+#[inline]
+pub(crate) fn assert_blockable(context: &str) {
+    debug_assert!(
+        spinlock_depth() == 0,
+        "{context}: blocked while holding {} IRQ spinlock(s)",
+        spinlock_depth()
+    );
+    debug_assert!(
+        !in_interrupt_context(),
+        "{context}: blocked inside interrupt context"
+    );
+}
+
 /// Queues `callback` for one or more CPUs and nudges them through the kernel's
 /// IPI path.
 ///
@@ -685,6 +761,7 @@ pub fn in_interrupt_context() -> bool {
 /// Returns the number of CPUs that accepted a new queued callback.
 pub fn send_ipi(callback: fn(), target: IpiTarget) -> usize {
     let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
+    let slot = IPI_REGISTRY.slot_for(callback);
     let mut queued = 0usize;
 
     match target {
@@ -694,14 +771,19 @@ pub fn send_ipi(callback: fn(), target: IpiTarget) -> usize {
                     continue;
                 }
 
-                if queue_ipi_job(cpu_id, callback) {
-                    kick_cpu(cpu_id, this_cpu);
+                if queue_ipi_job(cpu_id, slot) {
                     queued += 1;
                 }
             }
+
+            // One broadcast is cheaper than an interrupt per CPU. Waking a CPU
+            // whose bit was already pending just makes it drain sooner.
+            if queued != 0 {
+                arch::send_ipi_all_excluding_self();
+            }
         }
         IpiTarget::Single(cpu_id) => {
-            if queue_ipi_job(cpu_id, callback) {
+            if queue_ipi_job(cpu_id, slot) {
                 kick_cpu(cpu_id, this_cpu);
                 queued = 1;
             }
@@ -715,30 +797,21 @@ pub fn send_ipi(callback: fn(), target: IpiTarget) -> usize {
 ///
 /// This is called from the scheduler's trap-return path so every delivered IPI
 /// callback runs before the CPU decides whether to resume or switch threads.
+/// The common case is a single relaxed load of an empty bitmask.
 pub(crate) fn drain_ipi_queue() {
-    let cpu_id = arch::thiscpu().id;
-    let queue = &core_local(cpu_id)
-        .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
-        .ipi
-        .get()
-        .unwrap_or_else(|| panic!("smp: cpu{cpu_id} IPI queue not initialized"))
-        .queue;
+    let Some(cpu) = arch::thiscpu_opt() else {
+        return;
+    };
 
-    loop {
-        let job = {
-            let mut queue = queue.lock();
-            queue.pop()
-        };
-
-        let Some(job) = job else {
-            return;
-        };
-
-        job.run();
+    let mut pending = cpu.ipi.take();
+    while pending != 0 {
+        let slot = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        (IPI_REGISTRY.callback(slot))();
     }
 }
 
-fn queue_ipi_job(cpu_id: usize, callback: fn()) -> bool {
+fn queue_ipi_job(cpu_id: usize, slot: usize) -> bool {
     let Some(target) = smp_state().by_logical_id(cpu_id) else {
         return false;
     };
@@ -749,11 +822,7 @@ fn queue_ipi_job(cpu_id: usize, callback: fn()) -> bool {
     core_local(cpu_id)
         .unwrap_or_else(|| panic!("smp: missing core-local record for cpu{cpu_id}"))
         .ipi
-        .get()
-        .unwrap_or_else(|| panic!("smp: cpu{cpu_id} IPI queue not initialized"))
-        .queue
-        .lock()
-        .push(IpiJob::new(callback))
+        .post(slot)
 }
 
 fn kick_cpu(cpu_id: usize, this_cpu: Option<usize>) {
@@ -771,7 +840,7 @@ fn discover_cpus(response: &limine::response::MpResponse) -> Box<[CpuRecord]> {
     let bsp_platform_id = bsp_platform_id(response);
     let mut cpus = Vec::with_capacity(response.cpus().len().max(1));
 
-    let bsp_core_local = arch::thiscpu() as *const CoreLocal;
+    let bsp_core_local = arch::thiscpu();
     cpus.push(CpuRecord::new_bsp(bsp_platform_id, bsp_core_local));
 
     let mut next_logical_id = 1usize;

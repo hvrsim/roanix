@@ -31,6 +31,7 @@ pub mod addr;
 pub mod alloc;
 mod error;
 mod io;
+pub(crate) mod kstack;
 mod map;
 mod object;
 mod page;
@@ -157,6 +158,7 @@ pub fn init() {
     phys::init();
     alloc::init();
     init_state();
+    kstack::init();
 }
 
 fn init_state() {

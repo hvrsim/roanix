@@ -194,6 +194,10 @@ impl WaitRegistrations {
         }
     }
 
+    fn from_slice(waiters: &[EventWaiter]) -> RegistrationSlice<'_> {
+        RegistrationSlice(waiters)
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Inline { len, .. } => *len,
@@ -211,6 +215,34 @@ impl WaitRegistrations {
             }
             Self::Heap(waiters) => &waiters[index],
         }
+    }
+}
+
+/// Uniform read access to a set of pinned registrations.
+trait Registrations {
+    fn len(&self) -> usize;
+    fn get(&self, index: usize) -> &EventWaiter;
+}
+
+struct RegistrationSlice<'a>(&'a [EventWaiter]);
+
+impl Registrations for RegistrationSlice<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, index: usize) -> &EventWaiter {
+        &self.0[index]
+    }
+}
+
+impl Registrations for WaitRegistrations {
+    fn len(&self) -> usize {
+        WaitRegistrations::len(self)
+    }
+
+    fn get(&self, index: usize) -> &EventWaiter {
+        WaitRegistrations::get(self, index)
     }
 }
 
@@ -359,11 +391,13 @@ impl Event {
         let group = core::pin::pin!(WaitGroup::new(current, park_seq));
         let group_ptr = group.as_ref().get_ref() as *const WaitGroup as *mut WaitGroup;
         let waiter = core::pin::pin!(EventWaiter::new(self, group_ptr, 0));
-        let registrations = core::slice::from_ref(waiter.as_ref().get_ref());
+        let registrations = WaitRegistrations::from_slice(core::slice::from_ref(
+            waiter.as_ref().get_ref(),
+        ));
 
         let winner = wait_with_registrations(
             core::slice::from_ref(&self),
-            registrations,
+            &registrations,
             group.as_ref().get_ref(),
         );
         assert_eq!(winner, 0, "event: single wait returned invalid winner");
@@ -401,7 +435,7 @@ impl Event {
 
         // Pinning keeps inline registrations stable; large sets use a stable
         // boxed slice. Every node is unlinked before this storage is dropped.
-        wait_with_registration_set(
+        wait_with_registrations(
             events,
             registrations.as_ref().get_ref(),
             group.as_ref().get_ref(),
@@ -509,50 +543,11 @@ impl Default for Event {
     }
 }
 
-fn wait_with_registrations(
+/// Registers on each event in turn, parks if none claimed the wait, and then
+/// unregisters everything before returning the winning index.
+fn wait_with_registrations<R: Registrations + ?Sized>(
     events: &[&Event],
-    registrations: &[EventWaiter],
-    group: &WaitGroup,
-) -> usize {
-    let mut claimed_locally = false;
-
-    for (event, waiter) in events.iter().zip(registrations) {
-        if group.winner().is_some() {
-            break;
-        }
-        if event.register(waiter) {
-            continue;
-        }
-
-        if group.try_claim(waiter.index) {
-            claimed_locally = true;
-            group.target().wake();
-        }
-        break;
-    }
-
-    if !claimed_locally {
-        // Keep the park/reschedule handoff non-preemptible. A concurrent wake
-        // is still safe before `park_current` because the sequence handshake
-        // converts it into a pending wake.
-        arch::irqset(false);
-        sched::park_current(group.thread, group.park_seq);
-    }
-
-    for waiter in registrations {
-        // SAFETY: every registration was constructed from a live borrowed
-        // event, which remains borrowed for the duration of this wait.
-        unsafe { &*waiter.event }.unregister(waiter);
-    }
-
-    group
-        .winner()
-        .expect("event: wait resumed without a claimed event")
-}
-
-fn wait_with_registration_set(
-    events: &[&Event],
-    registrations: &WaitRegistrations,
+    registrations: &R,
     group: &WaitGroup,
 ) -> usize {
     assert_eq!(
@@ -605,4 +600,5 @@ fn assert_wait_context() {
         arch::irqstate() && !smp::in_interrupt_context(),
         "event: wait requires thread context with interrupts enabled"
     );
+    smp::assert_blockable("event: wait");
 }

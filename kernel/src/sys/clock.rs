@@ -6,7 +6,12 @@
 //!
 
 use alloc::vec::Vec;
-use core::{hint::spin_loop, ptr::NonNull, time::Duration};
+use core::{
+    hint::spin_loop,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::info;
@@ -25,6 +30,8 @@ use crate::{
 static CLOCK_SETUP: Once<()> = Once::new();
 static CLOCKSOURCE: Once<RegisteredClockSource> = Once::new();
 static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
+/// Offset from the monotonic clock to the Unix epoch, or `0` when unknown.
+static REALTIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 
 const CLOCK_SCALE_MAX_SHIFT: u32 = 48;
 const NSEC_PER_SEC: u128 = 1_000_000_000;
@@ -42,6 +49,16 @@ pub trait ClockSource: Sync {
 
     /// Current raw counter value.
     fn counter(&self) -> u64;
+
+    /// Number of significant bits in the raw counter.
+    ///
+    /// Kernel timekeeping assumes a counter that does not wrap within the
+    /// system's lifetime, so only 64-bit sources are accepted. Narrower
+    /// hardware must be wrapped in a source that widens the count before it is
+    /// registered.
+    fn counter_bits(&self) -> u32 {
+        64
+    }
 }
 
 /// One-shot local interrupt source used to deliver deadlines on the current CPU.
@@ -75,6 +92,11 @@ pub(crate) struct ClockScale {
 struct RegisteredClockSource {
     source: &'static dyn ClockSource,
     scale: ClockScale,
+    /// Raw counter value observed at registration.
+    ///
+    /// Subtracting it makes [`monotonic_ns`] start near zero at boot rather
+    /// than reporting whatever the hardware counter happened to hold.
+    epoch: u64,
 }
 
 /// Local timer state stored in [`crate::sys::smp::CoreLocal`].
@@ -95,6 +117,11 @@ struct Timer {
     link: RBTreeLink,
     deadline_ns: u64,
     order: u64,
+    /// CPU whose timer tree owns this entry.
+    ///
+    /// A sleeper may resume on a different CPU, so removal has to go back to
+    /// the tree the timer was inserted into.
+    cpu_id: usize,
     target: TimerTarget,
 }
 
@@ -138,27 +165,33 @@ struct LocalClockState {
 }
 
 impl Timer {
-    const fn new(deadline_ns: u64, target: TimerTarget) -> Self {
+    const fn new(deadline_ns: u64, cpu_id: usize, target: TimerTarget) -> Self {
         Self {
             link: RBTreeLink::new(),
             deadline_ns,
             order: 0,
+            cpu_id,
             target,
         }
     }
 
-    fn for_event(deadline_ns: u64, event: &Event) -> Self {
-        Self::new(deadline_ns, TimerTarget::Event(NonNull::from(event)))
+    fn for_event(deadline_ns: u64, cpu_id: usize, event: &Event) -> Self {
+        Self::new(deadline_ns, cpu_id, TimerTarget::Event(NonNull::from(event)))
     }
 
-    fn for_thread(deadline_ns: u64, thread: *mut Thread, park_seq: u64) -> Self {
+    fn for_thread(deadline_ns: u64, cpu_id: usize, thread: *mut Thread, park_seq: u64) -> Self {
         Self::new(
             deadline_ns,
+            cpu_id,
             TimerTarget::Thread {
                 thread: NonNull::new(thread).expect("clock: null sleep thread"),
                 park_seq,
             },
         )
+    }
+
+    fn is_linked(&self) -> bool {
+        self.link.is_linked()
     }
 }
 
@@ -338,9 +371,16 @@ pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
         "clock: clocksource already registered"
     );
     let frequency_hz = clocksource.frequency_hz();
+    assert_eq!(
+        clocksource.counter_bits(),
+        64,
+        "clock: clocksource {} must present a full 64-bit counter",
+        clocksource.name()
+    );
     CLOCKSOURCE.call_once(|| RegisteredClockSource {
         source: clocksource,
         scale: ClockScale::new(frequency_hz),
+        epoch: clocksource.counter(),
     });
 
     let (whole, frac, unit) = format_frequency(frequency_hz);
@@ -369,20 +409,12 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 /// Starts local timer delivery on the current CPU.
 pub(crate) fn start_cpu() {
     CLOCK_SETUP.call_once(bootstrap_clocks);
-
-    let arm = local_clock().lock().start();
-
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
+    with_local_clock(|local| (local.start(), ()));
 }
 
 /// Stops local timer delivery on the current CPU.
 pub fn stop() {
-    let arm = local_clock().lock().stop();
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
+    with_local_clock(|local| (local.stop(), ()));
 }
 
 /// Busy-waits for the requested duration using the active local counter.
@@ -410,67 +442,95 @@ pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<
         return events.iter().position(|event| event.is_signaled());
     }
 
-    assert!(arch::irqstate() && !smp::in_interrupt_context());
+    assert!(
+        arch::irqstate() && !smp::in_interrupt_context(),
+        "clock: timed wait requires thread context with interrupts enabled"
+    );
+    smp::assert_blockable("clock: timed wait");
+
     let current = sched::current_thread();
     // SAFETY: the scheduler keeps the current thread allocation live while it
     // is executing.
-    unsafe { &*current }.pin_migration();
+    let current_ref = unsafe { &*current };
+    // Pin so the timer stays associated with the CPU that owns its tree.
+    current_ref.pin_migration();
     arch::irqset(false);
 
+    let cpu_id = arch::thiscpu().id;
     let now_ns = monotonic_ns();
     let timeout_event = core::pin::pin!(Event::new());
     let mut timer = core::pin::pin!(Timer::for_event(
         now_ns.saturating_add(duration_ns),
+        cpu_id,
         timeout_event.as_ref().get_ref(),
     ));
-    let arm = {
-        let mut local = local_clock().lock();
-        local.insert_timer(timer.as_mut().get_mut())
-    };
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
-
+    with_local_clock(|local| (local.insert_timer(timer.as_mut().get_mut()), ()));
     arch::irqset(true);
-    let mut wait_events = Vec::with_capacity(events.len() + 1);
-    wait_events.extend_from_slice(events);
-    wait_events.push(timeout_event.as_ref().get_ref());
-    let winner = Event::wait_any(&wait_events);
-    if winner == events.len() {
-        // SAFETY: this balances the pin acquired before timer registration.
-        unsafe { &*current }.unpin_migration();
-        return None;
-    }
 
-    arch::irqset(false);
-    let arm = local_clock().lock().remove_timer(timer.as_ref().get_ref());
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
-    arch::irqset(true);
-    // SAFETY: this balances the pin acquired before timer registration.
-    unsafe { &*current }.unpin_migration();
-    Some(winner)
+    let winner = wait_with_timeout_event(events, timeout_event.as_ref().get_ref());
+
+    // Always unlink: on the timeout path the timer already fired, but any
+    // other outcome leaves this stack-pinned node in the CPU's timer tree.
+    remove_timer(timer.as_ref().get_ref());
+    current_ref.unpin_migration();
+
+    (winner != events.len()).then_some(winner)
 }
 
-/// Returns monotonic nanoseconds derived from the active local counter.
+/// Waits on `events` plus a trailing timeout event without heap allocation for
+/// the common small-set case.
+fn wait_with_timeout_event(events: &[&Event], timeout: &Event) -> usize {
+    const INLINE: usize = 8;
+
+    if events.len() < INLINE {
+        let mut inline: [&Event; INLINE] = [timeout; INLINE];
+        inline[..events.len()].copy_from_slice(events);
+        inline[events.len()] = timeout;
+        return Event::wait_any(&inline[..events.len() + 1]);
+    }
+
+    let mut wait_events = Vec::with_capacity(events.len() + 1);
+    wait_events.extend_from_slice(events);
+    wait_events.push(timeout);
+    Event::wait_any(&wait_events)
+}
+
+/// Returns monotonic nanoseconds since the clocksource was registered.
 #[inline]
 pub fn monotonic_ns() -> u64 {
     let registered = registered_clocksource();
-    registered.scale.cycles_to_ns(registered.source.counter())
+    let elapsed = registered
+        .source
+        .counter()
+        .wrapping_sub(registered.epoch);
+    registered.scale.cycles_to_ns(elapsed)
+}
+
+/// Returns wall-clock nanoseconds since the Unix epoch.
+///
+/// Until a real-time clock driver calls [`set_realtime_offset`] this tracks
+/// [`monotonic_ns`], so callers get a consistent but epoch-less timeline
+/// rather than silently mislabelled monotonic time.
+#[inline]
+pub fn realtime_ns() -> u64 {
+    monotonic_ns().saturating_add(REALTIME_OFFSET_NS.load(Ordering::Relaxed))
+}
+
+/// Returns whether wall-clock time has been established by a driver.
+#[inline]
+pub fn realtime_is_set() -> bool {
+    REALTIME_OFFSET_NS.load(Ordering::Relaxed) != 0
+}
+
+/// Records the offset between the monotonic clock and the Unix epoch.
+pub fn set_realtime_offset(offset_ns: u64) {
+    REALTIME_OFFSET_NS.store(offset_ns, Ordering::Relaxed);
 }
 
 /// Updates the current CPU's scheduler deadline and re-arms the local timer if
 /// needed.
 pub fn set_scheduler_deadline(deadline_ns: u64) {
-    let arm = {
-        let mut local = local_clock().lock();
-        local.set_scheduler_deadline(deadline_ns)
-    };
-
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
+    with_local_clock(|local| (local.set_scheduler_deadline(deadline_ns), ()));
 }
 
 /// Handles a local timer interrupt on the current CPU.
@@ -488,22 +548,49 @@ pub fn handle_local_timer_interrupt() {
                 unsafe { event.as_ref() }.signal();
             }
             TimerTarget::Thread { thread, park_seq } => {
-                assert!(
-                    sched::wake(thread.as_ptr(), park_seq),
-                    "clock: expired sleep timer had a stale park sequence"
-                );
+                // A stale sequence just means the sleeper was already woken by
+                // another path and this expiry lost the race, which is normal.
+                let _ = sched::wake(thread.as_ptr(), park_seq);
             }
         }
     }
 
-    let arm = {
-        let mut local = local_clock().lock();
-        local.finish_interrupt(now_ns)
-    };
+    with_local_clock(|local| (local.finish_interrupt(now_ns), ()));
+}
 
+/// Runs `f` against the local clock state and programs any resulting deadline
+/// before releasing the lock.
+///
+/// Programming the hardware inside the critical section keeps
+/// `armed_deadline_ns` and the timer register in agreement. Releasing the lock
+/// first would re-enable interrupts and let a timer IRQ reprogram the hardware
+/// in between, leaving the two permanently out of sync.
+fn with_local_clock<R>(f: impl FnOnce(&mut LocalClockState) -> (Option<u64>, R)) -> R {
+    let mut local = local_clock().lock();
+    let (arm, result) = f(&mut local);
     if let Some(deadline) = arm {
         apply_deadline(deadline);
     }
+    result
+}
+
+/// Runs `f` against a specific CPU's clock state.
+///
+/// Only the owning CPU may program its own timer hardware, so a remote update
+/// records the new deadline and relies on that CPU re-arming on its next trap.
+fn with_clock_for_cpu<R>(
+    cpu_id: usize,
+    f: impl FnOnce(&mut LocalClockState) -> (Option<u64>, R),
+) -> R {
+    let local_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
+    let mut local = clock_for_cpu(cpu_id).lock();
+    let (arm, result) = f(&mut local);
+    if let Some(deadline) = arm
+        && local_cpu == Some(cpu_id)
+    {
+        apply_deadline(deadline);
+    }
+    result
 }
 
 fn delay_ns(ns: u64) {
@@ -524,7 +611,11 @@ fn sleep_ns(ns: u64) {
         return;
     }
 
-    assert!(arch::irqstate() && !smp::in_interrupt_context());
+    assert!(
+        arch::irqstate() && !smp::in_interrupt_context(),
+        "clock: sleep requires thread context with interrupts enabled"
+    );
+    smp::assert_blockable("clock: sleep");
 
     // Keep timer setup on one CPU so the queue owner, measured timebase,
     // and programmed local deadline always match.
@@ -533,25 +624,38 @@ fn sleep_ns(ns: u64) {
     let current = sched::current_thread();
     // SAFETY: the scheduler keeps the current thread allocation live while it
     // is executing.
-    let park_seq = unsafe { (&*current).prepare_park() };
+    let current_ref = unsafe { &*current };
+    // Pin so the sleeper resumes on the CPU that owns its timer, keeping the
+    // removal below on the same tree the insertion used.
+    current_ref.pin_migration();
+    let park_seq = current_ref.prepare_park();
+    let cpu_id = arch::thiscpu().id;
     let now_ns = monotonic_ns();
     let mut timer = core::pin::pin!(Timer::for_thread(
         now_ns.saturating_add(ns),
+        cpu_id,
         current,
         park_seq,
     ));
 
-    let arm = {
-        let mut local = local_clock().lock();
-        local.insert_timer(timer.as_mut().get_mut())
-    };
-
-    if let Some(deadline) = arm {
-        apply_deadline(deadline);
-    }
+    with_local_clock(|local| (local.insert_timer(timer.as_mut().get_mut()), ()));
 
     sched::park_current(current, park_seq);
-    debug_assert!(!timer.as_ref().get_ref().link.is_linked());
+
+    // The timer normally fires and removes itself, but any other wake path
+    // would leave this stack-pinned node linked in the CPU's timer tree and
+    // dangling as soon as this frame returns.
+    remove_timer(timer.as_ref().get_ref());
+    current_ref.unpin_migration();
+}
+
+/// Unlinks `timer` from the tree it was inserted into, if still linked.
+fn remove_timer(timer: &Timer) {
+    if !timer.is_linked() {
+        return;
+    }
+
+    with_clock_for_cpu(timer.cpu_id, |local| (local.remove_timer(timer), ()));
 }
 
 fn bootstrap_clocks() {

@@ -76,6 +76,8 @@ syscall_table:
     .quad syscall_thread_exit
     .quad syscall_file_umask
     .quad syscall_file_umount
+    .quad syscall_process_setpriority
+    .quad syscall_process_getpriority
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

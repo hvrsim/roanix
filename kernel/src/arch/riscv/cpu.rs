@@ -502,6 +502,11 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
         }
     }
 
+    let (cpu_id, tid) = crate::arch::thiscpu_opt()
+        .map(|cpu| (cpu.id, cpu.current_thread))
+        .unwrap_or((usize::MAX, 0));
+    crate::mem::kstack::report_guard_fault(frame.stval, cpu_id, tid);
+
     panic!(
         "CPU trap triggered at IP=0x{:X}, stval=0x{:X}, cause=0x{:X}",
         frame.ip, frame.stval, frame.scause

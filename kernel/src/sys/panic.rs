@@ -64,7 +64,7 @@ impl Write for PanicWriter {
 fn panic_log(args: core::fmt::Arguments) {
     let mut writer = PanicWriter::new();
     write!(&mut writer, "{}", args).ok();
-    debug::write_to_sinks(writer.buf.as_ptr(), writer.buflen);
+    debug::write_to_sinks(&writer.buf[..writer.buflen]);
 }
 
 macro_rules! plog {
@@ -208,10 +208,32 @@ fn perform_bt(symtab: Option<&[Entry64]>, kfile: Option<&ElfFile>) {
 
 #[inline(always)]
 fn frame_ptr_in_bounds(ptr: usize, stack_ptr: usize) -> bool {
-    ptr != 0
-        && ptr.is_multiple_of(core::mem::align_of::<usize>())
-        && ptr >= stack_ptr
-        && ptr.saturating_sub(stack_ptr) < BACKTRACE_STACK_WINDOW
+    if ptr == 0 || !ptr.is_multiple_of(core::mem::align_of::<usize>()) || ptr < stack_ptr {
+        return false;
+    }
+
+    // Prefer the running thread's real stack extent so a corrupt frame chain
+    // can never dereference unmapped memory and fault while reporting the
+    // original panic.
+    //
+    // The bounds come from the core-local `kernel_stack` value the scheduler
+    // publishes in `activate_current`. Reading it takes no lock, which matters
+    // because panics frequently originate inside a scheduler critical section
+    // whose spinlock is still held.
+    if let Some(cpu) = arch::thiscpu_opt() {
+        let top = cpu.kernel_stack as usize;
+        let base = top.saturating_sub(crate::mem::kstack::STACK_SIZE);
+        if top != 0
+            && crate::mem::kstack::contains_address(top.saturating_sub(1) as u64)
+            && (base..top).contains(&stack_ptr)
+        {
+            return (base..top).contains(&ptr);
+        }
+    }
+
+    // Boot and early-trap stacks are not thread-owned; fall back to a bounded
+    // window above the current stack pointer.
+    ptr.saturating_sub(stack_ptr) < BACKTRACE_STACK_WINDOW
 }
 
 #[inline(always)]

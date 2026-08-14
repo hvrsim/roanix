@@ -4,31 +4,32 @@
 //! Kernel thread storage and bootstrap helpers used by the scheduler.
 //!
 
-use alloc::{
-    alloc::{Layout, alloc_zeroed, handle_alloc_error},
-    boxed::Box,
-    sync::Arc,
-};
+use alloc::{boxed::Box, sync::Arc};
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI8, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::{
     arch,
-    mem::{PAGE_SIZE, VirtAddr, VmSpace},
+    mem::{VirtAddr, VmSpace, kstack},
     proc::Process,
     sys::smp::IrqSpinLock,
 };
 use bitflags::bitflags;
-use intrusive_collections::{LinkedListLink, intrusive_adapter};
+use intrusive_collections::{LinkedListLink, UnsafeRef, intrusive_adapter};
 
 type TrapFrame = crate::arch::cpu::TrapFrame;
 
-const KSTACK_PAGES: usize = 32;
-const KSTACK_SIZE: usize = KSTACK_PAGES * (PAGE_SIZE as usize);
+const KSTACK_SIZE: usize = kstack::STACK_SIZE;
 const STACK_CANARY_WORDS: usize = 8;
 const STACK_CANARY: u64 = 0xC0DE_CAFE_D15C_A11A;
+
+/// Lowest nice value, granting the most CPU share.
+pub(crate) const NICE_MIN: i8 = -20;
+
+/// Highest nice value, granting the least CPU share.
+pub(crate) const NICE_MAX: i8 = 19;
 
 /// Scheduler class assigned to a kernel thread.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -89,6 +90,9 @@ pub(crate) struct Thread {
     /// Intrusive link used by the scheduler reaper queue.
     pub(crate) reap_link: LinkedListLink,
 
+    /// Intrusive link used by the global live-thread registry.
+    pub(crate) all_link: LinkedListLink,
+
     /// Monotonic thread identifier assigned by the scheduler.
     pub(crate) id: usize,
 
@@ -101,6 +105,14 @@ pub(crate) struct Thread {
     /// Miscellaneous scheduler flags.
     pub(crate) flags: ThreadFlags,
 
+    /// Whether the thread is permanently bound to its creation CPU.
+    ///
+    /// This mirrors [`ThreadFlags::NO_MIGRATE`] in an immutable field so that
+    /// migration decisions can read it without the owning CPU's lock, while
+    /// `flags` keeps changing for transient bits such as
+    /// [`ThreadFlags::SLICEEND`].
+    no_migrate: bool,
+
     /// Active priority used for run-queue placement.
     pub(crate) priority: u8,
 
@@ -110,14 +122,34 @@ pub(crate) struct Thread {
     /// Nominal interrupt-thread priority restored after voluntary sleep.
     pub(crate) ithread_base_priority: u8,
 
+    /// Best priority currently lent by blocked lock waiters, or `u8::MAX`.
+    ///
+    /// Priority inheritance keeps a low-priority lock holder from being
+    /// preempted indefinitely while a high-priority thread waits behind it.
+    pub(crate) lent_priority: u8,
+
+    /// Number of active priority boosts held against this thread.
+    ///
+    /// A thread can hold several contended locks at once, so the boost is only
+    /// dropped when the last lender goes away. Until then the lent priority is
+    /// held at the best value seen, which over-boosts slightly rather than
+    /// losing a boost.
+    pub(crate) boost_count: u32,
+
     /// User-visible priority computed from interactivity and nice value.
     pub(crate) user_priority: u8,
 
-    /// Nice value in the traditional `[-20, 20]` range.
-    pub(crate) nice: i8,
+    /// Nice value in the traditional `[-20, 19]` range.
+    ///
+    /// This is published atomically because `setpriority` updates it from
+    /// unrelated threads without taking the owning CPU's scheduler lock.
+    nice: AtomicI8,
 
     /// CPU that currently owns the thread.
-    pub(crate) cpu: usize,
+    ///
+    /// Wake-affinity decisions read this before any scheduler lock is held, so
+    /// it is published atomically.
+    cpu: AtomicUsize,
 
     /// Run-queue bucket index currently holding the thread.
     pub(crate) rqindex: u8,
@@ -132,7 +164,9 @@ pub(crate) struct Thread {
     pub(crate) cpu_last_update_ns: u64,
 
     /// Last point where running-time and slice accounting was refreshed.
-    pub(crate) last_run_ns: u64,
+    ///
+    /// Wake-affinity reads this without the owning CPU's scheduler lock.
+    last_run_ns: AtomicU64,
 
     /// Start of the current voluntary sleep, or `0` while not blocked.
     pub(crate) sleep_start_ns: u64,
@@ -146,8 +180,8 @@ pub(crate) struct Thread {
     /// Fixed-point CPU usage estimate in nanoseconds.
     pub(crate) cpu_estimate: u64,
 
-    /// Backing allocation for the kernel stack.
-    _stack: Box<KernelStack>,
+    /// Backing allocation for the guarded kernel stack.
+    stack: kstack::KernelStack,
 
     /// Initial top-of-stack address used for context setup.
     pub(crate) stack_top: VirtAddr,
@@ -186,12 +220,15 @@ unsafe impl Send for Thread {}
 // SAFETY: shared access is coordinated by the scheduler and low-level locks.
 unsafe impl Sync for Thread {}
 
-// Intrusive list adapter used by scheduler run queues.
-intrusive_adapter!(pub(crate) ThreadAdapter = &'static Thread: Thread { runq_link: LinkedListLink });
-intrusive_adapter!(pub(crate) ExitedThreadAdapter = &'static Thread: Thread { reap_link: LinkedListLink });
-
-#[repr(align(16))]
-struct KernelStack([u8; KSTACK_SIZE]);
+// Intrusive list adapters used by the scheduler.
+//
+// These use `UnsafeRef` rather than `&'static Thread` because the scheduler
+// also hands out `&mut Thread` for the same records while they are linked;
+// holding shared references in the lists at the same time would be an aliasing
+// violation.
+intrusive_adapter!(pub(crate) ThreadAdapter = UnsafeRef<Thread>: Thread { runq_link: LinkedListLink });
+intrusive_adapter!(pub(crate) ExitedThreadAdapter = UnsafeRef<Thread>: Thread { reap_link: LinkedListLink });
+intrusive_adapter!(pub(crate) AllThreadAdapter = UnsafeRef<Thread>: Thread { all_link: LinkedListLink });
 
 const PARK_STATE_IDLE: u8 = 0;
 const PARK_STATE_WAITING: u8 = 1;
@@ -253,8 +290,43 @@ impl Thread {
 
     /// Returns whether the thread may migrate to another CPU.
     pub(crate) fn can_migrate(&self) -> bool {
-        !self.flags.contains(ThreadFlags::NO_MIGRATE)
-            && self.migration_pins.load(Ordering::Acquire) == 0
+        !self.no_migrate && self.migration_pins.load(Ordering::Acquire) == 0
+    }
+
+    /// Returns the CPU that currently owns this thread.
+    #[inline]
+    pub(crate) fn cpu(&self) -> usize {
+        self.cpu.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the CPU that owns this thread.
+    #[inline]
+    pub(crate) fn set_cpu(&self, cpu_id: usize) {
+        self.cpu.store(cpu_id, Ordering::Relaxed);
+    }
+
+    /// Returns the last time running-time accounting was refreshed.
+    #[inline]
+    pub(crate) fn last_run_ns(&self) -> u64 {
+        self.last_run_ns.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the last time running-time accounting was refreshed.
+    #[inline]
+    pub(crate) fn set_last_run_ns(&self, now_ns: u64) {
+        self.last_run_ns.store(now_ns, Ordering::Relaxed);
+    }
+
+    /// Returns the thread's nice value.
+    #[inline]
+    pub(crate) fn nice(&self) -> i8 {
+        self.nice.load(Ordering::Relaxed)
+    }
+
+    /// Updates the thread's nice value, clamped to the supported range.
+    pub(crate) fn set_nice(&self, nice: i8) {
+        self.nice
+            .store(nice.clamp(NICE_MIN, NICE_MAX), Ordering::Relaxed);
     }
 
     /// Returns the thread's current user address space.
@@ -278,6 +350,16 @@ impl Thread {
     /// Returns the process associated with this thread.
     pub(crate) fn process(&self) -> Option<Arc<Process>> {
         self.process.clone()
+    }
+
+    /// Returns whether this thread belongs to process `pid`.
+    ///
+    /// This avoids cloning the `Arc`, which matters on paths that walk the
+    /// live-thread registry with its spinlock held.
+    pub(crate) fn belongs_to_process(&self, pid: usize) -> bool {
+        self.process
+            .as_ref()
+            .is_some_and(|process| process.pid() == pid)
     }
 
     /// Replaces the thread's user address space and returns the previous one.
@@ -310,6 +392,21 @@ impl Thread {
         assert!(previous != 0, "thread: migration pin underflow");
     }
 
+    /// Returns the priority this thread should run at.
+    ///
+    /// Lent priority from blocked lock waiters always wins over the thread's
+    /// own computed priority.
+    #[inline]
+    pub(crate) fn effective_priority(&self) -> u8 {
+        self.base_priority.min(self.lent_priority)
+    }
+
+    /// Recomputes the active priority from the base and any lent priority.
+    #[inline]
+    pub(crate) fn refresh_priority(&mut self) {
+        self.priority = self.effective_priority();
+    }
+
     /// Marks the thread runnable on run-queue bucket `rqindex`.
     pub(crate) fn mark_ready(&mut self, rqindex: u8) {
         self.publish_state(ThreadState::Ready);
@@ -330,8 +427,8 @@ impl Thread {
     /// Marks the thread as running on `cpu_id` at `now_ns`.
     pub(crate) fn mark_running(&mut self, cpu_id: usize, now_ns: u64) {
         self.publish_state(ThreadState::Running);
-        self.cpu = cpu_id;
-        self.last_run_ns = now_ns;
+        self.set_cpu(cpu_id);
+        self.set_last_run_ns(now_ns);
     }
 
     /// Clears and returns the deferred slice-end flag.
@@ -424,14 +521,16 @@ impl Thread {
     }
 
     /// Returns whether the low-end stack canary is still intact.
+    ///
+    /// The guard page below every kernel stack is the primary overflow
+    /// detector; this canary only catches writes that skip past the guard.
     pub(crate) fn has_valid_stack_canary(&self) -> bool {
-        self._stack
-            .0
-            .as_chunks::<{ size_of::<u64>() }>()
-            .0
-            .iter()
-            .take(STACK_CANARY_WORDS)
-            .all(|bytes| u64::from_ne_bytes(*bytes) == STACK_CANARY)
+        let base = self.stack.base().as_u64() as *const u64;
+        (0..STACK_CANARY_WORDS).all(|index| {
+            // SAFETY: the first canary words are mapped stack memory owned by
+            // this thread and are naturally aligned.
+            unsafe { base.add(index).read_volatile() == STACK_CANARY }
+        })
     }
 }
 
@@ -467,6 +566,7 @@ where
         class,
         priority,
         flags,
+        0,
         Some(Box::new(task)),
         None,
         None,
@@ -486,11 +586,13 @@ where
 }
 
 /// Allocates a user thread with a prepared initial userspace frame.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_user_thread(
     id: usize,
     cpu: usize,
     now_ns: u64,
     priority: u8,
+    nice: i8,
     process: Arc<Process>,
     entry: u64,
     stack: u64,
@@ -504,6 +606,7 @@ pub(crate) fn allocate_user_thread(
         ThreadClass::Timeshare,
         priority,
         ThreadFlags::empty(),
+        nice,
         None,
         Some(process),
         Some(address_space),
@@ -523,6 +626,7 @@ pub(crate) fn allocate_forked_user_thread(
     cpu: usize,
     now_ns: u64,
     priority: u8,
+    nice: i8,
     process: Arc<Process>,
     parent_frame: &TrapFrame,
     thread_pointer: u64,
@@ -535,6 +639,7 @@ pub(crate) fn allocate_forked_user_thread(
         ThreadClass::Timeshare,
         priority,
         ThreadFlags::empty(),
+        nice,
         None,
         Some(process),
         Some(address_space),
@@ -556,33 +661,24 @@ fn allocate_thread_record(
     class: ThreadClass,
     priority: u8,
     flags: ThreadFlags,
+    nice: i8,
     task: Option<Box<dyn KernelTask>>,
     process: Option<Arc<Process>>,
     address_space: Option<Arc<VmSpace>>,
 ) -> &'static mut Thread {
-    let layout = Layout::new::<KernelStack>();
-    // SAFETY: `layout` describes `KernelStack`; null is handled immediately.
-    let stack_ptr = unsafe { alloc_zeroed(layout) } as *mut KernelStack;
-    if stack_ptr.is_null() {
-        handle_alloc_error(layout);
+    let stack = kstack::allocate().expect("thread: out of kernel stack arena space");
+    let stack_base = stack.base();
+    let stack_top = stack.top();
+
+    // SAFETY: the freshly mapped stack is exclusively owned here and the
+    // canary words are naturally aligned within it.
+    unsafe {
+        let words = stack_base.as_u64() as *mut u64;
+        for index in 0..STACK_CANARY_WORDS {
+            words.add(index).write(STACK_CANARY);
+        }
     }
 
-    // SAFETY: `stack_ptr` is a fresh allocation with the exact `KernelStack`
-    // layout and ownership transfers into this box.
-    let mut stack = unsafe { Box::from_raw(stack_ptr) };
-    for chunk in stack
-        .0
-        .as_chunks_mut::<{ size_of::<u64>() }>()
-        .0
-        .iter_mut()
-        .take(STACK_CANARY_WORDS)
-    {
-        *chunk = STACK_CANARY.to_ne_bytes();
-    }
-    let stack_base = VirtAddr::from_ptr(stack.0.as_mut_ptr());
-    let stack_top = stack_base
-        .checked_add(KSTACK_SIZE as u64)
-        .expect("sched: stack top overflow");
     let frame_addr = stack_top.as_u64() - size_of::<TrapFrame>() as u64;
     let frame = frame_addr as *mut TrapFrame;
     let state = if flags.contains(ThreadFlags::IDLE) {
@@ -593,26 +689,30 @@ fn allocate_thread_record(
     let thread = Box::leak(Box::new(Thread {
         runq_link: LinkedListLink::new(),
         reap_link: LinkedListLink::new(),
+        all_link: LinkedListLink::new(),
         id,
         state,
         class,
         flags,
+        no_migrate: flags.contains(ThreadFlags::NO_MIGRATE),
         priority,
         base_priority: priority,
         ithread_base_priority: priority,
+        lent_priority: u8::MAX,
+        boost_count: 0,
         user_priority: priority,
-        nice: 0,
-        cpu,
+        nice: AtomicI8::new(nice.clamp(NICE_MIN, NICE_MAX)),
+        cpu: AtomicUsize::new(cpu),
         rqindex: priority,
         slice_ns: 0,
         cpu_window_start_ns: now_ns,
         cpu_last_update_ns: now_ns,
-        last_run_ns: now_ns,
+        last_run_ns: AtomicU64::new(now_ns),
         sleep_start_ns: 0,
         slptime_ns: 0,
         runtime_ns: 0,
         cpu_estimate: 0,
-        _stack: stack,
+        stack,
         stack_top,
         frame,
         park_state: AtomicU8::new(PARK_STATE_IDLE),

@@ -42,6 +42,8 @@ const LAPIC_ISR_BASE: u32 = 0x100;
 const LAPIC_ISR_END: u32 = 0x170;
 const LAPIC_ICR_LOW: u32 = 0x300;
 const LAPIC_ICR_HIGH: u32 = 0x310;
+/// ICR destination shorthand selecting every CPU except the sender.
+const ICR_SHORTHAND_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_INITIAL_COUNT: u32 = 0x380;
 const LAPIC_CURRENT_COUNT: u32 = 0x390;
@@ -249,6 +251,20 @@ pub fn handle_interrupt(vec: u64) -> bool {
 pub fn send_ipi(lapic_id: u32) {
     let state = lapic_state();
     send_fixed_ipi(state.access, lapic_id, RESCHEDULE_VECTOR);
+}
+
+/// Sends a reschedule IPI to every CPU except the current one.
+pub fn send_ipi_all_excluding_self() {
+    let state = lapic_state();
+    let icr = u32::from(RESCHEDULE_VECTOR) | ICR_SHORTHAND_ALL_EXCLUDING_SELF;
+
+    match state.access {
+        ApicAccess::XApic { .. } => {
+            write_register(state.access, LAPIC_ICR_HIGH, 0);
+            write_register(state.access, LAPIC_ICR_LOW, icr);
+        }
+        ApicAccess::X2Apic => write_register64(state.access, LAPIC_ICR_LOW, u64::from(icr)),
+    }
 }
 
 fn detect_access_mode(x2apic_supported: bool) -> ApicAccess {
