@@ -24,7 +24,15 @@
 
 ## Building Roanix
 
-For detailed build instructions, see the *Roanix Internals* book under [Building Roanix](book/src/guide/BUILDING.md).
+Roanix is built with `x.py`, a single-file build tool in the project root:
+
+```bash
+./x.py doctor     # check the host has everything that is needed
+./x.py            # build whatever changed and boot it in QEMU
+```
+
+For detailed build instructions, see the *Roanix Internals* book under
+[Building Roanix](book/src/guide/BUILDING.md).
 
 **NOTE: Builds are not supported on non-linux platforms.**
 

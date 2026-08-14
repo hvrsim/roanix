@@ -1,0 +1,34 @@
+# Roanix system package manifest
+#
+# This file defines the userland that xtool (x.py) assembles into the sysroot,
+# the initramfs, and the bootable images. It is the only place you need to edit
+# after adding a new recipe under userland/recipes/.
+#
+#   [install]  top-level packages installed into the system image. Their
+#              runtime dependencies come along automatically, so there is no
+#              need to list libraries that something else already pulls in.
+#
+#   [build]    packages that must be built but are not installed directly,
+#              such as headers-only or bootstrap packages.
+#
+# Blank lines and everything after a '#' are ignored.
+#
+# Useful commands:
+#   ./x.py list                 show every recipe and whether it is built
+#   ./x.py pkg <name>           rebuild one package into the sysroot
+#   ./x.py port <name> --url …  scaffold a brand new recipe
+
+[install]
+linux-headers
+bash
+coreutils
+python
+stress-ng
+init
+drivers
+
+[build]
+mlibc-headers
+mlibc
+ncurses
+readline

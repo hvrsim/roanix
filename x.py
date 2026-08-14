@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Roanix developer build tool."""
+"""xtool - the Roanix developer build system.
+
+xtool is a single-file front-end that knows how to build the Roanix kernel,
+drive the Jinx userland package manager, assemble bootable images, and boot
+the result in QEMU.  It is designed around what an OS developer actually does
+all day, so the common workflows are one command each:
+
+    ./x.py                    build whatever changed and boot it
+    ./x.py pkg bash           rebuild a userland package into the sysroot
+    ./x.py port zstd --url…   scaffold a brand new port
+    ./x.py shell python       drop into that port's Jinx build container
+    ./x.py status             see what is stale before committing to a build
+
+Run ``./x.py --help`` for the complete command list, or ``./x.py help
+<command>`` for details on one command.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +23,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -16,167 +32,395 @@ import tarfile
 import tempfile
 import time
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 
 if sys.version_info < (3, 11):
-    print("error: x.py requires Python 3.11 or newer", file=sys.stderr)
+    sys.stderr.write("==> ERROR: xtool requires Python 3.11 or newer\n")
     raise SystemExit(2)
 
 
-VERSION = "2.0"
+VERSION = "3.0"
+
+# --------------------------------------------------------------------------
+# Layout
+# --------------------------------------------------------------------------
+
 ROOT = Path(__file__).resolve().parent
 KERNEL_DIR = ROOT / "kernel"
 DRIVERS_DIR = ROOT / "drivers"
+BOOK_DIR = ROOT / "book"
 USERLAND_DIR = ROOT / "userland"
-JINX_DRIVERS_SOURCE = USERLAND_DIR / "drivers"
+RECIPES_DIR = USERLAND_DIR / "recipes"
+DISTRO_FILES_DIR = USERLAND_DIR / "distro-files"
+SYSTEM_MANIFEST = USERLAND_DIR / "system.list"
+
+BUILD_DIR = ROOT / "build"
+
+# Everything under build/ obeys one rule: anything that depends on the target
+# architecture lives in build/<arch>/, and anything shared by every
+# architecture lives beside it. That makes "what does riscv64 cost me?" a
+# `du -sh build/riscv64` away and "forget riscv64" an `rm -rf` away.
+CACHE_DIR = BUILD_DIR / "cache"          # pinned, immutable, arch independent
+DOWNLOADS_DIR = CACHE_DIR / "downloads"
+CARGO_DIR = BUILD_DIR / "cargo"          # CARGO_TARGET_DIR; Cargo namespaces
+CONFIG_FILE = BUILD_DIR / "config.json"  # saved defaults, not a build artefact
+
 DEFAULT_ARCH = "x86_64"
 DEFAULT_PROFILE = "dev"
-DEFAULT_OUTPUT_DIR = ROOT / "build"
-RUNTIME_ROOT = DEFAULT_OUTPUT_DIR / "runtime"
-LEGACY_STORE_DIR = ROOT / "store"
-SUPPORTED_PROFILES = ("dev", "release")
+PROFILES = ("dev", "release")
 
-LEGACY_COMMANDS: dict[str, list[str]] = {
-    "gen-hdd": ["build", "hdd"],
-    "gen-iso": ["build", "iso"],
-    "clippy": ["lint"],
-    "fmt-check": ["fmt", "--check"],
-    "rustdoc": ["docs", "rust", "--serve"],
-    "book": ["docs", "book", "--serve"],
-    "sysroot": ["build", "sysroot"],
-    "initramfs": ["build", "initramfs"],
-    "distclean": ["clean", "--all"],
-    "run-iso": ["run", "iso"],
-    "run-x86_64": ["run", "hdd", "--arch", "x86_64"],
-    "run-riscv64": ["run", "hdd", "--arch", "riscv64"],
-    "run-iso-x86_64": ["run", "iso", "--arch", "x86_64"],
-    "run-iso-riscv64": ["run", "iso", "--arch", "riscv64"],
-    "run-bios": ["run", "hdd", "--arch", "x86_64", "--firmware", "bios"],
-    "run-iso-bios": ["run", "iso", "--arch", "x86_64", "--firmware", "bios"],
+# Fallbacks used only when userland/system.list is missing.
+FALLBACK_SYSTEM_PACKAGES = (
+    "linux-headers",
+    "bash",
+    "coreutils",
+    "stress-ng",
+    "python",
+    "init",
+    "drivers",
+)
+FALLBACK_EXTRA_BUILD_PACKAGES = ("mlibc-headers", "mlibc", "ncurses", "readline")
+
+# Recipes whose sources live in this repository rather than being downloaded.
+# Editing these directories makes the corresponding package stale.
+IN_TREE_SOURCES: Mapping[str, Path] = {
+    "drivers": DRIVERS_DIR,
+    "init": USERLAND_DIR / "init",
 }
 
-OPTIONS_WITH_VALUES = {
-    "--arch",
-    "--profile",
-    "--rust-profile",
-    "--rust-target",
-    "--qemu-flags",
-    "--color",
-    "--out-dir",
+# Distro package names for the host tools xtool needs, used by `x.py doctor`.
+TOOL_PACKAGES = {
+    "cargo": {"apt": "rustup", "pacman": "rustup", "apk": "rust", "dnf": "rustup"},
+    "rustup": {"apt": "rustup", "pacman": "rustup", "apk": "rust", "dnf": "rustup"},
+    "git": {"apt": "git", "pacman": "git", "apk": "git", "dnf": "git"},
+    "make": {"apt": "make", "pacman": "make", "apk": "make", "dnf": "make"},
+    "xorriso": {"apt": "xorriso", "pacman": "xorriso", "apk": "xorriso", "dnf": "xorriso"},
+    "sgdisk": {"apt": "gdisk", "pacman": "gptfdisk", "apk": "sgdisk", "dnf": "gdisk"},
+    "mformat": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
+    "mmd": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
+    "mcopy": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
+    "zstd": {"apt": "zstd", "pacman": "zstd", "apk": "zstd", "dnf": "zstd"},
+    "tar": {"apt": "tar", "pacman": "tar", "apk": "tar", "dnf": "tar"},
+    "gzip": {"apt": "gzip", "pacman": "gzip", "apk": "gzip", "dnf": "gzip"},
+    "sed": {"apt": "sed", "pacman": "sed", "apk": "sed", "dnf": "sed"},
+    "awk": {"apt": "gawk", "pacman": "gawk", "apk": "gawk", "dnf": "gawk"},
+    "grep": {"apt": "grep", "pacman": "grep", "apk": "grep", "dnf": "grep"},
+    "find": {"apt": "findutils", "pacman": "findutils", "apk": "findutils", "dnf": "findutils"},
+    "bash": {"apt": "bash", "pacman": "bash", "apk": "bash", "dnf": "bash"},
+    "curl": {"apt": "curl", "pacman": "curl", "apk": "curl", "dnf": "curl"},
+    "mdbook": {"apt": "mdbook", "pacman": "mdbook", "apk": "mdbook", "dnf": "mdbook"},
+    "qemu-system-x86_64": {
+        "apt": "qemu-system-x86",
+        "pacman": "qemu-system-x86",
+        "apk": "qemu-system-x86_64",
+        "dnf": "qemu-system-x86",
+    },
+    "qemu-system-riscv64": {
+        "apt": "qemu-system-misc",
+        "pacman": "qemu-system-riscv",
+        "apk": "qemu-system-riscv64",
+        "dnf": "qemu-system-riscv",
+    },
 }
 
-PACKAGE_HINTS = {
-    "cargo": "rustup",
-    "rustup": "rustup",
-    "git": "git",
-    "make": "make",
-    "xorriso": "xorriso",
-    "sgdisk": "gdisk",
-    "mformat": "mtools",
-    "mmd": "mtools",
-    "mcopy": "mtools",
-    "qemu-system-x86_64": "qemu-system-x86",
-    "qemu-system-riscv64": "qemu-system-misc",
-    "mdbook": "mdbook",
-    "zstd": "zstd",
-}
+
+# --------------------------------------------------------------------------
+# Errors
+# --------------------------------------------------------------------------
 
 
-class BuildError(RuntimeError):
-    """A user-facing build failure."""
+class Failure(Exception):
+    """A user-facing failure, optionally carrying a suggested fix."""
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
-class HelpFormatter(
-    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
-):
-    """Readable command help with defaults and examples."""
+# --------------------------------------------------------------------------
+# Logging - modelled on makepkg's output style
+# --------------------------------------------------------------------------
+
+QUIET, NORMAL, VERBOSE = -1, 0, 1
 
 
-class UI:
-    """Small terminal UI."""
+class Log:
+    """makepkg-flavoured terminal output."""
 
-    _COLORS = {
-        "muted": "\033[2m",
-        "blue": "\033[34m",
-        "cyan": "\033[36m",
-        "green": "\033[32m",
-        "yellow": "\033[33m",
-        "red": "\033[31m",
-        "bold": "\033[1m",
-        "reset": "\033[0m",
-    }
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[1;31m"
+    GREEN = "\033[1;32m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[1;34m"
+    MAGENTA = "\033[1;35m"
+    CYAN = "\033[1;36m"
 
-    def __init__(self, *, color: str, quiet: bool, verbose: bool) -> None:
+    def __init__(self, *, color: str = "auto", level: int = NORMAL) -> None:
         if color == "always":
             self.color = True
         elif color == "never":
             self.color = False
         else:
             self.color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
-        self.quiet = quiet
-        self.verbose = verbose
-        self.started_at = time.monotonic()
+        self.level = level
 
-    def _format(self, text: str, *styles: str) -> str:
-        if not self.color:
+    # -- primitives --------------------------------------------------------
+
+    def paint(self, text: str, *styles: str) -> str:
+        if not self.color or not styles:
             return text
-        prefix = "".join(self._COLORS[style] for style in styles)
-        return f"{prefix}{text}{self._COLORS['reset']}"
+        return "".join(styles) + text + self.RESET
 
-    def heading(self, text: str) -> None:
-        if not self.quiet:
-            print(self._format(f"roanix: {text}", "blue", "bold"))
+    def _write(self, text: str, *, stream: Any = None) -> None:
+        target = stream or sys.stdout
+        target.write(text + "\n")
+        target.flush()
 
-    def step(self, text: str) -> None:
-        if not self.quiet:
-            print(self._format(f"  -> {text}", "bold"))
+    # -- levels ------------------------------------------------------------
 
-    def detail(self, text: str) -> None:
-        if not self.quiet:
-            print(self._format(f"     {text}", "muted"))
-
-    def command(self, argv: Sequence[str], cwd: Path) -> None:
-        if not self.verbose:
+    def msg(self, text: str) -> None:
+        """``==> Doing a big thing``"""
+        if self.level < NORMAL:
             return
-        try:
-            shown_cwd = cwd.relative_to(ROOT)
-        except ValueError:
-            shown_cwd = cwd
-        print(self._format(f"     [{shown_cwd or '.'}] {shlex.join(argv)}", "muted"))
+        self._write(self.paint("==>", self.GREEN) + " " + self.paint(text, self.BOLD))
 
-    def success(self, text: str, *, show_time: bool) -> None:
-        if self.quiet:
+    def msg2(self, text: str) -> None:
+        """``  -> a step within a big thing``"""
+        if self.level < NORMAL:
             return
-        suffix = ""
-        if show_time:
-            suffix = f" in {time.monotonic() - self.started_at:.2f}s"
-        print(self._format(f"  ok {text}{suffix}", "green", "bold"))
+        self._write(
+            "  " + self.paint("->", self.BLUE) + " " + self.paint(text, self.BOLD)
+        )
 
-    def warning(self, text: str) -> None:
-        print(self._format(f"warning: {text}", "yellow"), file=sys.stderr)
+    def msg3(self, text: str) -> None:
+        """``     * a minor detail``"""
+        if self.level < NORMAL:
+            return
+        self._write("     " + self.paint("* " + text, self.DIM))
+
+    def plain(self, text: str = "") -> None:
+        if self.level < NORMAL:
+            return
+        self._write(text)
+
+    def field(self, name: str, value: str, *, width: int = 16) -> None:
+        if self.level < NORMAL:
+            return
+        self._write(
+            "  "
+            + self.paint("->", self.BLUE)
+            + " "
+            + self.paint(name.ljust(width), self.BOLD)
+            + value
+        )
+
+    def output(self, text: str) -> None:
+        """A line of captured subprocess output."""
+        # Leave lines that already carry their own escape sequences alone,
+        # otherwise the tool's colours and our dimming fight each other.
+        body = text if "\033" in text else self.paint(text, self.DIM)
+        self._write("    " + body)
+
+    def warn(self, text: str) -> None:
+        self._write(
+            self.paint("==> WARNING:", self.YELLOW) + " " + self.paint(text, self.BOLD),
+            stream=sys.stderr,
+        )
 
     def error(self, text: str) -> None:
-        print(self._format(f"error: {text}", "red", "bold"), file=sys.stderr)
+        self._write(
+            self.paint("==> ERROR:", self.RED) + " " + self.paint(text, self.BOLD),
+            stream=sys.stderr,
+        )
+
+    def hint(self, text: str) -> None:
+        self._write(
+            "  " + self.paint("->", self.CYAN) + " " + text, stream=sys.stderr
+        )
+
+    def detail(self, text: str) -> None:
+        """A dimmed continuation line belonging to the previous error."""
+        self._write(self.paint(text, self.DIM), stream=sys.stderr)
+
+    def separator(self) -> None:
+        self._write("", stream=sys.stderr)
+
+    def note(self, text: str) -> None:
+        if self.level < NORMAL:
+            return
+        self._write("  " + self.paint("->", self.CYAN) + " " + text)
+
+    def debug(self, text: str) -> None:
+        if self.level < VERBOSE:
+            return
+        self._write("    " + self.paint("$ " + text, self.DIM))
+
+    def finished(self, what: str, seconds: float) -> None:
+        if self.level < NORMAL:
+            return
+        self._write(
+            self.paint("==>", self.GREEN)
+            + " "
+            + self.paint(f"Finished {what}", self.BOLD)
+            + " "
+            + self.paint(f"({human_time(seconds)})", self.DIM)
+        )
+
+
+def human_time(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def human_size(size: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def rel(path: Path) -> str:
+    """Render a path relative to the repository root when possible."""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def tree_size(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        return path.stat().st_size
+    for item in path.rglob("*"):
+        if item.is_file() and not item.is_symlink():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def age(path: Path) -> str:
+    try:
+        delta = time.time() - path.stat().st_mtime
+    except OSError:
+        return "unknown"
+    if delta < 90:
+        return "just now"
+    if delta < 3600:
+        return f"{delta / 60:.0f} minutes ago"
+    if delta < 86400:
+        return f"{delta / 3600:.0f} hours ago"
+    return f"{delta / 86400:.0f} days ago"
+
+
+# --------------------------------------------------------------------------
+# Persistent settings - so nobody has to retype --arch all day
+# --------------------------------------------------------------------------
+
+SETTINGS_KEYS = {
+    "arch": "Default target architecture (x86_64, riscv64)",
+    "profile": "Default Cargo profile (dev, release)",
+    "image": "Default image format for run/build (hdd, iso)",
+    "firmware": "Default firmware for run (uefi, bios)",
+    "jobs": "Parallelism handed to Cargo and Jinx",
+    "qemu-args": "Extra QEMU arguments always appended",
+}
+
+
+def load_settings() -> dict[str, str]:
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if k in SETTINGS_KEYS}
+
+
+def save_settings(settings: Mapping[str, str]) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(dict(sorted(settings.items())), indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(CONFIG_FILE)
+
+
+def setting(
+    settings: Mapping[str, str], key: str, cli: Any, default: Any = None
+) -> Any:
+    """Resolve one option: CLI flag > environment > saved config > default."""
+    if cli is not None:
+        return cli
+    env = os.environ.get("ROANIX_" + key.replace("-", "_").upper())
+    if env:
+        return env
+    if key in settings:
+        return settings[key]
+    return default
+
+
+# --------------------------------------------------------------------------
+# Architectures
+# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Architecture:
+class Arch:
     name: str
     rust_target: str
-    qemu_binary: str
-    qemu_memory: str
+    qemu: str
+    memory: str
+    efi_files: tuple[str, ...]
+    firmwares: tuple[str, ...]
+
+
+ARCHES: Mapping[str, Arch] = {
+    "x86_64": Arch(
+        name="x86_64",
+        rust_target="x86_64-unknown-none",
+        qemu="qemu-system-x86_64",
+        memory="4G",
+        efi_files=("BOOTX64.EFI", "BOOTIA32.EFI"),
+        firmwares=("uefi", "bios"),
+    ),
+    "riscv64": Arch(
+        name="riscv64",
+        rust_target="riscv64gc-unknown-none-elf",
+        qemu="qemu-system-riscv64",
+        memory="4G",
+        efi_files=("BOOTRISCV64.EFI",),
+        firmwares=("uefi",),
+    ),
+}
+
+
+# --------------------------------------------------------------------------
+# Pinned host resources
+# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class DownloadPin:
+class Tarball:
     name: str
     version: str
     url: str
     sha256: str
-    archive_root: str
+    root: str
     directory: str
 
     def marker(self) -> dict[str, str]:
@@ -185,7 +429,7 @@ class DownloadPin:
             "version": self.version,
             "url": self.url,
             "sha256": self.sha256,
-            "archive_root": self.archive_root,
+            "root": self.root,
         }
 
 
@@ -197,40 +441,8 @@ class GitPin:
     directory: str
 
 
-ARCHITECTURES: Mapping[str, Architecture] = {
-    "x86_64": Architecture(
-        name="x86_64",
-        rust_target="x86_64-unknown-none",
-        qemu_binary="qemu-system-x86_64",
-        qemu_memory="4G",
-    ),
-    "riscv64": Architecture(
-        name="riscv64",
-        rust_target="riscv64gc-unknown-none-elf",
-        qemu_binary="qemu-system-riscv64",
-        qemu_memory="4G",
-    ),
-}
-
-USERSPACE_PACKAGES = (
-    "linux-headers",
-    "bash",
-    "coreutils",
-    "stress-ng",
-    "python",
-    "init",
-    "drivers",
-)
-USERSPACE_BUILD_PACKAGES = (
-    "mlibc-headers",
-    "mlibc",
-    "ncurses",
-    "readline",
-    *USERSPACE_PACKAGES,
-)
-
-DOWNLOADS: Mapping[str, DownloadPin] = {
-    "limine": DownloadPin(
+TARBALLS: Mapping[str, Tarball] = {
+    "limine": Tarball(
         name="limine",
         version="12.5.0",
         url=(
@@ -238,10 +450,10 @@ DOWNLOADS: Mapping[str, DownloadPin] = {
             "v12.5.0/limine-binary.tar.gz"
         ),
         sha256="8bc0d0f2a2cd0e212f529c57d8a2033a25996dcdd9f58c916b7bf5594a0282eb",
-        archive_root="limine-binary",
+        root="limine-binary",
         directory="limine",
     ),
-    "ovmf": DownloadPin(
+    "ovmf": Tarball(
         name="ovmf",
         version="20260531T041444Z",
         url=(
@@ -249,12 +461,12 @@ DOWNLOADS: Mapping[str, DownloadPin] = {
             "20260531T041444Z/edk2-ovmf.tar.gz"
         ),
         sha256="534384e4b971730143f54708493fe43932eabbfd275094b636561fb2028bde62",
-        archive_root="edk2-ovmf",
+        root="edk2-ovmf",
         directory="edk2-ovmf",
     ),
 }
 
-JINX = GitPin(
+JINX_PIN = GitPin(
     name="jinx",
     url="https://github.com/Mintsuki/Jinx.git",
     commit="287ceaf9a2c08b43dbc56d38d8b815fd990a2192",
@@ -262,335 +474,1090 @@ JINX = GitPin(
 )
 
 
-@dataclass(frozen=True)
+# --------------------------------------------------------------------------
+# Context
+# --------------------------------------------------------------------------
+
+
+@dataclass
 class Context:
-    arch: Architecture
+    arch: Arch
     profile: str
-    rust_target: str
-    output_dir: Path
-    force: bool
-    no_bootstrap: bool
-    show_time: bool
-    ui: UI
+    log: Log
+    jobs: int
+    force: bool = False
+    offline: bool = False
+    dry_run: bool = False
+    assume_yes: bool = False
     qemu_args: tuple[str, ...] = ()
+    started: float = field(default_factory=time.monotonic)
+
+    # -- paths -------------------------------------------------------------
+    #
+    #   build/<arch>/out/<profile>/   kernel, initramfs, bootable images
+    #   build/<arch>/jinx/            Jinx build directory and packages
+    #   build/<arch>/sysroot/         installed userland
+    #   build/<arch>/firmware/        per-machine UEFI variables
+    #   build/<arch>/state/           xtool's incremental fingerprints
+    #   build/<arch>/tmp/<profile>/   scratch space
 
     @property
-    def artifact_dir(self) -> Path:
-        return self.output_dir / self.arch.name / self.profile
+    def arch_root(self) -> Path:
+        return BUILD_DIR / self.arch.name
 
     @property
-    def work_dir(self) -> Path:
-        return self.output_dir / ".work" / self.arch.name / self.profile
+    def artifacts(self) -> Path:
+        return self.arch_root / "out" / self.profile
 
     @property
-    def cargo_target_dir(self) -> Path:
-        return self.output_dir / ".cargo"
+    def work(self) -> Path:
+        return self.arch_root / "tmp" / self.profile
 
     @property
-    def kernel_artifact(self) -> Path:
-        return self.artifact_dir / "roanix"
+    def state_dir(self) -> Path:
+        return self.arch_root / "state"
 
     @property
-    def image_iso(self) -> Path:
-        return self.artifact_dir / f"roanix-{self.arch.name}.iso"
+    def cargo_target(self) -> Path:
+        # Shared on purpose: Cargo namespaces by target triple internally and
+        # reuses host-side build-script output across architectures.
+        return CARGO_DIR
 
     @property
-    def image_hdd(self) -> Path:
-        return self.artifact_dir / f"roanix-{self.arch.name}.hdd"
+    def cargo_arch_dir(self) -> Path:
+        return CARGO_DIR / self.arch.rust_target
 
     @property
-    def sysroot(self) -> Path:
-        return RUNTIME_ROOT / "sysroots" / self.arch.name
+    def kernel_binary(self) -> Path:
+        return self.artifacts / "roanix"
 
     @property
     def initramfs(self) -> Path:
-        return self.artifact_dir / f"roanix-{self.arch.name}.initramfs.tar.gz"
+        return self.artifacts / f"roanix-{self.arch.name}.initramfs.tar.gz"
 
     @property
-    def iso_root(self) -> Path:
-        return self.work_dir / "iso-root"
+    def sysroot(self) -> Path:
+        return self.arch_root / "sysroot"
 
     @property
-    def runtime_dir(self) -> Path:
-        return RUNTIME_ROOT / "qemu" / self.arch.name
+    def jinx_build(self) -> Path:
+        return self.arch_root / "jinx"
 
-    def environment(self, updates: Mapping[str, str] | None = None) -> dict[str, str]:
-        env = os.environ.copy()
+    @property
+    def firmware(self) -> Path:
+        return self.arch_root / "firmware"
+
+    def image(self, kind: str) -> Path:
+        return self.artifacts / f"roanix-{self.arch.name}.{kind}"
+
+    def env(self, updates: Mapping[str, str] | None = None) -> dict[str, str]:
+        environment = os.environ.copy()
         if updates:
-            env.update(updates)
-        return env
+            environment.update(updates)
+        return environment
 
 
-def _capture(argv: Sequence[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
+# --------------------------------------------------------------------------
+# Running commands
+# --------------------------------------------------------------------------
+
+#: Streamed output is passed through this to give Jinx/Cargo lines some colour.
+LineFilter = Callable[[str], tuple[str, str | None]]
+
+
+def plain_filter(line: str) -> tuple[str, str | None]:
+    return line, None
+
+
+def jinx_filter(line: str) -> tuple[str, str | None]:
+    """Fold Jinx's own progress chatter into makepkg-style lines."""
+    stripped = line.strip()
+    if stripped.startswith("***"):
+        return stripped.lstrip("* "), "warn"
+    if stripped.startswith("* "):
+        return stripped[2:].rstrip(".").rstrip(), "step"
+    lowered = stripped.lower()
+    if lowered.startswith(("error:", "fatal:", "jinx: ")) or " error:" in lowered:
+        return stripped, "error"
+    if lowered.startswith("warning:"):
+        return stripped, "warn"
+    return line, None
+
+
+def cargo_filter(line: str) -> tuple[str, str | None]:
+    stripped = line.strip()
+    if stripped.startswith(("Compiling", "Checking", "Documenting", "Building")):
+        return stripped, "step"
+    if stripped.startswith("Finished"):
+        return stripped, "step"
+    if stripped.startswith("error") or stripped.startswith("error["):
+        return line, "error"
+    if stripped.startswith("warning"):
+        return line, "warn"
+    return line, None
+
+
+class Runner:
+    """Subprocess helper with three output modes.
+
+    ``quiet``  buffer everything, show it only if the command fails.
+    ``stream`` print output live, indented and dimmed (for slow builds).
+    ``raw``    inherit stdio, for interactive things such as QEMU.
+    """
+
+    def __init__(self, ctx: Context) -> None:
+        self.ctx = ctx
+        self.log = ctx.log
+        self.last_status = 0
+
+    def __call__(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path = ROOT,
+        env: Mapping[str, str] | None = None,
+        mode: str = "quiet",
+        filter: LineFilter = plain_filter,
+        check: bool = True,
+        tail: int = 40,
+        always: bool = False,
+    ) -> str:
+        argv = [str(item) for item in argv]
+        self.log.debug(f"[{rel(cwd)}] {shlex.join(argv)}")
+        if self.ctx.dry_run and not always:
+            self.log.msg3(f"would run: {shlex.join(argv)}")
+            return ""
+        if self.ctx.log.level >= VERBOSE and mode == "quiet":
+            mode = "stream"
+        if self.ctx.log.level <= QUIET and mode == "stream":
+            mode = "quiet"
+
+        if mode == "raw":
+            return self._raw(argv, cwd, env, check)
+        return self._piped(argv, cwd, env, mode, filter, check, tail)
+
+    # -- implementations ---------------------------------------------------
+
+    def _raw(
+        self,
+        argv: list[str],
+        cwd: Path,
+        env: Mapping[str, str] | None,
+        check: bool,
+    ) -> str:
+        try:
+            completed = subprocess.run(argv, cwd=cwd, env=self.ctx.env(env), check=False)
+        except FileNotFoundError as exc:
+            raise missing_tool(argv[0]) from exc
+        self.last_status = completed.returncode
+        if check and completed.returncode != 0:
+            raise command_failure(argv, cwd, completed.returncode, [])
+        return ""
+
+    def _piped(
+        self,
+        argv: list[str],
+        cwd: Path,
+        env: Mapping[str, str] | None,
+        mode: str,
+        line_filter: LineFilter,
+        check: bool,
+        tail: int,
+    ) -> str:
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=self.ctx.env(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise missing_tool(argv[0]) from exc
+
+        collected: list[str] = []
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            collected.append(line)
+            if mode != "stream":
+                continue
+            text, kind = line_filter(line)
+            if not text.strip():
+                continue
+            if kind == "step":
+                self.log.msg3(text)
+            elif kind == "warn":
+                self.log.output(self.log.paint(text, Log.YELLOW))
+            elif kind == "error":
+                self.log.output(self.log.paint(text, Log.RED))
+            else:
+                self.log.output(text)
+        returncode = process.wait()
+        self.last_status = returncode
+        if check and returncode != 0:
+            raise command_failure(argv, cwd, returncode, collected[-tail:])
+        return "\n".join(collected)
+
+
+def missing_tool(tool: str) -> Failure:
+    packages = TOOL_PACKAGES.get(tool, {})
+    hint = None
+    if packages:
+        manager = detect_package_manager()
+        package = packages.get(manager) or next(iter(packages.values()))
+        hint = f"install it with: {install_command(manager, package)}"
+    return Failure(f"required tool not found: {tool}", hint=hint)
+
+
+def command_failure(
+    argv: Sequence[str], cwd: Path, returncode: int, tail: Sequence[str]
+) -> Failure:
+    lines = [f"command failed with exit code {returncode}"]
+    lines.append(f"    in {rel(cwd)}: {shlex.join(list(argv))}")
+    for line in tail:
+        if line.strip():
+            lines.append("    | " + line)
+    return Failure("\n".join(lines))
+
+
+def capture(argv: Sequence[str], *, cwd: Path = ROOT) -> tuple[int, str]:
     try:
-        return subprocess.run(
-            list(argv),
+        completed = subprocess.run(
+            [str(item) for item in argv],
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",
             check=False,
         )
-    except FileNotFoundError as exc:
-        raise BuildError(f"Required tool is missing: {argv[0]}") from exc
+    except FileNotFoundError:
+        return 127, ""
+    return completed.returncode, completed.stdout
 
 
-def make_context(args: argparse.Namespace) -> Context:
-    arch_name = getattr(args, "arch", None) or DEFAULT_ARCH
-    try:
-        arch = ARCHITECTURES[arch_name]
-    except KeyError as exc:
-        supported = ", ".join(sorted(ARCHITECTURES))
-        raise BuildError(
-            f"Unsupported architecture {arch_name!r}; choose one of: {supported}"
-        ) from exc
-
-    profile = getattr(args, "profile", None) or DEFAULT_PROFILE
-    if profile not in SUPPORTED_PROFILES:
-        supported = ", ".join(SUPPORTED_PROFILES)
-        raise BuildError(
-            f"Unsupported profile {profile!r}; choose one of: {supported}"
-        )
-
-    rust_target_override = getattr(args, "rust_target", None)
-    if rust_target_override and rust_target_override != arch.rust_target:
-        raise BuildError(
-            f"Rust target {rust_target_override!r} does not match "
-            f"architecture {arch.name!r} ({arch.rust_target})"
-        )
-    rust_target = arch.rust_target
-    output_dir_arg = getattr(args, "out_dir", None)
-    output_dir = Path(output_dir_arg) if output_dir_arg else DEFAULT_OUTPUT_DIR
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
-    output_dir = output_dir.resolve()
-    default_output = DEFAULT_OUTPUT_DIR.resolve()
-    runtime_root = RUNTIME_ROOT.resolve()
-    if output_dir != default_output:
-        try:
-            output_dir.relative_to(default_output)
-        except ValueError as exc:
-            raise BuildError(
-                f"Custom output directory must be inside "
-                f"{_display_path(DEFAULT_OUTPUT_DIR)}"
-            ) from exc
-        if output_dir.is_relative_to(runtime_root) or runtime_root.is_relative_to(
-            output_dir
-        ):
-            raise BuildError("Custom output directory must not overlap build/runtime")
-    color = getattr(args, "color", "auto")
-    quiet = bool(getattr(args, "quiet", False))
-    verbose = bool(getattr(args, "verbose", False))
-    ui = UI(color=color, quiet=quiet, verbose=verbose)
-    return Context(
-        arch=arch,
-        profile=profile,
-        rust_target=rust_target,
-        output_dir=output_dir,
-        force=bool(getattr(args, "force", False)),
-        no_bootstrap=bool(getattr(args, "no_bootstrap", False)),
-        show_time=bool(getattr(args, "show_time", False)),
-        ui=ui,
-    )
+def detect_package_manager() -> str:
+    for manager in ("pacman", "apt-get", "apk", "dnf"):
+        if shutil.which(manager):
+            return "apt" if manager == "apt-get" else manager
+    return "apt"
 
 
-def run(
-    ctx: Context,
-    argv: Sequence[str],
-    *,
-    step: str | None = None,
-    cwd: Path = ROOT,
-    env_updates: Mapping[str, str] | None = None,
-    capture: bool | None = None,
-) -> subprocess.CompletedProcess[str]:
-    if step:
-        ctx.ui.step(step)
-    ctx.ui.command(argv, cwd)
-    use_capture = not ctx.ui.verbose if capture is None else capture
-    try:
-        completed = subprocess.run(
-            list(argv),
-            cwd=cwd,
-            env=ctx.environment(env_updates),
-            stdout=subprocess.PIPE if use_capture else None,
-            stderr=subprocess.STDOUT if use_capture else None,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise BuildError(f"Required tool is missing: {argv[0]}") from exc
-    if completed.returncode != 0:
-        if use_capture and completed.stdout:
-            print(completed.stdout.rstrip(), file=sys.stderr)
-        raise BuildError(
-            f"Command failed with exit code {completed.returncode}: "
-            f"{shlex.join(argv)}"
-        )
-    return completed
+def install_command(manager: str, package: str) -> str:
+    return {
+        "apt": f"sudo apt-get install {package}",
+        "pacman": f"sudo pacman -S {package}",
+        "apk": f"sudo apk add {package}",
+        "dnf": f"sudo dnf install {package}",
+    }.get(manager, f"install {package}")
 
 
-def ensure_dir(path: Path) -> None:
+# --------------------------------------------------------------------------
+# Filesystem helpers
+# --------------------------------------------------------------------------
+
+
+def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def remove_path(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    if path.is_dir() and not path.is_symlink():
+def remove(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
         shutil.rmtree(path)
-    else:
-        path.unlink()
 
 
-def copy_file(source: Path, destination: Path) -> None:
+def copy(source: Path, destination: Path) -> None:
     ensure_dir(destination.parent)
     shutil.copy2(source, destination)
 
 
-def write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
+def write_file(path: Path, text: str, *, mode: int = 0o644) -> None:
     ensure_dir(path.parent)
     path.write_text(text, encoding="utf-8")
     path.chmod(mode)
 
 
-def sha256_file(path: Path) -> str:
+def swap_directory(staging: Path, destination: Path) -> None:
+    """Atomically-ish replace ``destination`` with ``staging``."""
+    if not destination.exists():
+        staging.rename(destination)
+        return
+    backup = destination.with_name(f".{destination.name}.old")
+    remove(backup)
+    destination.rename(backup)
+    try:
+        staging.rename(destination)
+    except OSError:
+        backup.rename(destination)
+        raise
+    remove(backup)
+
+
+# --------------------------------------------------------------------------
+# Fingerprints and the build cache
+# --------------------------------------------------------------------------
+
+IGNORED_FINGERPRINT_NAMES = {".git", "target", "build", "out", "__pycache__"}
+
+
+def _hash_path(digest: Any, path: Path, *, base: Path | None = None) -> None:
+    label = path.name if base is None else path.relative_to(base).as_posix()
+    digest.update(label.encode("utf-8", "surrogateescape"))
+    digest.update(b"\0")
+    if path.is_symlink():
+        digest.update(b"L" + os.readlink(path).encode("utf-8", "surrogateescape"))
+        return
+    if path.is_file():
+        stat = path.stat()
+        digest.update(b"F")
+        digest.update(str(stat.st_mode & 0o111).encode())
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return
+    if path.is_dir():
+        digest.update(b"D")
+        root = base or path
+        for child in sorted(path.iterdir(), key=lambda item: item.name):
+            if child.name in IGNORED_FINGERPRINT_NAMES:
+                continue
+            _hash_path(digest, child, base=root)
+        return
+    digest.update(b"?")
+
+
+def fingerprint(
+    label: str, *, values: Sequence[str] = (), paths: Sequence[Path] = ()
+) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for block in iter(lambda: file.read(1024 * 1024), b""):
+    digest.update(label.encode("utf-8"))
+    digest.update(b"\0")
+    for value in values:
+        digest.update(value.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+    for path in paths:
+        if path.exists() or path.is_symlink():
+            _hash_path(digest, path, base=path.parent)
+        else:
+            digest.update(b"MISSING\0")
+    return digest.hexdigest()
+
+
+def stamp(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return "missing"
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+class Cache:
+    """Tracks whether a build step's inputs changed since it last succeeded."""
+
+    def __init__(self, ctx: Context) -> None:
+        self.ctx = ctx
+
+    def _path(self, key: str) -> Path:
+        return self.ctx.state_dir / f"{key}.json"
+
+    def read(self, key: str) -> dict[str, Any]:
+        try:
+            data = json.loads(self._path(key).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def is_current(self, key: str, digest: str, outputs: Sequence[Path]) -> bool:
+        if self.ctx.force:
+            return False
+        if not all(path.exists() for path in outputs):
+            return False
+        state = self.read(key)
+        if state.get("fingerprint") != digest:
+            return False
+        stamps = state.get("stamps")
+        if not isinstance(stamps, dict):
+            return False
+        return all(stamps.get(rel(path)) == stamp(path) for path in outputs)
+
+    def record(self, key: str, digest: str, outputs: Sequence[Path], **extra: Any) -> None:
+        path = self._path(key)
+        ensure_dir(path.parent)
+        payload: dict[str, Any] = {
+            "fingerprint": digest,
+            "stamps": {rel(item): stamp(item) for item in outputs},
+        }
+        payload.update(extra)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        temporary.replace(path)
+
+
+# --------------------------------------------------------------------------
+# Downloads and pinned checkouts
+# --------------------------------------------------------------------------
+
+
+def safe_extract(archive: Path, destination: Path) -> None:
+    def check(name: str) -> None:
+        pure = PurePosixPath(name)
+        if pure.is_absolute() or ".." in pure.parts:
+            raise Failure(f"archive contains an unsafe path: {name!r}")
+
+    with tarfile.open(archive, "r:*") as tar:
+        for member in tar.getmembers():
+            check(member.name)
+            if member.isdev() or member.isfifo():
+                raise Failure(f"archive contains a special file: {member.name!r}")
+            if member.issym() or member.islnk():
+                link = PurePosixPath(member.linkname)
+                if link.is_absolute():
+                    raise Failure(f"archive contains an unsafe link: {member.name!r}")
+                target = (Path(member.name).parent / Path(*link.parts)).as_posix()
+                check(os.path.normpath(target))
+        tar.extractall(destination, filter="tar")
+
+
+def download(ctx: Context, pin: Tarball, run: Runner) -> Path:
+    suffix = "".join(Path(pin.url.split("?", 1)[0]).suffixes[-2:]) or ".tar"
+    cached = DOWNLOADS_DIR / f"{pin.name}-{pin.version}-{pin.sha256[:12]}{suffix}"
+    if cached.is_file() and sha256_of(cached) == pin.sha256:
+        return cached
+    if ctx.offline:
+        raise Failure(
+            f"{pin.name} {pin.version} is not cached and --offline was given",
+            hint=f"run './x.py fetch {pin.name}' while online",
+        )
+    remove(cached)
+    ensure_dir(cached.parent)
+    ctx.log.msg2(f"downloading {pin.name} {pin.version}")
+    request = urllib.request.Request(pin.url, headers={"User-Agent": f"xtool/{VERSION}"})
+    partial = cached.with_suffix(cached.suffix + ".part")
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            with partial.open("wb") as output:
+                while block := response.read(1 << 20):
+                    output.write(block)
+                    digest.update(block)
+                    done += len(block)
+                    if total and ctx.log.color and ctx.log.level >= NORMAL:
+                        percent = done * 100 // total
+                        sys.stdout.write(
+                            f"\r     {ctx.log.paint(f'* {percent:3d}%  {human_size(done)}', Log.DIM)}"
+                        )
+                        sys.stdout.flush()
+            if total and ctx.log.color and ctx.log.level >= NORMAL:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        remove(partial)
+        raise Failure(f"failed to download {pin.name}: {exc}") from exc
+    if digest.hexdigest() != pin.sha256:
+        remove(partial)
+        raise Failure(
+            f"{pin.name} checksum mismatch",
+            hint=f"expected {pin.sha256}, got {digest.hexdigest()}",
+        )
+    partial.replace(cached)
+    return cached
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
-def _fingerprint_path(digest: Any, path: Path) -> None:
+def install_tarball(ctx: Context, pin: Tarball, run: Runner) -> Path:
+    destination = CACHE_DIR / pin.directory
+    marker = destination / ".xtool-pin.json"
     try:
-        label = path.relative_to(ROOT).as_posix()
-    except ValueError:
-        label = str(path)
-    digest.update(label.encode("utf-8"))
-    digest.update(b"\0")
-    if path.is_symlink():
-        digest.update(b"L")
-        digest.update(os.readlink(path).encode("utf-8"))
-        digest.update(b"\0")
-        return
-    if path.is_file():
-        digest.update(b"F")
-        with path.open("rb") as file:
-            for block in iter(lambda: file.read(1024 * 1024), b""):
-                digest.update(block)
-        digest.update(b"\0")
-        return
-    if path.is_dir():
-        digest.update(b"D\0")
-        for child in sorted(path.rglob("*")):
-            if child.is_file() or child.is_symlink():
-                _fingerprint_path(digest, child)
-        return
-    digest.update(b"MISSING\0")
+        if json.loads(marker.read_text(encoding="utf-8")) == pin.marker():
+            return destination
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    archive = download(ctx, pin, run)
+    ensure_dir(CACHE_DIR)
+    ctx.log.msg2(f"unpacking {pin.name} {pin.version}")
+    with tempfile.TemporaryDirectory(prefix=f".{pin.name}-", dir=CACHE_DIR) as scratch:
+        scratch_path = Path(scratch)
+        safe_extract(archive, scratch_path)
+        extracted = scratch_path / pin.root
+        if not extracted.is_dir():
+            raise Failure(f"{pin.name} archive does not contain {pin.root!r}")
+        remove(destination)
+        shutil.move(str(extracted), destination)
+    write_file(marker, json.dumps(pin.marker(), indent=2, sort_keys=True) + "\n")
+    return destination
 
 
-def build_fingerprint(
-    name: str,
-    *,
-    values: Sequence[str] = (),
-    paths: Sequence[Path] = (),
-) -> str:
-    digest = hashlib.sha256()
-    digest.update(name.encode("utf-8"))
-    digest.update(b"\0")
-    for value in values:
-        digest.update(value.encode("utf-8"))
-        digest.update(b"\0")
-    for path in paths:
-        _fingerprint_path(digest, path)
-    return digest.hexdigest()
+def ensure_limine(ctx: Context, run: Runner) -> Path:
+    limine = install_tarball(ctx, TARBALLS["limine"], run)
+    if not (limine / "limine").exists():
+        run(["make", "-C", str(limine)], mode="quiet")
+    required = [limine / "limine-uefi-cd.bin", *(limine / name for name in ctx.arch.efi_files)]
+    if ctx.arch.name == "x86_64":
+        required += [limine / "limine-bios.sys", limine / "limine-bios-cd.bin"]
+    missing = [item.name for item in required if not item.exists()]
+    if missing:
+        raise Failure(f"the pinned Limine release is missing: {', '.join(missing)}")
+    return limine
 
 
-def output_stamp(path: Path) -> str:
-    stat = path.stat()
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+def ensure_ovmf(ctx: Context, run: Runner) -> Path:
+    ovmf = install_tarball(ctx, TARBALLS["ovmf"], run)
+    for kind in ("code", "vars"):
+        candidate = ovmf / f"ovmf-{kind}-{ctx.arch.name}.fd"
+        if not candidate.is_file():
+            raise Failure(f"the pinned OVMF release is missing {candidate.name}")
+    return ovmf
 
 
-def output_namespace(ctx: Context) -> str:
-    return hashlib.sha256(str(ctx.output_dir).encode("utf-8")).hexdigest()[:12]
+def git_head(path: Path) -> str | None:
+    if not (path / ".git").exists():
+        return None
+    code, out = capture(["git", "-C", str(path), "rev-parse", "HEAD"])
+    return out.strip().lower() if code == 0 else None
 
 
-def build_state_path(key: str) -> Path:
-    return RUNTIME_ROOT / "state" / f"{key}.json"
+def ensure_jinx(ctx: Context, run: Runner) -> Path:
+    """Check out the pinned Jinx revision under build/cache/jinx."""
+    destination = CACHE_DIR / JINX_PIN.directory
+    executable = destination / "jinx"
+    if git_head(destination) == JINX_PIN.commit and executable.is_file():
+        return destination
+    if ctx.offline:
+        raise Failure(
+            "Jinx is not checked out at the pinned commit and --offline was given",
+            hint="run './x.py fetch jinx' while online",
+        )
+    ctx.log.msg2(f"fetching Jinx {JINX_PIN.commit[:12]}")
+    ensure_dir(destination)
+    if not (destination / ".git").exists():
+        run(["git", "init", "-q", str(destination)])
+    run(["git", "-C", str(destination), "fetch", "--depth=1", JINX_PIN.url, JINX_PIN.commit])
+    run(["git", "-C", str(destination), "checkout", "-q", "--detach", JINX_PIN.commit])
+    if git_head(destination) != JINX_PIN.commit or not executable.is_file():
+        raise Failure("the Jinx checkout does not match the pinned commit")
+    return destination
 
 
-def build_is_current(
-    ctx: Context,
-    *,
-    key: str,
-    fingerprint: str,
-    outputs: Sequence[Path],
-    label: str,
-) -> bool:
-    if ctx.force or not all(path.exists() for path in outputs):
+# --------------------------------------------------------------------------
+# Recipes - a light-weight reader for Jinx recipe metadata
+# --------------------------------------------------------------------------
+
+_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_FUNCTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\)")
+
+
+@dataclass(frozen=True)
+class Recipe:
+    name: str
+    directory: Path
+    version: str
+    revision: str
+    deps: tuple[str, ...]
+    builddeps: tuple[str, ...]
+    from_source: str | None
+    source_dir: str | None
+
+    @property
+    def version_revision(self) -> str:
+        if not self.version:
+            return f"?-{self.revision}"
+        return f"{self.version}-{self.revision}"
+
+    @property
+    def in_tree_source(self) -> Path | None:
+        if self.source_dir and self.source_dir in IN_TREE_SOURCES:
+            return IN_TREE_SOURCES[self.source_dir]
+        return None
+
+
+def _expand(value: str, variables: Mapping[str, str]) -> str:
+    value = value.strip()
+    if value.startswith(("'", '"')) and value.endswith(value[0]) and len(value) >= 2:
+        value = value[1:-1]
+    if "$(" in value or "`" in value:
+        return ""  # dynamically computed; not statically knowable
+
+    def substitute(match: re.Match[str]) -> str:
+        return variables.get(match.group(1) or match.group(2), "")
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", substitute, value)
+
+
+def read_recipe(name: str) -> Recipe:
+    directory = RECIPES_DIR / name
+    path = directory / "recipe"
+    if not path.is_file():
+        raise Failure(
+            f"no such recipe: {name}",
+            hint="run './x.py list' to see the available packages",
+        )
+    variables: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if _FUNCTION.match(line):
+            break
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        match = _ASSIGNMENT.match(text)
+        if match:
+            variables[match.group(1)] = _expand(match.group(2), variables)
+    return Recipe(
+        name=name,
+        directory=directory,
+        version=variables.get("version", ""),
+        revision=variables.get("revision", "0"),
+        deps=tuple(variables.get("deps", "").split()),
+        builddeps=tuple(variables.get("builddeps", "").split()),
+        from_source=variables.get("from_source") or None,
+        source_dir=variables.get("source_dir") or None,
+    )
+
+
+class Recipes:
+    """The userland package graph, loaded straight out of userland/recipes."""
+
+    def __init__(self) -> None:
+        self._cache: dict[str, Recipe] = {}
+        self.names: tuple[str, ...] = tuple(
+            sorted(item.parent.name for item in RECIPES_DIR.glob("*/recipe"))
+        )
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.names
+
+    def get(self, name: str) -> Recipe:
+        if name not in self._cache:
+            recipe = read_recipe(name)
+            # A `from_source` recipe inherits the source recipe's version, which
+            # is what ends up in the .xbps filename Jinx looks for.
+            if not recipe.version and recipe.from_source and recipe.from_source != name:
+                try:
+                    recipe = replace(recipe, version=self.get(recipe.from_source).version)
+                except Failure:
+                    pass
+            self._cache[name] = recipe
+        return self._cache[name]
+
+    def resolve(self, names: Sequence[str]) -> tuple[str, ...]:
+        """Expand globs and validate names, keeping the caller's order."""
+        selected: list[str] = []
+        for pattern in names:
+            if any(character in pattern for character in "*?["):
+                matched = [item for item in self.names if _glob_match(pattern, item)]
+                if not matched:
+                    raise Failure(f"no package matches {pattern!r}")
+                selected.extend(matched)
+                continue
+            if pattern not in self.names:
+                raise Failure(
+                    f"unknown package: {pattern}", hint=self._suggest(pattern)
+                )
+            selected.append(pattern)
+        seen: dict[str, None] = {}
+        for name in selected:
+            seen.setdefault(name, None)
+        return tuple(seen)
+
+    def _suggest(self, name: str) -> str:
+        import difflib
+
+        close = difflib.get_close_matches(name, self.names, n=3, cutoff=0.5)
+        if close:
+            return "did you mean: " + ", ".join(close) + "?"
+        return "run './x.py list' to see the available packages"
+
+    # -- graph ------------------------------------------------------------
+
+    def requires(self, name: str) -> tuple[str, ...]:
+        """Build-order dependencies.
+
+        ``from_source`` is deliberately excluded: it only says that two recipes
+        share one source tree, not that one must be built before the other.
+        Treating it as an edge introduces cycles such as mlibc <-> mlibc-headers.
+        """
+        recipe = self.get(name)
+        related = list(recipe.deps) + list(recipe.builddeps)
+        return tuple(dict.fromkeys(item for item in related if item in self.names))
+
+    def dependency_closure(self, names: Sequence[str]) -> tuple[str, ...]:
+        seen = set(names)
+        pending = list(names)
+        while pending:
+            current = pending.pop()
+            related = list(self.requires(current))
+            source = self.get(current).from_source
+            if source and source in self.names:
+                related.append(source)
+            for dependency in related:
+                if dependency not in seen:
+                    seen.add(dependency)
+                    pending.append(dependency)
+        return tuple(sorted(seen))
+
+    def dependents(self, names: Sequence[str]) -> tuple[str, ...]:
+        """Every package that must be rebuilt when ``names`` change."""
+        closure = set(names)
+        changed = True
+        while changed:
+            changed = False
+            shared_sources = {
+                self.get(item).from_source
+                for item in closure
+                if self.get(item).from_source
+            } | closure
+            for candidate in self.names:
+                if candidate in closure:
+                    continue
+                recipe = self.get(candidate)
+                if recipe.from_source in shared_sources or closure.intersection(
+                    self.requires(candidate)
+                ):
+                    closure.add(candidate)
+                    changed = True
+        return tuple(sorted(closure))
+
+    def order(self, names: Iterable[str]) -> tuple[str, ...]:
+        """Topologically sort ``names`` so dependencies build first."""
+        wanted = set(names)
+        ordered: list[str] = []
+        visiting: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in ordered:
+                return
+            if name in visiting:
+                raise Failure(f"dependency cycle in the userland recipes at {name!r}")
+            visiting.add(name)
+            for dependency in self.requires(name):
+                if dependency in wanted:
+                    visit(dependency)
+            visiting.discard(name)
+            ordered.append(name)
+
+        for name in sorted(wanted):
+            visit(name)
+        return tuple(ordered)
+
+    # -- change detection --------------------------------------------------
+
+    def digest(self, name: str) -> str:
+        """Hash everything that would change this package's contents."""
+        recipe = self.get(name)
+        paths = [recipe.directory]
+        source = recipe.in_tree_source
+        if source is not None:
+            paths.append(source)
+        if recipe.from_source and recipe.from_source in self.names:
+            source_recipe = self.get(recipe.from_source)
+            paths.append(source_recipe.directory)
+            if source_recipe.in_tree_source is not None:
+                paths.append(source_recipe.in_tree_source)
+        return fingerprint(f"recipe:{name}", values=(recipe.version_revision,), paths=paths)
+
+
+def _glob_match(pattern: str, name: str) -> bool:
+    import fnmatch
+
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+# --------------------------------------------------------------------------
+# The system manifest - which packages make up the Roanix image
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Manifest:
+    install: tuple[str, ...]
+    extra_build: tuple[str, ...]
+    generated: bool
+
+    @property
+    def build(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.extra_build, *self.install)))
+
+
+def load_manifest(log: Log) -> Manifest:
+    if not SYSTEM_MANIFEST.is_file():
+        log.warn(f"{rel(SYSTEM_MANIFEST)} is missing; using built-in defaults")
+        return Manifest(FALLBACK_SYSTEM_PACKAGES, FALLBACK_EXTRA_BUILD_PACKAGES, True)
+    section = "install"
+    buckets: dict[str, list[str]] = {"install": [], "build": []}
+    for number, line in enumerate(
+        SYSTEM_MANIFEST.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        if text.startswith("[") and text.endswith("]"):
+            section = text[1:-1].strip().lower()
+            if section not in buckets:
+                raise Failure(
+                    f"{rel(SYSTEM_MANIFEST)}:{number}: unknown section [{section}]",
+                    hint="valid sections are [install] and [build]",
+                )
+            continue
+        buckets[section].append(text)
+    if not buckets["install"]:
+        raise Failure(
+            f"{rel(SYSTEM_MANIFEST)} lists no packages under [install]",
+            hint="add at least 'init' so the image can boot",
+        )
+    return Manifest(tuple(buckets["install"]), tuple(buckets["build"]), False)
+
+
+def add_to_manifest(name: str) -> bool:
+    """Append ``name`` to the [install] section; returns False if already there."""
+    if not SYSTEM_MANIFEST.is_file():
         return False
-    try:
-        state = json.loads(build_state_path(key).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(state, dict):
-        return False
-    if state.get("fingerprint") != fingerprint:
-        return False
-    recorded_stamps = state.get("output_stamps")
-    if not isinstance(recorded_stamps, dict):
-        return False
-    for output in outputs:
-        try:
-            current_stamp = output_stamp(output)
-        except OSError:
-            return False
-        if recorded_stamps.get(str(output)) != current_stamp:
-            return False
-    ctx.ui.step(f"reuse {label} (up to date)")
+    lines = SYSTEM_MANIFEST.read_text(encoding="utf-8").splitlines()
+    section = "install"
+    last_install = None
+    for index, line in enumerate(lines):
+        text = line.split("#", 1)[0].strip()
+        if text.startswith("[") and text.endswith("]"):
+            section = text[1:-1].strip().lower()
+            continue
+        if text and section == "install":
+            if text == name:
+                return False
+            last_install = index
+    insert_at = (last_install + 1) if last_install is not None else len(lines)
+    lines.insert(insert_at, name)
+    SYSTEM_MANIFEST.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return True
 
 
-def record_build_state(
-    *,
-    key: str,
-    fingerprint: str,
-    outputs: Sequence[Path],
-) -> None:
-    path = build_state_path(key)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    ensure_dir(path.parent)
-    try:
-        temporary.write_text(
-            json.dumps(
-                {
-                    "fingerprint": fingerprint,
-                    "output_stamps": {
-                        str(output): output_stamp(output) for output in outputs
-                    },
-                },
-                indent=2,
-                sort_keys=True,
+# --------------------------------------------------------------------------
+# Jinx driver
+# --------------------------------------------------------------------------
+
+WGET_SHIM = """#!/bin/sh
+# Minimal wget shim backed by curl, generated by xtool.
+output=""; agent=""; insecure=""; url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -O) output="$2"; shift 2 ;;
+        -qO-) output="-"; shift ;;
+        -U) agent="$2"; shift 2 ;;
+        -nv|-q) shift ;;
+        --no-check-certificate) insecure="-k"; shift ;;
+        --ca-certificate=*) ca_file="${1#*=}"; shift ;;
+        --certificate=*) certificate="${1#*=}"; shift ;;
+        --private-key=*) private_key="${1#*=}"; shift ;;
+        --) shift; break ;;
+        -*) echo "wget shim: unsupported option: $1" >&2; exit 2 ;;
+        *) url="$1"; shift ;;
+    esac
+done
+[ -n "$url" ] || { echo "wget shim: no URL given" >&2; exit 2; }
+set -- CURL -fL
+[ -n "$output" ] && set -- "$@" -o "$output"
+[ -n "$agent" ] && set -- "$@" -A "$agent"
+[ -n "$insecure" ] && set -- "$@" "$insecure"
+[ -n "${ca_file-}" ] && set -- "$@" --cacert "$ca_file"
+[ -n "${certificate-}" ] && set -- "$@" --cert "$certificate"
+[ -n "${private_key-}" ] && set -- "$@" --key "$private_key"
+exec "$@" "$url"
+"""
+
+
+class Jinx:
+    """Everything xtool knows about driving the userland package manager."""
+
+    def __init__(self, ctx: Context, run: Runner, recipes: Recipes) -> None:
+        self.ctx = ctx
+        self.run = run
+        self.recipes = recipes
+        self._binary: Path | None = None
+        self._env: dict[str, str] | None = None
+
+    # -- bootstrap ---------------------------------------------------------
+
+    def _environment(self) -> dict[str, str]:
+        if self._env is not None:
+            return self._env
+        path = os.environ.get("PATH", "")
+        env = {"JINX_PARALLELISM": str(self.ctx.jobs)}
+        if shutil.which("wget") is None:
+            curl = shutil.which("curl")
+            if curl is None:
+                raise Failure(
+                    "Jinx needs wget to download sources",
+                    hint=f"install wget, or curl for xtool's fallback: "
+                    f"{install_command(detect_package_manager(), 'wget')}",
+                )
+            shim_dir = ensure_dir(CACHE_DIR / "host-tools")
+            write_file(
+                shim_dir / "wget", WGET_SHIM.replace("CURL", shlex.quote(curl)), mode=0o755
             )
-            + "\n",
-            encoding="utf-8",
+            path = f"{shim_dir}:{path}" if path else str(shim_dir)
+        env["PATH"] = path
+        self._env = env
+        return env
+
+    def prepare(self) -> Path:
+        """Make sure Jinx exists and its build directory is initialised."""
+        if self._binary is not None:
+            return self._binary
+        self.sync_in_tree_sources()
+        checkout = ensure_jinx(self.ctx, self.run)
+        binary = checkout / "jinx"
+        build = self.ctx.jinx_build
+        if build.is_symlink():
+            raise Failure(f"refusing to use a symlinked Jinx build directory: {build}")
+        ensure_dir(build)
+        if not (build / ".jinx-parameters").is_file():
+            self.ctx.log.msg2(f"initialising the Jinx build directory for {self.ctx.arch.name}")
+            self.run(
+                [binary, "init", str(USERLAND_DIR), f"ARCH={self.ctx.arch.name}"],
+                cwd=build,
+                env=self._environment(),
+            )
+        self._binary = binary
+        return binary
+
+    def sync_in_tree_sources(self) -> None:
+        """Mirror in-repo source trees into the places recipes expect."""
+        staged = USERLAND_DIR / "drivers"
+        digest = fingerprint("drivers-source", paths=(DRIVERS_DIR,))
+        marker = staged / ".xtool-source.sha256"
+        if staged.is_dir() and marker.is_file():
+            if marker.read_text(encoding="utf-8").strip() == digest:
+                return
+        temporary = USERLAND_DIR / ".drivers.xtool-tmp"
+        remove(temporary)
+        shutil.copytree(
+            DRIVERS_DIR,
+            temporary,
+            ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.so"),
         )
-        temporary.replace(path)
-    finally:
-        remove_path(temporary)
+        write_file(temporary / ".xtool-source.sha256", digest + "\n")
+        remove(staged)
+        temporary.rename(staged)
+
+    # -- raw invocation ----------------------------------------------------
+
+    def __call__(self, arguments: Sequence[str], *, mode: str = "stream", always: bool = False) -> str:
+        binary = self.prepare()
+        return self.run(
+            [binary, *arguments],
+            cwd=self.ctx.jinx_build,
+            env=self._environment(),
+            mode=mode,
+            filter=jinx_filter,
+            always=always,
+        )
+
+    # -- commands ----------------------------------------------------------
+
+    def preview(self, names: Sequence[str]) -> tuple[str, ...]:
+        """``jinx dry-run``: what would be built, in order."""
+        try:
+            output = self(["dry-run", *names], mode="quiet", always=True)
+        except Failure:
+            return ()
+        return tuple(output.split())
+
+    def update(self, names: Sequence[str], *, build_missing: bool = True) -> None:
+        arguments = ["update"]
+        if build_missing:
+            arguments.append("-b")
+        self(arguments + list(names))
+
+    def rebuild(self, names: Sequence[str]) -> None:
+        self(["rebuild", *names])
+
+    def revbump(self, names: Sequence[str]) -> None:
+        self(["revbump", *names], mode="stream")
+
+    def regen(self, name: str) -> None:
+        self(["regen", name], mode="stream")
+
+    def run_in(self, name: str, command: Sequence[str]) -> None:
+        binary = self.prepare()
+        self.run(
+            [binary, "run-in", name, *command],
+            cwd=self.ctx.jinx_build,
+            env=self._environment(),
+            mode="raw",
+        )
+
+    def install(self, sysroot: Path, names: Sequence[str], *, force: bool = False) -> None:
+        arguments = ["install"]
+        if force:
+            arguments.append("-f")
+        self(arguments + [str(sysroot), *names])
+
+    # -- introspection -----------------------------------------------------
+
+    def built(self) -> dict[str, set[str]]:
+        """Map package name -> every ``version_revision`` present in pkgs/."""
+        result: dict[str, set[str]] = {}
+        packages = self.ctx.jinx_build / "pkgs"
+        if not packages.is_dir():
+            return result
+        suffix = f".{self.ctx.arch.name}.xbps"
+        for item in packages.glob(f"*{suffix}"):
+            stem = item.name[: -len(suffix)]
+            name, separator, version = stem.rpartition("-")
+            if name and separator:
+                result.setdefault(name, set()).add(version)
+        return result
+
+    def has_package(self, recipe: Recipe, built: Mapping[str, set[str]]) -> bool:
+        """Is this exact recipe revision already built?"""
+        versions = built.get(recipe.name)
+        if not versions:
+            return False
+        if not recipe.version:
+            return True  # dynamically computed version; trust that it exists
+        return f"{recipe.version}_{recipe.revision}" in versions
+
+    def is_initialised(self) -> bool:
+        return (self.ctx.jinx_build / ".jinx-parameters").is_file()
 
 
-def kernel_fingerprint(ctx: Context) -> str:
-    return build_fingerprint(
-        "kernel-v1",
+# --------------------------------------------------------------------------
+# Kernel
+# --------------------------------------------------------------------------
+
+
+def rust_env(ctx: Context) -> dict[str, str]:
+    flags = ["-Crelocation-model=static", "-Cforce-frame-pointers=yes"]
+    extra = os.environ.get("ROANIX_RUSTFLAGS")
+    if extra:
+        flags.append(extra)
+    return {"CARGO_TARGET_DIR": str(ctx.cargo_target), "RUSTFLAGS": " ".join(flags)}
+
+
+def kernel_digest(ctx: Context) -> str:
+    return fingerprint(
+        "kernel",
         values=(
             ctx.arch.name,
             ctx.profile,
-            ctx.rust_target,
+            ctx.arch.rust_target,
             os.environ.get("ROANIX_RUSTFLAGS", ""),
         ),
         paths=(
-            ROOT / "x.py",
             KERNEL_DIR / "Cargo.toml",
             KERNEL_DIR / "Cargo.lock",
             KERNEL_DIR / "rust-toolchain.toml",
@@ -598,822 +1565,283 @@ def kernel_fingerprint(ctx: Context) -> str:
             KERNEL_DIR / f"linker-{ctx.arch.name}.ld",
             KERNEL_DIR / ".cargo",
             KERNEL_DIR / "src",
+            KERNEL_DIR / "include",
         ),
     )
 
 
-def userspace_fingerprint(ctx: Context) -> str:
-    return build_fingerprint(
-        "userspace-v1",
-        values=(
-            ctx.arch.name,
-            JINX.commit,
-            *USERSPACE_BUILD_PACKAGES,
-            *USERSPACE_PACKAGES,
-        ),
-        paths=(
-            ROOT / "x.py",
-            USERLAND_DIR / "Jinxfile",
-            USERLAND_DIR / "build-support",
-            USERLAND_DIR / "host-recipes",
-            USERLAND_DIR / "recipes",
-            USERLAND_DIR / "init",
-            DRIVERS_DIR,
-        ),
+def cargo(
+    ctx: Context, run: Runner, subcommand: str, *arguments: str, mode: str = "stream", jobs: bool = True
+) -> None:
+    argv = ["cargo", subcommand]
+    if jobs and ctx.jobs:
+        argv += ["--jobs", str(ctx.jobs)]
+    argv += list(arguments)
+    run(argv, cwd=KERNEL_DIR, env=rust_env(ctx), mode=mode, filter=cargo_filter)
+
+
+def build_kernel(ctx: Context, run: Runner, cache: Cache) -> Path:
+    key = f"kernel-{ctx.profile}"
+    digest = kernel_digest(ctx)
+    if cache.is_current(key, digest, (ctx.kernel_binary,)):
+        ctx.log.msg2(f"kernel is up to date ({rel(ctx.kernel_binary)})")
+        return ctx.kernel_binary
+
+    started = time.monotonic()
+    ctx.log.msg(f"Building the kernel ({ctx.arch.name}, {ctx.profile})")
+    output_dir = ctx.cargo_arch_dir / (
+        "debug" if ctx.profile == "dev" else ctx.profile
     )
-
-
-def initramfs_fingerprint(ctx: Context) -> str:
-    return build_fingerprint(
-        "initramfs-v1",
-        values=(
-            ctx.arch.name,
-            ctx.profile,
-            userspace_fingerprint(ctx),
-            output_stamp(ctx.sysroot),
-        ),
-    )
-
-
-def image_fingerprint(ctx: Context, kind: str) -> str:
-    return build_fingerprint(
-        f"{kind}-image-v1",
-        values=(
-            ctx.arch.name,
-            ctx.profile,
-            kernel_fingerprint(ctx),
-            initramfs_fingerprint(ctx),
-            output_stamp(ctx.kernel_artifact),
-            output_stamp(ctx.initramfs),
-            json.dumps(DOWNLOADS["limine"].marker(), sort_keys=True),
-        ),
-        paths=(
-            ROOT / "x.py",
-            USERLAND_DIR / "distro-files" / "limine.conf",
-            USERLAND_DIR / "distro-files" / "splash.jpg",
-        ),
-    )
-
-
-def _safe_archive_path(destination: Path, name: str) -> Path:
-    pure = PurePosixPath(name)
-    if pure.is_absolute() or ".." in pure.parts:
-        raise BuildError(f"Archive contains unsafe path: {name!r}")
-    resolved = (destination / Path(*pure.parts)).resolve()
-    try:
-        resolved.relative_to(destination.resolve())
-    except ValueError as exc:
-        raise BuildError(f"Archive contains unsafe path: {name!r}") from exc
-    return resolved
-
-
-def safe_extract_tar(archive: Path, destination: Path) -> None:
-    with tarfile.open(archive, "r:*") as tar:
-        for member in tar.getmembers():
-            target = _safe_archive_path(destination, member.name)
-            if member.isdev() or member.isfifo():
-                raise BuildError(
-                    f"Archive contains unsupported special file: {member.name!r}"
-                )
-            if member.issym():
-                link = PurePosixPath(member.linkname)
-                if link.is_absolute():
-                    raise BuildError(
-                        f"Archive contains unsafe symlink: {member.name!r}"
-                    )
-                link_target = (target.parent / Path(*link.parts)).resolve()
-                try:
-                    link_target.relative_to(destination.resolve())
-                except ValueError as exc:
-                    raise BuildError(
-                        f"Archive contains unsafe symlink: {member.name!r}"
-                    ) from exc
-            if member.islnk():
-                _safe_archive_path(destination, member.linkname)
-        if hasattr(tarfile, "fully_trusted_filter"):
-            tar.extractall(destination, filter="fully_trusted")
-        else:
-            tar.extractall(destination)
-
-
-def _download_cache_path(pin: DownloadPin) -> Path:
-    suffix = "".join(Path(urllib.request.url2pathname(pin.url)).suffixes)
-    if not suffix:
-        suffix = ".archive"
-    return RUNTIME_ROOT / "downloads" / f"{pin.name}-{pin.version}-{pin.sha256[:12]}{suffix}"
-
-
-def fetch_download(ctx: Context, pin: DownloadPin) -> Path:
-    cache_path = _download_cache_path(pin)
-    if cache_path.is_file():
-        digest = sha256_file(cache_path)
-        if digest == pin.sha256:
-            return cache_path
-        remove_path(cache_path)
-
-    ensure_dir(cache_path.parent)
-    ctx.ui.step(f"download {pin.name} {pin.version}")
-    request = urllib.request.Request(
-        pin.url, headers={"User-Agent": f"roanix-x.py/{VERSION}"}
-    )
-    temporary = cache_path.with_suffix(cache_path.suffix + ".part")
-    remove_path(temporary)
-    digest = hashlib.sha256()
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            with temporary.open("wb") as output:
-                while block := response.read(1024 * 1024):
-                    output.write(block)
-                    digest.update(block)
-    except (HTTPError, URLError, TimeoutError) as exc:
-        remove_path(temporary)
-        raise BuildError(f"Failed to download {pin.name}: {exc}") from exc
-    actual = digest.hexdigest()
-    if actual != pin.sha256:
-        remove_path(temporary)
-        raise BuildError(
-            f"{pin.name} checksum mismatch: expected {pin.sha256}, got {actual}"
-        )
-    temporary.replace(cache_path)
-    return cache_path
-
-
-def _marker_matches(path: Path, pin: DownloadPin) -> bool:
-    marker = path / ".x-version.json"
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
-    return value == pin.marker()
-
-
-def install_download(ctx: Context, pin: DownloadPin) -> Path:
-    destination = RUNTIME_ROOT / pin.directory
-    if destination.is_dir() and _marker_matches(destination, pin):
-        return destination
-
-    archive = fetch_download(ctx, pin)
-    ensure_dir(RUNTIME_ROOT)
-    ctx.ui.step(f"extract {pin.name} {pin.version}")
-    with tempfile.TemporaryDirectory(prefix=f".{pin.name}-", dir=RUNTIME_ROOT) as temporary:
-        temporary_path = Path(temporary)
-        safe_extract_tar(archive, temporary_path)
-        extracted = temporary_path / pin.archive_root
-        if not extracted.is_dir():
-            raise BuildError(
-                f"{pin.name} archive did not contain {pin.archive_root!r}"
-            )
-        remove_path(destination)
-        shutil.move(str(extracted), destination)
-    write_text(
-        destination / ".x-version.json",
-        json.dumps(pin.marker(), indent=2, sort_keys=True) + "\n",
-    )
-    return destination
-
-
-def ensure_limine(ctx: Context) -> Path:
-    pin = DOWNLOADS["limine"]
-    destination = RUNTIME_ROOT / pin.directory
-    if ctx.no_bootstrap and not _marker_matches(destination, pin):
-        raise BuildError(
-            "Limine is not bootstrapped at the locked version; remove "
-            "--no-bootstrap or run 'x.py fetch limine'"
-        )
-    if not ctx.no_bootstrap:
-        destination = install_download(ctx, pin)
-    executable = destination / "limine"
-    if not executable.exists():
-        if ctx.no_bootstrap:
-            raise BuildError(f"Missing Limine host tool: {executable}")
-        run(
-            ctx,
-            ["make", "-C", str(destination)],
-            step="build Limine host tools",
-        )
-    required = [
-        destination / "limine-uefi-cd.bin",
-        destination / "BOOTX64.EFI",
-        destination / "BOOTIA32.EFI",
-        destination / "BOOTRISCV64.EFI",
-    ]
-    if ctx.arch.name == "x86_64":
-        required += [
-            destination / "limine-bios.sys",
-            destination / "limine-bios-cd.bin",
-        ]
-    missing = [path.name for path in required if not path.exists()]
-    if missing:
-        raise BuildError(f"Locked Limine release is missing: {', '.join(missing)}")
-    return destination
-
-
-def ensure_ovmf(ctx: Context) -> Path:
-    pin = DOWNLOADS["ovmf"]
-    destination = RUNTIME_ROOT / pin.directory
-    if ctx.no_bootstrap and not _marker_matches(destination, pin):
-        raise BuildError(
-            "OVMF is not bootstrapped at the locked version; remove "
-            "--no-bootstrap or run 'x.py fetch ovmf'"
-        )
-    if not ctx.no_bootstrap:
-        destination = install_download(ctx, pin)
-    for kind in ("code", "vars"):
-        firmware = destination / f"ovmf-{kind}-{ctx.arch.name}.fd"
-        if not firmware.is_file():
-            raise BuildError(f"Locked OVMF release is missing {firmware.name}")
-    return destination
-
-
-def _git_head(path: Path) -> str | None:
-    if not (path / ".git").exists():
-        return None
-    completed = _capture(["git", "-C", str(path), "rev-parse", "HEAD"])
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip().lower()
-
-
-def _git_worktree_clean(path: Path) -> bool:
-    completed = _capture(
-        [
-            "git",
-            "-C",
-            str(path),
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-        ]
-    )
-    return completed.returncode == 0 and not completed.stdout.strip()
-
-
-def ensure_jinx(ctx: Context) -> Path:
-    pin = JINX
-    destination = RUNTIME_ROOT / pin.directory
-    if _git_head(destination) == pin.commit and (destination / "jinx").is_file():
-        if not _git_worktree_clean(destination):
-            raise BuildError(
-                "The cached Jinx checkout has local modifications; remove "
-                "build/runtime/jinx before rebuilding"
-            )
-        return destination
-    if ctx.no_bootstrap:
-        raise BuildError(
-            "Jinx is not checked out at the locked commit; remove --no-bootstrap "
-            "or run 'x.py fetch jinx'"
-        )
-
-    ensure_dir(destination)
-    if not (destination / ".git").exists():
-        run(ctx, ["git", "init", str(destination)], step="initialize Jinx checkout")
-
-    run(
-        ctx,
-        [
-            "git",
-            "-C",
-            str(destination),
-            "fetch",
-            "--depth=1",
-            pin.url,
-            pin.commit,
-        ],
-        step=f"fetch Jinx {pin.commit[:12]}",
-    )
-    run(
-        ctx,
-        ["git", "-C", str(destination), "checkout", "--detach", pin.commit],
-        step="check out locked Jinx commit",
-    )
-    if _git_head(destination) != pin.commit or not (destination / "jinx").is_file():
-        raise BuildError("Jinx checkout does not match the expected commit")
-    if not _git_worktree_clean(destination):
-        raise BuildError("Jinx checkout contains local modifications")
-    return destination
-
-
-def jinx_environment(ctx: Context) -> Mapping[str, str]:
-    path = os.environ.get("PATH", "")
-    if shutil.which("wget") is not None:
-        return {"PATH": path}
-
-    curl = shutil.which("curl")
-    if curl is None:
-        raise BuildError("Jinx requires wget, or curl for the built-in fallback")
-
-    host_tools = RUNTIME_ROOT / "jinx-host-tools"
-    ensure_dir(host_tools)
-    wget = host_tools / "wget"
-    script = (
-        "#!/bin/sh\n"
-        'output=""\n'
-        'user_agent=""\n'
-        'insecure=""\n'
-        'url=""\n'
-        'while [ "$#" -gt 0 ]; do\n'
-        '    case "$1" in\n'
-        '        -O) output="$2"; shift 2 ;;\n'
-        '        -qO-) output="-"; shift ;;\n'
-        '        -U) user_agent="$2"; shift 2 ;;\n'
-        '        -nv|-q) shift ;;\n'
-        '        --no-check-certificate) insecure="-k"; shift ;;\n'
-        '        --ca-certificate=*) ca_file="${1#*=}"; shift ;;\n'
-        '        --certificate=*) certificate="${1#*=}"; shift ;;\n'
-        '        --private-key=*) private_key="${1#*=}"; shift ;;\n'
-        '        --) shift; break ;;\n'
-        '        -*) echo "unsupported wget option: $1" >&2; exit 2 ;;\n'
-        '        *) url="$1"; shift ;;\n'
-        "    esac\n"
-        "done\n"
-        '[ -n "$url" ] || { echo "wget fallback requires a URL" >&2; exit 2; }\n'
-        f"set -- {shlex.quote(curl)} -fL\n"
-        '[ -n "$output" ] && set -- "$@" -o "$output"\n'
-        '[ -n "$user_agent" ] && set -- "$@" -A "$user_agent"\n'
-        '[ -n "$insecure" ] && set -- "$@" "$insecure"\n'
-        '[ -n "${ca_file-}" ] && set -- "$@" --cacert "$ca_file"\n'
-        '[ -n "${certificate-}" ] && set -- "$@" --cert "$certificate"\n'
-        '[ -n "${private_key-}" ] && set -- "$@" --key "$private_key"\n'
-        'exec "$@" "$url"\n'
-    )
-    write_text(wget, script, mode=0o755)
-    combined = f"{host_tools}:{path}" if path else str(host_tools)
-    return {"PATH": combined}
-
-
-def cargo_arguments(*arguments: str) -> list[str]:
-    return ["cargo", *arguments]
-
-
-def rust_environment(ctx: Context) -> Mapping[str, str]:
-    flags = [
-        "-Crelocation-model=static",
-        "-Cforce-frame-pointers=yes",
-    ]
-    extra = os.environ.get("ROANIX_RUSTFLAGS")
-    if extra:
-        flags.append(extra)
-    return {
-        "CARGO_TARGET_DIR": str(ctx.cargo_target_dir),
-        "RUSTFLAGS": " ".join(flags),
-    }
-
-
-def _profile_directory(profile: str) -> str:
-    return "debug" if profile == "dev" else profile
-
-
-def cargo_profile_dir(ctx: Context) -> Path:
-    return (
-        ctx.cargo_target_dir
-        / ctx.rust_target
-        / _profile_directory(ctx.profile)
-    )
-
-
-def build_kernel(ctx: Context) -> Path:
-    fingerprint = kernel_fingerprint(ctx)
-    state_key = (
-        f"kernel-{ctx.arch.name}-{ctx.profile}-{output_namespace(ctx)}"
-    )
-    if build_is_current(
-        ctx,
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.kernel_artifact,),
-        label=f"kernel ({ctx.arch.name}, {ctx.profile})",
-    ):
-        return ctx.kernel_artifact
-
-    output_dir = cargo_profile_dir(ctx)
     if ctx.force:
-        remove_path(output_dir)
-        remove_path(ctx.kernel_artifact)
-    ensure_dir(ctx.artifact_dir)
-    argv = cargo_arguments(
-        "build",
-        "--target",
-        ctx.rust_target,
-        "--profile",
-        ctx.profile,
-    )
-    run(
-        ctx,
-        argv,
-        cwd=KERNEL_DIR,
-        env_updates=rust_environment(ctx),
-        step=f"build kernel ({ctx.arch.name}, {ctx.profile})",
-    )
-    preferred = output_dir / "roanix"
-    if preferred.is_file():
-        source = preferred
-    else:
+        remove(output_dir)
+        remove(ctx.kernel_binary)
+    ensure_dir(ctx.artifacts)
+    cargo(ctx, run, "build", "--target", ctx.arch.rust_target, "--profile", ctx.profile)
+    if ctx.dry_run:
+        return ctx.kernel_binary
+
+    produced = output_dir / "roanix"
+    if not produced.is_file():
         candidates = sorted(
-            path
-            for path in output_dir.iterdir()
-            if path.is_file() and os.access(path, os.X_OK)
+            item
+            for item in output_dir.iterdir()
+            if item.is_file() and os.access(item, os.X_OK)
         )
         if not candidates:
-            raise BuildError(f"No kernel executable was produced in {output_dir}")
-        source = candidates[0]
-    copy_file(source, ctx.kernel_artifact)
-    record_build_state(
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.kernel_artifact,),
+            raise Failure(f"cargo produced no kernel executable in {rel(output_dir)}")
+        produced = candidates[0]
+    copy(produced, ctx.kernel_binary)
+    cache.record(key, digest, (ctx.kernel_binary,))
+    ctx.log.msg2(
+        f"{rel(ctx.kernel_binary)} ({human_size(ctx.kernel_binary.stat().st_size)})"
     )
-    return ctx.kernel_artifact
+    ctx.log.finished("the kernel", time.monotonic() - started)
+    return ctx.kernel_binary
 
 
-def check_kernel(ctx: Context) -> None:
-    run(
-        ctx,
-        cargo_arguments(
-            "check",
-            "--target",
-            ctx.rust_target,
-            "--profile",
-            ctx.profile,
+# --------------------------------------------------------------------------
+# Userland
+# --------------------------------------------------------------------------
+
+
+def global_userland_digest() -> str:
+    """Inputs that affect every userland package."""
+    return fingerprint(
+        "userland-global",
+        values=(JINX_PIN.commit,),
+        paths=(USERLAND_DIR / "Jinxfile", USERLAND_DIR / "build-support"),
+    )
+
+
+def stale_packages(
+    ctx: Context, jinx: Jinx, recipes: Recipes, wanted: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split ``wanted`` into (never built, changed since last build).
+
+    A package with no recorded digest is adopted as-is rather than reported as
+    changed; otherwise the first run of a new xtool would rebuild a perfectly
+    good userland from scratch.
+    """
+    state = Cache(ctx).read("recipes")
+    recorded = state.get("digests", {})
+    built = jinx.built()
+    missing: list[str] = []
+    changed: list[str] = []
+    for name in wanted:
+        if not jinx.has_package(recipes.get(name), built):
+            missing.append(name)
+        elif name in recorded and recorded[name] != recipes.digest(name):
+            changed.append(name)
+    return tuple(missing), tuple(changed)
+
+
+def record_recipe_digests(ctx: Context, recipes: Recipes, names: Sequence[str]) -> None:
+    cache = Cache(ctx)
+    key = "recipes"
+    state = cache.read(key)
+    digests = dict(state.get("digests", {}))
+    for name in names:
+        digests[name] = recipes.digest(name)
+    cache.record(key, global_userland_digest(), (), digests=digests)
+
+
+def announce_plan(ctx: Context, jinx: Jinx, targets: Sequence[str]) -> None:
+    """Ask Jinx itself what it would build, and show it."""
+    planned = jinx.preview(targets)
+    if planned:
+        ctx.log.msg2(f"Jinx would build {len(planned)} package(s), in order:")
+        ctx.log.msg3(" ".join(planned))
+    else:
+        ctx.log.msg2("Jinx has nothing to build")
+
+
+def install_sysroot(
+    ctx: Context, jinx: Jinx, manifest: Manifest, *, force: bool = False
+) -> Path:
+    """Assemble a fresh sysroot from the built packages, then swap it in."""
+    ensure_dir(ctx.arch_root)
+    staging = ctx.arch_root / ".sysroot.staging"
+    remove(staging)
+    ensure_dir(staging)
+    try:
+        jinx.install(staging, manifest.install, force=force)
+        if ctx.dry_run:
+            return ctx.sysroot
+        swap_directory(staging, ctx.sysroot)
+    finally:
+        remove(staging)
+    ctx.log.msg2(
+        f"{rel(ctx.sysroot)} ({human_size(tree_size(ctx.sysroot))}, "
+        f"{len(manifest.install)} top-level packages)"
+    )
+    return ctx.sysroot
+
+
+def build_userland(
+    ctx: Context,
+    jinx: Jinx,
+    recipes: Recipes,
+    manifest: Manifest,
+    *,
+    only: Sequence[str] | None = None,
+    with_dependents: bool = True,
+) -> Path:
+    """Bring the sysroot in line with the recipes.
+
+    With ``only`` set this rebuilds exactly those packages (plus, unless
+    ``with_dependents`` is off, everything that links against them).  Without
+    it, xtool works out which recipes changed and rebuilds just those.
+    """
+    started = time.monotonic()
+    jinx.prepare()
+
+    if only is not None:
+        targets = recipes.order(
+            recipes.dependents(only) if with_dependents else only
+        )
+        extra = [name for name in targets if name not in only]
+        ctx.log.msg(
+            f"Rebuilding {len(only)} package{'s' if len(only) != 1 else ''}"
+            + (f" and {len(extra)} dependent{'s' if len(extra) != 1 else ''}" if extra else "")
+        )
+        ctx.log.msg2(" ".join(targets))
+        if ctx.dry_run:
+            ctx.log.msg3("these would be rebuilt from scratch, in that order")
+            return ctx.sysroot
+        # Dependencies that were never built still need to exist first.
+        jinx.update(recipes.dependency_closure(targets))
+        jinx.rebuild(targets)
+        rebuilt = targets
+    else:
+        wanted = recipes.order(recipes.dependency_closure(manifest.build))
+        missing, changed = stale_packages(ctx, jinx, recipes, wanted)
+        if ctx.force:
+            missing, changed = wanted, ()
+        if not missing and not changed:
+            ctx.log.msg2(f"userland is up to date ({len(wanted)} packages)")
+            if ctx.sysroot.is_dir():
+                if not ctx.dry_run:
+                    record_recipe_digests(ctx, recipes, wanted)
+                return ctx.sysroot
+        if changed:
+            targets = recipes.order(recipes.dependents(changed))
+            extra = [name for name in targets if name not in changed]
+            ctx.log.msg(
+                f"{len(changed)} recipe{'s' if len(changed) != 1 else ''} changed: "
+                + " ".join(changed)
+            )
+            if extra:
+                ctx.log.msg2(f"also rebuilding {len(extra)} dependent(s): " + " ".join(extra))
+            jinx.update(recipes.dependency_closure(targets))
+            jinx.rebuild(targets)
+        if missing:
+            ctx.log.msg(f"Building {len(missing)} new package(s)")
+            ctx.log.msg2(" ".join(missing))
+        if ctx.dry_run:
+            announce_plan(ctx, jinx, wanted)
+            return ctx.sysroot
+        jinx.update(wanted)
+        rebuilt = wanted
+
+    ctx.log.msg(f"Installing the sysroot ({ctx.arch.name})")
+    install_sysroot(ctx, jinx, manifest, force=only is not None or ctx.force)
+    if not ctx.dry_run:
+        record_recipe_digests(ctx, recipes, rebuilt)
+        Cache(ctx).record(
+            "sysroot",
+            sysroot_digest(ctx, recipes, manifest),
+            (ctx.sysroot,),
+        )
+    ctx.log.finished("the userland", time.monotonic() - started)
+    return ctx.sysroot
+
+
+def sysroot_digest(ctx: Context, recipes: Recipes, manifest: Manifest) -> str:
+    wanted = recipes.order(recipes.dependency_closure(manifest.build))
+    return fingerprint(
+        "sysroot",
+        values=(
+            ctx.arch.name,
+            global_userland_digest(),
+            *(f"{name}:{recipes.digest(name)}" for name in wanted),
+            *manifest.install,
         ),
-        cwd=KERNEL_DIR,
-        env_updates=rust_environment(ctx),
-        step=f"check kernel ({ctx.arch.name})",
     )
 
 
-def lint_kernel(ctx: Context) -> None:
-    argv = cargo_arguments(
-        "clippy",
-        "--target",
-        ctx.rust_target,
-        "--profile",
-        ctx.profile,
-    )
-    argv += ["--", "-D", "warnings"]
-    run(
-        ctx,
-        argv,
-        cwd=KERNEL_DIR,
-        env_updates=rust_environment(ctx),
-        step=f"lint kernel ({ctx.arch.name})",
-    )
+# --------------------------------------------------------------------------
+# Initramfs
+# --------------------------------------------------------------------------
 
 
-def format_kernel(ctx: Context, *, check: bool) -> None:
-    argv = ["cargo", "fmt", "--all"]
-    if check:
-        argv += ["--", "--check"]
-    run(
-        ctx,
-        argv,
-        cwd=KERNEL_DIR,
-        step="check Rust formatting" if check else "format Rust sources",
-    )
+def sysroot_token(ctx: Context) -> str:
+    """A cheap identity for the current sysroot.
+
+    The sysroot is only ever replaced wholesale (``swap_directory`` renames a
+    freshly staged tree into place), so its stamp plus the fingerprint recorded
+    by the last successful install identifies it exactly - without walking a
+    few hundred megabytes of files on every single invocation.
+    """
+    recorded = Cache(ctx).read("sysroot").get("fingerprint", "")
+    return f"{stamp(ctx.sysroot)}|{recorded}"
 
 
-def available_userland_packages() -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            path.parent.name
-            for path in (USERLAND_DIR / "recipes").glob("*/recipe")
-            if path.parent.name != "mlibc-source"
-        )
-    )
+def initramfs_digest(ctx: Context) -> str:
+    return fingerprint("initramfs", values=(ctx.arch.name, ctx.profile, sysroot_token(ctx)))
 
 
-def recipe_dependencies(package: str) -> tuple[str, ...]:
-    recipe = USERLAND_DIR / "recipes" / package / "recipe"
-    dependencies: list[str] = []
-    found = False
-    for line in recipe.read_text(encoding="utf-8").splitlines():
-        if not line.startswith("deps="):
-            continue
-        if found:
-            raise BuildError(f"Multiple deps assignments in {recipe}")
-        found = True
-        value = line.removeprefix("deps=").strip().strip("\"'")
-        if "$" in value or "`" in value:
-            raise BuildError(f"Dynamic deps assignment is unsupported in {recipe}")
-        dependencies.extend(value.split())
-    known = {
-        path.parent.name
-        for path in (USERLAND_DIR / "recipes").glob("*/recipe")
-    }
-    unknown = sorted(set(dependencies) - known)
-    if unknown:
-        raise BuildError(
-            f"Unknown dependencies in {recipe}: {', '.join(unknown)}"
-        )
-    return tuple(dependencies)
-
-
-def recipe_source(package: str) -> str | None:
-    recipe = USERLAND_DIR / "recipes" / package / "recipe"
-    for line in recipe.read_text(encoding="utf-8").splitlines():
-        if line.startswith("from_source="):
-            return line.removeprefix("from_source=").strip().strip("\"'")
-    return None
-
-
-def discard_failed_tarball(package: str, ui: UI) -> None:
-    recipe = USERLAND_DIR / "recipes" / package / "recipe"
-    assignments: dict[str, str] = {}
-    for line in recipe.read_text(encoding="utf-8").splitlines():
-        if "=" not in line or line.lstrip().startswith("#"):
-            continue
-        key, value = line.split("=", 1)
-        if key in {"version", "tarball_url"}:
-            assignments[key] = value.strip().strip("\"'")
-    url = assignments.get("tarball_url")
-    if not url:
-        return
-    url = url.replace("${version}", assignments.get("version", ""))
-    cached = USERLAND_DIR / "sources" / Path(url.split("?", 1)[0]).name
-    if cached.is_file():
-        ui.detail(f"discard failed source download: {_display_path(cached)}")
-        remove_path(cached)
-
-
-def reset_patched_source(package: str, ui: UI) -> None:
-    source = recipe_source(package) or package
-    patches = USERLAND_DIR / "recipes" / source / "patches"
-    if not patches.is_dir():
-        return
-    source_root = USERLAND_DIR / "sources"
-    candidates = (
-        source_root / source,
-        source_root / f"{source}-clean",
-        source_root / f"{source}-workdir",
-        source_root / f"{source}.version",
-        source_root / f"{source}.patched",
-        source_root / f"{source}.prepared",
-        source_root / f"{source}.revision",
-        source_root / f"{source}.host-revision",
-    )
-    if any(path.exists() for path in candidates):
-        ui.detail(f"refresh patched source: {source}")
-    for path in candidates:
-        remove_path(path)
-    discard_failed_tarball(source, ui)
-
-
-def package_rebuild_order(package: str) -> tuple[str, ...]:
-    packages = available_userland_packages()
-    dependencies = {name: recipe_dependencies(name) for name in packages}
-    sources = {name: recipe_source(name) for name in packages}
-    closure = {package}
-    changed = True
-    while changed:
-        changed = False
-        selected_sources = {
-            source for name, source in sources.items() if name in closure and source
-        }
-        for name, source in sources.items():
-            if name not in closure and source in selected_sources:
-                closure.add(name)
-                changed = True
-        for name, required in dependencies.items():
-            if name not in closure and closure.intersection(required):
-                closure.add(name)
-                changed = True
-
-    ordered: list[str] = []
-    visiting: set[str] = set()
-
-    def visit(name: str) -> None:
-        if name in ordered:
-            return
-        if name in visiting:
-            raise BuildError(f"Userspace package dependency cycle at {name}")
-        visiting.add(name)
-        for dependency in dependencies.get(name, ()):
-            if dependency in closure:
-                visit(dependency)
-        visiting.remove(name)
-        ordered.append(name)
-
-    for name in sorted(closure):
-        visit(name)
-    return tuple(ordered)
-
-
-def package_dependency_closure(packages: Sequence[str]) -> tuple[str, ...]:
-    closure = set(packages)
-    pending = list(packages)
-    while pending:
-        package = pending.pop()
-        related = list(recipe_dependencies(package))
-        source = recipe_source(package)
-        if source:
-            related.append(source)
-        for dependency in related:
-            if dependency not in closure:
-                closure.add(dependency)
-                pending.append(dependency)
-    return tuple(sorted(closure))
-
-
-def replace_directory(staging: Path, destination: Path, backup_name: str) -> None:
-    if not destination.exists():
-        staging.rename(destination)
-        return
-
-    backup = destination.parent / backup_name
-    remove_path(backup)
-    destination.rename(backup)
-    installed = False
-    try:
-        staging.rename(destination)
-        installed = True
-    finally:
-        if not installed and backup.exists() and not destination.exists():
-            backup.rename(destination)
-    remove_path(backup)
-
-
-def prepare_jinx_build(ctx: Context) -> tuple[Path, Path, Mapping[str, str]]:
-    sync_driver_source()
-    jinx = ensure_jinx(ctx)
-    build_dir = RUNTIME_ROOT / f"jinx-build-{ctx.arch.name}"
-    if build_dir.is_symlink():
-        raise BuildError(f"Refusing to use symlinked Jinx build directory: {build_dir}")
-    ensure_dir(build_dir)
-    env = jinx_environment(ctx)
-    if not (build_dir / ".jinx-parameters").is_file():
-        run(
-            ctx,
-            [str(jinx / "jinx"), "init", str(USERLAND_DIR), f"ARCH={ctx.arch.name}"],
-            cwd=build_dir,
-            env_updates=env,
-            step=f"initialize userspace build ({ctx.arch.name})",
-        )
-    return jinx, build_dir, env
-
-
-def sync_driver_source() -> None:
-    staging = USERLAND_DIR / ".drivers.tmp"
-    remove_path(staging)
-    shutil.copytree(
-        DRIVERS_DIR,
-        staging,
-        ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.so"),
-    )
-    remove_path(JINX_DRIVERS_SOURCE)
-    staging.rename(JINX_DRIVERS_SOURCE)
-
-
-def build_sysroot(ctx: Context) -> Path:
-    fingerprint = userspace_fingerprint(ctx)
-    state_key = f"userspace-{ctx.arch.name}"
-    if build_is_current(
-        ctx,
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.sysroot,),
-        label=f"userspace ({ctx.arch.name})",
-    ):
-        return ctx.sysroot
-
-    build_dir = RUNTIME_ROOT / f"jinx-build-{ctx.arch.name}"
-    if ctx.force:
-        remove_path(build_dir)
-        remove_path(ctx.sysroot)
-
-    jinx, build_dir, env = prepare_jinx_build(ctx)
-    for package in package_dependency_closure(USERSPACE_BUILD_PACKAGES):
-        reset_patched_source(package, ctx.ui)
-        discard_failed_tarball(package, ctx.ui)
-    run(
-        ctx,
-        [
-            str(jinx / "jinx"),
-            "update",
-            "-b",
-            *USERSPACE_BUILD_PACKAGES,
-        ],
-        cwd=build_dir,
-        env_updates=env,
-        step=f"build userspace package closure ({ctx.arch.name})",
-        capture=False,
-    )
-
-    staging = RUNTIME_ROOT / "sysroots" / f".{ctx.arch.name}.tmp"
-    remove_path(staging)
-    ensure_dir(staging)
-    try:
-        run(
-            ctx,
-            [
-                str(jinx / "jinx"),
-                "install",
-                str(staging),
-                *USERSPACE_PACKAGES,
-            ],
-            cwd=build_dir,
-            env_updates=env,
-            step=f"install userspace sysroot ({ctx.arch.name})",
-            capture=False,
-        )
-        replace_directory(staging, ctx.sysroot, f".{ctx.arch.name}.old")
-    finally:
-        remove_path(staging)
-    record_build_state(
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.sysroot,),
-    )
-    return ctx.sysroot
-
-
-def rebuild_userland_package(ctx: Context, package: str) -> Path:
-    if package not in available_userland_packages():
-        supported = ", ".join(available_userland_packages())
-        raise BuildError(
-            f"Unknown userspace package {package!r}; choose one of: {supported}"
-        )
-    expected_sysroot_root = RUNTIME_ROOT / "sysroots"
-    for path in (DEFAULT_OUTPUT_DIR, RUNTIME_ROOT, expected_sysroot_root):
-        if path.is_symlink():
-            raise BuildError(f"Refusing to use symlinked runtime path: {path}")
-    if ctx.sysroot.is_symlink():
-        raise BuildError(f"Refusing to use symlinked sysroot: {ctx.sysroot}")
-    if ctx.sysroot.parent != expected_sysroot_root or ctx.sysroot.name != ctx.arch.name:
-        raise BuildError(f"Unexpected sysroot path: {ctx.sysroot}")
+def build_initramfs(ctx: Context, cache: Cache) -> Path:
     if not ctx.sysroot.is_dir():
-        raise BuildError(
-            f"Userspace sysroot is missing: {ctx.sysroot}; run "
-            f"'x.py build sysroot --arch {ctx.arch.name}' first"
+        if ctx.dry_run:
+            # The sysroot would have been produced by the preceding step; a dry
+            # run must describe the plan rather than fail on its own simulation.
+            ctx.log.msg(f"Packing the initramfs ({ctx.arch.name})")
+            ctx.log.msg3("requires the sysroot built by the previous step")
+            return ctx.initramfs
+        raise Failure(
+            f"the {ctx.arch.name} sysroot does not exist yet",
+            hint=f"run './x.py build sysroot --arch {ctx.arch.name}'",
         )
+    key = f"initramfs-{ctx.profile}"
+    digest = initramfs_digest(ctx)
+    if cache.is_current(key, digest, (ctx.initramfs,)):
+        ctx.log.msg2(f"initramfs is up to date ({rel(ctx.initramfs)})")
+        return ctx.initramfs
 
-    jinx, build_dir, env = prepare_jinx_build(ctx)
-    rebuild_order = package_rebuild_order(package)
-    for rebuild_package in package_dependency_closure(rebuild_order):
-        reset_patched_source(rebuild_package, ctx.ui)
-        discard_failed_tarball(rebuild_package, ctx.ui)
-    run(
-        ctx,
-        [str(jinx / "jinx"), "update", "-b", package],
-        cwd=build_dir,
-        env_updates=env,
-        step=f"update dependencies for {package} ({ctx.arch.name})",
-        capture=False,
-    )
-    run(
-        ctx,
-        [str(jinx / "jinx"), "rebuild", *rebuild_order],
-        cwd=build_dir,
-        env_updates=env,
-        step=f"rebuild {' '.join(rebuild_order)} ({ctx.arch.name})",
-        capture=False,
-    )
-    staging = RUNTIME_ROOT / "sysroots" / f".{ctx.arch.name}.package.tmp"
-    remove_path(staging)
-    ensure_dir(staging)
-    try:
-        run(
-            ctx,
-            [
-                str(jinx / "jinx"),
-                "install",
-                str(staging),
-                *USERSPACE_PACKAGES,
-            ],
-            cwd=build_dir,
-            env_updates=env,
-            step=f"assemble updated sysroot with {package} ({ctx.arch.name})",
-            capture=False,
-        )
-        replace_directory(
-            staging,
-            ctx.sysroot,
-            f".{ctx.arch.name}.package.old",
-        )
-    finally:
-        remove_path(staging)
-    record_build_state(
-        key=f"userspace-{ctx.arch.name}",
-        fingerprint=userspace_fingerprint(ctx),
-        outputs=(ctx.sysroot,),
-    )
-    return ctx.sysroot
-
-
-def pack_initramfs(ctx: Context) -> Path:
-    if not ctx.sysroot.is_dir():
-        raise BuildError(
-            f"Userspace sysroot is missing: {ctx.sysroot}; run "
-            f"'x.py build sysroot --arch {ctx.arch.name}'"
-        )
+    ctx.log.msg(f"Packing the initramfs ({ctx.arch.name})")
+    if ctx.dry_run:
+        return ctx.initramfs
+    # The dev loop repacks this on every userland change, so trade a few
+    # megabytes for a much shorter wait; release builds still compress hard.
+    level = 1 if ctx.profile == "dev" else 9
+    ctx.log.msg3(f"gzip level {level} from {rel(ctx.sysroot)}")
     ensure_dir(ctx.initramfs.parent)
-    temporary = ctx.initramfs.with_suffix(ctx.initramfs.suffix + ".tmp")
-    remove_path(temporary)
-    ctx.ui.step(f"pack initramfs ({ctx.arch.name})")
+    temporary = ctx.initramfs.with_suffix(".tmp")
+    remove(temporary)
 
-    def root_owned(info: tarfile.TarInfo) -> tarfile.TarInfo:
-        info.uid = 0
-        info.gid = 0
-        info.uname = "root"
-        info.gname = "root"
+    def as_root(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.uid = info.gid = 0
+        info.uname = info.gname = "root"
         return info
 
     try:
@@ -1422,1018 +1850,1720 @@ def pack_initramfs(ctx: Context) -> Path:
             mode="w:gz",
             format=tarfile.USTAR_FORMAT,
             dereference=False,
-            compresslevel=9,
+            compresslevel=level,
         ) as archive:
-            paths = sorted(
+            entries = sorted(
                 ctx.sysroot.rglob("*"),
                 key=lambda item: item.relative_to(ctx.sysroot).as_posix(),
             )
-            for path in paths:
+            for entry in entries:
                 archive.add(
-                    path,
-                    arcname=path.relative_to(ctx.sysroot).as_posix(),
+                    entry,
+                    arcname=entry.relative_to(ctx.sysroot).as_posix(),
                     recursive=False,
-                    filter=root_owned,
+                    filter=as_root,
                 )
         temporary.replace(ctx.initramfs)
         ctx.initramfs.chmod(0o644)
     finally:
-        remove_path(temporary)
+        remove(temporary)
+    cache.record(key, digest, (ctx.initramfs,))
+    ctx.log.msg2(
+        f"{rel(ctx.initramfs)} ({human_size(ctx.initramfs.stat().st_size)})"
+    )
     return ctx.initramfs
 
 
-def build_initramfs(ctx: Context) -> Path:
-    build_sysroot(ctx)
-    fingerprint = initramfs_fingerprint(ctx)
-    state_key = (
-        f"initramfs-{ctx.arch.name}-{ctx.profile}-{output_namespace(ctx)}"
+# --------------------------------------------------------------------------
+# Bootable images
+# --------------------------------------------------------------------------
+
+
+def limine_config() -> str:
+    text = (DISTRO_FILES_DIR / "limine.conf").read_text(encoding="ascii")
+    return text + (
+        "    module_path: $boot():/boot/roanix-root.tar.gz\n"
+        "    module_string: initramfs\n"
     )
-    if build_is_current(
-        ctx,
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.initramfs,),
-        label=f"initramfs ({ctx.arch.name})",
-    ):
-        return ctx.initramfs
-    initramfs = pack_initramfs(ctx)
-    record_build_state(
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(initramfs,),
+
+
+def image_digest(ctx: Context, kind: str) -> str:
+    return fingerprint(
+        f"image-{kind}",
+        values=(
+            ctx.arch.name,
+            ctx.profile,
+            stamp(ctx.kernel_binary),
+            stamp(ctx.initramfs),
+            json.dumps(TARBALLS["limine"].marker(), sort_keys=True),
+        ),
+        paths=(DISTRO_FILES_DIR / "limine.conf", DISTRO_FILES_DIR / "splash.jpg"),
     )
-    return initramfs
 
 
-def limine_config_text(*, with_initramfs: bool) -> str:
-    path = USERLAND_DIR / "distro-files" / "limine.conf"
-    text = path.read_text(encoding="ascii")
-    if with_initramfs:
-        text += (
-            "    module_path: $boot():/boot/roanix-root.tar.gz\n"
-            "    module_string: initramfs\n"
-        )
-    return text
+def boot_payload(ctx: Context) -> list[tuple[Path, str]]:
+    """(source, destination) pairs shared by the ISO and HDD layouts."""
+    return [
+        (ctx.kernel_binary, "boot/roanix"),
+        (ctx.initramfs, "boot/roanix-root.tar.gz"),
+        (DISTRO_FILES_DIR / "splash.jpg", "boot/splash.jpg"),
+    ]
 
 
-def prepare_iso_root(ctx: Context, limine: Path, initramfs: Path) -> Path:
-    root = ctx.iso_root
-    remove_path(root)
+def build_iso(ctx: Context, run: Runner, cache: Cache) -> Path:
+    target = ctx.image("iso")
+    key = f"iso-{ctx.profile}"
+    digest = image_digest(ctx, "iso")
+    if cache.is_current(key, digest, (target,)):
+        ctx.log.msg2(f"ISO image is up to date ({rel(target)})")
+        return target
+
+    started = time.monotonic()
+    ctx.log.msg(f"Creating the ISO image ({ctx.arch.name})")
+    limine = ensure_limine(ctx, run)
+    if ctx.dry_run:
+        return target
+
+    root = ctx.work / "iso-root"
+    remove(root)
     ensure_dir(root / "boot" / "limine")
     ensure_dir(root / "EFI" / "BOOT")
-    copy_file(ctx.kernel_artifact, root / "boot" / "roanix")
-    copy_file(initramfs, root / "boot" / "roanix-root.tar.gz")
-    copy_file(
-        USERLAND_DIR / "distro-files" / "splash.jpg",
-        root / "boot" / "splash.jpg",
-    )
-    write_text(
-        root / "boot" / "limine" / "limine.conf",
-        limine_config_text(with_initramfs=True),
-    )
-
-    copy_file(
-        limine / "limine-uefi-cd.bin",
-        root / "boot" / "limine" / "limine-uefi-cd.bin",
-    )
+    for source, destination in boot_payload(ctx):
+        copy(source, root / destination)
+    write_file(root / "boot" / "limine" / "limine.conf", limine_config())
+    copy(limine / "limine-uefi-cd.bin", root / "boot/limine/limine-uefi-cd.bin")
+    for name in ctx.arch.efi_files:
+        copy(limine / name, root / "EFI" / "BOOT" / name)
     if ctx.arch.name == "x86_64":
-        copy_file(
-            limine / "limine-bios.sys",
-            root / "boot" / "limine" / "limine-bios.sys",
-        )
-        copy_file(
-            limine / "limine-bios-cd.bin",
-            root / "boot" / "limine" / "limine-bios-cd.bin",
-        )
-        copy_file(
-            limine / "BOOTX64.EFI",
-            root / "EFI" / "BOOT" / "BOOTX64.EFI",
-        )
-        copy_file(
-            limine / "BOOTIA32.EFI",
-            root / "EFI" / "BOOT" / "BOOTIA32.EFI",
-        )
-    elif ctx.arch.name == "riscv64":
-        copy_file(
-            limine / "BOOTRISCV64.EFI",
-            root / "EFI" / "BOOT" / "BOOTRISCV64.EFI",
-        )
-    else:
-        raise BuildError(f"Unsupported image architecture: {ctx.arch.name}")
-    return root
+        copy(limine / "limine-bios.sys", root / "boot/limine/limine-bios.sys")
+        copy(limine / "limine-bios-cd.bin", root / "boot/limine/limine-bios-cd.bin")
 
-
-def build_iso(ctx: Context) -> Path:
-    build_kernel(ctx)
-    initramfs = build_initramfs(ctx)
-    fingerprint = image_fingerprint(ctx, "iso")
-    state_key = f"iso-{ctx.arch.name}-{ctx.profile}-{output_namespace(ctx)}"
-    if build_is_current(
-        ctx,
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.image_iso,),
-        label=f"ISO image ({ctx.arch.name})",
-    ):
-        return ctx.image_iso
-
-    limine = ensure_limine(ctx)
-    root = prepare_iso_root(ctx, limine, initramfs)
-    ensure_dir(ctx.image_iso.parent)
-    remove_path(ctx.image_iso)
-    argv = [
-        "xorriso",
-        "-as",
-        "mkisofs",
-        "-R",
-        "-r",
-        "-J",
-        "-V",
-        f"ROANIX_{ctx.arch.name.upper()}",
-    ]
+    ensure_dir(target.parent)
+    remove(target)
+    argv = ["xorriso", "-as", "mkisofs", "-R", "-r", "-J", "-V", f"ROANIX_{ctx.arch.name.upper()}"]
     if ctx.arch.name == "x86_64":
         argv += [
-            "-b",
-            "boot/limine/limine-bios-cd.bin",
-            "-no-emul-boot",
-            "-boot-load-size",
-            "4",
-            "-boot-info-table",
+            "-b", "boot/limine/limine-bios-cd.bin",
+            "-no-emul-boot", "-boot-load-size", "4", "-boot-info-table",
         ]
     argv += [
-        "-hfsplus",
-        "-apm-block-size",
-        "2048",
-        "--efi-boot",
-        "boot/limine/limine-uefi-cd.bin",
-        "-efi-boot-part",
-        "--efi-boot-image",
-        "--protective-msdos-label",
-        str(root),
-        "-o",
-        str(ctx.image_iso),
+        "-hfsplus", "-apm-block-size", "2048",
+        "--efi-boot", "boot/limine/limine-uefi-cd.bin",
+        "-efi-boot-part", "--efi-boot-image", "--protective-msdos-label",
+        str(root), "-o", str(target),
     ]
     try:
-        run(
-            ctx,
-            argv,
-            step=f"create ISO ({ctx.arch.name})",
-        )
+        run(argv)
         if ctx.arch.name == "x86_64":
-            run(
-                ctx,
-                [str(limine / "limine"), "bios-install", str(ctx.image_iso)],
-                step="install Limine BIOS support",
-            )
+            run([limine / "limine", "bios-install", str(target)])
     finally:
-        remove_path(root)
-    record_build_state(
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.image_iso,),
-    )
-    return ctx.image_iso
+        remove(root)
+    cache.record(key, digest, (target,))
+    ctx.log.msg2(f"{rel(target)} ({human_size(target.stat().st_size)})")
+    ctx.log.finished("the ISO image", time.monotonic() - started)
+    return target
 
 
-def mcopy(
-    ctx: Context, image_spec: str, source: Path, destination: str, *, step: str | None = None
-) -> None:
-    run(
-        ctx,
-        ["mcopy", "-m", "-i", image_spec, str(source), destination],
-        step=step,
-    )
+def build_hdd(ctx: Context, run: Runner, cache: Cache) -> Path:
+    target = ctx.image("hdd")
+    key = f"hdd-{ctx.profile}"
+    digest = image_digest(ctx, "hdd")
+    if cache.is_current(key, digest, (target,)):
+        ctx.log.msg2(f"HDD image is up to date ({rel(target)})")
+        return target
 
+    started = time.monotonic()
+    ctx.log.msg(f"Creating the HDD image ({ctx.arch.name})")
+    limine = ensure_limine(ctx, run)
+    if ctx.dry_run:
+        return target
 
-def build_hdd(ctx: Context) -> Path:
-    build_kernel(ctx)
-    initramfs = build_initramfs(ctx)
-    fingerprint = image_fingerprint(ctx, "hdd")
-    state_key = f"hdd-{ctx.arch.name}-{ctx.profile}-{output_namespace(ctx)}"
-    if build_is_current(
-        ctx,
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.image_hdd,),
-        label=f"HDD image ({ctx.arch.name})",
-    ):
-        return ctx.image_hdd
+    payload = sum(source.stat().st_size for source, _ in boot_payload(ctx))
+    size = max(128 * 1024 * 1024, int(payload * 1.4) + 32 * 1024 * 1024)
+    size = (size + 1024 * 1024 - 1) // (1024 * 1024) * (1024 * 1024)
 
-    limine = ensure_limine(ctx)
-    ensure_dir(ctx.image_hdd.parent)
-    remove_path(ctx.image_hdd)
-    with ctx.image_hdd.open("wb") as disk:
-        disk.truncate(128 * 1024 * 1024)
+    ensure_dir(target.parent)
+    remove(target)
+    with target.open("wb") as disk:
+        disk.truncate(size)
 
     path = os.environ.get("PATH", "")
-    tool_path = f"{path}:/usr/sbin:/sbin" if path else "/usr/sbin:/sbin"
-    partition_args = [
-        "sgdisk",
-        str(ctx.image_hdd),
-        "-n",
-        "1:2048",
-        "-t",
-        "1:ef00",
-    ]
+    sbin_path = f"{path}:/usr/sbin:/sbin" if path else "/usr/sbin:/sbin"
+    partition = ["sgdisk", str(target), "-n", "1:2048", "-t", "1:ef00"]
     if ctx.arch.name == "x86_64":
-        partition_args += ["-m", "1"]
-    run(
-        ctx,
-        partition_args,
-        env_updates={"PATH": tool_path},
-        step=f"partition disk image ({ctx.arch.name})",
-    )
+        partition += ["-m", "1"]
+    run(partition, env={"PATH": sbin_path})
     if ctx.arch.name == "x86_64":
-        run(
-            ctx,
-            [str(limine / "limine"), "bios-install", str(ctx.image_hdd)],
-            step="install Limine BIOS support",
-        )
+        run([limine / "limine", "bios-install", str(target)])
 
-    image_spec = f"{ctx.image_hdd}@@1M"
-    run(
-        ctx,
-        [
-            "mformat",
-            "-v",
-            "ROANIX",
-            "-i",
-            image_spec,
-            "::",
-        ],
-        step="format EFI filesystem",
-    )
-    run(
-        ctx,
-        [
-            "mmd",
-            "-i",
-            image_spec,
-            "::/EFI",
-            "::/EFI/BOOT",
-            "::/boot",
-            "::/boot/limine",
-        ],
-        step="create boot filesystem layout",
-    )
-    mcopy(ctx, image_spec, ctx.kernel_artifact, "::/boot/roanix")
-    mcopy(ctx, image_spec, initramfs, "::/boot/roanix-root.tar.gz")
-    mcopy(
-        ctx,
-        image_spec,
-        USERLAND_DIR / "distro-files" / "splash.jpg",
-        "::/boot/splash.jpg",
-    )
-    config = ctx.work_dir / "limine.conf"
-    write_text(
-        config,
-        limine_config_text(with_initramfs=True),
-    )
-    mcopy(ctx, image_spec, config, "::/boot/limine/limine.conf")
+    spec = f"{target}@@1M"
+    run(["mformat", "-v", "ROANIX", "-i", spec, "::"])
+    run(["mmd", "-i", spec, "::/EFI", "::/EFI/BOOT", "::/boot", "::/boot/limine"])
+    for source, destination in boot_payload(ctx):
+        run(["mcopy", "-m", "-i", spec, str(source), f"::/{destination}"])
+    config = ctx.work / "limine.conf"
+    write_file(config, limine_config())
+    run(["mcopy", "-m", "-i", spec, str(config), "::/boot/limine/limine.conf"])
     if ctx.arch.name == "x86_64":
-        mcopy(
-            ctx,
-            image_spec,
-            limine / "limine-bios.sys",
-            "::/boot/limine/limine-bios.sys",
-        )
-        mcopy(ctx, image_spec, limine / "BOOTX64.EFI", "::/EFI/BOOT/BOOTX64.EFI")
-        mcopy(ctx, image_spec, limine / "BOOTIA32.EFI", "::/EFI/BOOT/BOOTIA32.EFI")
-    elif ctx.arch.name == "riscv64":
-        mcopy(
-            ctx,
-            image_spec,
-            limine / "BOOTRISCV64.EFI",
-            "::/EFI/BOOT/BOOTRISCV64.EFI",
-        )
-    else:
-        raise BuildError(f"Unsupported image architecture: {ctx.arch.name}")
-    record_build_state(
-        key=state_key,
-        fingerprint=fingerprint,
-        outputs=(ctx.image_hdd,),
-    )
-    return ctx.image_hdd
+        run(["mcopy", "-m", "-i", spec, str(limine / "limine-bios.sys"),
+             "::/boot/limine/limine-bios.sys"])
+    for name in ctx.arch.efi_files:
+        run(["mcopy", "-m", "-i", spec, str(limine / name), f"::/EFI/BOOT/{name}"])
+
+    cache.record(key, digest, (target,))
+    ctx.log.msg2(f"{rel(target)} ({human_size(target.stat().st_size)})")
+    ctx.log.finished("the HDD image", time.monotonic() - started)
+    return target
 
 
-def _display_path(path: Path) -> str:
-    try:
-        return path.relative_to(ROOT).as_posix()
-    except ValueError:
-        return str(path)
+# --------------------------------------------------------------------------
+# QEMU
+# --------------------------------------------------------------------------
 
 
-def build_target(ctx: Context, target: str) -> list[Path]:
-    if target == "kernel":
-        return [build_kernel(ctx)]
-    if target == "sysroot":
-        return [build_sysroot(ctx)]
-    if target == "initramfs":
-        return [build_initramfs(ctx)]
-    if target == "iso":
-        return [build_iso(ctx)]
-    if target == "hdd":
-        return [build_hdd(ctx)]
-    raise BuildError(f"Unknown build target: {target}")
+@dataclass
+class QemuOptions:
+    image: str = "hdd"
+    firmware: str = "uefi"
+    gdb: bool = False
+    gdb_port: int = 1234
+    wait: bool = True
+    accel: str = "auto"
+    memory: str | None = None
+    smp: int | None = None
+    monitor: bool = False
+    display: str | None = None
+    serial_log: Path | None = None
+    trace: str | None = None
+    extra: tuple[str, ...] = ()
 
 
 def kvm_available() -> bool:
     try:
-        descriptor = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+        handle = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
     except OSError:
         return False
-    os.close(descriptor)
+    os.close(handle)
     return True
 
 
-def qemu_acceleration_overridden(arguments: Sequence[str]) -> bool:
+def accel_overridden(arguments: Sequence[str]) -> bool:
     for index, argument in enumerate(arguments):
-        if argument in {"-accel", "-enable-kvm", "-no-kvm"}:
+        if argument in {"-accel", "-enable-kvm", "-no-kvm"} or argument.startswith("-accel="):
             return True
-        if argument.startswith("-accel="):
-            return True
-        if argument in {"-machine", "-M"}:
-            if index + 1 < len(arguments) and "accel=" in arguments[index + 1]:
+        if argument in {"-machine", "-M"} and index + 1 < len(arguments):
+            if "accel=" in arguments[index + 1]:
                 return True
-        if (
-            argument.startswith("-machine=") or argument.startswith("-M=")
-        ) and "accel=" in argument:
+        if argument.startswith(("-machine=", "-M=")) and "accel=" in argument:
             return True
     return False
 
 
-def run_qemu(ctx: Context, *, image: str, firmware: str) -> None:
-    if firmware == "bios" and ctx.arch.name != "x86_64":
-        raise BuildError("BIOS boot is only available for x86_64")
-    artifact = build_iso(ctx) if image == "iso" else build_hdd(ctx)
-    argv = [ctx.arch.qemu_binary, "-m", ctx.arch.qemu_memory]
-    if image == "iso":
-        argv += ["-cdrom", str(artifact)]
+def qemu_command(ctx: Context, run: Runner, image: Path, options: QemuOptions) -> list[str]:
+    arch = ctx.arch
+    argv = [arch.qemu, "-m", options.memory or arch.memory]
+    if options.smp:
+        argv += ["-smp", str(options.smp)]
+    if options.image == "iso":
+        argv += ["-cdrom", str(image)]
     else:
-        argv += ["-drive", f"file={artifact},format=raw"]
+        argv += ["-drive", f"file={image},format=raw"]
 
-    if firmware == "bios":
+    use_kvm = (
+        options.accel != "tcg"
+        and arch.name == "x86_64"
+        and platform.machine() == "x86_64"
+        and kvm_available()
+        and not accel_overridden(options.extra)
+    )
+
+    if options.firmware == "bios":
         argv += ["-M", "q35,smm=off"]
-        if kvm_available() and not qemu_acceleration_overridden(ctx.qemu_args):
-            argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
-        else:
-            argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
-        argv += ["-serial", "stdio"]
     else:
-        ovmf = ensure_ovmf(ctx)
-        ensure_dir(ctx.runtime_dir)
-        variables = ctx.runtime_dir / "ovmf-vars.fd"
-        copy_file(ovmf / f"ovmf-vars-{ctx.arch.name}.fd", variables)
+        ovmf = ensure_ovmf(ctx, run)
+        ensure_dir(ctx.firmware)
+        variables = ctx.firmware / "ovmf-vars.fd"
+        if not variables.is_file():
+            copy(ovmf / f"ovmf-vars-{arch.name}.fd", variables)
         argv += [
             "-drive",
-            "if=pflash,unit=0,format=raw,"
-            f"file={ovmf / f'ovmf-code-{ctx.arch.name}.fd'},readonly=on",
+            f"if=pflash,unit=0,format=raw,file={ovmf / f'ovmf-code-{arch.name}.fd'},readonly=on",
             "-drive",
             f"if=pflash,unit=1,format=raw,file={variables}",
         ]
-        if ctx.arch.name == "x86_64":
+        if arch.name == "x86_64":
             argv += ["-M", "q35"]
-            if kvm_available() and not qemu_acceleration_overridden(ctx.qemu_args):
-                argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
-            else:
-                argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
-            argv += ["-serial", "stdio"]
-        elif ctx.arch.name == "riscv64":
-            argv += [
-                "-M",
-                "virt,acpi=off",
-                "-cpu",
-                "rv64",
-                "-device",
-                "ramfb",
-                "-device",
-                "qemu-xhci",
-                "-device",
-                "usb-kbd",
-                "-device",
-                "usb-mouse",
-                "-serial",
-                "stdio",
-            ]
-    argv += list(ctx.qemu_args)
-    run(ctx, argv, step=f"run {ctx.arch.name} in QEMU", capture=False)
-
-
-def build_docs(ctx: Context, *, kind: str, serve: bool, port: int) -> None:
-    if kind == "book":
-        argv = ["mdbook", "serve", "--port", str(port)] if serve else ["mdbook", "build"]
-        run(
-            ctx,
-            argv,
-            cwd=ROOT / "book",
-            step="serve the Roanix book" if serve else "build the Roanix book",
-            capture=not serve,
-        )
-        return
-
-    run(
-        ctx,
-        cargo_arguments(
-            "doc",
-            "--no-deps",
-            "--target",
-            ctx.rust_target,
-        ),
-        cwd=KERNEL_DIR,
-        env_updates=rust_environment(ctx),
-        step=f"build kernel API documentation ({ctx.arch.name})",
-    )
-    if serve:
-        doc_dir = ctx.cargo_target_dir / ctx.rust_target / "doc"
-        run(
-            ctx,
-            [sys.executable, "-m", "http.server", str(port)],
-            cwd=doc_dir,
-            step=f"serve API documentation on http://127.0.0.1:{port}",
-            capture=False,
-        )
-
-
-def _safe_clean_root(path: Path) -> None:
-    resolved = path.resolve()
-    forbidden = {
-        Path("/"),
-        ROOT.resolve(),
-        ROOT.parent.resolve(),
-        Path.home().resolve(),
-    }
-    if resolved in forbidden:
-        raise BuildError(f"Refusing to remove unsafe output directory: {resolved}")
-    try:
-        resolved.relative_to(ROOT.resolve())
-    except ValueError as exc:
-        raise BuildError(
-            f"Refusing to clean an output directory outside the repository: {resolved}"
-        ) from exc
-    remove_path(resolved)
-
-
-def clean_output_dir(ctx: Context) -> None:
-    output = ctx.output_dir.resolve()
-    if output != DEFAULT_OUTPUT_DIR.resolve():
-        _safe_clean_root(output)
-        return
-    if not output.is_dir():
-        return
-
-    runtime = RUNTIME_ROOT.resolve()
-    for child in output.iterdir():
-        if child.resolve() == runtime:
-            continue
-        remove_path(child)
-
-
-def clean(ctx: Context, *, all_files: bool) -> None:
-    ctx.ui.step(f"remove build outputs from {_display_path(ctx.output_dir)}")
-    clean_output_dir(ctx)
-    for pattern in ("roanix-*.iso", "roanix-*.hdd"):
-        for path in ROOT.glob(pattern):
-            remove_path(path)
-    remove_path(ROOT / "iso_root")
-    for path in KERNEL_DIR.glob("roanix-*"):
-        remove_path(path)
-    remove_path(KERNEL_DIR / "target")
-    if all_files:
-        ctx.ui.step("remove downloaded tools and userspace caches")
-        remove_path(RUNTIME_ROOT)
-        remove_path(LEGACY_STORE_DIR)
-        remove_path(ROOT / "book" / "book")
-
-
-def fetch_resources(ctx: Context, resources: Sequence[str]) -> None:
-    fetch_ctx = replace(ctx, no_bootstrap=False)
-    selected = list(resources) or ["limine", "ovmf", "jinx"]
-    for resource in selected:
-        if resource in DOWNLOADS:
-            install_download(fetch_ctx, DOWNLOADS[resource])
-        elif resource == "jinx":
-            ensure_jinx(fetch_ctx)
         else:
-            raise BuildError(
-                f"Unknown resource {resource!r}; choose limine, ovmf, or jinx"
+            argv += [
+                "-M", "virt,acpi=off", "-cpu", "rv64",
+                "-device", "ramfb",
+                "-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-mouse",
+            ]
+
+    if arch.name == "x86_64":
+        if use_kvm:
+            argv += ["-accel", "kvm", "-cpu", "host,+invtsc"]
+        else:
+            argv += ["-cpu", "max,+invtsc,+tsc-deadline,+fsgsbase"]
+
+    if options.serial_log is not None:
+        ensure_dir(options.serial_log.parent)
+        mux = "on" if options.monitor else "off"
+        argv += [
+            "-chardev",
+            f"stdio,id=roanix-serial,logfile={options.serial_log},mux={mux}",
+            "-serial",
+            "chardev:roanix-serial",
+        ]
+        if options.monitor:
+            argv += ["-mon", "chardev=roanix-serial"]
+    else:
+        argv += ["-serial", "mon:stdio" if options.monitor else "stdio"]
+
+    if options.display:
+        argv += ["-display", options.display]
+    if options.trace:
+        argv += ["-d", options.trace, "-D", str(ctx.firmware / "qemu.log")]
+    if options.gdb:
+        argv += ["-gdb", f"tcp::{options.gdb_port}"]
+        if options.wait:
+            argv.append("-S")
+    argv += list(options.extra)
+    return argv
+
+
+def run_qemu(ctx: Context, run: Runner, image: Path, options: QemuOptions) -> None:
+    if options.firmware not in ctx.arch.firmwares:
+        raise Failure(
+            f"{options.firmware.upper()} boot is not supported on {ctx.arch.name}",
+            hint=f"supported firmware: {', '.join(ctx.arch.firmwares)}",
+        )
+    argv = qemu_command(ctx, run, image, options)
+    accel = "KVM" if "-accel" in argv and "kvm" in argv else "TCG"
+
+    ctx.log.msg(f"Booting Roanix {ctx.arch.name} ({options.firmware.upper()}, {accel})")
+    ctx.log.msg2(f"image: {rel(image)} ({options.image})")
+    if options.serial_log is not None:
+        ctx.log.msg2(f"serial log: {rel(options.serial_log)}")
+    if options.trace:
+        ctx.log.msg2(f"QEMU trace: {rel(ctx.firmware / 'qemu.log')}")
+    if options.gdb:
+        ctx.log.msg2(f"GDB server listening on tcp::{options.gdb_port}"
+                     + (" (halted, waiting for a debugger)" if options.wait else ""))
+        ctx.log.note(
+            f"connect with: rust-gdb {rel(ctx.kernel_binary)} "
+            f"-ex 'target remote :{options.gdb_port}'"
+        )
+    ctx.log.note(
+        "press Ctrl-A X to quit QEMU" if options.monitor else "press Ctrl-C to stop QEMU"
+    )
+    ctx.log.plain()
+    run(argv, mode="raw", check=False)
+    if run.last_status not in (0, 130, -2):
+        ctx.log.plain()
+        ctx.log.warn(f"QEMU exited with status {run.last_status}")
+        ctx.log.hint("re-run with -v to see the exact command line")
+
+
+# --------------------------------------------------------------------------
+# Build planning
+# --------------------------------------------------------------------------
+
+TARGETS = ("kernel", "sysroot", "initramfs", "iso", "hdd", "all")
+
+
+@dataclass
+class Component:
+    name: str
+    state: str  # "ready", "stale", "missing"
+    detail: str = ""
+
+
+def survey(
+    ctx: Context,
+    jinx: Jinx,
+    recipes: Recipes,
+    manifest: Manifest,
+    *,
+    default_image: str = "hdd",
+) -> list[Component]:
+    """Work out what is up to date without building anything."""
+    cache = Cache(ctx)
+    components: list[Component] = []
+
+    if not ctx.kernel_binary.exists():
+        components.append(Component("kernel", "missing", "never built"))
+    elif not cache.is_current(
+        f"kernel-{ctx.profile}", kernel_digest(ctx), (ctx.kernel_binary,)
+    ):
+        components.append(Component("kernel", "stale", "sources changed"))
+    else:
+        components.append(
+            Component("kernel", "ready", f"{human_size(ctx.kernel_binary.stat().st_size)}")
+        )
+
+    if not jinx.is_initialised() or not ctx.sysroot.is_dir():
+        components.append(Component("userland", "missing", "sysroot not built"))
+    else:
+        wanted = recipes.order(recipes.dependency_closure(manifest.build))
+        missing, changed = stale_packages(ctx, jinx, recipes, wanted)
+        if missing or changed:
+            parts = []
+            if changed:
+                shown = " ".join(changed[:4]) + (" ..." if len(changed) > 4 else "")
+                parts.append(f"{len(changed)} changed: {shown}")
+            if missing:
+                shown = " ".join(missing[:4]) + (" ..." if len(missing) > 4 else "")
+                parts.append(f"{len(missing)} not built: {shown}")
+            components.append(Component("userland", "stale", "; ".join(parts)))
+        else:
+            components.append(
+                Component("userland", "ready", f"{len(wanted)} packages, "
+                          f"{human_size(tree_size(ctx.sysroot))}")
             )
 
-
-def _tool_version(tool: str) -> str | None:
-    completed = subprocess.run(
-        [tool, "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0 or not completed.stdout:
-        return None
-    return completed.stdout.splitlines()[0].strip()
-
-
-def doctor(ctx: Context, *, target: str, json_output: bool) -> bool:
-    kernel_tools = {"cargo", "rustup", "git"}
-    userspace_tools = {
-        "bash",
-        "awk",
-        "find",
-        "git",
-        "grep",
-        "gzip",
-        "make",
-        "sed",
-        "tar",
-        "zstd",
-    }
-    tools_by_target = {
-        "kernel": kernel_tools,
-        "hdd": kernel_tools
-        | userspace_tools
-        | {"sgdisk", "mformat", "mmd", "mcopy"},
-        "iso": kernel_tools | userspace_tools | {"xorriso"},
-        "run": kernel_tools
-        | userspace_tools
-        | {"sgdisk", "mformat", "mmd", "mcopy", ctx.arch.qemu_binary},
-        "sysroot": userspace_tools,
-        "docs": {"cargo", "rustup", "mdbook"},
-    }
-    if target == "all":
-        required = set().union(*tools_by_target.values())
+    if not ctx.initramfs.exists():
+        components.append(Component("initramfs", "missing", "never packed"))
+    elif not ctx.sysroot.is_dir() or not cache.is_current(
+        f"initramfs-{ctx.profile}", initramfs_digest(ctx), (ctx.initramfs,)
+    ):
+        components.append(Component("initramfs", "stale", "sysroot changed"))
     else:
-        required = tools_by_target[target]
-    result: dict[str, Any] = {
-        "host": platform.platform(),
-        "python": platform.python_version(),
-        "target": target,
-        "architecture": ctx.arch.name,
-        "rust_target": ctx.rust_target,
-        "tools": {},
-        "problems": [],
-    }
-    if platform.system() != "Linux":
-        result["problems"].append("Roanix builds currently require a Linux host")
+        components.append(
+            Component("initramfs", "ready", human_size(ctx.initramfs.stat().st_size))
+        )
 
-    for tool in sorted(required):
-        path = shutil.which(tool)
-        entry: dict[str, Any] = {"path": path}
-        if path:
-            entry["version"] = _tool_version(tool)
+    for kind in ("hdd", "iso"):
+        image = ctx.image(kind)
+        if not image.exists():
+            # Only nag about the image format that is actually in use.
+            if kind != default_image:
+                continue
+            components.append(Component(f"{kind} image", "missing", "never built"))
+        elif not cache.is_current(
+            f"{kind}-{ctx.profile}", image_digest(ctx, kind), (image,)
+        ):
+            components.append(Component(f"{kind} image", "stale", "inputs changed"))
         else:
-            result["problems"].append(f"missing tool: {tool}")
-        result["tools"][tool] = entry
+            components.append(
+                Component(f"{kind} image", "ready", human_size(image.stat().st_size))
+            )
+    return components
+
+
+def build_chain(
+    ctx: Context,
+    run: Runner,
+    jinx: Jinx,
+    recipes: Recipes,
+    manifest: Manifest,
+    target: str,
+) -> list[Path]:
+    """Build ``target`` and everything it depends on."""
+    cache = Cache(ctx)
+    if target == "kernel":
+        return [build_kernel(ctx, run, cache)]
+    if target == "sysroot":
+        return [build_userland(ctx, jinx, recipes, manifest)]
+    if target == "initramfs":
+        build_userland(ctx, jinx, recipes, manifest)
+        return [build_initramfs(ctx, cache)]
+    if target in ("iso", "hdd", "all"):
+        build_kernel(ctx, run, cache)
+        build_userland(ctx, jinx, recipes, manifest)
+        build_initramfs(ctx, cache)
+        if target == "iso":
+            return [build_iso(ctx, run, cache)]
+        if target == "hdd":
+            return [build_hdd(ctx, run, cache)]
+        return [build_hdd(ctx, run, cache), build_iso(ctx, run, cache)]
+    raise Failure(f"unknown build target: {target}", hint=f"valid targets: {', '.join(TARGETS)}")
+
+
+# --------------------------------------------------------------------------
+# Recipe templates for `x.py port`
+# --------------------------------------------------------------------------
+
+PORT_TEMPLATES: Mapping[str, str] = {
+    "autotools": """prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    autotools_configure
+}
+
+build() {
+    make -j${parallelism}
+}
+
+package() {
+    make install DESTDIR="${dest_dir}"
+
+    post_package_strip
+}
+""",
+    "meson": """configure() {
+    meson_configure
+}
+
+build() {
+    ninja -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+
+    post_package_strip
+}
+""",
+    "cmake": """configure() {
+    cmake_configure
+}
+
+build() {
+    ninja -j${parallelism}
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+
+    post_package_strip
+}
+""",
+    "make": """configure() {
+    cp -a "${source_dir}"/. .
+}
+
+build() {
+    make \\
+        CC="${OS_TRIPLET}-gcc" \\
+        CFLAGS="${TARGET_CFLAGS}" \\
+        LDFLAGS="${TARGET_LDFLAGS}" \\
+        -j${parallelism}
+}
+
+package() {
+    make install DESTDIR="${dest_dir}" PREFIX="${prefix}"
+
+    post_package_strip
+}
+""",
+}
+
+PORT_IMAGEDEPS = {
+    "autotools": "build-essential",
+    "meson": "build-essential meson ninja-build",
+    "cmake": "build-essential cmake ninja-build",
+    "make": "build-essential",
+}
+
+PORT_HOSTDEPS = {
+    "autotools": "gcc-host pkg-config",
+    "meson": "gcc-host pkg-config",
+    "cmake": "cmake gcc-host pkg-config",
+    "make": "gcc-host binutils",
+}
+
+
+def blake2b_of(path: Path) -> str:
+    digest = hashlib.blake2b()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class World:
+    """Everything a command needs, assembled once by main()."""
+
+    ctx: Context
+    run: Runner
+    recipes: Recipes
+    manifest: Manifest
+    jinx: Jinx
+
+    @property
+    def log(self) -> Log:
+        return self.ctx.log
+
+
+def qemu_options_from(args: argparse.Namespace, ctx: Context, settings: Mapping[str, str]) -> QemuOptions:
+    extra = list(ctx.qemu_args)
+    saved = settings.get("qemu-args")
+    if saved:
+        extra = shlex.split(saved) + extra
+    serial_log = getattr(args, "serial_log", None)
+    return QemuOptions(
+        image=getattr(args, "image", None) or setting(settings, "image", None, "hdd"),
+        firmware=getattr(args, "firmware", None) or setting(settings, "firmware", None, "uefi"),
+        gdb=bool(getattr(args, "gdb", False)),
+        gdb_port=int(getattr(args, "gdb_port", 1234)),
+        wait=not bool(getattr(args, "no_wait", False)),
+        accel="tcg" if getattr(args, "tcg", False) else "auto",
+        memory=getattr(args, "memory", None),
+        smp=getattr(args, "smp", None),
+        monitor=bool(getattr(args, "monitor", False)),
+        display=getattr(args, "display", None),
+        serial_log=Path(serial_log).resolve() if serial_log else None,
+        trace=getattr(args, "trace", None),
+        extra=tuple(extra),
+    )
+
+
+def cmd_run(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    options = qemu_options_from(args, ctx, settings)
+    image = ctx.image(options.image)
+    if args.no_build:
+        if not image.exists():
+            raise Failure(
+                f"no {options.image} image to boot: {rel(image)}",
+                hint="drop --no-build so xtool can create it",
+            )
+    else:
+        header(ctx, world.manifest)
+        build_chain(ctx, world.run, world.jinx, world.recipes, world.manifest, options.image)
+    if ctx.dry_run:
+        ctx.log.msg2("would boot: " + shlex.join(qemu_command(ctx, world.run, image, options)))
+        return 0
+    run_qemu(ctx, world.run, image, options)
+    return 0
+
+
+def cmd_build(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    default_image = str(setting(settings, "image", None, "hdd"))
+    targets = list(args.targets) or [default_image]
+    if args.run and not any(target in ("hdd", "iso", "all") for target in targets):
+        # `build kernel --run` should still produce something bootable.
+        targets.append(default_image)
+    header(ctx, world.manifest)
+    produced: list[Path] = []
+    for target in targets:
+        produced += build_chain(ctx, world.run, world.jinx, world.recipes, world.manifest, target)
+    ctx.log.msg("Build complete")
+    for artifact in produced:
+        ctx.log.msg2(rel(artifact))
+    ctx.log.finished(f"{', '.join(targets)}", time.monotonic() - ctx.started)
+    if args.run:
+        options = qemu_options_from(args, ctx, settings)
+        bootable = [target for target in targets if target in ("hdd", "iso")]
+        options.image = bootable[-1] if bootable else default_image
+        run_qemu(ctx, world.run, ctx.image(options.image), options)
+    return 0
+
+
+def cmd_pkg(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    names = world.recipes.resolve(args.packages)
+    header(ctx, world.manifest)
+
+    if args.revbump:
+        ctx.log.msg("Bumping the revision of every dependent recipe")
+        world.jinx.revbump(names)
+
+    build_userland(
+        ctx,
+        world.jinx,
+        world.recipes,
+        world.manifest,
+        only=names,
+        with_dependents=not args.only,
+    )
+    not_installed = [
+        name for name in names if name not in world.recipes.dependency_closure(world.manifest.install)
+    ]
+    if not_installed:
+        ctx.log.warn(
+            f"not part of the system image: {' '.join(not_installed)}"
+        )
+        ctx.log.hint(f"add it to {rel(SYSTEM_MANIFEST)} under [install] to ship it")
+
+    if args.run or args.image_target:
+        target = args.image_target or setting(settings, "image", None, "hdd")
+        cache = Cache(ctx)
+        build_kernel(ctx, world.run, cache)
+        build_initramfs(ctx, cache)
+        image = build_iso(ctx, world.run, cache) if target == "iso" else build_hdd(ctx, world.run, cache)
+        if args.run:
+            options = qemu_options_from(args, ctx, settings)
+            options.image = target
+            run_qemu(ctx, world.run, image, options)
+            return 0
+    ctx.log.finished("the package rebuild", time.monotonic() - ctx.started)
+    if not args.run:
+        ctx.log.note("boot it with: ./x.py run")
+    return 0
+
+
+def cmd_port(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    name = args.name
+    directory = RECIPES_DIR / name
+    recipe_path = directory / "recipe"
+    if recipe_path.exists() and not ctx.force:
+        raise Failure(
+            f"{rel(recipe_path)} already exists",
+            hint="pass --force to overwrite it, or pick another name",
+        )
+
+    ctx.log.msg(f"Creating a new port: {name}")
+    checksum = ""
+    url = args.url or ""
+    version = args.version or "0.0.0"
+    if url:
+        url = url.replace(version, "${version}") if version in url else url
+        concrete = url.replace("${version}", version)
+        cached = USERLAND_DIR / "sources" / Path(concrete.split("?", 1)[0]).name
+        if not cached.is_file():
+            ctx.log.msg2(f"downloading {concrete}")
+            ensure_dir(cached.parent)
+            try:
+                request = urllib.request.Request(
+                    concrete, headers={"User-Agent": f"xtool/{VERSION}"}
+                )
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    cached.write_bytes(response.read())
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                remove(cached)
+                raise Failure(f"could not download the tarball: {exc}") from exc
+        checksum = blake2b_of(cached)
+        ctx.log.msg2(f"blake2b: {checksum[:32]}...")
+
+    template = PORT_TEMPLATES[args.template]
+    lines = ["#! /bin/sh", "", f"version={version}", "revision=1"]
+    if url:
+        lines.append(f'tarball_url="{url}"')
+        lines.append(f'tarball_blake2b="{checksum}"')
+    else:
+        lines.append(f'source_dir="{name}"')
+    lines.append(f'imagedeps="{PORT_IMAGEDEPS[args.template]}"')
+    lines.append(f'hostdeps="{PORT_HOSTDEPS[args.template]}"')
+    lines.append(f'deps="{args.deps}"')
+    lines.append("")
+    lines.append(template)
+    if ctx.dry_run:
+        ctx.log.plain("\n".join(lines))
+        return 0
+    ensure_dir(directory)
+    write_file(recipe_path, "\n".join(lines))
+    ctx.log.msg2(f"wrote {rel(recipe_path)}")
+
+    if args.install and add_to_manifest(name):
+        ctx.log.msg2(f"added {name} to {rel(SYSTEM_MANIFEST)}")
+
+    ctx.log.msg("Next steps")
+    ctx.log.msg2(f"edit {rel(recipe_path)} to match the project's build system")
+    ctx.log.msg2(f"./x.py pkg {name}".ljust(28) + "build it into the sysroot")
+    ctx.log.msg2(f"./x.py shell {name}".ljust(28) + "debug the build inside its container")
+    ctx.log.msg2("./x.py run".ljust(28) + f"boot Roanix with {name} installed")
+    return 0
+
+
+def cmd_shell(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    name = args.package
+    if not name.startswith("host:"):
+        world.recipes.resolve([name])
+    command = list(args.shell_command) or ["bash"]
+    ctx.log.msg(f"Entering the Jinx build container for {name}")
+    ctx.log.note("the sysroot, host tools, and image dependencies are all present")
+    ctx.log.plain()
+    world.jinx.run_in(name, command)
+    return 0
+
+
+def cmd_regen(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    name = args.package
+    ctx.log.msg(f"Regenerating patches for {name}")
+    ctx.log.note(
+        f"reading local edits from {rel(USERLAND_DIR / 'sources' / (name + '-workdir'))}"
+    )
+    world.jinx.regen(name)
+    ctx.log.msg2(f"patch written to {rel(RECIPES_DIR / name / 'patches')}")
+    ctx.log.note(f"rebuild it with: ./x.py pkg {name}")
+    return 0
+
+
+def cmd_revbump(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    names = world.recipes.resolve(args.packages)
+    world.ctx.log.msg(f"Bumping revisions of everything that depends on {' '.join(names)}")
+    world.jinx.revbump(names)
+    world.ctx.log.note("apply the rebuilds with: ./x.py build sysroot")
+    return 0
+
+
+def cmd_jinx(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    arguments = list(args.args)
+    if not arguments:
+        arguments = ["help"]
+    world.jinx(arguments, mode="stream" if world.ctx.log.level >= NORMAL else "quiet")
+    return 0
+
+
+def cmd_status(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    log = ctx.log
+    components = survey(
+        ctx,
+        world.jinx,
+        world.recipes,
+        world.manifest,
+        default_image=str(setting(settings, "image", None, "hdd")),
+    )
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "arch": ctx.arch.name,
+                    "profile": ctx.profile,
+                    "sysroot": str(ctx.sysroot),
+                    "components": [
+                        {"name": item.name, "state": item.state, "detail": item.detail}
+                        for item in components
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    log.msg(f"Roanix {ctx.arch.name} ({ctx.profile})")
+    log.field("repository", str(ROOT))
+    log.field("artifacts", rel(ctx.artifacts))
+    log.field("sysroot", rel(ctx.sysroot) + (f" - {age(ctx.sysroot)}" if ctx.sysroot.is_dir() else " - absent"))
+    log.field("recipes", f"{len(world.recipes.names)} packages, {len(world.manifest.install)} installed")
+    log.plain()
+
+    log.msg("Components")
+    marks = {
+        "ready": (log.paint("ready  ", Log.GREEN)),
+        "stale": (log.paint("stale  ", Log.YELLOW)),
+        "missing": (log.paint("missing", Log.RED)),
+    }
+    for item in components:
+        log.plain(f"     {item.name:<14} {marks[item.state]}  {log.paint(item.detail, Log.DIM)}")
+    log.plain()
+
+    pending = [item for item in components if item.state != "ready"]
+    if pending:
+        log.msg("Next")
+        log.msg2("./x.py            build what changed and boot it")
+    else:
+        log.msg("Everything is up to date")
+        log.msg2("./x.py run --no-build     boot the existing image immediately")
+    return 0
+
+
+def cmd_list(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    log = ctx.log
+    if args.what == "targets":
+        log.msg("Build targets")
+        for target, description in (
+            ("kernel", "the Rust kernel binary"),
+            ("sysroot", "every userland package, installed into a sysroot"),
+            ("initramfs", "the sysroot packed as a boot module"),
+            ("hdd", "a bootable GPT disk image"),
+            ("iso", "a bootable hybrid ISO"),
+            ("all", "both images"),
+        ):
+            log.plain(f"     {target:<12} {log.paint(description, Log.DIM)}")
+        return 0
+
+    built = world.jinx.built()
+    installed = set(world.recipes.dependency_closure(world.manifest.install))
+    rows = []
+    for name in world.recipes.names:
+        recipe = world.recipes.get(name)
+        present = sorted(built.get(name, ()))
+        wanted = recipe.version_revision
+        if not recipe.version and present:
+            wanted = present[-1].replace("_", "-")
+        if not present:
+            state, style = "not built", Log.DIM
+        elif world.jinx.has_package(recipe, built):
+            state, style = "built", Log.GREEN
+        else:
+            state, style = f"needs rebuild (have {present[-1].replace('_', '-')})", Log.YELLOW
+        rows.append((name, wanted, state, style, name in installed))
+
+    if args.json_output:
+        print(
+            json.dumps(
+                [
+                    {"name": n, "version": v, "built": s == "built", "in_image": i}
+                    for n, v, s, _, i in rows
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    name_width = max((len(row[0]) for row in rows), default=4) + 2
+    version_width = max((len(row[1]) for row in rows), default=7) + 2
+    log.msg(f"Userland packages ({len(rows)})")
+    log.plain(
+        "       "
+        + log.paint("NAME".ljust(name_width) + "VERSION".ljust(version_width) + "STATUS", Log.BOLD)
+    )
+    for name, version, state, style, in_image in rows:
+        mark = log.paint("*", Log.CYAN) if in_image else " "
+        log.plain(
+            f"     {mark} {name.ljust(name_width)}{version.ljust(version_width)}"
+            + log.paint(state, style)
+        )
+    log.plain()
+    log.note(f"{log.paint('*', Log.CYAN)} = part of the system image ({rel(SYSTEM_MANIFEST)})")
+    return 0
+
+
+def cmd_doctor(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    log = ctx.log
+    if args.json_output:
+        log.level = QUIET  # collect everything silently, then emit one JSON blob
+    groups: dict[str, tuple[str, ...]] = {
+        "kernel": ("cargo", "rustup"),
+        "userland": ("bash", "git", "make", "tar", "gzip", "zstd", "sed", "awk", "grep", "find"),
+        "images": ("xorriso", "sgdisk", "mformat", "mmd", "mcopy"),
+        "emulator": (ctx.arch.qemu,),
+    }
+    problems: list[tuple[str, str | None]] = []
+    report: dict[str, Any] = {"host": platform.platform(), "python": platform.python_version()}
+
+    if platform.system() != "Linux":
+        problems.append(("Roanix can only be built on Linux hosts", None))
+
+    log.msg(f"Host environment for {ctx.arch.name}")
+    log.field("system", platform.platform())
+    log.field("python", platform.python_version())
+    log.field("cpus", str(os.cpu_count() or 1) + f" (using -j{ctx.jobs})")
+    log.plain()
+
+    tools: dict[str, Any] = {}
+    for group, names in groups.items():
+        log.msg2(group)
+        for tool in names:
+            path = shutil.which(tool)
+            tools[tool] = path
+            if path:
+                code, out = capture([tool, "--version"])
+                version = out.splitlines()[0].strip() if code == 0 and out else ""
+                log.plain(
+                    f"       {log.paint('ok', Log.GREEN)}      {tool.ljust(20)}"
+                    f"{log.paint(version[:56], Log.DIM)}"
+                )
+            else:
+                packages = TOOL_PACKAGES.get(tool, {})
+                manager = detect_package_manager()
+                package = packages.get(manager) or tool
+                log.plain(
+                    f"       {log.paint('missing', Log.RED)} {tool.ljust(20)}"
+                    f"{log.paint(install_command(manager, package), Log.DIM)}"
+                )
+                problems.append((f"missing tool: {tool}", install_command(manager, package)))
+    report["tools"] = tools
 
     downloader = shutil.which("wget") or shutil.which("curl")
-    if target in {"hdd", "iso", "run", "sysroot", "all"} and not downloader:
-        result["problems"].append("missing tool: wget or curl")
-    result["downloader"] = downloader
+    if not downloader:
+        problems.append(("neither wget nor curl is available", "install wget"))
 
-    if shutil.which("rustup") and target in {
-        "kernel",
-        "hdd",
-        "iso",
-        "run",
-        "docs",
-        "all",
-    }:
-        installed = subprocess.run(
-            ["rustup", "target", "list", "--installed"],
-            cwd=KERNEL_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-        targets = installed.stdout.splitlines() if installed.returncode == 0 else []
-        result["installed_rust_targets"] = targets
-        if ctx.rust_target not in targets:
-            result["problems"].append(
-                f"Rust target is not installed: {ctx.rust_target}"
+    if shutil.which("rustup"):
+        code, out = capture(["rustup", "target", "list", "--installed"], cwd=KERNEL_DIR)
+        installed = out.split() if code == 0 else []
+        report["rust_targets"] = installed
+        log.plain()
+        log.msg2("rust targets")
+        if ctx.arch.rust_target in installed:
+            log.plain(f"       {log.paint('ok', Log.GREEN)}      {ctx.arch.rust_target}")
+        else:
+            log.plain(f"       {log.paint('missing', Log.RED)} {ctx.arch.rust_target}")
+            problems.append(
+                (
+                    f"rust target not installed: {ctx.arch.rust_target}",
+                    f"rustup target add {ctx.arch.rust_target}",
+                )
             )
 
-    if json_output:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        print(f"Host:        {result['host']}")
-        print(f"Python:      {result['python']}")
-        print(f"Build check: {target} ({ctx.arch.name})")
-        for tool, entry in result["tools"].items():
-            if entry["path"]:
-                version = f" - {entry['version']}" if entry.get("version") else ""
-                print(f"  [ok]      {tool}: {entry['path']}{version}")
-            else:
-                hint = PACKAGE_HINTS.get(tool)
-                suffix = f" (package: {hint})" if hint else ""
-                print(f"  [missing] {tool}{suffix}")
-        if target in {"hdd", "iso", "run", "sysroot", "all"}:
-            status = "[ok]" if downloader else "[missing]"
-            print(f"  {status:<9} wget or curl: {downloader or 'not found'}")
-        if result["problems"]:
-            print("\nProblems:")
-            for problem in result["problems"]:
-                print(f"  - {problem}")
+    if ctx.arch.name == "x86_64":
+        log.plain()
+        log.msg2("acceleration")
+        if kvm_available():
+            log.plain(f"       {log.paint('ok', Log.GREEN)}      /dev/kvm is usable")
         else:
-            print("\nReady.")
-    return not result["problems"]
+            log.plain(
+                f"       {log.paint('note', Log.YELLOW)}    /dev/kvm is unavailable; "
+                f"{log.paint('QEMU will fall back to TCG', Log.DIM)}"
+            )
+
+    report["problems"] = [message for message, _ in problems]
+    if args.json_output:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if not problems else 1
+
+    log.plain()
+    if problems:
+        log.msg(f"{len(problems)} problem(s) found")
+        for message, fix in problems:
+            log.msg2(message)
+            if fix:
+                log.note(fix)
+        return 1
+    log.msg("Everything xtool needs is installed")
+    log.msg2("build and boot Roanix with: ./x.py")
+    return 0
 
 
-def show_config(ctx: Context, *, json_output: bool) -> None:
-    data = {
-        "root": str(ROOT),
-        "architecture": ctx.arch.name,
-        "profile": ctx.profile,
-        "rust_target": ctx.rust_target,
-        "output_dir": str(ctx.output_dir),
-        "artifact_dir": str(ctx.artifact_dir),
-        "runtime_dir": str(RUNTIME_ROOT),
-    }
-    if json_output:
-        print(json.dumps(data, indent=2, sort_keys=True))
-        return
-    print(f"Architecture:       {ctx.arch.name}")
-    print(f"Rust target:        {ctx.rust_target}")
-    print(f"Profile:            {ctx.profile}")
-    print(f"Output directory:   {_display_path(ctx.output_dir)}")
-    print(f"Artifact directory: {_display_path(ctx.artifact_dir)}")
-    print(f"Runtime directory:  {_display_path(RUNTIME_ROOT)}")
+def cmd_config(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    log = world.ctx.log
+    stored = load_settings()
+    if args.action in (None, "show", "list"):
+        log.msg("Saved defaults")
+        if not stored:
+            log.msg2(f"none yet - try: ./x.py config set arch {world.ctx.arch.name}")
+        for key in sorted(SETTINGS_KEYS):
+            value = stored.get(key)
+            shown = (
+                value.ljust(18)
+                if value is not None
+                else log.paint("(unset)".ljust(18), Log.DIM)
+            )
+            log.plain(f"     {key.ljust(12)}{shown}{log.paint(SETTINGS_KEYS[key], Log.DIM)}")
+        log.plain()
+        log.msg("Effective configuration")
+        log.field("arch", world.ctx.arch.name)
+        log.field("profile", world.ctx.profile)
+        log.field("jobs", str(world.ctx.jobs))
+        log.field("config file", rel(CONFIG_FILE))
+        return 0
+    if args.action == "set":
+        if not args.key or args.value is None:
+            raise Failure("usage: ./x.py config set <key> <value>")
+        if args.key not in SETTINGS_KEYS:
+            raise Failure(
+                f"unknown setting: {args.key}",
+                hint="valid settings: " + ", ".join(sorted(SETTINGS_KEYS)),
+            )
+        validate_setting(args.key, args.value)
+        stored[args.key] = args.value
+        save_settings(stored)
+        log.msg(f"{args.key} = {args.value}")
+        return 0
+    if args.action == "unset":
+        if not args.key:
+            raise Failure("usage: ./x.py config unset <key>")
+        stored.pop(args.key, None)
+        save_settings(stored)
+        log.msg(f"cleared {args.key}")
+        return 0
+    raise Failure(f"unknown config action: {args.action}")
 
 
-def _common_parser(*, include_force: bool = False) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
-    parser.add_argument(
-        "--arch",
-        choices=tuple(ARCHITECTURES),
-        help="Target architecture.",
-    )
-    parser.add_argument(
-        "--profile",
-        "--rust-profile",
-        dest="profile",
-        choices=SUPPORTED_PROFILES,
-        help="Cargo profile.",
-    )
-    if include_force:
-        parser.add_argument(
-            "--force",
-            action="store_true",
-            help="Rebuild even when outputs are up to date.",
+def validate_setting(key: str, value: str) -> None:
+    if key == "arch" and value not in ARCHES:
+        raise Failure(f"unknown architecture: {value}", hint=", ".join(ARCHES))
+    if key == "profile" and value not in PROFILES:
+        raise Failure(f"unknown profile: {value}", hint=", ".join(PROFILES))
+    if key == "image" and value not in ("hdd", "iso"):
+        raise Failure(f"unknown image format: {value}", hint="hdd, iso")
+    if key == "firmware" and value not in ("uefi", "bios"):
+        raise Failure(f"unknown firmware: {value}", hint="uefi, bios")
+    if key == "jobs" and (not value.isdigit() or int(value) < 1):
+        raise Failure("jobs must be a positive integer")
+
+
+CLEAN_TARGETS: Mapping[str, str] = {
+    # per-architecture
+    "out": "kernel binary, initramfs, and images for this arch and profile",
+    "cargo": "the Cargo target directory for this architecture",
+    "sysroot": "the installed sysroot for this architecture",
+    "packages": "this architecture's Jinx build tree and packages",
+    "state": "this architecture's incremental build state",
+    "arch": "everything for this architecture (all of the above)",
+    # shared by every architecture
+    "sources": "downloaded and patched userland sources (shared)",
+    "cache": "pinned Limine, OVMF, and Jinx downloads (shared)",
+    "all": "everything under build/",
+}
+
+#: Targets that wipe work shared by every architecture.
+SHARED_CLEAN_TARGETS = {"sources", "cache"}
+#: Targets whose removal forces a very long rebuild.
+EXPENSIVE_CLEAN_TARGETS = {"packages", "sources", "cache", "arch", "all"}
+
+
+def clean_plan(ctx: Context) -> list[tuple[str, list[Path]]]:
+    return [
+        ("out", [ctx.artifacts]),
+        ("cargo", [ctx.cargo_arch_dir]),
+        ("sysroot", [ctx.sysroot]),
+        ("packages", [ctx.jinx_build]),
+        ("state", [ctx.state_dir, ctx.work]),
+        ("arch", [ctx.arch_root, ctx.cargo_arch_dir]),
+        ("sources", [
+            USERLAND_DIR / "sources",
+            USERLAND_DIR / "host-sources",
+            USERLAND_DIR / ".jinx-cache",
+        ]),
+        ("cache", [CACHE_DIR]),
+        ("all", [BUILD_DIR]),
+    ]
+
+
+def cmd_clean(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    log = ctx.log
+    wanted = set(args.targets or ["out", "state"])
+    unknown = wanted - set(CLEAN_TARGETS)
+    if unknown:
+        raise Failure(
+            f"unknown clean target(s): {', '.join(sorted(unknown))}",
+            hint="valid targets: " + ", ".join(CLEAN_TARGETS),
         )
-    parser.add_argument(
-        "--rust-target",
-        help=argparse.SUPPRESS,
+    if "all" in wanted:
+        wanted = {"all", "sources"}
+
+    expensive = wanted & EXPENSIVE_CLEAN_TARGETS
+    if expensive and not ctx.assume_yes and sys.stdin.isatty():
+        log.warn(f"about to remove: {', '.join(sorted(expensive))}")
+        log.hint("this forces a full userland rebuild, which takes a long time")
+        if input("  -> continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            log.msg("Nothing was removed")
+            return 1
+
+    shared = wanted & SHARED_CLEAN_TARGETS or ({"all"} & wanted)
+    log.msg(f"Cleaning {ctx.arch.name}" + (" and shared state" if shared else ""))
+    removed = 0
+    for target, paths in clean_plan(ctx):
+        if target not in wanted:
+            continue
+        for path in paths:
+            if not path.exists():
+                continue
+            if not is_inside_repo(path):
+                log.warn(f"refusing to remove {path} (outside the repository)")
+                continue
+            size = tree_size(path)
+            removed += size
+            scope = " (shared)" if target in SHARED_CLEAN_TARGETS else ""
+            log.msg2(f"{rel(path)} ({human_size(size)}){scope}")
+            if not ctx.dry_run:
+                remove(path)
+    if "all" in wanted and not ctx.dry_run:
+        for pattern in ("roanix-*.iso", "roanix-*.hdd"):
+            for stray in ROOT.glob(pattern):
+                remove(stray)
+        remove(BOOK_DIR / "book")
+    log.msg2(f"reclaimed {human_size(removed)}")
+    log.finished("cleaning", time.monotonic() - ctx.started)
+    return 0
+
+
+def is_inside_repo(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved == ROOT.resolve():
+        return False
+    return resolved.is_relative_to(ROOT.resolve())
+
+
+def cmd_check(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    ctx.log.msg(f"Type-checking the kernel ({ctx.arch.name})")
+    cargo(ctx, world.run, "check", "--target", ctx.arch.rust_target, "--profile", ctx.profile)
+    ctx.log.finished("the check", time.monotonic() - ctx.started)
+    return 0
+
+
+def cmd_lint(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    ctx.log.msg(f"Running Clippy ({ctx.arch.name})")
+    cargo(
+        ctx, world.run, "clippy",
+        "--target", ctx.arch.rust_target, "--profile", ctx.profile,
+        "--", "-D", "warnings",
     )
-    parser.add_argument(
-        "--out-dir",
-        help=argparse.SUPPRESS,
+    ctx.log.finished("the lint", time.monotonic() - ctx.started)
+    return 0
+
+
+def cmd_fmt(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    argv = ["cargo", "fmt", "--all"]
+    if args.check:
+        argv += ["--", "--check"]
+    ctx.log.msg("Checking Rust formatting" if args.check else "Formatting Rust sources")
+    world.run(argv, cwd=KERNEL_DIR, mode="stream")
+    return 0
+
+
+def cmd_docs(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    if args.kind == "book":
+        argv = ["mdbook", "serve", "--port", str(args.port)] if args.serve else ["mdbook", "build"]
+        ctx.log.msg("Serving the Roanix book" if args.serve else "Building the Roanix book")
+        if args.serve:
+            ctx.log.note(f"http://127.0.0.1:{args.port}")
+        world.run(argv, cwd=BOOK_DIR, mode="raw" if args.serve else "stream")
+        return 0
+    ctx.log.msg(f"Building the kernel API documentation ({ctx.arch.name})")
+    cargo(ctx, world.run, "doc", "--no-deps", "--target", ctx.arch.rust_target)
+    docs = ctx.cargo_arch_dir / "doc"
+    ctx.log.msg2(rel(docs))
+    if args.serve:
+        ctx.log.note(f"http://127.0.0.1:{args.port}/roanix/index.html")
+        world.run([sys.executable, "-m", "http.server", str(args.port)], cwd=docs, mode="raw")
+    return 0
+
+
+def cmd_fetch(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
+    ctx = world.ctx
+    ctx.log.msg("Fetching pinned build resources")
+    wanted = args.resources or ["limine", "ovmf", "jinx"]
+    for resource in wanted:
+        if resource in TARBALLS:
+            install_tarball(ctx, TARBALLS[resource], world.run)
+        elif resource == "jinx":
+            ensure_jinx(ctx, world.run)
+        else:
+            raise Failure(
+                f"unknown resource: {resource}", hint="valid resources: limine, ovmf, jinx"
+            )
+        ctx.log.msg2(f"{resource} is ready")
+    return 0
+
+
+def header(ctx: Context, manifest: Manifest) -> None:
+    ctx.log.msg(
+        f"Roanix {ctx.arch.name} ({ctx.profile})"
+        + (" [forced rebuild]" if ctx.force else "")
     )
-    parser.add_argument(
-        "--no-bootstrap",
-        action="store_true",
-        help=argparse.SUPPRESS,
+    if manifest.generated:
+        ctx.log.msg2(f"create {rel(SYSTEM_MANIFEST)} to control the package set")
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+OVERVIEW = """xtool builds, packages, and boots the Roanix operating system.
+
+everyday commands:
+  run                 build whatever changed and boot it in QEMU  (default)
+  build               build one or more targets without booting
+  pkg                 rebuild userland package(s) and reinstall the sysroot
+  status              show what is built, what is stale, and what is next
+
+userland and Jinx:
+  port                scaffold a brand new package recipe
+  shell               open a shell inside a package's Jinx build container
+  regen               regenerate a package's patches from its work tree
+  revbump             bump the revision of every dependent recipe
+  list                list userland packages or build targets
+  jinx                run Jinx directly in the configured build directory
+
+kernel:
+  check               cargo check the kernel
+  lint                cargo clippy with warnings denied
+  fmt                 format the Rust sources
+  docs                build or serve the book and the kernel API docs
+
+environment:
+  doctor              verify the host has everything xtool needs
+  config              show or change saved defaults such as the architecture
+  fetch               pre-download Limine, OVMF, and Jinx
+  clean               remove build artefacts
+"""
+
+EXAMPLES = """workflow examples:
+  ./x.py                              build what changed and boot it
+  ./x.py -a riscv64                   the same, targeting riscv64
+  ./x.py -r                           build and boot a release kernel
+
+  ./x.py pkg bash --run               rebuild Bash, reinstall it, boot
+  ./x.py pkg mlibc --run              rebuild mlibc and everything linked to it
+  ./x.py port zstd --url https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz --version 1.5.7
+  ./x.py shell python                 debug a failing build interactively
+  ./x.py regen python                 turn local source edits into a patch
+
+  ./x.py run --gdb                    boot halted with a GDB stub on :1234
+  ./x.py run iso --firmware bios      boot the ISO through SeaBIOS
+  ./x.py run -- -d int -no-reboot     pass raw flags straight to QEMU
+
+  ./x.py config set arch riscv64      stop typing --arch every time
+  ./x.py -A status                    report on every architecture
+  ./x.py status                       what would a build actually do?
+
+Run './x.py help <command>' for the full options of one command.
+"""
+
+COMMANDS = (
+    "run", "build", "pkg", "status", "port", "shell", "regen", "revbump",
+    "list", "jinx", "check", "lint", "fmt", "docs", "doctor", "config",
+    "fetch", "clean", "help",
+)
+ALIASES = {"r": "run", "b": "build", "p": "pkg", "st": "status", "ls": "list"}
+VALUE_OPTIONS = {
+    "-a", "--arch", "-p", "--profile", "-j", "--jobs", "--color", "-m",
+    "--memory", "--smp", "--gdb-port", "--display", "--serial-log", "--trace",
+    "--image", "--firmware", "-F", "--port", "--template", "--url", "--deps",
+}
+
+
+class Formatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog: str, **kwargs: Any) -> None:
+        super().__init__(prog, max_help_position=32, width=96, **kwargs)
+
+
+def global_options() -> argparse.ArgumentParser:
+    # SUPPRESS keeps unset options out of the namespace entirely, so that a
+    # subparser's copy of --arch cannot overwrite a value the root parser
+    # already accepted (`./x.py -a riscv64 status`).
+    parser = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    group = parser.add_argument_group("common options")
+    group.add_argument(
+        "-a", "--arch", action="append", choices=tuple(ARCHES),
+        help="target architecture; repeat to act on several",
     )
-    parser.add_argument(
-        "--color",
-        choices=("auto", "always", "never"),
-        help=argparse.SUPPRESS,
+    group.add_argument(
+        "-A", "--all-arches", action="store_true", help="act on every architecture",
     )
-    parser.add_argument(
-        "--no-color",
-        dest="color",
-        action="store_const",
-        const="never",
-        help=argparse.SUPPRESS,
+    group.add_argument("-p", "--profile", choices=PROFILES, help="Cargo profile")
+    group.add_argument(
+        "-r", "--release", action="store_true", help="shorthand for --profile release"
     )
-    parser.add_argument("-q", "--quiet", action="store_true", help="Only print errors.")
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Show commands and stream their output.",
+    group.add_argument("-j", "--jobs", type=int, help="parallel jobs for Cargo and Jinx")
+    group.add_argument(
+        "-f", "--force", action="store_true", help="rebuild even if nothing changed"
     )
-    parser.add_argument(
-        "--timings",
-        "--show-time",
-        dest="show_time",
-        action="store_true",
-        help="Show total command duration.",
-    )
-    parser.add_argument(
-        "--qemu-flags",
-        help=argparse.SUPPRESS,
-    )
+    group.add_argument("-q", "--quiet", action="store_true", help="only print warnings and errors")
+    group.add_argument("-v", "--verbose", action="store_true", help="show every command and all output")
+    group.add_argument("--color", choices=("auto", "always", "never"), help="colourise output")
+    group.add_argument("--offline", action="store_true", help="never touch the network")
+    group.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
+    group.add_argument("-y", "--yes", action="store_true", help="assume yes for confirmations")
     return parser
 
 
-def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
-    common = _common_parser()
-    build_common = _common_parser(include_force=True)
+def qemu_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_argument_group("emulator options")
+    group.add_argument("-F", "--firmware", choices=("uefi", "bios"), help="firmware to boot with")
+    group.add_argument("--gdb", action="store_true", help="expose a GDB stub and halt at reset")
+    group.add_argument("--gdb-port", type=int, default=1234, help="port for the GDB stub")
+    group.add_argument("--no-wait", action="store_true", help="with --gdb, start running immediately")
+    group.add_argument("--tcg", action="store_true", help="disable KVM and use pure emulation")
+    group.add_argument("-m", "--memory", help="guest memory size, e.g. 2G")
+    group.add_argument("--smp", type=int, help="number of guest CPUs")
+    group.add_argument("--monitor", action="store_true", help="multiplex the QEMU monitor onto serial")
+    group.add_argument("--display", help="QEMU display backend, e.g. none")
+    group.add_argument("--serial-log", help="also write the serial console to this file")
+    group.add_argument("--trace", help="QEMU -d items to log, e.g. int,cpu_reset")
+    return parser
+
+
+def build_cli() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    common = global_options()
+    emulator = qemu_options()
     parser = argparse.ArgumentParser(
         prog="x.py",
-        parents=[build_common],
-        formatter_class=HelpFormatter,
-        description="Build, inspect, and run Roanix.",
-        epilog="""Examples:
-  ./x.py                         Build the default x86_64 HDD image
-  ./x.py build iso --arch riscv64 --profile release
-  ./x.py build hdd --force
-  ./x.py package init
-  ./x.py run -- --no-reboot
-  ./x.py doctor
-  ./x.py help build""",
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
-    commands: dict[str, argparse.ArgumentParser] = {}
-
-    build = subparsers.add_parser(
-        "build",
-        parents=[build_common],
-        formatter_class=HelpFormatter,
-        help="Build a kernel, image, or userspace artifact.",
-        description="Build one Roanix artifact.",
-        epilog="""Examples:
-  ./x.py build                   Build the kernel only
-  ./x.py build hdd               Build the bootable HDD image
-  ./x.py build iso --arch riscv64
-  ./x.py build initramfs --profile release
-  ./x.py build hdd --force       Rebuild every dependency""",
-    )
-    build.add_argument(
-        "target",
-        nargs="?",
-        choices=("kernel", "hdd", "iso", "sysroot", "initramfs"),
-        default="kernel",
-        help="Artifact to build.",
-    )
-    commands["build"] = build
-
-    run_parser = subparsers.add_parser(
-        "run",
-        parents=[build_common],
-        formatter_class=HelpFormatter,
-        help="Build and boot Roanix in QEMU.",
-        description="Build an image and launch it using UEFI firmware or BIOS.",
-        epilog="""Examples:
-  ./x.py run
-  ./x.py run iso --arch riscv64
-  ./x.py run hdd --firmware bios
-  ./x.py run -- --no-reboot -d int""",
-    )
-    run_parser.add_argument(
-        "image",
-        nargs="?",
-        choices=("hdd", "iso"),
-        default="hdd",
-        help="Image format to boot.",
-    )
-    run_parser.add_argument(
-        "--firmware",
-        choices=("uefi", "bios"),
-        default="uefi",
-        help="Firmware mode.",
-    )
-    commands["run"] = run_parser
-
-    package_parser = subparsers.add_parser(
-        "package",
         parents=[common],
-        formatter_class=HelpFormatter,
-        help="Rebuild a userspace package and reinstall the sysroot.",
+        formatter_class=Formatter,
+        usage="%(prog)s [<command>] [options] [-- qemu arguments]",
+        description=OVERVIEW,
+        epilog=EXAMPLES,
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="show this message")
+    parser.add_argument("-V", "--version", action="version", version=f"xtool {VERSION}")
+    subparsers = parser.add_subparsers(
+        dest="command", metavar="<command>", help=argparse.SUPPRESS
+    )
+    registry: dict[str, argparse.ArgumentParser] = {}
+
+    def add(name: str, aliases: Sequence[str] = (), **kwargs: Any) -> argparse.ArgumentParser:
+        sub = subparsers.add_parser(
+            name,
+            aliases=list(aliases),
+            parents=kwargs.pop("parents", [common]),
+            formatter_class=Formatter,
+            **kwargs,
+        )
+        registry[name] = sub
+        return sub
+
+    run = add(
+        "run", ["r"], parents=[common, emulator],
+        description="Build anything that changed, then boot Roanix in QEMU.",
+        epilog="examples:\n"
+               "  ./x.py run\n"
+               "  ./x.py run iso --arch riscv64\n"
+               "  ./x.py run --gdb --tcg\n"
+               "  ./x.py run --no-build          boot the existing image as-is\n"
+               "  ./x.py run -- -d int           pass raw arguments to QEMU\n",
+    )
+    run.add_argument("image", nargs="?", choices=("hdd", "iso"), help="image format to boot")
+    run.add_argument("--no-build", action="store_true", help="boot the existing image without rebuilding")
+
+    build = add(
+        "build", ["b"], parents=[common, emulator],
+        description="Build one or more targets: " + ", ".join(TARGETS) + ".",
+        epilog="examples:\n"
+               "  ./x.py build kernel\n"
+               "  ./x.py build sysroot --arch riscv64\n"
+               "  ./x.py build iso --profile release\n"
+               "  ./x.py build hdd --run\n",
+    )
+    build.add_argument("targets", nargs="*", choices=(*TARGETS, []), help="what to build")
+    build.add_argument("--run", action="store_true", help="boot the result when the build finishes")
+
+    pkg = add(
+        "pkg", ["p"], parents=[common, emulator],
         description=(
-            "Rebuild one Jinx package plus affected reverse dependencies, "
-            "then replace the existing architecture sysroot."
+            "Rebuild userland package(s) with Jinx and reinstall the sysroot.\n"
+            "By default everything that depends on the named packages is rebuilt too,\n"
+            "which is what you want after changing a library."
         ),
-        epilog="""Examples:
-  ./x.py package init
-  ./x.py package bash --arch riscv64
-  ./x.py package mlibc""",
+        epilog="examples:\n"
+               "  ./x.py pkg bash                rebuild Bash into the sysroot\n"
+               "  ./x.py pkg bash --run          ...then boot it\n"
+               "  ./x.py pkg mlibc               rebuild mlibc and every dependent\n"
+               "  ./x.py pkg drivers --only      rebuild just the drivers package\n"
+               "  ./x.py pkg 'lib*'              globs work too\n",
     )
-    package_parser.add_argument(
-        "package",
-        choices=available_userland_packages(),
-        help="Userspace package recipe to rebuild.",
-    )
-    commands["package"] = package_parser
+    pkg.add_argument("packages", nargs="+", help="recipe name(s); shell globs are allowed")
+    pkg.add_argument("-1", "--only", action="store_true", help="do not rebuild dependents")
+    pkg.add_argument("-R", "--run", action="store_true", help="build an image and boot it afterwards")
+    pkg.add_argument("--image", dest="image_target", choices=("hdd", "iso"), help="image to refresh")
+    pkg.add_argument("--revbump", action="store_true", help="also bump dependent recipe revisions")
 
-    check = subparsers.add_parser(
-        "check",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Type-check the kernel.",
+    port = add(
+        "port",
+        description="Scaffold a new userland port and wire it into the system image.",
+        epilog="examples:\n"
+               "  ./x.py port zstd --url https://.../zstd-1.5.7.tar.gz --version 1.5.7\n"
+               "  ./x.py port mytool --template make --deps 'sys-libs ncurses'\n",
     )
-    commands["check"] = check
+    port.add_argument("name", help="package name, which becomes userland/recipes/<name>")
+    port.add_argument("--url", help="tarball URL; xtool downloads it and records the blake2b sum")
+    port.add_argument("--version", dest="version", help="upstream version")
+    port.add_argument(
+        "--template", choices=tuple(PORT_TEMPLATES), default="autotools", help="build system template"
+    )
+    port.add_argument("--deps", default="sys-libs", help="space separated runtime dependencies")
+    port.add_argument(
+        "--no-install", dest="install", action="store_false",
+        help="do not add the package to the system image",
+    )
 
-    lint = subparsers.add_parser(
-        "lint",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Run Clippy with warnings denied.",
+    shell = add(
+        "shell",
+        description="Run a command inside the container Jinx would use to build a package.",
+        epilog="examples:\n"
+               "  ./x.py shell python            interactive Bash in python's build tree\n"
+               "  ./x.py shell mlibc meson test  run a one-off command there\n"
+               "  ./x.py shell host:gcc-host     host recipes work with the host: prefix\n",
     )
-    commands["lint"] = lint
+    shell.add_argument("package", help="recipe name, optionally prefixed with host:")
+    shell.add_argument(
+        "shell_command",
+        nargs=argparse.REMAINDER,
+        metavar="command",
+        help="command to run (default: bash)",
+    )
 
-    fmt = subparsers.add_parser(
-        "fmt",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Format Rust sources.",
+    regen = add(
+        "regen",
+        description=(
+            "Regenerate a package's patch from edits made in userland/sources/<pkg>-workdir,\n"
+            "then re-run the recipe's prepare() step."
+        ),
     )
-    fmt.add_argument("--check", action="store_true", help="Check without modifying files.")
-    commands["fmt"] = fmt
+    regen.add_argument("package", help="recipe whose patches should be regenerated")
 
-    docs = subparsers.add_parser(
-        "docs",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Build or serve project documentation.",
+    revbump = add(
+        "revbump",
+        description="Bump the revision of every recipe that depends on the named package(s).",
     )
-    docs.add_argument(
-        "kind",
-        nargs="?",
-        choices=("book", "rust"),
-        default="book",
-        help="Documentation set.",
-    )
-    docs.add_argument("--serve", action="store_true", help="Start a preview server.")
-    docs.add_argument("--port", type=int, default=8080, help="Preview server port.")
-    commands["docs"] = docs
+    revbump.add_argument("packages", nargs="+", help="recipe name(s)")
 
-    clean_parser = subparsers.add_parser(
-        "clean",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Remove generated files.",
+    listing = add("list", ["ls"], description="List userland packages or build targets.")
+    listing.add_argument(
+        "what", nargs="?", choices=("packages", "targets"), default="packages", help="what to list"
     )
-    clean_parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Also remove downloads, firmware, Jinx, and userspace caches.",
-    )
-    commands["clean"] = clean_parser
+    listing.add_argument("--json", dest="json_output", action="store_true", help="emit JSON")
 
-    fetch = subparsers.add_parser(
-        "fetch",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Fetch bootloader, firmware, and userspace tooling.",
+    jinx = add(
+        "jinx",
+        description="Run Jinx directly, in the build directory for the selected architecture.",
+        epilog="examples:\n"
+               "  ./x.py jinx dry-run '*'\n"
+               "  ./x.py jinx build host:gcc-host\n",
     )
-    fetch.add_argument(
-        "resources",
-        nargs="*",
-        choices=("limine", "ovmf", "jinx"),
-        help="Resources to fetch; all are fetched by default.",
-    )
-    commands["fetch"] = fetch
+    jinx.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed straight to jinx")
 
-    doctor_parser = subparsers.add_parser(
-        "doctor",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Diagnose the host build environment.",
-    )
-    doctor_parser.add_argument(
-        "target",
-        nargs="?",
-        choices=("kernel", "hdd", "iso", "run", "sysroot", "docs", "all"),
-        default="hdd",
-        help="Workflow whose dependencies should be checked.",
-    )
-    doctor_parser.add_argument(
-        "--json", dest="json_output", action="store_true", help="Emit machine-readable JSON."
-    )
-    commands["doctor"] = doctor_parser
+    status = add("status", ["st"], description="Report what is built and what is stale.")
+    status.add_argument("--json", dest="json_output", action="store_true", help="emit JSON")
 
-    config = subparsers.add_parser(
+    add("check", description="Type-check the kernel with cargo check.")
+    add("lint", description="Run Clippy over the kernel with warnings denied.")
+    fmt = add("fmt", description="Format the kernel sources with rustfmt.")
+    fmt.add_argument("--check", action="store_true", help="fail instead of rewriting files")
+
+    docs = add("docs", description="Build or serve the Roanix book or the kernel API docs.")
+    docs.add_argument("kind", nargs="?", choices=("book", "rust"), default="book", help="which docs")
+    docs.add_argument("--serve", action="store_true", help="serve them over HTTP")
+    docs.add_argument("--port", type=int, default=8080, help="port for --serve")
+
+    doctor = add("doctor", description="Check that the host has every tool xtool needs.")
+    doctor.add_argument("--json", dest="json_output", action="store_true", help="emit JSON")
+
+    config = add(
         "config",
-        parents=[common],
-        formatter_class=HelpFormatter,
-        help="Show the fully resolved build configuration.",
+        description="Show or change the defaults xtool remembers between runs.",
+        epilog="examples:\n"
+               "  ./x.py config                      show everything\n"
+               "  ./x.py config set arch riscv64\n"
+               "  ./x.py config set qemu-args '-display none'\n"
+               "  ./x.py config unset profile\n",
     )
-    config.add_argument(
-        "--json", dest="json_output", action="store_true", help="Emit machine-readable JSON."
+    config.add_argument("action", nargs="?", choices=("show", "list", "set", "unset"), help="what to do")
+    config.add_argument("key", nargs="?", help="setting name")
+    config.add_argument("value", nargs="?", help="new value")
+
+    fetch = add("fetch", description="Pre-download Limine, OVMF, and Jinx.")
+    fetch.add_argument("resources", nargs="*", choices=("limine", "ovmf", "jinx", []), help="what to fetch")
+
+    clean = add(
+        "clean",
+        description=(
+            "Remove build artefacts.\n\n"
+            "Per-architecture targets only ever touch build/<arch>/, so cleaning one\n"
+            "architecture never disturbs another. Targets:\n"
+            + "\n".join(f"  {name:<10} {text}" for name, text in CLEAN_TARGETS.items())
+        ),
+        epilog="examples:\n"
+               "  ./x.py clean                   this arch's images and build state\n"
+               "  ./x.py clean arch -a riscv64   forget riscv64 entirely\n"
+               "  ./x.py clean all --yes         the whole build/ tree\n",
     )
-    commands["config"] = config
+    clean.add_argument("targets", nargs="*", help="what to remove (default: out state)")
 
-    help_parser = subparsers.add_parser(
-        "help",
-        formatter_class=HelpFormatter,
-        help="Show help for a command.",
-    )
-    help_parser.add_argument("topic", nargs="?", help="Command name.")
-    commands["help"] = help_parser
-    return parser, commands
+    help_parser = add("help", description="Show help for a command.")
+    help_parser.add_argument("topic", nargs="?", help="command name")
+    return parser, registry
 
 
-def rewrite_legacy_command(argv: Sequence[str]) -> list[str]:
-    rewritten = list(argv)
+HANDLERS: Mapping[str, Callable[[World, argparse.Namespace, Mapping[str, str]], int]] = {
+    "run": cmd_run,
+    "build": cmd_build,
+    "pkg": cmd_pkg,
+    "port": cmd_port,
+    "shell": cmd_shell,
+    "regen": cmd_regen,
+    "revbump": cmd_revbump,
+    "jinx": cmd_jinx,
+    "status": cmd_status,
+    "list": cmd_list,
+    "check": cmd_check,
+    "lint": cmd_lint,
+    "fmt": cmd_fmt,
+    "docs": cmd_docs,
+    "doctor": cmd_doctor,
+    "config": cmd_config,
+    "fetch": cmd_fetch,
+    "clean": cmd_clean,
+}
+
+#: Commands that never need Jinx, a sysroot, or the recipe graph.
+LIGHTWEIGHT = {"doctor", "config", "fetch", "check", "lint", "fmt", "docs", "clean"}
+
+#: Commands that can sensibly act on several architectures in one invocation.
+MULTI_ARCH = {"build", "pkg", "status", "list", "clean", "fetch", "check", "lint", "doctor"}
+
+
+def locate_command(argv: Sequence[str]) -> str | None:
     index = 0
-    while index < len(rewritten):
-        token = rewritten[index]
+    while index < len(argv):
+        token = argv[index]
         if token == "--":
-            break
-        if token in OPTIONS_WITH_VALUES:
+            return None
+        if token in VALUE_OPTIONS:
             index += 2
-            continue
-        if any(token.startswith(option + "=") for option in OPTIONS_WITH_VALUES):
-            index += 1
             continue
         if token.startswith("-"):
             index += 1
             continue
-        replacement = LEGACY_COMMANDS.get(token)
-        if replacement:
-            return rewritten[:index] + replacement + rewritten[index + 1 :]
-        break
-    return rewritten
+        return token
+    return None
+
+
+def split_qemu_arguments(argv: Sequence[str], command: str | None) -> tuple[list[str], list[str]]:
+    """Everything after a bare ``--`` goes to QEMU, unless Jinx owns it."""
+    if command in ("jinx", "shell") or "--" not in argv:
+        return list(argv), []
+    index = list(argv).index("--")
+    return list(argv[:index]), list(argv[index + 1 :])
+
+
+def opt(args: argparse.Namespace, name: str, default: Any = None) -> Any:
+    """Read an option that may have been suppressed when it was not given."""
+    return getattr(args, name, default)
+
+
+def resolve_arches(args: argparse.Namespace, settings: Mapping[str, str]) -> tuple[str, ...]:
+    """Which architectures should this invocation act on?"""
+    if opt(args, "all_arches"):
+        return tuple(ARCHES)
+    selected = opt(args, "arch") or []
+    if not selected:
+        selected = [str(setting(settings, "arch", None, DEFAULT_ARCH))]
+    ordered = tuple(dict.fromkeys(selected))
+    unknown = [name for name in ordered if name not in ARCHES]
+    if unknown:
+        raise Failure(
+            f"unknown architecture: {', '.join(unknown)}",
+            hint="supported architectures: " + ", ".join(ARCHES),
+        )
+    return ordered
+
+
+def make_context(
+    args: argparse.Namespace, settings: Mapping[str, str], log: Log, arch_name: str
+) -> Context:
+    profile = (
+        "release"
+        if opt(args, "release")
+        else str(setting(settings, "profile", opt(args, "profile"), DEFAULT_PROFILE))
+    )
+    if profile not in PROFILES:
+        raise Failure(f"unknown profile: {profile}", hint="supported profiles: " + ", ".join(PROFILES))
+    jobs = int(setting(settings, "jobs", opt(args, "jobs"), os.cpu_count() or 1))
+    return Context(
+        arch=ARCHES[arch_name],
+        profile=profile,
+        log=log,
+        jobs=max(1, jobs),
+        force=bool(opt(args, "force")),
+        offline=bool(opt(args, "offline")),
+        dry_run=bool(opt(args, "dry_run")),
+        assume_yes=bool(opt(args, "yes")),
+    )
+
+
+def command_suggestions(token: str) -> list[str]:
+    """Turn a plausible-looking mistake into an actionable hint."""
+    import difflib
+
+    hints: list[str] = []
+    if token in TARGETS:
+        hints.append(f"to build it, run: ./x.py build {token}")
+        if token in ("hdd", "iso"):
+            hints.append(f"to boot it, run: ./x.py run {token}")
+        return hints
+    if (RECIPES_DIR / token / "recipe").is_file():
+        hints.append(f"that is a userland package; run: ./x.py pkg {token}")
+        return hints
+    close = difflib.get_close_matches(token, COMMANDS, n=3, cutoff=0.4)
+    if close:
+        hints.append("did you mean: " + ", ".join(close) + "?")
+    return hints
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if not raw_argv:
-        raw_argv = ["build", "hdd"]
-    raw_argv = rewrite_legacy_command(raw_argv)
-    qemu_passthrough: list[str] = []
-    if "--" in raw_argv:
-        separator = raw_argv.index("--")
-        qemu_passthrough = raw_argv[separator + 1 :]
-        raw_argv = raw_argv[:separator]
-    parser, commands = build_parser()
-    args = parser.parse_args(raw_argv)
-    if args.command is None:
-        raw_argv += ["build", "hdd"]
-        args = parser.parse_args(raw_argv)
-    if args.command == "help":
-        if args.topic is None:
-            parser.print_help()
-            return 0
-        command_parser = commands.get(args.topic)
-        if command_parser is None:
-            parser.error(f"unknown help topic: {args.topic}")
-        command_parser.print_help()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    command = locate_command(raw)
+    resolved = ALIASES.get(command or "", command)
+
+    if resolved is not None and resolved not in COMMANDS:
+        log = Log()
+        log.error(f"unknown command: {resolved}")
+        for suggestion in command_suggestions(resolved):
+            log.hint(suggestion)
+        log.hint("run './x.py --help' for the command list")
+        return 2
+
+    raw, qemu_extra = split_qemu_arguments(raw, resolved)
+    if command is None and not any(item in raw for item in ("-h", "--help", "-V", "--version")):
+        raw.append("run")  # `./x.py` and `./x.py -a riscv64` both mean "run"
+
+    parser, registry = build_cli()
+    args = parser.parse_args(raw)
+    if opt(args, "command") is None:
+        parser.print_help()
+        return 0
+    name = ALIASES.get(args.command, args.command)
+
+    if name == "help":
+        topic = opt(args, "topic") or ""
+        target = registry.get(ALIASES.get(topic, topic))
+        (target or parser).print_help()
         return 0
 
-    ctx: Context | None = None
+    level = VERBOSE if opt(args, "verbose") else QUIET if opt(args, "quiet") else NORMAL
+    log = Log(color=opt(args, "color") or "auto", level=level)
+
     try:
-        ctx = make_context(args)
-        legacy_qemu_flags = getattr(args, "qemu_flags", None)
-        if qemu_passthrough and args.command != "run":
-            raise BuildError("Arguments after '--' are only supported by the run command")
-        qemu_args = qemu_passthrough
-        if legacy_qemu_flags:
-            qemu_args = shlex.split(legacy_qemu_flags) + qemu_args
-        ctx = replace(ctx, qemu_args=tuple(qemu_args))
-        command = args.command
-        if ctx.force and command not in {"build", "run"}:
-            raise BuildError("--force is only supported by build and run commands")
-        machine_output = (
-            (command == "config" and args.json_output)
-            or (command == "doctor" and args.json_output)
-        )
-        if not machine_output:
-            ctx.ui.heading(command)
+        settings = load_settings()
+        arches = resolve_arches(args, settings)
+        if len(arches) > 1 and name not in MULTI_ARCH:
+            raise Failure(
+                f"'{name}' works on one architecture at a time",
+                hint=f"run it once per architecture, or use a command from: "
+                f"{', '.join(sorted(MULTI_ARCH))}",
+            )
+        if qemu_extra and name not in ("run", "build", "pkg"):
+            raise Failure("arguments after '--' are only understood by run, build, and pkg")
 
-        if command == "build":
-            artifacts = build_target(ctx, args.target)
-            for artifact in artifacts:
-                ctx.ui.detail(f"artifact: {_display_path(artifact)}")
-        elif command == "run":
-            run_qemu(ctx, image=args.image, firmware=args.firmware)
-        elif command == "package":
-            sysroot = rebuild_userland_package(ctx, args.package)
-            ctx.ui.detail(f"sysroot: {_display_path(sysroot)}")
-        elif command == "check":
-            check_kernel(ctx)
-        elif command == "lint":
-            lint_kernel(ctx)
-        elif command == "fmt":
-            format_kernel(ctx, check=args.check)
-        elif command == "docs":
-            build_docs(ctx, kind=args.kind, serve=args.serve, port=args.port)
-        elif command == "clean":
-            clean(ctx, all_files=args.all)
-        elif command == "fetch":
-            fetch_resources(ctx, args.resources)
-        elif command == "doctor":
-            return 0 if doctor(ctx, target=args.target, json_output=args.json_output) else 1
-        elif command == "config":
-            show_config(ctx, json_output=args.json_output)
-        else:
-            raise BuildError(f"Unknown command: {command}")
-        if command != "config":
-            ctx.ui.success(f"{command} completed", show_time=ctx.show_time)
-        return 0
-    except BuildError as exc:
-        if ctx is not None:
-            ctx.ui.error(str(exc))
-        else:
-            UI(color="auto", quiet=False, verbose=False).error(str(exc))
+        manifest = Manifest((), (), True) if name in LIGHTWEIGHT else load_manifest(log)
+        status = 0
+        for index, arch_name in enumerate(arches):
+            if len(arches) > 1:
+                log.plain()
+                log.msg(log.paint(f"[{index + 1}/{len(arches)}] {arch_name}", Log.MAGENTA))
+            ctx = make_context(args, settings, log, arch_name)
+            ctx.qemu_args = tuple(qemu_extra)
+            runner = Runner(ctx)
+            recipes = Recipes()
+            world = World(ctx, runner, recipes, manifest, Jinx(ctx, runner, recipes))
+            status = max(status, HANDLERS[name](world, args, settings))
+        return status
+    except Failure as error:
+        log.separator()
+        for line in str(error).splitlines():
+            if line.startswith("    "):
+                log.detail(line)
+            else:
+                log.error(line)
+        if error.hint:
+            log.hint(error.hint)
         return 1
     except KeyboardInterrupt:
-        if ctx is not None:
-            ctx.ui.error("interrupted")
-        else:
-            print("error: interrupted", file=sys.stderr)
+        log.separator()
+        log.error("interrupted")
         return 130
+    except BrokenPipeError:
+        return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        status = main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Something like `./x.py list | head` closed the pipe early; make sure
+        # the interpreter does not complain again while shutting down.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        status = 0
+    raise SystemExit(status)
