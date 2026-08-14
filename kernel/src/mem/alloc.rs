@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Base virtual address for the kernel heap window.
-const HEAP_BASE: u64 = 0xFFFF_A000_0000_0000;
+pub(crate) const HEAP_BASE: u64 = 0xFFFF_A000_0000_0000;
 /// Total virtual address space reserved for heap growth.
 const HEAP_SIZE: u64 = 1 << 32;
 /// Number of heap pages inside the reserved window.

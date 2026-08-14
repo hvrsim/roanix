@@ -44,6 +44,7 @@ pub use map::{
     FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmInheritance, VmMap,
     VmMapEntry, VmProtection,
 };
+pub(crate) use alloc::HEAP_BASE;
 pub use object::{ObjectKind, PageAccount, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};
 pub use pmap::{Pmap, VmSpace};
@@ -69,6 +70,9 @@ bitflags! {
         const GLOBAL  = 1 << 4;
         /// Device/uncached style mapping.
         const DEVICE  = 1 << 5;
+        /// Write-combining mapping for large streaming writes such as a
+        /// framebuffer.
+        const WRITE_COMBINE = 1 << 6;
     }
 }
 
@@ -389,6 +393,32 @@ pub(super) fn record_fault(promoted: bool) {
 
 pub(super) fn kernel_root() -> PhysAddr {
     state().kernel_root
+}
+
+/// Returns the page-table root that owns the shared kernel address space.
+///
+/// Kernel-half mappings must be installed in this root so that every address
+/// space created afterwards inherits them.
+pub fn kernel_page_root() -> PhysAddr {
+    state().kernel_root
+}
+
+/// Invalidates `length` bytes of kernel virtual address space on every CPU.
+pub fn flush_tlb_range(base: VirtAddr, length: u64) {
+    let pages = length.div_ceil(PAGE_SIZE);
+    for index in 0..pages {
+        arch::paging::flush_page(VirtAddr::new(base.as_u64() + index * PAGE_SIZE));
+    }
+    synchronize_remote_tlbs();
+}
+
+/// Returns whether the boot protocol's direct map covers `pa`.
+pub fn is_direct_mapped(pa: PhysAddr) -> bool {
+    let address = pa.as_u64();
+    memory_map_entries().iter().any(|entry| {
+        let end = entry.base.saturating_add(entry.length);
+        (entry.base..end).contains(&address)
+    })
 }
 
 pub(super) fn retire_mapping(page: Arc<VmPage>) {

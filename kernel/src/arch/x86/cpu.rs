@@ -656,7 +656,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
 
     let action = match crate::arch::timer::handle_interrupt(frame.vec) {
         crate::arch::timer::InterruptAction::Unhandled => {
-            let outcome = crate::dev::interrupt::dispatch_vector(frame.vec as u8);
+            let outcome = crate::driver::irq::dispatch_vector(frame.vec as u8);
             if outcome.handled {
                 crate::arch::lapic::eoi();
                 if outcome.reschedule {

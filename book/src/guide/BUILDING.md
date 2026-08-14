@@ -390,32 +390,62 @@ Older checkouts used a `build/runtime/` tree. Nothing under `build/` is tracked
 by Git, so if you have one, `rm -rf build` and rebuild — or move the pieces into
 place by hand if you want to keep a populated Jinx tree.
 
-## Driver modules and DevKit
+## Driver modules
 
-Native drivers are freestanding C shared objects built from `drivers/`. Each
-module links the static DevKit runtime built from `drivers/devkit/`, includes
-`<devkit/devkit.h>`, and exports one `dk_driver_definition`.
+Native drivers are freestanding C shared objects built from `drivers/` and
+installed as `.ko` module images. Each module includes `<roanix/driver.h>` and
+declares itself with the `RDF_MODULE` macro.
 
-DevKit negotiates versioned kernel service tables during module startup.
-Drivers publish and acquire typed resources through leases; resource lookup is
-kept on the control path while acquired protocols use cached operation tables
-for direct calls. The kernel retains ownership of device topology, MMIO and
-interrupt authorization, resource lifetimes, TTY/devtmpfs frontends, and driver
-unload ordering.
+There is no driver support library. Every kernel service is reached through a
+service table the kernel hands to the module entry point, and everything that
+does not need the kernel — register access, spin locks, byte-order helpers,
+message formatting — is inlined from the headers. That is what lets the loader
+accept only self-contained images with no undefined symbols and no relocations
+other than position-independent ones.
 
-Modules may also register declarative `dk_driver_class` records. Classes match
-provider nodes by kind, exact properties, and required inherited resources;
-higher-priority matches bind first, and `DK_EDEFER` retries binding after the
-provider tree changes. Provider nodes may contain buses or devices, allowing
-layered stacks such as PCI function → NVMe controller and USB interface → HID.
+The framework is built from five ideas:
 
-The `drivers` userland package builds DevKit automatically and links it into
-every packaged module. xtool mirrors `drivers/` into the Jinx workspace and
-treats it as an input to that package, so editing a driver is enough to make
-`./x.py` rebuild and reinstall it:
+* A **device** is a uniform node in one tree. There is no separate bus node
+  type, so a bridge, a hub, or a controller is an ordinary device that happens
+  to have children.
+* A **bus** describes how a family of devices is enumerated, matched, and
+  addressed. Buses are registered by modules, so PCI, USB, or I2C support is
+  added without touching the framework. The kernel registers only `platform`,
+  the namespace for firmware-described devices.
+* A **driver** binds to devices through a match table that understands
+  device-tree `compatible` strings, ACPI identifiers, and masked numeric
+  identifier tables of the kind PCI and USB use.
+* An **interface** is a versioned operation table published under a name, and
+  is the only mechanism for one driver to call another. It has no ancestry
+  requirement, so a driver can combine services from anywhere in the system. A
+  driver whose prerequisite has not appeared yet returns `RDF_EDEFER`, and the
+  probe engine retries it when the topology changes — which is why module load
+  order does not matter.
+* A **class** groups devices that share a software contract and notifies its
+  owner as members come and go. This is how a whole subsystem — a block layer,
+  an input stack, a display core — can be implemented as an ordinary driver.
+
+Handles crossing the C boundary are pointers to reference-counted kernel
+objects rather than identifiers resolved through a table, so a framework call
+takes no lock and performs no lookup. After a register window is mapped, device
+register access involves no framework call at all.
+
+The tree is organized by role:
+
+```text
+drivers/include/roanix/   the API headers, installed to /usr/include/roanix
+drivers/platform/         firmware enumerators (ACPI, device tree)
+drivers/irqchip/          interrupt controllers
+drivers/tty/              serial ports and pseudo-terminals
+drivers/char/             character devices
+```
+
+xtool mirrors `drivers/` into the Jinx workspace and treats it as an input to
+the `drivers` package, so editing a driver is enough to make `./x.py` rebuild
+and reinstall it:
 
 ```bash
-$ vim drivers/char/pty.c
+$ vim drivers/tty/pty.c
 $ ./x.py                # rebuilds the drivers package and boots the result
 ```
 

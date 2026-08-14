@@ -1,4 +1,4 @@
-#include <devkit/devkit.h>
+#include <roanix/driver.h>
 
 enum special_kind {
     SPECIAL_KMSG,
@@ -10,34 +10,34 @@ enum special_kind {
 static uint8_t console_output_disabled;
 
 static int32_t special_open(
-    uintptr_t context,
+    void *context,
     uint32_t flags,
     uintptr_t *out_file_context)
 {
     (void)flags;
     if (out_file_context == NULL)
-        return DK_EINVAL;
-    *out_file_context = context == SPECIAL_KMSG
-        ? (uintptr_t)dk_kmsg_end()
+        return RDF_EINVAL;
+    *out_file_context = (uintptr_t)context == SPECIAL_KMSG
+        ? (uintptr_t)rdf_kmsg_end()
         : 0;
-    return DK_OK;
+    return RDF_OK;
 }
 
 static int64_t special_initial_offset(
-    uintptr_t context,
+    void *context,
     uintptr_t file_context,
     uint32_t flags)
 {
     (void)file_context;
     (void)flags;
-    if (context != SPECIAL_KMSG)
+    if ((uintptr_t)context != SPECIAL_KMSG)
         return 0;
-    uint64_t offset = dk_kmsg_start();
-    return offset <= INT64_MAX ? (int64_t)offset : DK_EIO;
+    uint64_t offset = rdf_kmsg_start();
+    return offset <= INT64_MAX ? (int64_t)offset : RDF_EIO;
 }
 
 static int64_t special_read(
-    uintptr_t context,
+    void *context,
     uintptr_t file_context,
     uint64_t offset,
     uint8_t *data,
@@ -45,7 +45,7 @@ static int64_t special_read(
     uint32_t flags)
 {
     (void)flags;
-    switch ((enum special_kind)context) {
+    switch ((enum special_kind)(uintptr_t)context) {
     case SPECIAL_KMSG: {
         uint64_t snapshot_end = (uint64_t)file_context;
         if (offset >= snapshot_end)
@@ -53,8 +53,8 @@ static int64_t special_read(
         uint64_t remaining = snapshot_end - offset;
         if ((uint64_t)len > remaining)
             len = (size_t)remaining;
-        int64_t result = dk_kmsg_read(offset, data, len, 1);
-        return result == DK_EAGAIN ? 0 : result;
+        int64_t result = rdf_kmsg_read(offset, data, len, 1);
+        return result == RDF_EAGAIN ? 0 : result;
     }
     case SPECIAL_NULL:
         return 0;
@@ -62,14 +62,14 @@ static int64_t special_read(
         memset(data, 0, len);
         return (int64_t)len;
     case SPECIAL_RANDOM:
-        dk_random_fill(data, len);
+        rdf_random_fill(data, len);
         return (int64_t)len;
     }
-    return DK_EINVAL;
+    return RDF_EINVAL;
 }
 
 static int64_t special_write(
-    uintptr_t context,
+    void *context,
     uintptr_t file_context,
     uint64_t offset,
     const uint8_t *data,
@@ -79,53 +79,53 @@ static int64_t special_write(
     (void)file_context;
     (void)offset;
     (void)flags;
-    switch ((enum special_kind)context) {
+    switch ((enum special_kind)(uintptr_t)context) {
     case SPECIAL_KMSG: {
-        int32_t status = dk_kmsg_append(data, len);
-        return status == DK_OK ? (int64_t)len : status;
+        int32_t status = rdf_kmsg_append(data, len);
+        return status == RDF_OK ? (int64_t)len : status;
     }
     case SPECIAL_RANDOM:
-        dk_random_mix(data, len);
+        rdf_random_mix(data, len);
         return (int64_t)len;
     case SPECIAL_NULL:
     case SPECIAL_ZERO:
         return (int64_t)len;
     }
-    return DK_EINVAL;
+    return RDF_EINVAL;
 }
 
-static uint64_t special_size(uintptr_t context)
+static uint64_t special_size(void *context)
 {
-    return context == SPECIAL_KMSG ? dk_kmsg_end() : 0;
+    return (uintptr_t)context == SPECIAL_KMSG ? rdf_kmsg_end() : 0;
 }
 
 static int64_t special_poll(
-    uintptr_t context,
+    void *context,
     uintptr_t file_context,
     uint64_t offset,
     uint16_t events,
     uint32_t flags)
 {
     (void)flags;
-    uint16_t ready = events & (DK_POLL_OUT | DK_POLL_WRNORM);
+    uint16_t ready = events & (RDF_POLL_OUT | RDF_POLL_WRNORM);
 
-    if (context == SPECIAL_KMSG) {
+    if ((uintptr_t)context == SPECIAL_KMSG) {
         uint64_t snapshot_end = (uint64_t)file_context;
-        if (offset < dk_kmsg_start())
-            ready |= DK_POLL_ERR;
+        if (offset < rdf_kmsg_start())
+            ready |= RDF_POLL_ERR;
         else if (offset < snapshot_end)
-            ready |= events & (DK_POLL_IN | DK_POLL_RDNORM);
+            ready |= events & (RDF_POLL_IN | RDF_POLL_RDNORM);
         else
-            ready |= DK_POLL_HUP;
+            ready |= RDF_POLL_HUP;
         return ready;
     }
-    return events & (DK_POLL_IN | DK_POLL_RDNORM |
-                     DK_POLL_OUT | DK_POLL_WRNORM);
+    return events & (RDF_POLL_IN | RDF_POLL_RDNORM |
+                     RDF_POLL_OUT | RDF_POLL_WRNORM);
 }
 
-static const struct dk_device_ops kmsg_operations = {
+static const struct rdf_node_ops kmsg_operations = {
     .size = sizeof(kmsg_operations),
-    .context = SPECIAL_KMSG,
+    .context = (void *)(uintptr_t)SPECIAL_KMSG,
     .open = special_open,
     .close = NULL,
     .initial_offset = special_initial_offset,
@@ -137,9 +137,9 @@ static const struct dk_device_ops kmsg_operations = {
     .ioctl = NULL,
 };
 
-static const struct dk_device_ops null_operations = {
+static const struct rdf_node_ops null_operations = {
     .size = sizeof(null_operations),
-    .context = SPECIAL_NULL,
+    .context = (void *)(uintptr_t)SPECIAL_NULL,
     .open = NULL,
     .close = NULL,
     .initial_offset = NULL,
@@ -151,9 +151,9 @@ static const struct dk_device_ops null_operations = {
     .ioctl = NULL,
 };
 
-static const struct dk_device_ops zero_operations = {
+static const struct rdf_node_ops zero_operations = {
     .size = sizeof(zero_operations),
-    .context = SPECIAL_ZERO,
+    .context = (void *)(uintptr_t)SPECIAL_ZERO,
     .open = NULL,
     .close = NULL,
     .initial_offset = NULL,
@@ -165,9 +165,9 @@ static const struct dk_device_ops zero_operations = {
     .ioctl = NULL,
 };
 
-static const struct dk_device_ops random_operations = {
+static const struct rdf_node_ops random_operations = {
     .size = sizeof(random_operations),
-    .context = SPECIAL_RANDOM,
+    .context = (void *)(uintptr_t)SPECIAL_RANDOM,
     .open = NULL,
     .close = NULL,
     .initial_offset = NULL,
@@ -180,122 +180,52 @@ static const struct dk_device_ops random_operations = {
 };
 
 static int32_t publish_device(
-    dk_bus_t bus,
-    dk_devnode_t devfs,
+    rdf_devnode_t devfs,
     const char *name,
-    size_t name_len,
     uint16_t mode,
-    const struct dk_device_ops *operations)
+    const struct rdf_node_ops *operations)
 {
-    struct dk_slice slice = {
-        .data = (const uint8_t *)name,
-        .len = name_len,
-    };
-    dk_device_t device = 0;
-    dk_devnode_t node = 0;
-    int32_t status = dk_device_create(bus, slice, &device);
-    if (status != DK_OK)
-        return status;
-    status = dk_node_set_property(
-        device,
-        DK_PROPERTY_SUBSYSTEM,
-        DK_SLICE_LITERAL("mem"));
-    if (status != DK_OK)
-        return status;
-    return dk_devfs_create_device(
-        devfs,
-        slice,
-        DK_DEVICE_CHARACTER,
-        mode,
-        device,
-        operations,
-        &node);
+    rdf_devnode_t node = 0;
+    return rdf_devfs_create(NULL, devfs, name, RDF_NODE_CHARACTER, mode, operations, &node);
 }
 
-static int32_t special_start(dk_driver_t driver, uintptr_t context)
+static int32_t special_init(struct rdf_module *self)
 {
-    (void)driver;
-    (void)context;
+    (void)self;
 
-    dk_bus_t root = 0;
-    dk_bus_t bus = 0;
-    dk_devnode_t devfs = 0;
-    int32_t status = dk_root_bus(&root);
-    if (status != DK_OK)
-        return status;
-    status = dk_bus_create(root, DK_SLICE_LITERAL("special"), &bus);
-    if (status != DK_OK)
-        return status;
-    status = dk_devfs_root(&devfs);
-    if (status != DK_OK)
+    rdf_devnode_t devfs = 0;
+    int32_t status = rdf_devfs_root(&devfs);
+    if (status != RDF_OK)
         return status;
 
-    status = publish_device(
-        bus,
-        devfs,
-        "kmsg",
-        4,
-        0600,
-        &kmsg_operations);
-    if (status != DK_OK)
+    status = publish_device(devfs, "kmsg", 0600, &kmsg_operations);
+    if (status != RDF_OK)
         return status;
 
-    status = publish_device(
-        bus,
-        devfs,
-        "null",
-        4,
-        0666,
-        &null_operations);
-    if (status != DK_OK)
+    status = publish_device(devfs, "null", 0666, &null_operations);
+    if (status != RDF_OK)
         return status;
-    status = publish_device(
-        bus,
-        devfs,
-        "zero",
-        4,
-        0666,
-        &zero_operations);
-    if (status != DK_OK)
+    status = publish_device(devfs, "zero", 0666, &zero_operations);
+    if (status != RDF_OK)
         return status;
-    status = publish_device(
-        bus,
-        devfs,
-        "random",
-        6,
-        0666,
-        &random_operations);
-    if (status != DK_OK)
+    status = publish_device(devfs, "random", 0666, &random_operations);
+    if (status != RDF_OK)
         return status;
-    status = publish_device(
-        bus,
-        devfs,
-        "urandom",
-        7,
-        0666,
-        &random_operations);
-    if (status != DK_OK)
+    status = publish_device(devfs, "urandom", 0666, &random_operations);
+    if (status != RDF_OK)
         return status;
-    dk_kmsg_disable_console_output();
+    rdf_kmsg_mute();
     console_output_disabled = 1;
-    return DK_OK;
+    return RDF_OK;
 }
 
-static void special_stop(dk_driver_t driver, uintptr_t context)
+static void special_exit(struct rdf_module *self)
 {
-    (void)driver;
-    (void)context;
+    (void)self;
     if (console_output_disabled != 0) {
-        dk_kmsg_enable_console_output();
+        rdf_kmsg_unmute();
         console_output_disabled = 0;
     }
 }
 
-static const struct dk_driver_definition driver = {
-    .name = DK_SLICE_LITERAL("special"),
-    .context = 0,
-    .start = special_start,
-    .stop = special_stop,
-};
-
-DK_DRIVER_EXPORT(driver)
+RDF_MODULE("special", "Null, zero, random, and kmsg pseudo-devices", special_init, special_exit);

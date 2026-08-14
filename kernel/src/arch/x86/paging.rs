@@ -34,8 +34,55 @@ const PTE_DIRTY: u64 = 1 << 6;
 const PTE_HUGE: u64 = 1 << 7;
 /// Global TLB entry.
 const PTE_GLOBAL: u64 = 1 << 8;
+/// Page-attribute-table selector for a 4 KiB leaf entry.
+///
+/// For 4 KiB leaves the PAT index is `(PAT << 2) | (PCD << 1) | PWT`, so this
+/// bit alone selects PAT entry 4, which [`init_memory_types`] programs to
+/// write-combining.
+const PTE_PAT4K: u64 = 1 << 7;
 /// Execute-disable bit.
 const PTE_NX: u64 = 1 << 63;
+
+/// Model-specific register holding the page-attribute table.
+const IA32_PAT: u32 = 0x277;
+/// Uncacheable memory type.
+const PAT_UC: u64 = 0x00;
+/// Write-combining memory type.
+const PAT_WC: u64 = 0x01;
+/// Write-through memory type.
+const PAT_WT: u64 = 0x04;
+/// Uncacheable memory type that a WC MTRR may override.
+const PAT_UC_MINUS: u64 = 0x07;
+/// Write-back memory type.
+const PAT_WB: u64 = 0x06;
+
+/// Programs the page-attribute table on the current CPU.
+///
+/// Entries 0 through 3 keep their architectural defaults so existing mappings
+/// are unaffected, and entry 4 is redefined from write-back to write-combining
+/// so [`VmFlags::WRITE_COMBINE`] can be expressed with the PAT bit alone. Every
+/// CPU must run this before it uses a write-combining mapping.
+pub fn init_memory_types() {
+    let value = PAT_WB
+        | (PAT_WT << 8)
+        | (PAT_UC_MINUS << 16)
+        | (PAT_UC << 24)
+        | (PAT_WC << 32)
+        | (PAT_WT << 40)
+        | (PAT_UC_MINUS << 48)
+        | (PAT_UC << 56);
+    // SAFETY: IA32_PAT exists on every CPU supporting long mode, and the value
+    // only redefines entry 4, which no existing mapping selects.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_PAT,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 
 /// Paging operation errors.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -144,7 +191,9 @@ pub unsafe fn map_page(
         if flags.contains(VmFlags::GLOBAL) {
             bits |= PTE_GLOBAL;
         }
-        if flags.contains(VmFlags::DEVICE) {
+        if flags.contains(VmFlags::WRITE_COMBINE) {
+            bits |= PTE_PAT4K;
+        } else if flags.contains(VmFlags::DEVICE) {
             bits |= PTE_PWT | PTE_PCD;
         }
         if !flags.contains(VmFlags::EXECUTE) {
@@ -406,7 +455,11 @@ fn leaf_bits(flags: VmFlags) -> u64 {
     if flags.contains(VmFlags::GLOBAL) {
         bits |= PTE_GLOBAL;
     }
-    if flags.contains(VmFlags::DEVICE) {
+    if flags.contains(VmFlags::WRITE_COMBINE) {
+        // PAT entry 4 is programmed to write-combining, and for 4 KiB leaves
+        // that entry is selected by the PAT bit alone.
+        bits |= PTE_PAT4K;
+    } else if flags.contains(VmFlags::DEVICE) {
         bits |= PTE_PWT | PTE_PCD;
     }
     if !flags.contains(VmFlags::EXECUTE) {

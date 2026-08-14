@@ -115,6 +115,7 @@ pub fn init_secondary_cpu(core_local: *const CoreLocal) {
 
 fn init_cpu(core_local: *const CoreLocal) {
     set_core_local(core_local);
+    paging::init_memory_types();
     let feats = cpu::enable_features(core_local);
     // Loading the GDT refreshes the hidden GS base from its zero-base segment
     // descriptor, so restore both SWAPGS slots afterwards.

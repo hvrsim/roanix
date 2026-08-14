@@ -1447,7 +1447,7 @@ class Jinx:
         shutil.copytree(
             DRIVERS_DIR,
             temporary,
-            ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.so"),
+            ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.ko"),
         )
         write_file(temporary / ".xtool-source.sha256", digest + "\n")
         remove(staged)

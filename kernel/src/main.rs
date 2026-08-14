@@ -12,7 +12,7 @@ use limine::{
 use log::info;
 
 pub mod arch;
-pub mod dev;
+pub mod driver;
 pub mod fs;
 pub mod mem;
 pub mod proc;
@@ -51,7 +51,7 @@ fn early_init() -> ! {
     sys::initramfs::init();
 
     mem::init();
-    dev::init();
+    driver::init();
     arch::init_platform();
     sys::smp::discover();
     sys::sched::bootstrap(init_thread);
@@ -65,7 +65,7 @@ fn init_thread() {
     fs::init();
     sys::random::init();
     sys::initramfs::populate().expect("boot: failed to import initramfs");
-    dev::start_external_drivers().expect("boot: failed to load packaged drivers");
+    driver::load_packaged_modules().expect("boot: failed to load packaged driver modules");
     proc::spawn_init().expect("boot: failed to start /sbin/init");
     info!("boot: initialization complete");
 }

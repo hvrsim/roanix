@@ -450,7 +450,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 let cpu = crate::arch::thiscpu();
                 let platform_id = crate::sys::smp::platform_id(cpu.id)
                     .expect("riscv: current hart is absent from SMP topology");
-                let outcome = crate::dev::interrupt::dispatch_external(cpu.id as u32, platform_id);
+                let outcome = crate::driver::irq::dispatch_external(cpu.id as u32, platform_id);
                 if outcome.handled {
                     return if outcome.reschedule {
                         crate::sys::sched::trap_return(frame)

@@ -189,7 +189,7 @@ crate::syscall_handler! {
         let Descriptor::File(file) = descriptor else {
             return Err(Errno::NotTty);
         };
-        let spec = crate::dev::console::ioctl_spec(request);
+        let spec = crate::driver::class::tty::ioctl_spec(request);
         if spec.size > MAX_IOCTL_SIZE {
             return Err(Errno::Invalid);
         }
@@ -200,14 +200,14 @@ crate::syscall_handler! {
                 .read_user(VirtAddr::new(argument), &mut bytes)
                 .map_err(map_memory_error)?;
         }
-        if request == crate::dev::console::TIOCSPGRP {
+        if request == crate::driver::class::tty::TIOCSPGRP {
             let group =
                 i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| Errno::Invalid)?);
             if group <= 0 || !proc::process_group_in_session(group as usize, process.session()) {
                 return Err(Errno::Permission);
             }
         }
-        if request == crate::dev::console::TIOCSCTTY
+        if request == crate::driver::class::tty::TIOCSCTTY
             && process
                 .controlling_tty_key()
                 .is_some_and(|key| key != file.vnode().key())
@@ -218,11 +218,11 @@ crate::syscall_handler! {
             .ioctl(ioctl_context(&process)?, request, argument, &mut bytes)
             .map_err(map_fs_error)?;
         match request {
-            crate::dev::console::TIOCSCTTY => process.set_controlling_tty(file.clone()),
-            crate::dev::console::TIOCNOTTY if process.session() == process.pid() => {
+            crate::driver::class::tty::TIOCSCTTY => process.set_controlling_tty(file.clone()),
+            crate::driver::class::tty::TIOCNOTTY if process.session() == process.pid() => {
                 proc::clear_session_controlling_tty(process.session(), file.vnode().key());
             }
-            crate::dev::console::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
+            crate::driver::class::tty::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
             _ => {}
         }
         if spec.output && spec.size != 0 {
@@ -750,7 +750,7 @@ fn file_open_at(process: &Process, dirfd: i32, path: u64, flags: u64, mode: u64)
         && file
             .ioctl(
                 ioctl_context(process)?,
-                crate::dev::console::TIOCSCTTY,
+                crate::driver::class::tty::TIOCSCTTY,
                 0,
                 &mut [],
             )

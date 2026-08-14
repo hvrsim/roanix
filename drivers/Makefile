@@ -1,56 +1,55 @@
 ARCH ?=
 CC ?= cc
 LD ?= ld
-AR ?= ar
 STRIP ?= strip
 DESTDIR ?=
 PREFIX ?= /usr
 
 BUILD_DIR := build/$(ARCH)
 OUTPUT_DIR := out/$(ARCH)
-INSTALL_DIR := $(DESTDIR)$(PREFIX)/lib/roanix/drivers
-DEVKIT_INSTALL_DIR := $(DESTDIR)$(PREFIX)/lib/roanix
-DEVKIT_INCLUDE_DIR := $(DESTDIR)$(PREFIX)/include/devkit
+MODULE_DIR := $(DESTDIR)$(PREFIX)/lib/roanix/drivers
+INCLUDE_DIR := $(DESTDIR)$(PREFIX)/include/roanix
 
+# Modules are freestanding, self-contained shared objects. They link against no
+# library at all: the framework API is header-only and every kernel service is
+# reached through the table handed to the module entry point.
 COMMON_CFLAGS := \
 	-O3 -std=c11 -ffreestanding -fPIC -fvisibility=hidden \
 	-fno-builtin -fno-stack-protector -fno-unwind-tables \
 	-fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
-	-Wall -Wextra -Werror -Idevkit/include
+	-Wall -Wextra -Werror -Iinclude
 
+# The loader accepts only self-contained images, so undefined symbols and text
+# relocations are rejected here rather than at boot.
 COMMON_LDFLAGS := \
 	-shared -Bsymbolic --no-undefined --gc-sections --build-id=none \
 	--hash-style=sysv -z now -z relro -z separate-code -z noexecstack \
-	-z max-page-size=4096 -e roanix_driver_entry
+	-z max-page-size=4096 -e rdf_module_entry
 
 ifeq ($(ARCH),x86_64)
 ARCH_CFLAGS := \
 	-march=x86-64 -mtune=generic -mcmodel=small -mno-red-zone \
 	-mgeneral-regs-only -fcf-protection=none
 MODULES := \
-	$(OUTPUT_DIR)/acpi.so \
-	$(OUTPUT_DIR)/ioapic.so \
-	$(OUTPUT_DIR)/uart16550.so \
-	$(OUTPUT_DIR)/special.so \
-	$(OUTPUT_DIR)/pty.so
+	$(OUTPUT_DIR)/acpi.ko \
+	$(OUTPUT_DIR)/ioapic.ko \
+	$(OUTPUT_DIR)/pty.ko \
+	$(OUTPUT_DIR)/special.ko \
+	$(OUTPUT_DIR)/uart8250.ko
 else ifeq ($(ARCH),riscv64)
 ARCH_CFLAGS := \
 	-march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany \
 	-msmall-data-limit=0 -mno-save-restore
 MODULES := \
-	$(OUTPUT_DIR)/dtb.so \
-	$(OUTPUT_DIR)/uart8250.so \
-	$(OUTPUT_DIR)/special.so \
-	$(OUTPUT_DIR)/pty.so
+	$(OUTPUT_DIR)/fdt.ko \
+	$(OUTPUT_DIR)/pty.ko \
+	$(OUTPUT_DIR)/special.ko \
+	$(OUTPUT_DIR)/uart8250.ko
 else
 $(error Unsupported ARCH "$(ARCH)")
 endif
 
 CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(EXTRA_CFLAGS)
-DEVKIT_OBJECTS := \
-	$(BUILD_DIR)/devkit/src/devkit.o \
-	$(BUILD_DIR)/devkit/src/runtime.o
-DEVKIT_LIBRARY := $(BUILD_DIR)/devkit/libdevkit.a
 
 .PHONY: all clean install
 
@@ -60,33 +59,29 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(DEVKIT_LIBRARY): $(DEVKIT_OBJECTS)
-	@mkdir -p $(@D)
-	$(AR) rcs $@ $^
-
+# Each module is one translation unit today, but the rule takes a list so a
+# driver can grow into several files without changing anything else.
 define link_module
-$(1): $(2) $(DEVKIT_LIBRARY)
+$(OUTPUT_DIR)/$(1).ko: $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(2)))
 	@mkdir -p $$(@D)
 	$(LD) $(COMMON_LDFLAGS) -soname $$(@F) -o $$@ $$^
 	$(STRIP) --strip-debug $$@
 endef
 
-$(eval $(call link_module,$(OUTPUT_DIR)/acpi.so,$(BUILD_DIR)/bus/acpi.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/dtb.so,$(BUILD_DIR)/bus/dtb.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/ioapic.so,$(BUILD_DIR)/irq/ioapic.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/uart16550.so,$(BUILD_DIR)/char/uart16550.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/uart8250.so,$(BUILD_DIR)/char/uart8250.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/special.so,$(BUILD_DIR)/char/special.o))
-$(eval $(call link_module,$(OUTPUT_DIR)/pty.so,$(BUILD_DIR)/char/pty.o))
+$(eval $(call link_module,acpi,platform/acpi))
+$(eval $(call link_module,fdt,platform/fdt))
+$(eval $(call link_module,ioapic,irqchip/ioapic))
+$(eval $(call link_module,uart8250,tty/uart8250))
+$(eval $(call link_module,pty,tty/pty))
+$(eval $(call link_module,special,char/special))
 
 install: all
-	install -d "$(INSTALL_DIR)"
+	install -d "$(MODULE_DIR)"
 	for module in $(MODULES); do \
-		install -m644 "$$module" "$(INSTALL_DIR)/$${module##*/}"; \
+		install -m644 "$$module" "$(MODULE_DIR)/$${module##*/}"; \
 	done
-	install -d "$(DEVKIT_INSTALL_DIR)" "$(DEVKIT_INCLUDE_DIR)"
-	install -m644 "$(DEVKIT_LIBRARY)" "$(DEVKIT_INSTALL_DIR)/libdevkit.a"
-	install -m644 devkit/include/devkit/*.h "$(DEVKIT_INCLUDE_DIR)"
+	install -d "$(INCLUDE_DIR)"
+	install -m644 include/roanix/*.h "$(INCLUDE_DIR)"
 
 clean:
 	rm -rf "$(BUILD_DIR)" "$(OUTPUT_DIR)"

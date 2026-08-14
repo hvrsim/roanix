@@ -737,6 +737,164 @@ pub fn alloc_zeroed_phys(usage: PageUse) -> Option<PhysAddr> {
     Some(pa)
 }
 
+/// Allocates `count` physically contiguous pages.
+///
+/// Device engines that walk descriptor rings, command queues, or scatter lists
+/// need a run of adjacent frames, and controllers with a narrow addressing
+/// window need that run to sit below a limit. `align_pages` constrains the
+/// alignment of the first frame in pages, and `max_address` bounds the last
+/// addressable byte.
+///
+/// The run is located by scanning the frame database, so this is a setup-time
+/// operation rather than a hot path.
+pub fn alloc_contiguous(
+    usage: PageUse,
+    count: usize,
+    align_pages: usize,
+    max_address: u64,
+) -> Option<&'static Page> {
+    if !READY.load(Ordering::Acquire) || count == 0 {
+        return None;
+    }
+    assert!(
+        !matches!(
+            usage,
+            PageUse::None | PageUse::Reserved | PageUse::PfnDatabase
+        ),
+        "mem/phys: invalid dynamic page use {usage:?}"
+    );
+    let align = align_pages.max(1);
+    if !align.is_power_of_two() {
+        return None;
+    }
+
+    // Frames parked in per-CPU caches are free but unlinked, so returning them
+    // to the shared lists first is what makes a long run findable.
+    drain_page_caches();
+
+    let entries = DATABASE_ENTRIES.load(Ordering::Acquire);
+    let limit = ((max_address.saturating_add(1)) / PAGE_SIZE) as usize;
+    let entries = entries.min(limit);
+    if entries < count {
+        return None;
+    }
+
+    let mut guard = PMM.lock();
+    let state = guard.as_mut()?;
+
+    let mut start = align_index(0, align);
+    let mut claimed = None;
+    while start + count <= entries {
+        let mut index = start;
+        let mut run = 0usize;
+        while run < count {
+            match page_by_index(index) {
+                Some(page) if is_linked_free(page) => {
+                    index += 1;
+                    run += 1;
+                }
+                _ => break,
+            }
+        }
+        if run == count {
+            let mut zeroed = 0usize;
+            for offset in 0..count {
+                let page = page_by_index(start + offset)?;
+                let was_zero = page.state() == PageState::Zero;
+                // SAFETY: the page is linked into the list selected by its
+                // state, and the PMM lock is held for the whole removal.
+                unsafe {
+                    let list = if was_zero {
+                        &mut state.zero
+                    } else {
+                        &mut state.free
+                    };
+                    list.cursor_mut_from_ptr(page).remove();
+                }
+                if was_zero {
+                    zeroed += 1;
+                }
+            }
+            claimed = Some((start, zeroed));
+            break;
+        }
+        // `index` is the first frame that broke the run, so resume after it.
+        start = align_index(index.max(start) + 1, align);
+    }
+    drop(guard);
+
+    // `prepare_allocation` takes a sleeping lock, so it must run with the
+    // allocator's interrupt-safe lock released.
+    let (base, zeroed) = claimed?;
+    for offset in 0..count {
+        let Some(page) = page_by_index(base + offset) else {
+            return None;
+        };
+        page.prepare_allocation(usage);
+    }
+    FREE_PAGES.fetch_sub(count, Ordering::AcqRel);
+    USED_PAGES.fetch_add(count, Ordering::AcqRel);
+    if zeroed != 0 {
+        ZERO_PAGES.fetch_sub(zeroed, Ordering::AcqRel);
+    }
+    page_by_index(base)
+}
+
+/// Releases a run previously produced by [`alloc_contiguous`].
+///
+/// # Safety
+///
+/// The same requirements as [`free_page`] apply to every frame in the run, and
+/// `count` must match the original allocation.
+pub unsafe fn free_contiguous(first: &'static Page, count: usize) {
+    let base = first.pfn();
+    for offset in 0..count {
+        let Some(page) = page_by_index(base + offset) else {
+            return;
+        };
+        // SAFETY: forwarded from this function's caller.
+        unsafe { free_page(page) };
+    }
+}
+
+const fn align_index(index: usize, align: usize) -> usize {
+    index.next_multiple_of(align)
+}
+
+fn is_linked_free(page: &'static Page) -> bool {
+    matches!(page.state(), PageState::Free | PageState::Zero) && page.free_link.is_linked()
+}
+
+/// Returns every per-CPU cached frame to the shared free lists.
+fn drain_page_caches() {
+    for cache_id in 0..MAX_PAGE_CPUS {
+        loop {
+            let entry = {
+                let mut cache = PAGE_CACHES[cache_id].lock();
+                match cache.pop(false) {
+                    Some(pfn) => Some((pfn, false)),
+                    None => cache.pop(true).map(|pfn| (pfn, true)),
+                }
+            };
+            let Some((pfn, zeroed)) = entry else {
+                break;
+            };
+            let Some(page) = page_by_index(pfn as usize) else {
+                continue;
+            };
+            let mut guard = PMM.lock();
+            let Some(state) = guard.as_mut() else {
+                return;
+            };
+            if zeroed {
+                state.zero.push_back(page);
+            } else {
+                state.free.push_back(page);
+            }
+        }
+    }
+}
+
 /// Frees an allocated page whose contents should be treated as dirty.
 ///
 /// # Safety

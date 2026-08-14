@@ -606,7 +606,7 @@ impl Process {
                     session_id: self.session() as i32,
                     is_session_leader: true,
                 },
-                crate::dev::console::TIOCNOTTY,
+                crate::driver::class::tty::TIOCNOTTY,
                 0,
                 &mut [],
             );

@@ -12,7 +12,6 @@ use core::{
 };
 
 use crate::{
-    dev::{DeviceNodeId, DriverId, KERNEL_DRIVER},
     sys::{
         clock,
         event::Event,
@@ -36,11 +35,34 @@ const NODE_OPEN_ONE: u64 = 1 << 32;
 const NODE_OPEN_MASK: u64 = ((1 << 31) - 1) << 32;
 const NODE_ACTIVE_MASK: u64 = u32::MAX as u64;
 
+/// Opaque token identifying the code that owns a devtempfs node.
+///
+/// The filesystem never interprets this value. It only uses it to decide which
+/// nodes disappear when a module is unloaded, which keeps devtempfs independent
+/// of the driver framework.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OwnerId(u64);
+
+impl OwnerId {
+    /// Owner used by kernel-created nodes such as the filesystem root.
+    pub const KERNEL: Self = Self(0);
+
+    /// Creates an owner token from a caller-defined value.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Stable devtempfs node identifier.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DevNodeId(u64);
-
 impl DevNodeId {
     const fn new(value: u64) -> Self {
         Self(value)
@@ -185,7 +207,7 @@ struct DevtempfsState {
 }
 
 struct DevRecord {
-    owner: DriverId,
+    owner: OwnerId,
     parent: DevNodeId,
     vnode: Vnode,
     children: BTreeMap<Box<[u8]>, DevNodeId>,
@@ -194,7 +216,7 @@ struct DevRecord {
 struct DevtempfsNode {
     filesystem: Weak<Devtempfs>,
     id: DevNodeId,
-    owner: DriverId,
+    owner: OwnerId,
     kind: VnodeKind,
     mode: AtomicU16,
     links: AtomicU64,
@@ -202,7 +224,6 @@ struct DevtempfsNode {
     modified_ns: AtomicU64,
     changed_ns: AtomicU64,
     lifecycle: AtomicU64,
-    device: Option<DeviceNodeId>,
     data: DevtempfsData,
 }
 
@@ -242,16 +263,15 @@ impl Devtempfs {
         let root_id = DevNodeId::new(ROOT_NODE_ID);
         let root = filesystem.make_node(
             root_id,
-            KERNEL_DRIVER,
+            OwnerId::KERNEL,
             VnodeKind::Directory,
             0o755,
-            None,
             DevtempfsData::Directory,
         );
         filesystem.state.lock().records.insert(
             root_id,
             DevRecord {
-                owner: KERNEL_DRIVER,
+                owner: OwnerId::KERNEL,
                 parent: root_id,
                 vnode: root.clone(),
                 children: BTreeMap::new(),
@@ -270,21 +290,17 @@ impl Devtempfs {
     /// Creates a driver-owned directory.
     pub fn create_dir(
         self: &Arc<Self>,
-        owner: DriverId,
+        owner: OwnerId,
         parent: DevNodeId,
         name: &[u8],
         mode: u16,
     ) -> Result<DevNodeId> {
-        let _owner = crate::dev::mutation_guard(owner).map_err(device_error)?;
-        let parent_owner = self.owner(parent)?;
-        let _parent = crate::dev::parent_guard(owner, parent_owner).map_err(device_error)?;
         self.create_node(
             owner,
             parent,
             name,
             VnodeKind::Directory,
             mode,
-            None,
             DevtempfsData::Directory,
         )
     }
@@ -292,31 +308,25 @@ impl Devtempfs {
     /// Creates a driver-owned character or block device node.
     pub fn create_device(
         self: &Arc<Self>,
-        owner: DriverId,
+        owner: OwnerId,
         parent: DevNodeId,
         name: &[u8],
         kind: DeviceNodeKind,
         mode: u16,
-        device: DeviceNodeId,
         operations: Arc<dyn DeviceNodeOps>,
     ) -> Result<DevNodeId> {
-        let _owner = crate::dev::mutation_guard(owner).map_err(device_error)?;
-        let parent_owner = self.owner(parent)?;
-        let _parent = crate::dev::parent_guard(owner, parent_owner).map_err(device_error)?;
         self.create_node(
             owner,
             parent,
             name,
             kind.vnode_kind(),
             mode,
-            Some(device),
             DevtempfsData::Device(operations),
         )
     }
 
     /// Removes one empty, unopened node owned by a driver.
-    pub fn remove_node(&self, owner: DriverId, node: DevNodeId) -> Result<()> {
-        let _owner = crate::dev::mutation_guard(owner).map_err(device_error)?;
+    pub fn remove_node(&self, owner: OwnerId, node: DevNodeId) -> Result<()> {
         if node == self.root_id() {
             return Err(Error::PermissionDenied);
         }
@@ -335,14 +345,7 @@ impl Devtempfs {
         Ok(())
     }
 
-    /// Returns the hierarchy device associated with a devtempfs node.
-    pub fn device(&self, node: DevNodeId) -> Result<Option<DeviceNodeId>> {
-        let state = self.state.lock();
-        let record = state.records.get(&node).ok_or(Error::NotFound)?;
-        Ok(node_operations(&record.vnode)?.device)
-    }
-
-    pub(crate) fn owner(&self, node: DevNodeId) -> Result<DriverId> {
+    pub(crate) fn owner(&self, node: DevNodeId) -> Result<OwnerId> {
         self.state
             .lock()
             .records
@@ -351,18 +354,45 @@ impl Devtempfs {
             .ok_or(Error::NotFound)
     }
 
-    pub(crate) fn can_remove_owner(&self, owner: DriverId) -> Result<()> {
+    /// Returns the child of `parent` named `name`.
+    pub fn lookup_child(&self, parent: DevNodeId, name: &[u8]) -> Result<DevNodeId> {
+        self.state
+            .lock()
+            .records
+            .get(&parent)
+            .ok_or(Error::NotFound)?
+            .children
+            .get(name)
+            .copied()
+            .ok_or(Error::NotFound)
+    }
+
+    /// Returns the names of every entry directly below `parent`.
+    pub fn child_names(&self, parent: DevNodeId) -> Result<Vec<Box<[u8]>>> {
+        Ok(self
+            .state
+            .lock()
+            .records
+            .get(&parent)
+            .ok_or(Error::NotFound)?
+            .children
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn can_remove_owner(&self, owner: OwnerId) -> Result<()> {
         let state = self.state.lock();
         validate_owner_removal(&state, owner)
     }
 
-    pub(crate) fn remove_owner(&self, owner: DriverId) -> Result<()> {
+    pub(crate) fn remove_owner(&self, owner: OwnerId) -> Result<()> {
         let mut state = self.state.lock();
         revoke_owner_nodes(&state, owner)?;
         remove_owned_records(self, &mut state, owner)
     }
 
-    pub(crate) fn force_remove_owner(&self, owner: DriverId) -> Result<()> {
+    pub(crate) fn force_remove_owner(&self, owner: OwnerId) -> Result<()> {
         let mut state = self.state.lock();
         validate_no_foreign_children(&state, owner)?;
         for record in state
@@ -377,18 +407,17 @@ impl Devtempfs {
 
     fn create_node(
         self: &Arc<Self>,
-        owner: DriverId,
+        owner: OwnerId,
         parent: DevNodeId,
         name: &[u8],
         kind: VnodeKind,
         mode: u16,
-        device: Option<DeviceNodeId>,
         data: DevtempfsData,
     ) -> Result<DevNodeId> {
         path::validate_leaf_name(name)?;
         let id = DevNodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
         assert!(id.get() != 0, "devtempfs: node identifier wrapped");
-        let vnode = self.make_node(id, owner, kind, mode, device, data);
+        let vnode = self.make_node(id, owner, kind, mode, data);
 
         let mut state = self.state.lock();
         let parent_record = state.records.get_mut(&parent).ok_or(Error::NotFound)?;
@@ -421,10 +450,9 @@ impl Devtempfs {
     fn make_node(
         self: &Arc<Self>,
         id: DevNodeId,
-        owner: DriverId,
+        owner: OwnerId,
         kind: VnodeKind,
         mode: u16,
-        device: Option<DeviceNodeId>,
         data: DevtempfsData,
     ) -> Vnode {
         let now = clock::monotonic_ns();
@@ -446,7 +474,6 @@ impl Devtempfs {
                 modified_ns: AtomicU64::new(now),
                 changed_ns: AtomicU64::new(now),
                 lifecycle: AtomicU64::new(0),
-                device,
                 data,
             }),
         )
@@ -456,7 +483,7 @@ impl Devtempfs {
 fn remove_owned_records(
     filesystem: &Devtempfs,
     state: &mut DevtempfsState,
-    owner: DriverId,
+    owner: OwnerId,
 ) -> Result<()> {
     let mut nodes: Vec<_> = state
         .records
@@ -610,7 +637,6 @@ impl VnodeOps for DevtempfsNode {
             }
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
-                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
                 operations.initial_offset(file_context, flags)
             }
         }
@@ -623,7 +649,6 @@ impl VnodeOps for DevtempfsNode {
         }
         let _activity = self.begin_activity()?;
         let operations = self.device_operations()?;
-        let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         let file_context = operations.open(flags)?;
         if let Err(error) = self.mark_open() {
             operations.close(file_context, flags);
@@ -645,10 +670,6 @@ impl VnodeOps for DevtempfsNode {
             self.mark_closed();
             return;
         };
-        let Ok(_guard) = crate::dev::close_callback_guard(self.owner) else {
-            self.mark_closed();
-            return;
-        };
         operations.close(file_context, flags);
         self.mark_closed();
     }
@@ -659,7 +680,6 @@ impl VnodeOps for DevtempfsNode {
             DevtempfsData::Directory => 0,
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
-                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
                 operations.size()
             }
         };
@@ -741,7 +761,6 @@ impl VnodeOps for DevtempfsNode {
         flags: u32,
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
-        let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         let read =
             self.device_operations()?
                 .read_at_with_flags(file_context, offset, buffer, flags)?;
@@ -765,7 +784,6 @@ impl VnodeOps for DevtempfsNode {
         flags: u32,
     ) -> Result<usize> {
         let _activity = self.begin_activity()?;
-        let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         let written =
             self.device_operations()?
                 .write_at_with_flags(file_context, offset, buffer, flags)?;
@@ -796,7 +814,6 @@ impl VnodeOps for DevtempfsNode {
             }
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
-                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
                 operations.poll(file_context, offset, events, flags)
             }
         }
@@ -813,9 +830,6 @@ impl VnodeOps for DevtempfsNode {
             DevtempfsData::Directory => false,
             DevtempfsData::Device(operations) => {
                 let Ok(_activity) = self.begin_activity() else {
-                    return false;
-                };
-                let Ok(_guard) = crate::dev::callback_guard(self.owner) else {
                     return false;
                 };
                 operations.poll_events(file_context, events, output)
@@ -873,7 +887,6 @@ impl VnodeOps for DevtempfsNode {
             DevtempfsData::Directory => self.ensure_live(),
             DevtempfsData::Device(operations) => {
                 let _activity = self.begin_activity()?;
-                let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
                 operations.sync()
             }
         }
@@ -889,7 +902,6 @@ impl VnodeOps for DevtempfsNode {
         argument: &mut [u8],
     ) -> Result<u64> {
         let _activity = self.begin_activity()?;
-        let _guard = crate::dev::callback_guard(self.owner).map_err(device_error)?;
         self.device_operations()?
             .ioctl(file_context, context, request, value, argument)
     }
@@ -934,7 +946,7 @@ fn remove_record(state: &mut DevtempfsState, node: DevNodeId) -> Result<()> {
     Ok(())
 }
 
-fn validate_owner_removal(state: &DevtempfsState, owner: DriverId) -> Result<()> {
+fn validate_owner_removal(state: &DevtempfsState, owner: OwnerId) -> Result<()> {
     validate_no_foreign_children(state, owner)?;
     state
         .records
@@ -948,7 +960,7 @@ fn validate_owner_removal(state: &DevtempfsState, owner: DriverId) -> Result<()>
         })
 }
 
-fn revoke_owner_nodes(state: &DevtempfsState, owner: DriverId) -> Result<()> {
+fn revoke_owner_nodes(state: &DevtempfsState, owner: OwnerId) -> Result<()> {
     validate_no_foreign_children(state, owner)?;
     let mut revoked: Vec<&DevtempfsNode> = Vec::new();
     for record in state
@@ -968,7 +980,7 @@ fn revoke_owner_nodes(state: &DevtempfsState, owner: DriverId) -> Result<()> {
     Ok(())
 }
 
-fn validate_no_foreign_children(state: &DevtempfsState, owner: DriverId) -> Result<()> {
+fn validate_no_foreign_children(state: &DevtempfsState, owner: OwnerId) -> Result<()> {
     state
         .records
         .values()
@@ -986,16 +998,3 @@ fn validate_no_foreign_children(state: &DevtempfsState, owner: DriverId) -> Resu
         })
 }
 
-fn device_error(error: crate::dev::Error) -> Error {
-    match error {
-        crate::dev::Error::InvalidArgument => Error::InvalidArgument,
-        crate::dev::Error::NotFound => Error::NotFound,
-        crate::dev::Error::AlreadyExists => Error::AlreadyExists,
-        crate::dev::Error::PermissionDenied => Error::PermissionDenied,
-        crate::dev::Error::Busy => Error::Busy,
-        crate::dev::Error::Unsupported => Error::Unsupported,
-        crate::dev::Error::NoSpace => Error::NoSpace,
-        crate::dev::Error::OutOfMemory => Error::OutOfMemory,
-        _ => Error::Io,
-    }
-}
