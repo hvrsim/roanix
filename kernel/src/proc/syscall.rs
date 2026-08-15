@@ -1,7 +1,10 @@
 //! Process, thread, and futex syscall implementations.
 
-use alloc::{collections::BTreeMap, sync::Arc};
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     proc,
@@ -11,8 +14,8 @@ use crate::{
         sync::{Mutex, Once},
     },
     syscall::{
-        Errno, current_process, map_memory_error, map_process_error, read_user_i32,
-        read_user_path, read_user_path_array, read_user_timespec,
+        Errno, current_process, map_memory_error, map_process_error, read_user_bytes,
+        read_user_i32, read_user_path, read_user_path_array, read_user_timespec,
     },
 };
 
@@ -20,7 +23,10 @@ const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
 
-static FUTEXES: Once<Mutex<BTreeMap<FutexKey, Arc<Futex>>>> = Once::new();
+/// Longest thread name the kernel stores, excluding the terminator.
+const THREAD_NAME_CAPACITY: usize = crate::sys::thread::ThreadName::CAPACITY;
+
+static FUTEXES: Once<Mutex<BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>>> = Once::new();
 
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct FutexKey {
@@ -28,18 +34,83 @@ struct FutexKey {
     address: u64,
 }
 
-struct Futex {
-    generation: AtomicU64,
+/// One thread parked on a futex address.
+///
+/// Every waiter owns its own event rather than sharing one per address. The
+/// event carries a persistent signaled state, so a wake that lands between the
+/// point where the waiter is published on the queue and the point where it
+/// actually blocks is still observed instead of being lost.
+struct FutexWaiter {
     event: Event,
+    woken: AtomicBool,
 }
 
-impl Futex {
+impl FutexWaiter {
     fn new() -> Self {
         Self {
-            generation: AtomicU64::new(0),
             event: Event::new(),
+            woken: AtomicBool::new(false),
         }
     }
+
+    fn was_woken(&self) -> bool {
+        self.woken.load(Ordering::Acquire)
+    }
+
+    /// Marks this waiter as woken by `futex_wake` and releases it.
+    fn wake(&self) {
+        self.woken.store(true, Ordering::Release);
+        self.event.signal();
+    }
+}
+
+/// Why a futex wait stopped blocking.
+enum FutexOutcome {
+    /// The futex event fired.
+    Woken,
+
+    /// A signal became deliverable.
+    Interrupted,
+
+    /// The caller-supplied deadline elapsed.
+    TimedOut,
+
+    /// The word changed, or could not be read, before blocking began.
+    Skipped,
+}
+
+/// Index of the signal-interruption event in a futex wait set.
+const INTERRUPT_EVENT: usize = 1;
+
+/// Publishes `waiter` on the queue for `key` so wakers can find it.
+fn futex_enqueue(key: FutexKey, waiter: &Arc<FutexWaiter>) {
+    futexes()
+        .lock()
+        .entry(key)
+        .or_default()
+        .push_back(waiter.clone());
+}
+
+/// Removes `waiter` from the queue for `key`, reclaiming an emptied queue.
+///
+/// Returns whether the waiter was still queued, which distinguishes a timeout
+/// or a signal from a wake that raced with them.
+fn futex_dequeue(key: FutexKey, waiter: &Arc<FutexWaiter>) -> bool {
+    let mut futexes = futexes().lock();
+    let Some(queue) = futexes.get_mut(&key) else {
+        return false;
+    };
+    let removed = match queue.iter().position(|entry| Arc::ptr_eq(entry, waiter)) {
+        Some(index) => {
+            queue.remove(index);
+            true
+        }
+        None => false,
+    };
+    if queue.is_empty() {
+        futexes.remove(&key);
+    }
+    removed
 }
 
 crate::syscall_handler! {
@@ -62,38 +133,71 @@ crate::syscall_handler! {
         }
 
         let process = current_process()?;
-        if read_user_i32(&process, address)? != expected {
-            return Err(Errno::TryAgain);
-        }
         let key = FutexKey {
             address_space: Arc::as_ptr(&process.address_space()) as usize,
             address,
         };
-        let futex = {
-            let mut futexes = futexes().lock();
-            futexes
-                .entry(key)
-                .or_insert_with(|| Arc::new(Futex::new()))
-                .clone()
-        };
-
-        futex.event.reset();
-        let generation = futex.generation.load(Ordering::Acquire);
+        // Fast path, and it also faults the word in before the comparison that
+        // decides whether to block is repeated below.
         if read_user_i32(&process, address)? != expected {
             return Err(Errno::TryAgain);
         }
-        if futex.generation.load(Ordering::Acquire) != generation {
+
+        let duration = if timeout == 0 {
+            None
+        } else {
+            Some(read_user_timespec(&process, timeout)?)
+        };
+
+        let waiter = Arc::new(FutexWaiter::new());
+        futex_enqueue(key, &waiter);
+
+        // The waiter is visible to wakers from here on, so re-reading the word
+        // now closes the race where the value changes and the matching wake
+        // runs before this thread manages to block.
+        let recheck = read_user_i32(&process, address);
+        let outcome = match recheck {
+            Ok(value) if value == expected => {
+                if process.prepare_interrupt_wait() {
+                    FutexOutcome::Interrupted
+                } else {
+                    let events = [&waiter.event, process.interrupt_event()];
+                    match duration {
+                        Some(duration) => match clock::wait_any_timeout(&events, duration) {
+                            None => FutexOutcome::TimedOut,
+                            Some(INTERRUPT_EVENT) => FutexOutcome::Interrupted,
+                            Some(_) => FutexOutcome::Woken,
+                        },
+                        None => match Event::wait_any(&events) {
+                            INTERRUPT_EVENT => FutexOutcome::Interrupted,
+                            _ => FutexOutcome::Woken,
+                        },
+                    }
+                }
+            }
+            _ => FutexOutcome::Skipped,
+        };
+
+        futex_dequeue(key, &waiter);
+
+        // A wake that raced with a timeout or a signal still counts as a wake:
+        // the waiter had already been taken off the queue, so reporting the
+        // race instead would drop that wakeup entirely.
+        if waiter.was_woken() {
             return Ok(0);
         }
-        if timeout == 0 {
-            futex.event.wait();
-        } else {
-            let duration = read_user_timespec(&process, timeout)?;
-            if !clock::wait_timeout(&futex.event, duration) {
-                return Err(Errno::TimedOut);
-            }
+
+        match outcome {
+            // A bare futex wake without the flag is a spurious wakeup, which
+            // the futex contract allows callers to see.
+            FutexOutcome::Woken => Ok(0),
+            FutexOutcome::Interrupted => Err(Errno::Interrupted),
+            FutexOutcome::TimedOut => Err(Errno::TimedOut),
+            FutexOutcome::Skipped => match recheck? {
+                value if value != expected => Err(Errno::TryAgain),
+                _ => Ok(0),
+            },
         }
-        Ok(0)
     }
 }
 
@@ -110,12 +214,26 @@ crate::syscall_handler! {
             address_space: Arc::as_ptr(&process.address_space()) as usize,
             address,
         };
-        let Some(futex) = futexes().lock().get(&key).cloned() else {
-            return Ok(0);
+
+        // Detach the chosen waiters under the lock but release them outside it,
+        // so a woken thread never has to wait on this lock to make progress.
+        let woken = {
+            let mut futexes = futexes().lock();
+            let Some(queue) = futexes.get_mut(&key) else {
+                return Ok(0);
+            };
+            let count = queue.len().min(maximum as usize);
+            let woken: alloc::vec::Vec<_> = queue.drain(..count).collect();
+            if queue.is_empty() {
+                futexes.remove(&key);
+            }
+            woken
         };
-        futex.generation.fetch_add(1, Ordering::AcqRel);
-        let woken = futex.event.signal();
-        Ok(woken.min(maximum as usize) as u64)
+
+        for waiter in &woken {
+            waiter.wake();
+        }
+        Ok(woken.len() as u64)
     }
 }
 
@@ -242,6 +360,62 @@ crate::syscall_handler! {
     }
 }
 
-fn futexes() -> &'static Mutex<BTreeMap<FutexKey, Arc<Futex>>> {
+crate::syscall_handler! {
+    syscall_thread_yield(_frame) {
+        crate::sys::sched::yield_current();
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_thread_kill(_frame, pid: u64 = 0, tid: u64 = 1, signal: i32 = 2) {
+        let pid = usize::try_from(pid).map_err(|_| Errno::Invalid)?;
+        let tid = usize::try_from(tid).map_err(|_| Errno::Invalid)?;
+        proc::signal::kill_thread(pid, tid, signal).map_err(map_process_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_thread_set_name(_frame, tid: u64 = 0, name: u64 = 1) {
+        let tid = usize::try_from(tid).map_err(|_| Errno::Invalid)?;
+        let process = current_process()?;
+        // Reject rather than truncate an oversized name, matching
+        // `pthread_setname_np`, which reports `ERANGE` instead of silently
+        // storing a shortened name.
+        let name = read_user_bytes(&process, name, THREAD_NAME_CAPACITY + 1)
+            .map_err(|_| Errno::Range)?;
+        if name.len() > THREAD_NAME_CAPACITY {
+            return Err(Errno::Range);
+        }
+        if !crate::sys::sched::set_thread_name(tid, process.pid(), &name) {
+            return Err(Errno::NoProcess);
+        }
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_thread_get_name(_frame, tid: u64 = 0, buffer: u64 = 1, length: u64 = 2) {
+        let tid = usize::try_from(tid).map_err(|_| Errno::Invalid)?;
+        let process = current_process()?;
+        let Some((name, name_length)) = crate::sys::sched::thread_name(tid, process.pid()) else {
+            return Err(Errno::NoProcess);
+        };
+        // Userspace supplies the buffer for the name plus its terminator.
+        if length <= name_length as u64 {
+            return Err(Errno::Range);
+        }
+        let mut record = [0u8; THREAD_NAME_CAPACITY + 1];
+        record[..name_length].copy_from_slice(&name[..name_length]);
+        process
+            .address_space()
+            .write_user(crate::mem::VirtAddr::new(buffer), &record[..name_length + 1])
+            .map_err(map_memory_error)?;
+        Ok(0)
+    }
+}
+
+fn futexes() -> &'static Mutex<BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>> {
     FUTEXES.call_once(|| Mutex::new(BTreeMap::new()))
 }

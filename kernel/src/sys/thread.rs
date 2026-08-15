@@ -212,6 +212,37 @@ pub(crate) struct Thread {
 
     /// Architecture user thread pointer or TLS base.
     thread_pointer: AtomicU64,
+
+    /// Short debug name set by `pthread_setname_np`.
+    name: IrqSpinLock<ThreadName>,
+}
+
+/// Fixed-capacity thread name, matching the 16-byte Linux `comm` limit that
+/// `pthread_setname_np` callers already expect.
+pub(crate) struct ThreadName {
+    bytes: [u8; Self::CAPACITY],
+    length: usize,
+}
+
+impl ThreadName {
+    /// Maximum stored name length, excluding the terminator userspace adds.
+    pub(crate) const CAPACITY: usize = 15;
+
+    const fn new() -> Self {
+        Self {
+            bytes: [0; Self::CAPACITY],
+            length: 0,
+        }
+    }
+
+    fn set(&mut self, name: &[u8]) {
+        self.length = name.len().min(Self::CAPACITY);
+        self.bytes[..self.length].copy_from_slice(&name[..self.length]);
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
 }
 
 // SAFETY: `Thread` instances are scheduler-owned, live for the lifetime of the
@@ -378,6 +409,19 @@ impl Thread {
     /// Changes the userspace thread pointer restored on resume.
     pub(crate) fn set_thread_pointer(&self, pointer: u64) {
         self.thread_pointer.store(pointer, Ordering::Release);
+    }
+
+    /// Records a short debug name for this thread, truncating if needed.
+    pub(crate) fn set_name(&self, name: &[u8]) {
+        self.name.lock().set(name);
+    }
+
+    /// Copies this thread's debug name into `sink` and returns its length.
+    pub(crate) fn read_name(&self, sink: &mut [u8; ThreadName::CAPACITY]) -> usize {
+        let name = self.name.lock();
+        let bytes = name.as_bytes();
+        sink[..bytes.len()].copy_from_slice(bytes);
+        bytes.len()
     }
 
     /// Prevents the scheduler from migrating this thread until the matching
@@ -723,6 +767,7 @@ fn allocate_thread_record(
         process,
         address_space: IrqSpinLock::new(address_space),
         thread_pointer: AtomicU64::new(0),
+        name: IrqSpinLock::new(ThreadName::new()),
     }));
     thread
 }

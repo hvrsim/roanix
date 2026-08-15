@@ -31,7 +31,7 @@ use crate::{
         sync::{Mutex, Once},
         thread::{
             AllThreadAdapter, ExitedThreadAdapter, Thread, ThreadAdapter, ThreadClass, ThreadFlags,
-            ThreadState, WakeResult, allocate_forked_user_thread, allocate_thread,
+            ThreadName, ThreadState, WakeResult, allocate_forked_user_thread, allocate_thread,
             allocate_user_thread, free_thread, idle_task,
         },
     },
@@ -1951,6 +1951,26 @@ impl Scheduler {
         });
     }
 
+    /// Gives up the rest of the running thread's timeslice.
+    ///
+    /// The thread stays runnable and is requeued behind its peers of equal
+    /// priority rather than at the preemption point, so a caller spinning on a
+    /// lock cannot starve the thread it is waiting for. The switch itself is
+    /// left to `trap_return`, which already runs on the way out of the syscall.
+    fn yield_current(&self, cpu_id: usize) {
+        let mut cpu = self.cpu(cpu_id).lock();
+        let Some(current_ptr) = cpu.current_thread() else {
+            return;
+        };
+        let current = thread_mut(current_ptr);
+        if current.is_idle() {
+            return;
+        }
+        current.slice_ns = 0;
+        current.flags.insert(ThreadFlags::SLICEEND);
+        cpu.need_resched = true;
+    }
+
     /// Sets or clears the priority lent to `thread` by blocked lock waiters.
     fn adjust_boost(&self, thread: ThreadPtr, boost: Option<u8>) {
         self.reprioritize(thread, |_, thread| {
@@ -2045,6 +2065,23 @@ fn for_each_process_thread(pid: usize, mut f: impl FnMut(ThreadPtr)) {
             f(NonNull::from(thread));
         }
     }
+}
+
+/// Runs `f` on the live thread whose identifier is `tid`.
+///
+/// Threads that have already exited are skipped even though the reaper may not
+/// have unlinked them yet, so callers such as `tgkill` cannot address a thread
+/// that is only still present because reclamation is asynchronous.
+///
+/// The registry lock is held across the callback for the same reason as in
+/// [`for_each_process_thread`]: it is what keeps the allocation alive.
+fn with_thread<R>(tid: usize, f: impl FnOnce(ThreadPtr) -> R) -> Option<R> {
+    let all = ALL_THREADS.lock();
+    let list = all.as_ref()?;
+    let thread = list
+        .iter()
+        .find(|thread| thread.id == tid && thread.observed_state() != ThreadState::Exited)?;
+    Some(f(NonNull::from(thread)))
 }
 
 #[inline]
@@ -2293,6 +2330,51 @@ pub(crate) fn wake(thread: *mut Thread, seq: u64) -> bool {
 /// Terminates the current thread and immediately schedules a replacement.
 pub fn exit_current() -> ! {
     scheduler().exit_current(arch::thiscpu().id)
+}
+
+/// Yields the rest of the current thread's timeslice to other runnable work.
+pub(crate) fn yield_current() {
+    let Some(cpu) = arch::thiscpu_opt() else {
+        return;
+    };
+    let Some(scheduler) = SCHEDULER.get() else {
+        return;
+    };
+    scheduler.yield_current(cpu.id);
+}
+
+/// Returns whether `tid` is a live thread of `pid`.
+pub(crate) fn thread_belongs_to(tid: usize, pid: usize) -> bool {
+    with_thread(tid, |thread| thread_ref(thread).belongs_to_process(pid)).unwrap_or(false)
+}
+
+/// Sets the debug name of a live thread belonging to `pid`.
+///
+/// Returns whether the thread was found.
+pub(crate) fn set_thread_name(tid: usize, pid: usize, name: &[u8]) -> bool {
+    with_thread(tid, |thread| {
+        let thread = thread_ref(thread);
+        if !thread.belongs_to_process(pid) {
+            return false;
+        }
+        thread.set_name(name);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Reads the debug name of a live thread belonging to `pid`.
+pub(crate) fn thread_name(tid: usize, pid: usize) -> Option<([u8; ThreadName::CAPACITY], usize)> {
+    with_thread(tid, |thread| {
+        let thread = thread_ref(thread);
+        if !thread.belongs_to_process(pid) {
+            return None;
+        }
+        let mut buffer = [0u8; ThreadName::CAPACITY];
+        let length = thread.read_name(&mut buffer);
+        Some((buffer, length))
+    })
+    .flatten()
 }
 
 /// Handles reschedule decisions before returning from a trap.

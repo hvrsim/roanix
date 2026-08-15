@@ -80,6 +80,10 @@ syscall_table:
     .quad syscall_process_getpriority
     .quad syscall_memory_protect
     .quad syscall_memory_advise
+    .quad syscall_thread_yield
+    .quad syscall_thread_kill
+    .quad syscall_thread_set_name
+    .quad syscall_thread_get_name
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

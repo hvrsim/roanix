@@ -81,6 +81,13 @@ const SIGNAL_FRAME_MAGIC: u64 = 0x524f_414e_5349_4746;
 const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 128;
 
+/// `si_code` marking a signal aimed at one specific thread.
+///
+/// `pthread_cancel` installs a `SIGCANCEL` handler that ignores anything not
+/// carrying this code, so thread-directed signals must be distinguishable from
+/// process-directed ones.
+const SI_TKILL: i32 = -6;
+
 #[derive(Clone, Copy)]
 pub(crate) struct SignalAction {
     handler: u64,
@@ -534,6 +541,36 @@ pub(crate) fn kill(selector: i64, signal: i32) -> Result<()> {
             synchronous: false,
         });
     }
+    Ok(())
+}
+
+/// Queues a signal aimed at one specific thread of the calling process.
+///
+/// The signal is validated against the target thread and then queued on the
+/// process, because pending signals and their dispositions are process-wide
+/// here. That matches POSIX for every process-directed effect — the handler,
+/// the mask semantics, and the default action are all shared — and differs
+/// only in which thread runs the handler, since any thread of the process may
+/// pick it up rather than strictly the addressed one.
+pub(crate) fn kill_thread(pid: usize, tid: usize, signal: i32) -> Result<()> {
+    let signal = validate_optional_signal(signal)?;
+    let current = super::current().ok_or(Error::InvalidArgument)?;
+    if pid != current.pid() {
+        return Err(Error::PermissionDenied);
+    }
+    if current.is_exited() || !crate::sys::sched::thread_belongs_to(tid, current.pid()) {
+        return Err(Error::NoSuchProcess);
+    }
+    let Some(signal) = signal else {
+        return Ok(());
+    };
+    current.signals.enqueue(SignalInfo {
+        signal,
+        code: SI_TKILL,
+        sender_pid: current.pid() as u32,
+        sender_uid: 0,
+        synchronous: false,
+    });
     Ok(())
 }
 

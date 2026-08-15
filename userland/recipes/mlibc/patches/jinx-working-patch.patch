@@ -1,6 +1,24 @@
-diff --git a/options/linux/generic/sys-fsuid.cpp b/options/linux/generic/sys-fsuid.cpp
---- a/options/linux/generic/sys-fsuid.cpp
-+++ b/options/linux/generic/sys-fsuid.cpp
+diff --git mlibc-clean/meson.build mlibc-workdir/meson.build
+index 9b7d774..2bc5079 100644
+--- mlibc-clean/meson.build
++++ mlibc-workdir/meson.build
+@@ -258,6 +258,12 @@ elif host_machine.system() == 'managarm'
+ 	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
+ 	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
+ 	subdir('sysdeps/managarm')
++elif host_machine.system() == 'roanix'
++	rtld_include_dirs += include_directories('sysdeps/roanix/include')
++	libc_include_dirs += include_directories('sysdeps/roanix/include')
++	internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', true)
++	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
++	subdir('sysdeps/roanix')
+ elif host_machine.system() == 'ironclad'
+ 	rtld_include_dirs += include_directories('sysdeps/ironclad/include')
+ 	libc_include_dirs += include_directories('sysdeps/ironclad/include')
+diff --git mlibc-clean/options/linux/generic/sys-fsuid.cpp mlibc-workdir/options/linux/generic/sys-fsuid.cpp
+index 653456c..1eecf0d 100644
+--- mlibc-clean/options/linux/generic/sys-fsuid.cpp
++++ mlibc-workdir/options/linux/generic/sys-fsuid.cpp
 @@ -1,12 +1,10 @@
 -#include <bits/ensure.h>
  #include <sys/fsuid.h>
@@ -17,28 +35,23 @@ diff --git a/options/linux/generic/sys-fsuid.cpp b/options/linux/generic/sys-fsu
 -	__builtin_unreachable();
 +	return getegid();
  }
-diff --git a/meson.build b/meson.build
-index 9b7d7745c2141c1b1ac46c98d205a8031734aabd..2bc507902df0b37011d3a5ac90fb59dee4d4ecd8 100644
---- a/meson.build
-+++ b/meson.build
-@@ -258,6 +258,12 @@ elif host_machine.system() == 'managarm'
- 	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
- 	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
- 	subdir('sysdeps/managarm')
-+elif host_machine.system() == 'roanix'
-+	rtld_include_dirs += include_directories('sysdeps/roanix/include')
-+	libc_include_dirs += include_directories('sysdeps/roanix/include')
-+	internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', true)
-+	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
-+	subdir('sysdeps/roanix')
- elif host_machine.system() == 'ironclad'
- 	rtld_include_dirs += include_directories('sysdeps/ironclad/include')
- 	libc_include_dirs += include_directories('sysdeps/ironclad/include')
-diff --git a/sysdeps/roanix/generic/entry.cpp b/sysdeps/roanix/generic/entry.cpp
+diff --git mlibc-clean/options/posix/generic/sys-resource.cpp mlibc-workdir/options/posix/generic/sys-resource.cpp
+index 4ec13b1..d388bbd 100644
+--- mlibc-clean/options/posix/generic/sys-resource.cpp
++++ mlibc-workdir/options/posix/generic/sys-resource.cpp
+@@ -11,6 +11,7 @@ int getpriority(int which, id_t who) {
+ 	int value = 0;
+ 	if(int e = mlibc::sysdep_or_enosys<GetPriority>(which, who, &value); e) {
+ 		errno = e;
++		return -1;
+ 	}
+ 	return value;
+ }
+diff --git mlibc-workdir/sysdeps/roanix/generic/entry.cpp mlibc-workdir/sysdeps/roanix/generic/entry.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9e8955e585976b53006313c77512f52e9dd62167
+index 0000000..9e8955e
 --- /dev/null
-+++ b/sysdeps/roanix/generic/entry.cpp
++++ mlibc-workdir/sysdeps/roanix/generic/entry.cpp
 @@ -0,0 +1,19 @@
 +#include <stdint.h>
 +#include <stdlib.h>
@@ -59,12 +72,12 @@ index 0000000000000000000000000000000000000000..9e8955e585976b53006313c77512f52e
 +    );
 +    exit(result);
 +}
-diff --git a/sysdeps/roanix/generic/sysdeps.cpp b/sysdeps/roanix/generic/sysdeps.cpp
+diff --git mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373d3510a18
+index 0000000..3209d9b
 --- /dev/null
-+++ b/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1259 @@
++++ mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
+@@ -0,0 +1,1360 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -226,16 +239,24 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +        size_t *guard_size,
 +        void **stack_base) {
 +    constexpr size_t default_stack_size = 2 * 1024 * 1024;
++    constexpr size_t page_size = 0x1000;
 +    if (!*stack_size)
 +        *stack_size = default_stack_size;
-+    *guard_size = 0;
++    *stack_size = (*stack_size + page_size - 1) & ~(page_size - 1);
 +
 +    if (*stack) {
++        // A caller-supplied stack is not ours to carve a guard page out of.
++        *guard_size = 0;
 +        *stack_base = *stack;
 +    } else {
++        *guard_size = (*guard_size + page_size - 1) & ~(page_size - 1);
++        size_t total = *stack_size + *guard_size;
++        if (total < *stack_size)
++            return EINVAL;
++
 +        int error = sysdep<VmMap>(
 +            nullptr,
-+            *stack_size,
++            total,
 +            PROT_READ | PROT_WRITE,
 +            MAP_PRIVATE | MAP_ANONYMOUS,
 +            -1,
@@ -244,6 +265,16 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +        );
 +        if (error)
 +            return error;
++
++        // Stacks grow down, so the guard belongs at the low end of the
++        // mapping. Losing the guard is not worth failing thread creation
++        // over, so an unsupported mprotect just leaves the stack unguarded.
++        if (*guard_size) {
++            if (mlibc::sysdep_or_enosys<VmProtect>(*stack_base, *guard_size, PROT_NONE))
++                *guard_size = 0;
++            else
++                *stack_base = reinterpret_cast<char *>(*stack_base) + *guard_size;
++        }
 +    }
 +
 +    uintptr_t top =
@@ -933,9 +964,12 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    return error ? error : close_error;
 +}
 +
-+int Sysdeps<Umask>::operator()(mode_t, mode_t *old) {
-+    *old = 022;
-+    return 0;
++int Sysdeps<Umask>::operator()(mode_t mode, mode_t *old) {
++    long result = roanix_syscall1(ROANIX_SYS_FILE_UMASK, mode);
++    int error = syscall_error(result);
++    if (!error)
++        *old = static_cast<mode_t>(result);
++    return error;
 +}
 +
 +int Sysdeps<SetItimer>::operator()(
@@ -1323,21 +1357,177 @@ index 0000000000000000000000000000000000000000..270cdec91ef5281f57b7de7565140373
 +    return syscall_error(result);
 +}
 +
++int Sysdeps<VmProtect>::operator()(void *pointer, size_t size, int protection) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_MEMORY_PROTECT,
++        as_word(pointer),
++        size,
++        protection
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<Madvise>::operator()(void *address, size_t length, int advice) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_MEMORY_ADVISE,
++        as_word(address),
++        length,
++        advice
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<PosixMadvise>::operator()(void *address, size_t length, int advice) {
++    // POSIX_MADV_* and MADV_* happen to share values in this ABI, but that is a
++    // coincidence rather than a guarantee, so the advice is translated
++    // explicitly and anything unrecognised is rejected.
++    int translated;
++    switch (advice) {
++        case POSIX_MADV_NORMAL:
++            translated = MADV_NORMAL;
++            break;
++        case POSIX_MADV_RANDOM:
++            translated = MADV_RANDOM;
++            break;
++        case POSIX_MADV_SEQUENTIAL:
++            translated = MADV_SEQUENTIAL;
++            break;
++        case POSIX_MADV_WILLNEED:
++            translated = MADV_WILLNEED;
++            break;
++        case POSIX_MADV_DONTNEED:
++            // POSIX_MADV_DONTNEED must preserve the mapping's contents, while
++            // MADV_DONTNEED discards them. There is no faithful translation, so
++            // the advisory form is accepted and ignored, as glibc also does.
++            return 0;
++        default:
++            return EINVAL;
++    }
++    return Sysdeps<Madvise>::operator()(address, length, translated);
++}
++
++int Sysdeps<SetPriority>::operator()(int which, id_t who, int priority) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_PROCESS_SETPRIORITY,
++        which,
++        who,
++        priority
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<GetPriority>::operator()(int which, id_t who, int *value) {
++    long result = roanix_syscall2(
++        ROANIX_SYS_PROCESS_GETPRIORITY,
++        which,
++        who
++    );
++    int error = syscall_error(result);
++    if (!error)
++        *value = ROANIX_PRIO_BIAS - static_cast<int>(result);
++    return error;
++}
++
++int Sysdeps<Umount2>::operator()(const char *target, int flags) {
++    // The kernel unmount path takes a target only; there is nothing to map the
++    // Linux MNT_* flags onto, so reject them rather than silently ignoring.
++    if (flags != 0)
++        return EINVAL;
++    long result = roanix_syscall1(ROANIX_SYS_FILE_UMOUNT, as_word(target));
++    return syscall_error(result);
++}
++
 +} // namespace mlibc
-diff --git a/sysdeps/roanix/include/abi-bits b/sysdeps/roanix/include/abi-bits
-new file mode 120000
-index 0000000000000000000000000000000000000000..375b4f1a5277b64b9e9510b86e60e3815e7666be
+diff --git mlibc-workdir/sysdeps/roanix/generic/thread.cpp mlibc-workdir/sysdeps/roanix/generic/thread.cpp
+new file mode 100644
+index 0000000..2e85c93
 --- /dev/null
-+++ b/sysdeps/roanix/include/abi-bits
++++ mlibc-workdir/sysdeps/roanix/generic/thread.cpp
+@@ -0,0 +1,70 @@
++// Threading sysdeps for Roanix.
++//
++// The rest of the roanix sysdeps live in generic/sysdeps.cpp. Thread support is
++// kept here so the two can be worked on independently.
++
++#include <errno.h>
++#include <string.h>
++
++#include <bits/ensure.h>
++#include <mlibc/all-sysdeps.hpp>
++#include <mlibc/tcb.hpp>
++#include <roanix/syscall.h>
++
++namespace {
++
++constexpr bool syscall_failed(long result) {
++    return result < 0 && result >= -4095;
++}
++
++int syscall_error(long result) {
++    return syscall_failed(result) ? static_cast<int>(-result) : 0;
++}
++
++long as_word(const void *pointer) {
++    return static_cast<long>(reinterpret_cast<uintptr_t>(pointer));
++}
++
++// The kernel addresses threads by the identifier it returned from
++// thread_create, which mlibc stores in the TCB.
++int tcb_tid(void *tcb) {
++    return reinterpret_cast<Tcb *>(tcb)->tid;
++}
++
++} // namespace
++
++namespace mlibc {
++
++void Sysdeps<Yield>::operator()() {
++    roanix_syscall0(ROANIX_SYS_THREAD_YIELD);
++}
++
++int Sysdeps<Tgkill>::operator()(int tgid, int tid, int sig) {
++    if (tgid < 0 || tid < 0)
++        return EINVAL;
++    long result = roanix_syscall3(ROANIX_SYS_THREAD_KILL, tgid, tid, sig);
++    return syscall_error(result);
++}
++
++int Sysdeps<ThreadSetname>::operator()(void *tcb, const char *name) {
++    if (strlen(name) > ROANIX_THREAD_NAME_MAX)
++        return ERANGE;
++    long result = roanix_syscall2(
++        ROANIX_SYS_THREAD_SET_NAME,
++        tcb_tid(tcb),
++        as_word(name)
++    );
++    return syscall_error(result);
++}
++
++int Sysdeps<ThreadGetname>::operator()(void *tcb, char *name, size_t size) {
++    long result = roanix_syscall3(
++        ROANIX_SYS_THREAD_GET_NAME,
++        tcb_tid(tcb),
++        as_word(name),
++        static_cast<long>(size)
++    );
++    return syscall_error(result);
++}
++
++} // namespace mlibc
+diff --git mlibc-workdir/sysdeps/roanix/include/abi-bits mlibc-workdir/sysdeps/roanix/include/abi-bits
+new file mode 120000
+index 0000000..375b4f1
+--- /dev/null
++++ mlibc-workdir/sysdeps/roanix/include/abi-bits
 @@ -0,0 +1 @@
 +../../../abis/linux
 \ No newline at end of file
-diff --git a/sysdeps/roanix/include/mlibc/sysdeps.hpp b/sysdeps/roanix/include/mlibc/sysdeps.hpp
+diff --git mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f3274fbc011
+index 0000000..44482f7
 --- /dev/null
-+++ b/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,132 @@
++++ mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
+@@ -0,0 +1,142 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1459,7 +1649,17 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +    Tcsetwinsize,
 +    ClockGet,
 +    VmMap,
-+    VmUnmap
++    VmUnmap,
++    VmProtect,
++    Madvise,
++    PosixMadvise,
++    GetPriority,
++    SetPriority,
++    Umount2,
++    Yield,
++    Tgkill,
++    ThreadSetname,
++    ThreadGetname
 +{};
 +
 +template<typename Tag>
@@ -1470,12 +1670,12 @@ index 0000000000000000000000000000000000000000..b77c7089b3fbefd4a237f9dc548b6f32
 +};
 +
 +} // namespace mlibc
-diff --git a/sysdeps/roanix/include/roanix/syscall.h b/sysdeps/roanix/include/roanix/syscall.h
+diff --git mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1ac16b5ed
+index 0000000..fd97218
 --- /dev/null
-+++ b/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,229 @@
++++ mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
+@@ -0,0 +1,246 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1552,8 +1752,25 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +    ROANIX_SYS_TIMERFD_SETTIME,
 +    ROANIX_SYS_TIMERFD_GETTIME,
 +    ROANIX_SYS_THREAD_CREATE,
-+    ROANIX_SYS_THREAD_EXIT
++    ROANIX_SYS_THREAD_EXIT,
++    ROANIX_SYS_FILE_UMASK,
++    ROANIX_SYS_FILE_UMOUNT,
++    ROANIX_SYS_PROCESS_SETPRIORITY,
++    ROANIX_SYS_PROCESS_GETPRIORITY,
++    ROANIX_SYS_MEMORY_PROTECT,
++    ROANIX_SYS_MEMORY_ADVISE,
++    ROANIX_SYS_THREAD_YIELD,
++    ROANIX_SYS_THREAD_KILL,
++    ROANIX_SYS_THREAD_SET_NAME,
++    ROANIX_SYS_THREAD_GET_NAME
 +};
++
++/// Longest thread name the kernel stores, excluding the NUL terminator.
++#define ROANIX_THREAD_NAME_MAX 15
++
++/// `process_getpriority` returns `ROANIX_PRIO_BIAS - nice` so that a valid
++/// result is never negative, which the syscall ABI reserves for errors.
++#define ROANIX_PRIO_BIAS 20
 +
 +#define ROANIX_UTSNAME_FIELD_SIZE 65
 +
@@ -1705,48 +1922,12 @@ index 0000000000000000000000000000000000000000..f8a6303f82f7cc0c0ad3cd6cd244fbd1
 +#endif
 +
 +#endif
-diff --git a/sysdeps/roanix/riscv64/thread.S b/sysdeps/roanix/riscv64/thread.S
+diff --git mlibc-workdir/sysdeps/roanix/meson.build mlibc-workdir/sysdeps/roanix/meson.build
 new file mode 100644
-index 0000000000000000000000000000000000000000..6db9df968cb50af8700a52be77fcaa92bb0d018a
+index 0000000..6a5211f
 --- /dev/null
-+++ b/sysdeps/roanix/riscv64/thread.S
-@@ -0,0 +1,12 @@
-+.section .text
-+.global __mlibc_start_thread
-+.type __mlibc_start_thread, @function
-+__mlibc_start_thread:
-+    ld a0, 0(sp)
-+    ld a1, 8(sp)
-+    ld a2, 16(sp)
-+    addi sp, sp, 24
-+    andi sp, sp, -16
-+    call __mlibc_enter_thread
-+    unimp
-+.section .note.GNU-stack,"",@progbits
-diff --git a/sysdeps/roanix/x86_64/thread.S b/sysdeps/roanix/x86_64/thread.S
-new file mode 100644
-index 0000000000000000000000000000000000000000..7140633ac9a243d52b0efe98f608d3a5b1f61c4d
---- /dev/null
-+++ b/sysdeps/roanix/x86_64/thread.S
-@@ -0,0 +1,12 @@
-+.section .text
-+.global __mlibc_start_thread
-+.type __mlibc_start_thread, @function
-+__mlibc_start_thread:
-+    pop %rdi
-+    pop %rsi
-+    pop %rdx
-+    call __mlibc_enter_thread
-+    ud2
-+.size __mlibc_start_thread, . - __mlibc_start_thread
-+.section .note.GNU-stack,"",@progbits
-+
-diff --git a/sysdeps/roanix/meson.build b/sysdeps/roanix/meson.build
-new file mode 100644
-index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd084da5b780
---- /dev/null
-+++ b/sysdeps/roanix/meson.build
-@@ -0,0 +1,131 @@
++++ mlibc-workdir/sysdeps/roanix/meson.build
+@@ -0,0 +1,132 @@
 +sysdep_supported_options = {
 +    'posix': true,
 +    'linux': true,
@@ -1761,6 +1942,7 @@ index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd08
 +libc_sources += files(
 +    'generic/entry.cpp',
 +    'generic/sysdeps.cpp',
++    'generic/thread.cpp',
 +    host_machine.cpu_family() / 'thread.S',
 +)
 +
@@ -1878,11 +2060,11 @@ index 0000000000000000000000000000000000000000..b3a9c7e18016d064949e18a71e01dd08
 +        install_dir: get_option('libdir'),
 +    )
 +endif
-diff --git a/sysdeps/roanix/riscv64/crt-src/Scrt1.S b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
+diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/Scrt1.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/Scrt1.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..4e61d620d34bc6d95723d084c2ab5e5c9ca8a3a3
+index 0000000..4e61d62
 --- /dev/null
-+++ b/sysdeps/roanix/riscv64/crt-src/Scrt1.S
++++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/Scrt1.S
 @@ -0,0 +1,17 @@
 +.weak __global_pointer$
 +.hidden __global_pointer$
@@ -1901,11 +2083,11 @@ index 0000000000000000000000000000000000000000..4e61d620d34bc6d95723d084c2ab5e5c
 +    unimp
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/riscv64/crt-src/crt0.S b/sysdeps/roanix/riscv64/crt-src/crt0.S
+diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crt0.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crt0.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7ccfd4a932d1f83f59954d62347ef98b354dacd
+index 0000000..d7ccfd4
 --- /dev/null
-+++ b/sysdeps/roanix/riscv64/crt-src/crt0.S
++++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crt0.S
 @@ -0,0 +1,17 @@
 +.weak __global_pointer$
 +.hidden __global_pointer$
@@ -1924,11 +2106,11 @@ index 0000000000000000000000000000000000000000..d7ccfd4a932d1f83f59954d62347ef98
 +    unimp
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/riscv64/crt-src/crti.S b/sysdeps/roanix/riscv64/crt-src/crti.S
+diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..1baada4634bea2c16adf2269a5b31377e6f7ad5a
+index 0000000..1baada4
 --- /dev/null
-+++ b/sysdeps/roanix/riscv64/crt-src/crti.S
++++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S
 @@ -0,0 +1,11 @@
 +.section .init
 +.global _init
@@ -1941,11 +2123,11 @@ index 0000000000000000000000000000000000000000..1baada4634bea2c16adf2269a5b31377
 +    nop
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/riscv64/crt-src/crtn.S b/sysdeps/roanix/riscv64/crt-src/crtn.S
+diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..76a4b873f3c701c2642b4786fae5e2d9a2c017e5
+index 0000000..76a4b87
 --- /dev/null
-+++ b/sysdeps/roanix/riscv64/crt-src/crtn.S
++++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
 @@ -0,0 +1,7 @@
 +.section .init
 +    nop
@@ -1954,11 +2136,29 @@ index 0000000000000000000000000000000000000000..76a4b873f3c701c2642b4786fae5e2d9
 +    nop
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/x86_64/crt-src/Scrt1.S b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
+diff --git mlibc-workdir/sysdeps/roanix/riscv64/thread.S mlibc-workdir/sysdeps/roanix/riscv64/thread.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..2715c9b5088316d66eb47ba30a3816dfe64c1ec4
+index 0000000..9515379
 --- /dev/null
-+++ b/sysdeps/roanix/x86_64/crt-src/Scrt1.S
++++ mlibc-workdir/sysdeps/roanix/riscv64/thread.S
+@@ -0,0 +1,12 @@
++.section .text
++.global __mlibc_start_thread
++.type __mlibc_start_thread, @function
++__mlibc_start_thread:
++    ld a0, 0(sp)
++    ld a1, 8(sp)
++    ld a2, 16(sp)
++    addi sp, sp, 24
++    andi sp, sp, -16
++    call __mlibc_enter_thread
++    unimp
++.section .note.GNU-stack,"",@progbits
+diff --git mlibc-workdir/sysdeps/roanix/x86_64/crt-src/Scrt1.S mlibc-workdir/sysdeps/roanix/x86_64/crt-src/Scrt1.S
+new file mode 100644
+index 0000000..2715c9b
+--- /dev/null
++++ mlibc-workdir/sysdeps/roanix/x86_64/crt-src/Scrt1.S
 @@ -0,0 +1,8 @@
 +.section .text
 +.global _start
@@ -1968,11 +2168,11 @@ index 0000000000000000000000000000000000000000..2715c9b5088316d66eb47ba30a3816df
 +    call __mlibc_entry
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/x86_64/crt-src/crt0.S b/sysdeps/roanix/x86_64/crt-src/crt0.S
+diff --git mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crt0.S mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crt0.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..e39014c17cb3cd1c16c03db7ec1b5187cd05d2ce
+index 0000000..2715c9b
 --- /dev/null
-+++ b/sysdeps/roanix/x86_64/crt-src/crt0.S
++++ mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crt0.S
 @@ -0,0 +1,8 @@
 +.section .text
 +.global _start
@@ -1982,11 +2182,11 @@ index 0000000000000000000000000000000000000000..e39014c17cb3cd1c16c03db7ec1b5187
 +    call __mlibc_entry
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/x86_64/crt-src/crti.S b/sysdeps/roanix/x86_64/crt-src/crti.S
+diff --git mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crti.S mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crti.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..6fd3c221794f1bf1508e1e950465f260adba46cb
+index 0000000..6fd3c22
 --- /dev/null
-+++ b/sysdeps/roanix/x86_64/crt-src/crti.S
++++ mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crti.S
 @@ -0,0 +1,11 @@
 +.section .init
 +.global _init
@@ -1999,11 +2199,11 @@ index 0000000000000000000000000000000000000000..6fd3c221794f1bf1508e1e950465f260
 +    push %rax
 +
 +.section .note.GNU-stack,"",%progbits
-diff --git a/sysdeps/roanix/x86_64/crt-src/crtn.S b/sysdeps/roanix/x86_64/crt-src/crtn.S
+diff --git mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crtn.S mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crtn.S
 new file mode 100644
-index 0000000000000000000000000000000000000000..89d1536c0baaa5b1013636e4a5a20823a3248359
+index 0000000..89d1536
 --- /dev/null
-+++ b/sysdeps/roanix/x86_64/crt-src/crtn.S
++++ mlibc-workdir/sysdeps/roanix/x86_64/crt-src/crtn.S
 @@ -0,0 +1,9 @@
 +.section .init
 +    pop %rax
@@ -2014,3 +2214,21 @@ index 0000000000000000000000000000000000000000..89d1536c0baaa5b1013636e4a5a20823
 +    ret
 +
 +.section .note.GNU-stack,"",%progbits
+diff --git mlibc-workdir/sysdeps/roanix/x86_64/thread.S mlibc-workdir/sysdeps/roanix/x86_64/thread.S
+new file mode 100644
+index 0000000..839004f
+--- /dev/null
++++ mlibc-workdir/sysdeps/roanix/x86_64/thread.S
+@@ -0,0 +1,12 @@
++.section .text
++.global __mlibc_start_thread
++.type __mlibc_start_thread, @function
++__mlibc_start_thread:
++    pop %rdi
++    pop %rsi
++    pop %rdx
++    call __mlibc_enter_thread
++    ud2
++.size __mlibc_start_thread, . - __mlibc_start_thread
++.section .note.GNU-stack,"",@progbits
++
