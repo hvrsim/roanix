@@ -507,7 +507,7 @@ pub fn unload_all() {
             match unload(&module) {
                 Ok(()) => progress = true,
                 Err(error) => warn!(
-                    "driver: module {} could not be unloaded: {error:?}",
+                    "module {} could not be unloaded: {error:?}",
                     module.name
                 ),
             }
@@ -518,6 +518,6 @@ pub fn unload_all() {
     }
     let stuck = registry.modules.lock().len();
     if stuck != 0 {
-        error!("driver: {stuck} modules remain loaded");
+        error!("{stuck} module(s) could not be unloaded and remain live");
     }
 }

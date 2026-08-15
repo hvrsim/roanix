@@ -1,8 +1,8 @@
 #! /bin/sh
 
 version=0.1
-revision=2
-source_dir="init"
+revision=1
+source_dir="util-roanix"
 hostdeps="gcc-host binutils"
 deps="sys-libs"
 
@@ -20,6 +20,7 @@ build() {
 
 package() {
     install -Dm755 init "${dest_dir}/usr/bin/init"
+    install -Dm755 dmesg "${dest_dir}/usr/bin/dmesg"
 
     mkdir -p "${dest_dir}/sbin"
     ln -s ../usr/bin/init "${dest_dir}/sbin/init"

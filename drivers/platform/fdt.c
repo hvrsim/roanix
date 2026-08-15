@@ -298,7 +298,7 @@ static int32_t fdt_init(struct rdf_module *self)
 
     status = rdf_firmware_devicetree(blob, sizeof(blob), &blob_length);
     if (status == RDF_ENOENT) {
-        RDF_INFO("no device tree on this platform");
+        RDF_DEBUG("no device tree on this platform");
         return RDF_OK;
     }
     if (status != RDF_OK)

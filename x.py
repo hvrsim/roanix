@@ -79,7 +79,7 @@ FALLBACK_SYSTEM_PACKAGES = (
     "coreutils",
     "stress-ng",
     "python",
-    "init",
+    "util-roanix",
     "drivers",
 )
 FALLBACK_EXTRA_BUILD_PACKAGES = ("mlibc-headers", "mlibc", "ncurses", "readline")
@@ -88,7 +88,7 @@ FALLBACK_EXTRA_BUILD_PACKAGES = ("mlibc-headers", "mlibc", "ncurses", "readline"
 # Editing these directories makes the corresponding package stale.
 IN_TREE_SOURCES: Mapping[str, Path] = {
     "drivers": DRIVERS_DIR,
-    "init": USERLAND_DIR / "init",
+    "util-roanix": USERLAND_DIR / "util-roanix",
 }
 
 # Distro package names for the host tools xtool needs, used by `x.py doctor`.
@@ -1318,7 +1318,7 @@ def load_manifest(log: Log) -> Manifest:
     if not buckets["install"]:
         raise Failure(
             f"{rel(SYSTEM_MANIFEST)} lists no packages under [install]",
-            hint="add at least 'init' so the image can boot",
+            hint="add at least 'util-roanix' so the image can boot",
         )
     return Manifest(tuple(buckets["install"]), tuple(buckets["build"]), False)
 

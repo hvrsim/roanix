@@ -24,7 +24,7 @@ use core::{
     ptr::{self, NonNull},
 };
 
-use log::{error, info};
+use log::{debug, error};
 
 use xmas_elf::{
     ElfFile,
@@ -198,10 +198,10 @@ pub fn load_directory(path: &[u8]) -> Result<usize> {
         full.extend_from_slice(name.as_bytes());
         match load_file(&full) {
             Ok(module) => {
-                info!("driver: loaded module {}", module.name());
+                debug!("loaded module {}", module.name());
                 loaded += 1;
             }
-            Err(failure) => error!("driver: failed to load {name}: {failure:?}"),
+            Err(failure) => error!("failed to load module {name}: {failure:?}"),
         }
     }
     super::super::core::probe::retrigger();

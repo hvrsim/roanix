@@ -765,7 +765,7 @@ static int32_t pty_init(struct rdf_module *self)
     if (status != RDF_OK)
         goto fail_events;
 
-    RDF_INFO("pty: published /dev/ptmx and /dev/pts");
+    RDF_INFO("published /dev/ptmx and /dev/pts");
     return RDF_OK;
 
 fail_events:

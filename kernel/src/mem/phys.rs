@@ -15,7 +15,7 @@ use core::{
 use bitflags::bitflags;
 use intrusive_collections::{LinkedList, LinkedListLink, intrusive_adapter};
 use limine::memory_map::{Entry, EntryType};
-use log::{debug, info};
+use log::info;
 
 use crate::{
     arch,
@@ -527,11 +527,11 @@ pub fn init() {
     let mut max_usable_end = 0u64;
     let mut usable_pages = 0usize;
 
-    debug!("mem/phys: memory map structure:");
+    info!("memory map structure:");
     for entry in mmap.iter() {
         let end = entry.base.saturating_add(entry.length);
-        debug!(
-            "mem/phys: \t[{:016x}-{:016x}] {}",
+        info!(
+            "\t[{:016x}-{:016x}] {}",
             entry.base,
             end,
             entry_type_name(entry)
@@ -664,7 +664,7 @@ pub fn init() {
     }
 
     info!(
-        "mem/phys: PFNDB phys=[0x{:x}-0x{:x}] entries={} metadata={} KiB used={} free={}",
+        "page database at [0x{:x}-0x{:x}], {} entries, {} KiB metadata, {} pages used, {} free",
         pagedb_phys_base,
         pagedb_phys_base + pagedb_pages * PAGE_SIZE,
         database_entries,

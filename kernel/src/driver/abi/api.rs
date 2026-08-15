@@ -11,12 +11,10 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::ffi::{c_char, c_void};
 
-use log::{Level, log};
-
 use crate::{
     fs::devtempfs::DevNodeId,
     mem::VirtAddr,
-    sys::{clock, random, smp},
+    sys::{clock, klog, random, smp},
 };
 
 use super::{
@@ -506,18 +504,14 @@ pub struct Api {
     pub tty_unregister: unsafe extern "C" fn(*mut c_void) -> i32,
 
     // Kernel log.
-    /// Returns the oldest readable log offset.
-    pub kmsg_start: unsafe extern "C" fn() -> u64,
-    /// Returns the log end offset.
-    pub kmsg_end: unsafe extern "C" fn() -> u64,
-    /// Reads log bytes. Negative results are status codes.
-    pub kmsg_read: unsafe extern "C" fn(u64, *mut u8, usize, u8) -> i64,
-    /// Appends a log record.
-    pub kmsg_append: unsafe extern "C" fn(*const u8, usize) -> i32,
-    /// Stops mirroring log records to early consoles.
-    pub kmsg_mute: unsafe extern "C" fn(),
-    /// Restores mirroring of log records to early consoles.
-    pub kmsg_unmute: unsafe extern "C" fn(),
+    /// Returns the severity currently recorded into the kernel log.
+    pub klog_level: unsafe extern "C" fn() -> u32,
+    /// Changes the recorded severity and returns the previous one.
+    pub klog_set_level: unsafe extern "C" fn(u32) -> u32,
+    /// Returns the severity currently mirrored to the console.
+    pub klog_console_level: unsafe extern "C" fn() -> u32,
+    /// Changes the mirrored severity and returns the previous one.
+    pub klog_set_console_level: unsafe extern "C" fn(u32) -> u32,
 }
 
 /// Bus callbacks supplied from C.
@@ -604,9 +598,9 @@ mod layout {
         io::dma::DmaOps,
     };
 
-    const _: () = assert!(size_of::<Api>() == 1008);
+    const _: () = assert!(size_of::<Api>() == 992);
     const _: () = assert!(core::mem::offset_of!(Api, log) == 16);
-    const _: () = assert!(core::mem::offset_of!(Api, kmsg_unmute) == 1000);
+    const _: () = assert!(core::mem::offset_of!(Api, klog_set_console_level) == 984);
     const _: () = assert!(size_of::<crate::driver::abi::types::ModuleDef>() == 48);
     const _: () = assert!(size_of::<NodeOps>() == 112);
     const _: () = assert!(size_of::<ConsoleOps>() == 160);
@@ -762,10 +756,8 @@ pub static API: Api = Api {
     tty_register: shim_tty_register,
     tty_unregister: shim_tty_unregister,
 
-    kmsg_start: shim_kmsg_start,
-    kmsg_end: shim_kmsg_end,
-    kmsg_read: shim_kmsg_read,
-    kmsg_append: shim_kmsg_append,
-    kmsg_mute: shim_kmsg_mute,
-    kmsg_unmute: shim_kmsg_unmute,
+    klog_level: shim_klog_level,
+    klog_set_level: shim_klog_set_level,
+    klog_console_level: shim_klog_console_level,
+    klog_set_console_level: shim_klog_set_console_level,
 };

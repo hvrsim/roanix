@@ -221,7 +221,7 @@ $ ./x.py pkg 'lib*'
 ```
 
 You usually do not even need `pkg`: editing a recipe (or the in-tree sources
-under `drivers/` and `userland/init/`) marks that package stale, so a plain
+under `drivers/` and `userland/util-roanix/`) marks that package stale, so a plain
 `./x.py` rebuilds it, reinstalls the sysroot, and boots.
 
 Use `./x.py list` to see every recipe, its version, whether it has been built,

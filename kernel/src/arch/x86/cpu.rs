@@ -511,15 +511,15 @@ pub fn enable_features(core_local: *const CoreLocal) -> CpuFeatures {
 
     BSP_STARTUP.call_once(|| {
         if let Some(brand_string) = cpuid.get_processor_brand_string() {
-            info!("cpu: model name \"{}\"", brand_string.as_str());
+            info!("{}", brand_string.as_str());
         }
 
         if !ext_feats.has_fsgsbase() {
-            warn!("cpu: {{FS/GS}}BASE instructions are not supported!");
+            warn!("{{FS/GS}}BASE instructions are unavailable; thread-local access is slower");
         }
 
         if !ext_feats.has_smep() {
-            warn!("cpu: SMEP not supported!");
+            warn!("SMEP is unavailable; the CPU cannot trap kernel execution of user pages");
         }
 
         // SAFETY: BSP startup is serialized by `BSP_STARTUP`, so the static
@@ -628,7 +628,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             crate::mem::kstack::report_guard_fault(Cr2::read_raw(), cpu_id, tid);
         }
         log::error!(
-            "x86/trap: exception ip=0x{:X} vec=0x{:X} ec=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
+            "unhandled exception vec=0x{:X} ec=0x{:X} ip=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
             frame.ip,
             frame.vec,
             frame.ec,

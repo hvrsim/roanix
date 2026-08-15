@@ -24,7 +24,7 @@ bash
 coreutils
 python
 stress-ng
-init
+util-roanix
 drivers
 
 [build]

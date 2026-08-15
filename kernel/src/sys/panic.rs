@@ -1,10 +1,16 @@
 //!
 //! # Kernel Panic Handling
 //!
-//! Captures panic details and writes them directly to registered log sinks.
+//! Stops the machine, reports why, and unwinds the failing stack.
+//!
+//! A panic is the one path that cannot rely on the rest of the kernel working.
+//! The first CPU to arrive claims ownership, stops every other CPU with an IPI
+//! so nothing can keep mutating state or writing to the console, force-releases
+//! the log sink registry in case the crash happened while it was held, and only
+//! then reports. Every line goes straight to the console sinks through
+//! [`klog::emergency`], bypassing severity filters entirely.
 //!
 
-use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -13,7 +19,7 @@ use xmas_elf::{ElfFile, sections::*, symbol_table::*};
 
 use crate::{
     arch,
-    sys::{debug, smp},
+    sys::{klog, smp},
 };
 
 #[used]
@@ -28,48 +34,14 @@ static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
 const BACKTRACE_STACK_WINDOW: usize = 256 * 1024;
 const PANIC_SHOOTDOWN_SPINS: usize = 1_000_000;
 
-/// Fixed-size formatter for panic log lines.
-struct PanicWriter {
-    buf: [u8; 256],
-    buflen: usize,
-}
-
-impl PanicWriter {
-    /// Create a new `PanicWriter` with an empty internal buffer.
-    #[inline(always)]
-    const fn new() -> Self {
-        Self {
-            buf: [0; 256],
-            buflen: 0,
-        }
-    }
-}
-
-impl Write for PanicWriter {
-    /// Copy `s` into the internal buffer, truncating on overflow.
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let space = self.buf.len().saturating_sub(self.buflen);
-        let count = bytes.len().min(space);
-
-        self.buf[self.buflen..self.buflen + count].copy_from_slice(&bytes[..count]);
-        self.buflen += count;
-
-        Ok(())
-    }
-}
-
-/// Helper function to bridge `plog!` to `debug::write_to_sinks`
-#[inline(always)]
-fn panic_log(args: core::fmt::Arguments) {
-    let mut writer = PanicWriter::new();
-    write!(&mut writer, "{}", args).ok();
-    debug::write_to_sinks(&writer.buf[..writer.buflen]);
-}
-
+/// Writes one panic line straight to the console sinks.
+///
+/// This deliberately skips the log filters and the record ring's normal entry
+/// point: by the time a panic reports itself the machine may be holding the
+/// very locks a regular log call would need.
 macro_rules! plog {
     ($($arg:tt)*) => {
-        panic_log(format_args!($($arg)*))
+        klog::emergency(format_args!($($arg)*))
     };
 }
 
@@ -288,15 +260,63 @@ fn prepare_panic_output() {
     PANIC_OWNER.store(owner, Ordering::Release);
     PANIC_STOPPED_CPUS.store(0, Ordering::Release);
 
-    debug::enter_panic_mode();
+    klog::enter_panic_mode();
     shoot_down_other_cpus(owner);
     wait_for_other_cpus();
 
     // SAFETY: every other CPU has stopped or been abandoned, so stale lock
     // owners cannot resume after panic recovery force-unlocks them.
     unsafe {
-        debug::force_unlock_for_panic();
+        klog::force_unlock_for_panic();
     }
+}
+
+/// Prints the panic banner.
+///
+/// The cow is not decoration. A panic can arrive in the middle of unrelated
+/// console traffic, and a block of art that cannot be mistaken for anything
+/// else marks exactly where the machine stopped being trustworthy.
+fn print_banner() {
+    plog!("");
+    plog!("  _________________________  ");
+    plog!("< uh oh, kernel panicked... >");
+    plog!("  -------------------------  ");
+    plog!("          \\   ^__^          ");
+    plog!("           \\  (oo)\\_______  ");
+    plog!("              (__)\\       )\\/\\\\");
+    plog!("                  ||----w |  ");
+    plog!("                  ||     ||  ");
+    plog!("");
+}
+
+/// Prints where and on what the kernel stopped.
+fn print_context(info: &PanicInfo<'_>) {
+    plog!("\x1b[1;31m{}\x1b[0m", info.message());
+
+    match info.location() {
+        Some(location) => plog!(
+            "panicked at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        ),
+        None => plog!("panicked at an unknown location"),
+    }
+
+    match arch::thiscpu_opt() {
+        Some(cpu) => plog!("cpu {} thread {}", cpu.id, cpu.current_thread),
+        None => plog!("cpu unknown, core-local state is not established"),
+    }
+
+    let uptime = crate::sys::clock::monotonic_ns_or_zero();
+    plog!(
+        "uptime {}.{:06}s, {} of {} CPU(s) stopped",
+        uptime / 1_000_000_000,
+        (uptime % 1_000_000_000) / 1_000,
+        PANIC_STOPPED_CPUS.load(Ordering::Acquire),
+        smp::online_cpus()
+    );
+    plog!("");
 }
 
 #[doc(hidden)]
@@ -308,24 +328,8 @@ fn rust_panic(info: &PanicInfo) -> ! {
     }
 
     prepare_panic_output();
-
-    plog!("\n  _________________________  ");
-    plog!("< uh oh, kernel panicked... >");
-    plog!("  -------------------------  ");
-    plog!("          \\   ^__^          ");
-    plog!("           \\  (oo)\\_______  ");
-    plog!("              (__)\\       )\\/\\\\");
-    plog!("                  ||----w |  ");
-    plog!("                  ||     ||  \n\n");
-    plog!("\x1b[31m{}\x1b[0m", info.message());
-
-    if let Some(loc) = info.location() {
-        plog!(
-            "panic occurred in file '{}' at line {}.",
-            loc.file(),
-            loc.line()
-        );
-    }
+    print_banner();
+    print_context(info);
 
     if let Some(resp) = KERNEL_FILE.get_response() {
         let file = resp.file();
@@ -349,6 +353,9 @@ fn rust_panic(info: &PanicInfo) -> ! {
     } else {
         perform_bt(None, None);
     }
+
+    plog!("");
+    plog!("system halted.");
 
     panic_loop()
 }

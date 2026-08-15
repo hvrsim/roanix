@@ -8,7 +8,7 @@ use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{fmt, slice, str};
 
 use limine::request::ModuleRequest;
-use log::info;
+use log::{debug, error, info};
 
 use crate::fs::{self, OpenFlags, SetAttr};
 
@@ -271,15 +271,17 @@ pub(crate) fn populate() -> Result<usize> {
     }
 
     resolve_hard_links(pending_links)?;
-    info!("boot: imported {count} initramfs entries");
+    info!("imported {count} initramfs entries");
     Ok(count)
 }
 
 /// Reports whether Limine supplied an initramfs module.
 pub(crate) fn init() {
     match archive() {
-        Some(archive) => info!("boot: initramfs module loaded ({} bytes)", archive.len()),
-        None => info!("boot: no initramfs module"),
+        Some(archive) => debug!("initramfs module is {} KiB", archive.len() / 1024),
+        // Without an initramfs there is no /sbin/init to hand control to, so
+        // this is a boot failure that has simply not happened yet.
+        None => error!("the bootloader supplied no initramfs module"),
     }
 }
 

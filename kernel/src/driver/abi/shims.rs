@@ -34,20 +34,21 @@ fn status<T>(result: Result<T>) -> i32 {
 // --- Diagnostics and memory -------------------------------------------------
 
 unsafe extern "C" fn shim_log(level: u32, module: *const c_char, message: *const c_char) {
+    let level = clamp_level(level);
+    if level > klog::record_level() {
+        return;
+    }
+
     // SAFETY: the ABI requires both arguments to be NUL-terminated strings.
-    let name = unsafe { borrow_opt_str(module) }.ok().flatten().unwrap_or("driver");
+    let name = unsafe { borrow_opt_str(module) }
+        .ok()
+        .flatten()
+        .unwrap_or("driver");
     // SAFETY: as above.
     let Ok(text) = (unsafe { borrow_str(message) }) else {
         return;
     };
-    let level = match level {
-        1 => Level::Error,
-        2 => Level::Warn,
-        3 => Level::Info,
-        4 => Level::Debug,
-        _ => Level::Trace,
-    };
-    log!(level, "{name}: {text}");
+    klog::emit(level, name, "", 0, text.as_bytes(), 0);
 }
 
 fn layout(size: usize, align: usize) -> Option<core::alloc::Layout> {
@@ -1663,48 +1664,24 @@ unsafe extern "C" fn shim_tty_unregister(handle: *mut c_void) -> i32 {
 
 // --- Kernel log -------------------------------------------------------------
 
-unsafe extern "C" fn shim_kmsg_start() -> u64 {
-    crate::sys::debug::log_start_offset()
+unsafe extern "C" fn shim_klog_level() -> u32 {
+    klog::record_level().as_raw().into()
 }
 
-unsafe extern "C" fn shim_kmsg_end() -> u64 {
-    crate::sys::debug::log_end_offset()
+unsafe extern "C" fn shim_klog_set_level(level: u32) -> u32 {
+    klog::set_record_level(clamp_level(level)).as_raw().into()
 }
 
-unsafe extern "C" fn shim_kmsg_read(
-    offset: u64,
-    buffer: *mut u8,
-    length: usize,
-    nonblocking: u8,
-) -> i64 {
-    if buffer.is_null() || length == 0 {
-        return 0;
-    }
-    // SAFETY: the ABI requires `length` writable bytes.
-    let slice = unsafe { core::slice::from_raw_parts_mut(buffer, length) };
-    match crate::sys::debug::read_log(offset, slice, nonblocking != 0) {
-        Ok(read) => read as i64,
-        Err(crate::sys::debug::LogReadError::WouldBlock) => {
-            i64::from(Error::WouldBlock.to_status())
-        }
-        Err(crate::sys::debug::LogReadError::Overrun) => i64::from(Error::NoSpace.to_status()),
-    }
+unsafe extern "C" fn shim_klog_console_level() -> u32 {
+    klog::console_level().as_raw().into()
 }
 
-unsafe extern "C" fn shim_kmsg_append(buffer: *const u8, length: usize) -> i32 {
-    if buffer.is_null() || length == 0 {
-        return STATUS_OK;
-    }
-    // SAFETY: the ABI requires `length` readable bytes.
-    let slice = unsafe { core::slice::from_raw_parts(buffer, length) };
-    crate::sys::debug::append_kernel_message(slice);
-    STATUS_OK
+unsafe extern "C" fn shim_klog_set_console_level(level: u32) -> u32 {
+    klog::set_console_level(clamp_level(level)).as_raw().into()
 }
 
-unsafe extern "C" fn shim_kmsg_mute() {
-    crate::sys::debug::disable_regular_sink_output();
-}
-
-unsafe extern "C" fn shim_kmsg_unmute() {
-    crate::sys::debug::enable_regular_sink_output();
+/// Converts a severity supplied by a driver, saturating at the least severe
+/// level rather than rejecting the call.
+fn clamp_level(level: u32) -> klog::Level {
+    klog::Level::from_raw(level.min(u32::from(klog::LEVEL_COUNT) - 1) as u8)
 }

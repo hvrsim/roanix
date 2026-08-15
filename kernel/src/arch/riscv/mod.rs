@@ -8,7 +8,7 @@
 //! manuals. You can grab the latest copies [here](https://github.com/riscv/riscv-isa-manual/releases/tag/latest).
 //!
 
-use crate::sys::{debug, smp::CoreLocal, sync::Mutex};
+use crate::sys::{klog, smp::CoreLocal, sync::Mutex};
 use core::{
     arch::asm,
     hint::spin_loop,
@@ -49,15 +49,10 @@ pub(crate) struct SbiRet {
     pub(crate) error: isize,
 }
 
-/// Writes debug messages to the current debug sink.
-///
-/// On all riscv64 platforms, we use the SBI debug console API.
-fn dbgcon_write(line: &[u8]) {
-    console_write(line);
-    console_write(b"\n");
-}
-
 /// Writes bytes directly to the architecture debug console.
+///
+/// On all riscv64 platforms, this uses the SBI debug console API, falling back
+/// to the legacy `console_putchar` extension.
 pub(crate) fn console_write(line: &[u8]) {
     let putc = |byte: u8| {
         let ret = sbi_call1(byte as usize, DEBUG_EXT_ID, 2);
@@ -196,7 +191,7 @@ pub fn irqset(enable: bool) {
 /// Initializes the bootstrap hart and early debug output.
 pub fn init_boot_cpu() {
     init_cpu(&raw const BSP_CORE_LOCAL);
-    debug::register_sink(dbgcon_write);
+    klog::register_sink(console_write);
 }
 
 /// Initializes global RISC-V platform facilities that require memory services.

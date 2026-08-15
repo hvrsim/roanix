@@ -289,7 +289,7 @@ pub(crate) fn report_guard_fault(address: u64, cpu_id: usize, tid: usize) {
     }
 
     log::error!(
-        "mem/kstack: kernel stack overflow at 0x{address:X} (cpu={cpu_id} tid={tid}, {} live stacks)",
+        "kernel stack overflow at 0x{address:X} on cpu {cpu_id}, tid {tid} ({} live stacks)",
         live_stacks()
     );
 }

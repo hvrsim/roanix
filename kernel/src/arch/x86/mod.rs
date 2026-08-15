@@ -17,7 +17,7 @@ use x86_64::addr::VirtAddr;
 use x86_64::instructions::{hlt, interrupts as x86_interrupts, port::*};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 
-use crate::sys::{debug, smp::CoreLocal};
+use crate::sys::{klog, smp::CoreLocal};
 
 pub mod cpu;
 pub mod lapic;
@@ -31,7 +31,7 @@ pub mod timer;
 static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 
 ///
-/// Writes debug messages to the current debug sink.
+/// Writes bytes directly to the architecture debug console.
 ///
 /// On QEMU/bochs, the debug sink is port 0xE9 (unallocated on real hardware).
 ///
@@ -46,12 +46,6 @@ static mut BSP_CORE_LOCAL: CoreLocal = CoreLocal::new(0);
 /// $ QEMUFLAGS="... -debugcon stdio" make run-bios
 /// ```
 ///
-fn dbgcon_write(line: &[u8]) {
-    console_write(line);
-    console_write(b"\n");
-}
-
-/// Writes bytes directly to the architecture debug console.
 pub(crate) fn console_write(line: &[u8]) {
     let mut dbgcon_e9: PortGeneric<u8, WriteOnlyAccess> = PortWriteOnly::new(0xE9);
 
@@ -96,7 +90,7 @@ fn dbgcon_init() {
 pub fn init_boot_cpu() {
     dbgcon_init();
     init_cpu(&raw const BSP_CORE_LOCAL);
-    debug::register_sink(dbgcon_write);
+    klog::register_sink(console_write);
 }
 
 /// Initializes global x86 platform facilities that require memory services.

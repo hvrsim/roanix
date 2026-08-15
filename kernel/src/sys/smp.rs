@@ -614,13 +614,13 @@ pub(crate) fn start_secondary_cpus() {
         if crate::sys::clock::monotonic_ns() >= deadline {
             let online = online_cpus();
             warn!(
-                "smp: {} of {} CPU(s) came online; continuing without the rest",
+                "only {} of {} CPU(s) came online; continuing without the rest",
                 online,
                 state.cpu_count()
             );
             for cpu_id in 0..state.cpu_count() {
                 if !is_online(cpu_id) {
-                    warn!("smp: cpu{cpu_id} did not report in and stays offline");
+                    warn!("cpu{cpu_id} did not report in and stays offline");
                 }
             }
             return;
@@ -628,7 +628,7 @@ pub(crate) fn start_secondary_cpus() {
         spin_loop();
     }
 
-    info!("smp: all {} CPU(s) online", state.cpu_count());
+    info!("all {} CPU(s) online", state.cpu_count());
 }
 
 /// Returns the number of CPUs known to the kernel.

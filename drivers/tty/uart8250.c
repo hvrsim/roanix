@@ -723,8 +723,8 @@ static int32_t uart_probe(void *context, struct rdf_device *device, uintptr_t ma
         goto fail;
 
     rdf_device_set_data(device, port);
-    RDF_INFO("%s: %s at %s interrupt", rdf_device_name(device), name,
-             port->interrupts_enabled != 0 ? "with" : "without");
+    RDF_INFO("%s: %s, %s", rdf_device_name(device), name,
+             port->interrupts_enabled != 0 ? "interrupt driven" : "polled");
     return RDF_OK;
 
 fail:

@@ -142,14 +142,14 @@ pub fn init(tsc_hz: u64) {
 
     if timer_mode == TimerMode::LocalOneShot {
         info!(
-            "x86/lapic: mode={} timer={} hz={}",
+            "{} mode, {} timer at {} Hz",
             access.name(),
             timer_mode.name(),
             lapic_timer_hz
         );
     } else {
         info!(
-            "x86/lapic: mode={} timer={}",
+            "{} mode, {} timer",
             access.name(),
             timer_mode.name()
         );

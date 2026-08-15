@@ -194,6 +194,7 @@ RDF_UNUSED RDF_PRINTF(2, 3) static void rdf_log(uint32_t level, const char *form
 #define RDF_WARN(...) rdf_log(RDF_LOG_WARN, __VA_ARGS__)
 #define RDF_INFO(...) rdf_log(RDF_LOG_INFO, __VA_ARGS__)
 #define RDF_DEBUG(...) rdf_log(RDF_LOG_DEBUG, __VA_ARGS__)
+#define RDF_TRACE(...) rdf_log(RDF_LOG_TRACE, __VA_ARGS__)
 
 /* Allocates uninitialized kernel memory. */
 static inline void *rdf_alloc(size_t size, size_t align)
@@ -1041,41 +1042,28 @@ static inline int32_t rdf_tty_unregister(struct rdf_tty *tty)
 
 /* --- Kernel log --------------------------------------------------------- */
 
-/* Returns the oldest readable log offset. */
-static inline uint64_t rdf_kmsg_start(void)
+/* Returns the severity currently recorded into the kernel log. */
+static inline uint32_t rdf_klog_level(void)
 {
-    return rdf_api->kmsg_start();
+    return rdf_api->klog_level();
 }
 
-/* Returns the log end offset. */
-static inline uint64_t rdf_kmsg_end(void)
+/* Changes the recorded severity and returns the previous one. */
+static inline uint32_t rdf_klog_set_level(uint32_t level)
 {
-    return rdf_api->kmsg_end();
+    return rdf_api->klog_set_level(level);
 }
 
-/* Reads log bytes. Negative results are status codes. */
-static inline int64_t rdf_kmsg_read(uint64_t offset, uint8_t *buffer, size_t length,
-                                    uint8_t nonblocking)
+/* Returns the severity currently mirrored to the console. */
+static inline uint32_t rdf_klog_console_level(void)
 {
-    return rdf_api->kmsg_read(offset, buffer, length, nonblocking);
+    return rdf_api->klog_console_level();
 }
 
-/* Appends a log record. */
-static inline int32_t rdf_kmsg_append(const uint8_t *buffer, size_t length)
+/* Changes the mirrored severity and returns the previous one. */
+static inline uint32_t rdf_klog_set_console_level(uint32_t level)
 {
-    return rdf_api->kmsg_append(buffer, length);
-}
-
-/* Stops mirroring log records to early consoles. */
-static inline void rdf_kmsg_mute(void)
-{
-    rdf_api->kmsg_mute();
-}
-
-/* Restores mirroring of log records to early consoles. */
-static inline void rdf_kmsg_unmute(void)
-{
-    rdf_api->kmsg_unmute();
+    return rdf_api->klog_set_console_level(level);
 }
 
 /* --- Match table helpers ------------------------------------------------ */

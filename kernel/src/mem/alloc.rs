@@ -12,7 +12,7 @@ use core::{
     ptr::{self, null_mut},
 };
 
-use log::info;
+use log::debug;
 
 use crate::{
     arch,
@@ -683,8 +683,8 @@ pub fn init() {
     let mut heap = heap_lock();
     heap.init();
 
-    info!(
-        "mem/alloc: heap window active: virt=[0x{:x}-0x{:x}] size={} MiB",
+    debug!(
+        "heap window [0x{:x}-0x{:x}], {} MiB",
         HEAP_BASE,
         HEAP_BASE + HEAP_SIZE,
         HEAP_SIZE / (1024 * 1024),
@@ -695,7 +695,7 @@ pub fn init() {
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
     panic!(
-        "mem/alloc: allocation failure (size={} align={})",
+        "kernel heap exhausted: cannot allocate {} bytes aligned to {}",
         layout.size(),
         layout.align()
     );

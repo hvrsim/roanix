@@ -45,9 +45,9 @@ unsafe extern "C" fn rmain() -> ! {
 
 /// Initializes the facilities required to start the first kernel thread.
 fn early_init() -> ! {
-    sys::debug::register();
+    sys::klog::init();
     arch::init_boot_cpu();
-    info!("welcome to roanix!");
+    info!(target: "boot", "welcome to roanix!");
     sys::initramfs::init();
 
     mem::init();
@@ -66,6 +66,16 @@ fn init_thread() {
     sys::random::init();
     sys::initramfs::populate().expect("boot: failed to import initramfs");
     driver::load_packaged_modules().expect("boot: failed to load packaged driver modules");
+
+    info!(
+        target: "boot",
+        "initialization complete in {}ms",
+        sys::clock::monotonic_ns() / 1_000_000
+    );
+
+    // The console is the user's terminal from here on. Routine kernel chatter
+    // would fight with the shell for it, so only failures stay on screen while
+    // the full log remains available through /dev/klog and dmesg.
+    sys::klog::set_console_level(sys::klog::Level::Error);
     proc::spawn_init().expect("boot: failed to start /sbin/init");
-    info!("boot: initialization complete");
 }

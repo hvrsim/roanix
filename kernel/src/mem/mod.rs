@@ -16,7 +16,7 @@ use limine::{
     memory_map::Entry,
     request::{HhdmRequest, MemoryMapRequest},
 };
-use log::info;
+use log::{debug, info};
 
 use crate::{
     arch,
@@ -149,7 +149,7 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 /// Initializes physical memory, the heap, and pageable virtual memory.
 pub fn init() {
-    info!("mem: hhdm=0x{:x}", hhdm_offset());
+    debug!("direct map based at 0x{:x}", hhdm_offset());
     phys::init();
     alloc::init();
     init_state();
@@ -193,7 +193,7 @@ fn init_state() {
     register_cpu();
 
     info!(
-        "mem: initialized (free low={} high={} compressed_swap={} MiB)",
+        "ready: reclaim watermarks low={} high={}, {} MiB of compressed swap",
         low_watermark,
         high_watermark,
         compressed_limit / (1024 * 1024),
@@ -208,6 +208,7 @@ pub(crate) fn start_page_daemon() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        debug!("starting the page daemon");
         sched::run(page_daemon);
     }
 }

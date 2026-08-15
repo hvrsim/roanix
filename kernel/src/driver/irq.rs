@@ -27,7 +27,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
-use log::{error, warn};
+use log::{error, trace};
 
 use crate::sys::{
     event::Event,
@@ -856,7 +856,10 @@ pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
             let result = run(virq);
             outcome.reschedule |= result.reschedule;
         } else {
-            warn!("driver/irq: unmapped hardware interrupt {hwirq} on {}", domain.name);
+            // A device can raise a line nobody claimed, and it will keep
+            // doing so every time it fires. Reporting each one at warn would
+            // bury the console under a single misbehaving device.
+            trace!("unmapped hardware interrupt {hwirq} on {}", domain.name);
         }
         if let Some(complete) = domain.ops.complete {
             // SAFETY: registration validated the callback and `hwirq` was just
@@ -989,7 +992,7 @@ fn for_each_action<F: Fn(&Arc<IrqAction>) -> bool>(select: F) {
         for action in matching {
             if let Err(error) = release(&action) {
                 error!(
-                    "driver/irq: failed to release {} on virq {virq}: {error:?}",
+                    "failed to release {} on virq {virq}: {error:?}",
                     action.name
                 );
             }

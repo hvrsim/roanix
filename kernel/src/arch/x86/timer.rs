@@ -91,7 +91,7 @@ pub fn init() {
         .map(|info| info.has_invariant_tsc())
         .unwrap_or(false);
     if !invariant_tsc {
-        warn!("x86/timer: TSC is not invariant; clock stability is not guaranteed");
+        warn!("TSC is not invariant; timekeeping may drift under frequency changes");
     }
 
     let tsc_hz = calibrate_tsc(&cpuid);

@@ -6,10 +6,10 @@
 //!
 
 pub mod clock;
-pub mod debug;
 pub mod event;
 pub mod firmware;
 pub mod initramfs;
+pub mod klog;
 pub mod panic;
 pub mod random;
 pub mod sched;

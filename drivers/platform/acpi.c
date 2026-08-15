@@ -248,7 +248,7 @@ static int32_t acpi_init(struct rdf_module *self)
 
     status = rdf_firmware_acpi(rsdp, sizeof(rsdp), &length);
     if (status == RDF_ENOENT) {
-        RDF_INFO("no ACPI root pointer on this platform");
+        RDF_DEBUG("no ACPI root pointer on this platform");
         return RDF_OK;
     }
     if (status != RDF_OK)

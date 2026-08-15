@@ -381,12 +381,10 @@ struct rdf_api {
                             const struct rdf_console_ops *ops, struct rdf_tty **out);
     int32_t (*tty_unregister)(struct rdf_tty *tty);
 
-    uint64_t (*kmsg_start)(void);
-    uint64_t (*kmsg_end)(void);
-    int64_t (*kmsg_read)(uint64_t offset, uint8_t *buffer, size_t length, uint8_t nonblocking);
-    int32_t (*kmsg_append)(const uint8_t *buffer, size_t length);
-    void (*kmsg_mute)(void);
-    void (*kmsg_unmute)(void);
+    uint32_t (*klog_level)(void);
+    uint32_t (*klog_set_level)(uint32_t level);
+    uint32_t (*klog_console_level)(void);
+    uint32_t (*klog_set_console_level)(uint32_t level);
 };
 
 /* Module entry point resolved as the image's ELF entry. */

@@ -18,7 +18,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU16, AtomicUsize, Ordering},
 };
 
-use log::info;
+use log::{debug, info, trace};
 
 use crate::{
     arch::cpu::TrapFrame,
@@ -745,7 +745,7 @@ pub fn spawn_init() -> Result<usize> {
     let process = Process::new_root(image.address_space);
     let pid = process.pid();
     let tid = sched::run_user(process, image.entry, image.stack);
-    info!("proc: started /sbin/init pid={pid} tid={tid}");
+    info!("started /sbin/init as pid {pid}, tid {tid}");
     Ok(pid)
 }
 
@@ -1049,7 +1049,7 @@ pub(crate) fn create_session() -> Result<usize> {
 /// Terminates the current process and thread.
 pub(crate) fn exit_current(status: i32) -> ! {
     if let Some(process) = current() {
-        //info!("proc: pid={} exited with status {status}", process.pid());
+        trace!("pid {} exited with status {status}", process.pid());
         process.mark_exited((status & 0xff) << 8);
         process.unregister_thread();
     }
@@ -1059,6 +1059,10 @@ pub(crate) fn exit_current(status: i32) -> ! {
 /// Terminates the current process as the result of an uncaught signal.
 pub(crate) fn exit_current_signal(signal: u8) -> ! {
     if let Some(process) = current() {
+        // A process dying on a signal it never handled is almost always a bug
+        // in that process, and it is invisible from userspace once the shell
+        // has reported the exit status.
+        debug!("pid {} killed by signal {signal}", process.pid());
         process.mark_exited(i32::from(signal & 0x7f));
         process.unregister_thread();
     }

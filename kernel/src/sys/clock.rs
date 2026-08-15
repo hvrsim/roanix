@@ -14,7 +14,7 @@ use core::{
 };
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
-use log::info;
+use log::{debug, info};
 
 use crate::{
     arch,
@@ -384,8 +384,8 @@ pub fn register_clocksource(clocksource: &'static dyn ClockSource) {
     });
 
     let (whole, frac, unit) = format_frequency(frequency_hz);
-    info!(
-        "clock: active clocksource={} ({}.{:02} {}, rating={})",
+    debug!(
+        "clocksource {} registered ({}.{:02} {}, rating {})",
         clocksource.name(),
         whole,
         frac,
@@ -403,7 +403,7 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
         "clock: event timer already registered"
     );
     EVENT_TIMER.call_once(|| timer);
-    info!("clock: registered event timer {}", timer.name());
+    debug!("event timer {} registered", timer.name());
 }
 
 /// Starts local timer delivery on the current CPU.
@@ -499,6 +499,22 @@ fn wait_with_timeout_event(events: &[&Event], timeout: &Event) -> usize {
 #[inline]
 pub fn monotonic_ns() -> u64 {
     let registered = registered_clocksource();
+    elapsed_ns(registered)
+}
+
+/// Returns monotonic nanoseconds, or zero while timekeeping is unavailable.
+///
+/// The kernel log timestamps every record, and the first records are written
+/// before any clocksource exists. Those callers need a reading that degrades to
+/// zero instead of panicking, which would turn a missing timestamp into an
+/// unrecoverable early boot failure.
+#[inline]
+pub fn monotonic_ns_or_zero() -> u64 {
+    CLOCKSOURCE.get().map_or(0, elapsed_ns)
+}
+
+#[inline]
+fn elapsed_ns(registered: &RegisteredClockSource) -> u64 {
     let elapsed = registered
         .source
         .counter()
@@ -668,7 +684,7 @@ fn bootstrap_clocks() {
 
     let (whole, frac, unit) = format_frequency(registered_clocksource().source.frequency_hz());
     info!(
-        "clock: source={} ({}.{:02} {}, timer={})",
+        "clocksource {} at {}.{:02} {}, event timer {}",
         registered_clocksource().source.name(),
         whole,
         frac,

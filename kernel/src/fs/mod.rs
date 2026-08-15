@@ -13,7 +13,7 @@ pub mod vnode;
 
 use alloc::sync::Arc;
 
-use log::info;
+use log::debug;
 
 pub use error::{Error, Result};
 pub use file::{FileRef, OpenFile, OpenFlags, SeekFrom};
@@ -36,6 +36,6 @@ pub fn init() {
     let filesystem: Arc<dyn FileSystem> = filesystem;
     vfs::init_root(filesystem).expect("fs: failed to mount root filesystem");
     devtempfs::mount_global().expect("fs: failed to mount devtempfs");
-    info!("fs: mounted tmpfs root");
-    info!("fs: mounted devtempfs at /dev");
+    crate::sys::klog::dev::register().expect("fs: failed to publish kernel log devices");
+    debug!("mounted tmpfs on / and devtempfs on /dev");
 }

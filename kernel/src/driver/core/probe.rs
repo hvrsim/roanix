@@ -18,7 +18,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use log::{debug, error};
+use log::{debug, warn};
 
 use crate::sys::sync::{Mutex, Once};
 
@@ -197,10 +197,7 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
         match candidate.evaluate(device) {
             Ok(Some(result)) => candidates.push((result.score, result.data, candidate)),
             Ok(None) => {}
-            Err(error) => debug!(
-                "driver: bus match for {} failed: {error:?}",
-                device.path()
-            ),
+            Err(error) => debug!("bus match for {} failed: {error:?}", device.path()),
         }
     }
     if candidates.is_empty() {
@@ -228,9 +225,18 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
                 park(device);
                 return;
             }
+            // A driver declining hardware that is simply absent is the
+            // normal outcome of probing a static device list, so it stays out
+            // of the way at debug. Anything else means a driver that matched
+            // the device could not drive it, which someone has to see.
+            Err(Error::NoDevice) => debug!(
+                "{} found no device at {}",
+                candidate.name(),
+                device.path()
+            ),
             Err(error) => {
-                error!(
-                    "driver: {} failed to probe {}: {error:?}",
+                warn!(
+                    "{} failed to probe {}: {error:?}",
                     candidate.name(),
                     device.path()
                 );
@@ -368,6 +374,6 @@ pub fn report_unbound() {
     });
     for path in deferred {
         let path: alloc::string::String = path;
-        debug!("driver: {path} is still waiting for a prerequisite");
+        debug!("{path} is still waiting for a prerequisite");
     }
 }
