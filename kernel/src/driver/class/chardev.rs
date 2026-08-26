@@ -17,16 +17,14 @@ use alloc::{
 };
 use core::{
     ffi::c_void,
+    mem::{MaybeUninit, size_of},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
     fs::{
         self, Error as FsError, IoctlContext, PollEvents, Result as FsResult,
-        devtempfs::{
-            self, DevNodeId, DeviceNodeKind, DeviceNodeOps, Devtempfs, OwnerId, read_windows,
-            write_windows,
-        },
+        provider::{self, FsTerminalState},
     },
     mem::{IoSink, IoSource},
     sys::{event::Event, sync::Mutex},
@@ -35,9 +33,10 @@ use crate::{
 use super::super::{
     core::{
         device::Device,
-        module::{self, Module},
+        module::{self, Module, ModuleLease},
     },
     error::{self, Error, Result},
+    obj::{ObjHeader, ObjKind},
 };
 
 /// Node kinds a driver may create.
@@ -46,6 +45,115 @@ pub mod kind {
     pub const CHARACTER: u32 = 1;
     /// Random-access block device.
     pub const BLOCK: u32 = 2;
+}
+
+/// Stable identifier for a node within the devfs namespace.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DevNodeId(u64);
+
+impl DevNodeId {
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw namespace identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The operation surface a device node implementation provides.
+///
+/// Kernel-native nodes implement this trait directly; loadable modules
+/// instead supply a [`NodeOps`] C table, which the adapter below dispatches.
+pub trait DeviceNodeOps: Send + Sync {
+    /// Byte offset reads start from when the node has no stored offset.
+    fn initial_offset(&self, _file_context: usize, _flags: u32) -> FsResult<u64> {
+        Ok(0)
+    }
+
+    /// Creates per-open state and returns its opaque identifier.
+    fn open(&self, _flags: u32) -> FsResult<usize> {
+        Ok(0)
+    }
+
+    /// Releases state returned by [`Self::open`].
+    fn close(&self, _file_context: usize, _flags: u32) {}
+
+    /// Reads bytes without per-open state or flags.
+    fn read_at(&self, _offset: u64, _sink: &mut IoSink<'_>) -> FsResult<usize> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Writes bytes without per-open state or flags.
+    fn write_at(&self, _offset: u64, _source: &IoSource<'_>) -> FsResult<usize> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Reads bytes using per-open state and open flags.
+    fn read_at_with_flags(
+        &self,
+        file_context: usize,
+        offset: u64,
+        sink: &mut IoSink<'_>,
+        flags: u32,
+    ) -> FsResult<usize>;
+
+    /// Writes bytes using per-open state and open flags.
+    fn write_at_with_flags(
+        &self,
+        file_context: usize,
+        offset: u64,
+        source: &IoSource<'_>,
+        flags: u32,
+    ) -> FsResult<usize>;
+
+    /// Reports the subset of requested events that are immediately ready.
+    fn poll(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        _events: PollEvents,
+        _flags: u32,
+    ) -> FsResult<PollEvents> {
+        Ok(PollEvents::empty())
+    }
+
+    /// Appends waitable events and returns whether the request is supported.
+    fn poll_events<'a>(
+        &'a self,
+        _file_context: usize,
+        _events: PollEvents,
+        _output: &mut Vec<&'a Event>,
+    ) -> bool {
+        false
+    }
+
+    /// Returns terminal job-control state when this node is a terminal.
+    fn terminal_state(&self) -> Option<crate::fs::vnode::TerminalState> {
+        None
+    }
+
+    /// Returns the logical size in bytes.
+    fn size(&self) -> u64 {
+        0
+    }
+
+    /// Flushes pending state to the backing device.
+    fn sync(&self) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Performs a device-specific control operation.
+    fn ioctl(
+        &self,
+        file_context: usize,
+        context: IoctlContext,
+        request: u64,
+        value: u64,
+        argument: &mut [u8],
+    ) -> FsResult<u64>;
 }
 
 /// Operations a driver implements for a device node.
@@ -93,6 +201,8 @@ pub struct NodeOps {
     pub writable_event: Option<unsafe extern "C" fn(*mut c_void, usize) -> usize>,
     /// Returns an event signalled after the device hangs up.
     pub hangup_event: Option<unsafe extern "C" fn(*mut c_void, usize) -> usize>,
+    /// Appended in ABI minor 1; legacy tables leave it absent.
+    pub terminal_state: Option<unsafe extern "C" fn(*mut c_void, *mut FsTerminalState) -> i32>,
 }
 
 /// Caller identity supplied to a control operation.
@@ -143,15 +253,41 @@ impl Node {
         module::pin_owner(self.owner.as_ref(), true).ok()
     }
 
-    fn event(&self, callback: Option<unsafe extern "C" fn(*mut c_void, usize) -> usize>,
-        file_context: usize) -> Option<&'static Event> {
+    fn event(
+        &self,
+        callback: Option<unsafe extern "C" fn(*mut c_void, usize) -> usize>,
+        file_context: usize,
+    ) -> Option<&'static Event> {
         let callback = callback?;
         let _pin = self.pin().ok()?;
         // SAFETY: registration validated the callback.
         let pointer = unsafe { callback(self.ops.context, file_context) };
         super::super::abi::events::resolve(pointer)
     }
+
+    /// The terminal job-control state of the node, when it implements the request.
+    fn terminal_state_value(&self) -> Option<crate::fs::vnode::TerminalState> {
+        let callback = self.ops.terminal_state?;
+        let mut state = FsTerminalState {
+            session: 0,
+            foreground_group: 0,
+            stop_background_output: 0,
+            reserved: [0; 3],
+        };
+        // SAFETY: the record outlives this immediate call.
+        let status = unsafe { callback(self.ops.context, &raw mut state) };
+        if status != error::STATUS_OK {
+            return None;
+        }
+        Some(crate::fs::vnode::TerminalState {
+            session: state.session,
+            foreground_group: state.foreground_group,
+            stop_background_output: state.stop_background_output != 0,
+        })
+    }
 }
+
+pub(crate) const NODE_OPS_LEGACY_SIZE: usize = 112;
 
 fn signed_result(value: i64) -> FsResult<usize> {
     if value < 0 {
@@ -159,6 +295,92 @@ fn signed_result(value: i64) -> FsResult<usize> {
     } else {
         Ok(value as usize)
     }
+}
+
+/// Runs `transfer` once per page-bounded window of `sink`.
+fn read_windows<F>(
+    sink: &mut IoSink<'_>,
+    offset: u64,
+    flags: u32,
+    mut transfer: F,
+) -> FsResult<usize>
+where
+    F: FnMut(u64, &mut [u8], u32) -> FsResult<usize>,
+{
+    let total = sink.len();
+    let mut done = 0;
+    while done < total {
+        let window_flags = if done == 0 {
+            flags
+        } else {
+            flags | fs::OpenFlags::NONBLOCK.bits()
+        };
+        let mut window = sink
+            .window(done, total - done)
+            .map_err(|_| FsError::InvalidArgument)?;
+        if window.is_empty() {
+            break;
+        }
+        let capacity = window.len();
+        let count = match transfer(
+            offset.saturating_add(done as u64),
+            &mut window,
+            window_flags,
+        ) {
+            Ok(count) => count,
+            Err(_) if done != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if count > capacity {
+            return Err(FsError::Io);
+        }
+        done += count;
+        if count < capacity {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// Runs `transfer` once per page-bounded window of `source`.
+fn write_windows<F>(
+    source: &IoSource<'_>,
+    offset: u64,
+    flags: u32,
+    mut transfer: F,
+) -> FsResult<usize>
+where
+    F: FnMut(u64, &[u8], u32) -> FsResult<usize>,
+{
+    let total = source.len();
+    let mut done = 0;
+    while done < total {
+        let window_flags = if done == 0 {
+            flags
+        } else {
+            flags | fs::OpenFlags::NONBLOCK.bits()
+        };
+        let window = source
+            .window(done, total - done)
+            .map_err(|_| FsError::InvalidArgument)?;
+        if window.is_empty() {
+            break;
+        }
+        let capacity = window.len();
+        let count = match transfer(offset.saturating_add(done as u64), &window, window_flags) {
+            Ok(count) => count,
+            Err(_) if done != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if count > capacity {
+            return Err(FsError::Io);
+        }
+        done += count;
+        if count < capacity {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 impl DeviceNodeOps for Node {
@@ -277,15 +499,8 @@ impl DeviceNodeOps for Node {
         };
         let _pin = self.pin()?;
         // SAFETY: registration validated the callback.
-        let value = unsafe {
-            callback(
-                self.ops.context,
-                file_context,
-                offset,
-                events.bits(),
-                flags,
-            )
-        };
+        let value =
+            unsafe { callback(self.ops.context, file_context, offset, events.bits(), flags) };
         if value < 0 {
             return Err(Error::from_status(value as i32).into());
         }
@@ -372,29 +587,309 @@ impl DeviceNodeOps for Node {
         }
         Ok(result as u64)
     }
+
+    fn terminal_state(&self) -> Option<crate::fs::vnode::TerminalState> {
+        self.terminal_state_value()
+    }
 }
 
-fn filesystem() -> Result<&'static Arc<Devtempfs>> {
-    devtempfs::global().map_err(Error::from)
+/// One driver-backed device endpoint retained by the devfs provider.
+///
+/// The receipt owns a module lease rather than taking transient callback
+/// pins. The provider retains this receipt for every live vnode and open file,
+/// which keeps the hardware driver's code resident through all callbacks.
+struct Endpoint {
+    header: ObjHeader,
+    operations: Arc<dyn DeviceNodeOps>,
+    _lease: ModuleLease,
 }
 
-/// Returns the identifier of the device filesystem root.
+// SAFETY: `DeviceNodeOps` is `Send + Sync`, and the immutable lease has no
+// interior mutability.
+unsafe impl Send for Endpoint {}
+// SAFETY: the same immutable fields make shared endpoint references safe.
+unsafe impl Sync for Endpoint {}
+
+pub(crate) fn endpoint_receipt(
+    owner: Option<&Arc<Module>>,
+    name: &str,
+    operations: Arc<dyn DeviceNodeOps>,
+) -> Result<*mut c_void> {
+    let header = ObjHeader::new_with(
+        ObjKind::DeviceNode,
+        Some(name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
+    let lease = match owner {
+        Some(module) => module::lease(module)?,
+        None => ModuleLease::none(),
+    };
+    let endpoint = Arc::new(Endpoint {
+        header,
+        operations,
+        _lease: lease,
+    });
+    endpoint.header.register()?;
+    // SAFETY: the receipt leaks one strong reference; release consumes it.
+    Ok(Arc::into_raw(endpoint).cast_mut().cast())
+}
+
+unsafe fn borrow_endpoint<'a>(receipt: *mut c_void) -> Result<&'a Endpoint> {
+    if receipt.is_null() {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: the caller guarantees a live endpoint receipt for 'a.
+    Ok(unsafe { &*(receipt.cast::<Endpoint>()) })
+}
+
+pub(crate) unsafe fn endpoint_open(receipt: *mut c_void, flags: u32) -> Result<usize> {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    endpoint.operations.open(flags).map_err(Error::from)
+}
+
+pub(crate) unsafe fn endpoint_close(receipt: *mut c_void, file: usize, flags: u32) {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = match unsafe { borrow_endpoint(receipt) } {
+        Ok(endpoint) => endpoint,
+        Err(_) => return,
+    };
+    endpoint.operations.close(file, flags);
+}
+
+pub(crate) unsafe fn endpoint_initial_offset(
+    receipt: *mut c_void,
+    file: usize,
+    flags: u32,
+) -> Result<u64> {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    endpoint
+        .operations
+        .initial_offset(file, flags)
+        .map_err(Error::from)
+}
+
+pub(crate) unsafe fn endpoint_read(
+    receipt: *mut c_void,
+    file: usize,
+    offset: u64,
+    buffer: *mut u8,
+    length: usize,
+    flags: u32,
+) -> Result<i64> {
+    use core::slice;
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    let data = if length == 0 {
+        &mut []
+    } else {
+        if buffer.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        // SAFETY: the non-null ABI buffer is writable for `length` bytes.
+        unsafe { slice::from_raw_parts_mut(buffer, length) }
+    };
+    let read = endpoint
+        .operations
+        .read_at_with_flags(file, offset, &mut IoSink::kernel(data), flags)
+        .map_err(Error::from)?;
+    i64::try_from(read).map_err(|_| Error::InvalidArgument)
+}
+
+pub(crate) unsafe fn endpoint_write(
+    receipt: *mut c_void,
+    file: usize,
+    offset: u64,
+    buffer: *const u8,
+    length: usize,
+    flags: u32,
+) -> Result<i64> {
+    use core::slice;
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    let data = if length == 0 {
+        &[]
+    } else {
+        if buffer.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        // SAFETY: the non-null ABI buffer is readable for `length` bytes.
+        unsafe { slice::from_raw_parts(buffer, length) }
+    };
+    let written = endpoint
+        .operations
+        .write_at_with_flags(file, offset, &IoSource::kernel(data), flags)
+        .map_err(Error::from)?;
+    i64::try_from(written).map_err(|_| Error::InvalidArgument)
+}
+
+pub(crate) unsafe fn endpoint_size(receipt: *mut c_void) -> u64 {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = match unsafe { borrow_endpoint(receipt) } {
+        Ok(endpoint) => endpoint,
+        Err(_) => return 0,
+    };
+    endpoint.operations.size()
+}
+
+pub(crate) unsafe fn endpoint_sync(receipt: *mut c_void) -> Result<()> {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    endpoint.operations.sync().map_err(Error::from)
+}
+
+pub(crate) unsafe fn endpoint_poll(
+    receipt: *mut c_void,
+    file: usize,
+    offset: u64,
+    events: u16,
+    flags: u32,
+) -> Result<u16> {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    Ok(endpoint
+        .operations
+        .poll(file, offset, PollEvents::from_bits_truncate(events), flags)
+        .map_err(Error::from)?
+        .bits())
+}
+
+pub(crate) unsafe fn endpoint_event(receipt: *mut c_void, file: usize, selector: u32) -> usize {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = match unsafe { borrow_endpoint(receipt) } {
+        Ok(endpoint) => endpoint,
+        Err(_) => return 0,
+    };
+    let requested = match selector {
+        provider::DEVFS_EVENT_READABLE => PollEvents::IN | PollEvents::RDNORM,
+        provider::DEVFS_EVENT_WRITABLE => PollEvents::OUT | PollEvents::WRNORM,
+        provider::DEVFS_EVENT_HANGUP => PollEvents::HUP,
+        _ => return 0,
+    };
+    let mut events = Vec::new();
+    if !endpoint
+        .operations
+        .poll_events(file, requested, &mut events)
+    {
+        return 0;
+    }
+    events
+        .first()
+        .map_or(0, |event| (*event as *const Event).cast::<()>() as usize)
+}
+
+pub(crate) unsafe fn endpoint_terminal_state(receipt: *mut c_void) -> Result<FsTerminalState> {
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    let state = endpoint.operations.terminal_state().ok_or(Error::NotTty)?;
+    Ok(FsTerminalState {
+        session: state.session,
+        foreground_group: state.foreground_group,
+        stop_background_output: state.stop_background_output as u8,
+        reserved: [0; 3],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn endpoint_ioctl(
+    receipt: *mut c_void,
+    file: usize,
+    process: u64,
+    group: i32,
+    session: i32,
+    session_leader: bool,
+    request: u64,
+    value: u64,
+    argument: *mut u8,
+    length: usize,
+) -> Result<u64> {
+    use core::slice;
+    // SAFETY: the caller guarantees a live endpoint receipt.
+    let endpoint = unsafe { borrow_endpoint(receipt) }?;
+    let data = if length == 0 {
+        &mut []
+    } else {
+        if argument.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        // SAFETY: the non-null ABI buffer is writable for `length` bytes.
+        unsafe { slice::from_raw_parts_mut(argument, length) }
+    };
+    let context = IoctlContext {
+        process_id: process as usize,
+        process_group: group,
+        session_id: session,
+        is_session_leader: session_leader,
+    };
+    endpoint
+        .operations
+        .ioctl(file, context, request, value, data)
+        .map_err(Error::from)
+}
+
+/// Releases one endpoint receipt consumed by devfs.
+///
+/// # Safety
+///
+/// `receipt` must be an owned endpoint receipt consumed exactly once.
+pub unsafe fn endpoint_release(receipt: *mut c_void) {
+    if !receipt.is_null() {
+        // SAFETY: forwarded from this function's contract.
+        drop(unsafe { Arc::from_raw(receipt.cast::<Endpoint>()) });
+    }
+}
+
+/// Copies a size-prefixed node table without reading past an old ABI table.
+///
+/// # Safety
+///
+/// `operations` must point to a readable table containing at least its
+/// size-prefixed legacy prefix.
+pub(crate) unsafe fn copy_node_ops(operations: *const NodeOps) -> Result<NodeOps> {
+    if operations.is_null() {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: only the always-present prefix field is read before checking.
+    let declared = unsafe { (*operations).size as usize };
+    if declared < NODE_OPS_LEGACY_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    let copied = declared.min(size_of::<NodeOps>());
+    let mut table = MaybeUninit::<NodeOps>::zeroed();
+    // SAFETY: `copied` is no larger than one full destination table and no
+    // larger than what the caller declares readable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            operations.cast::<u8>(),
+            table.as_mut_ptr().cast::<u8>(),
+            copied,
+        );
+        Ok(table.assume_init())
+    }
+}
+
+/// Returns the identifier of the devfs root.
 pub fn root() -> Result<DevNodeId> {
-    Ok(filesystem()?.root_id())
+    Ok(DevNodeId::from_raw(provider::devfs_root()?))
 }
 
-fn owner_token(owner: Option<&Arc<Module>>) -> OwnerId {
-    owner.map_or(OwnerId::KERNEL, |module| OwnerId::new(module.id().get()))
+fn owner_id(owner: Option<&Arc<Module>>) -> u64 {
+    owner.map_or(0, |module| module.id().get())
 }
 
-/// Creates a directory below the device filesystem root.
+/// Creates a directory inside the devfs namespace.
 pub fn create_directory(
     owner: Option<&Arc<Module>>,
     parent: DevNodeId,
     name: &str,
     mode: u16,
 ) -> Result<DevNodeId> {
-    Ok(filesystem()?.create_dir(owner_token(owner), parent, name.as_bytes(), mode)?)
+    match provider::devfs_mkdir(owner_id(owner), parent.get(), name.as_bytes(), mode) {
+        Ok(id) => Ok(DevNodeId::from_raw(id)),
+        Err(error) => Err(error),
+    }
 }
 
 /// Creates a device node backed by a driver's operation table.
@@ -412,12 +907,13 @@ pub unsafe fn create_node(
     mode: u16,
     ops: NodeOps,
 ) -> Result<(DevNodeId, Arc<Node>)> {
-    if (ops.size as usize) < size_of::<NodeOps>() {
+    if (ops.size as usize) < NODE_OPS_LEGACY_SIZE {
         return Err(Error::InvalidArgument);
     }
+
     let devfs_kind = match node_kind {
-        kind::CHARACTER => DeviceNodeKind::Character,
-        kind::BLOCK => DeviceNodeKind::Block,
+        kind::CHARACTER => provider::FS_KIND_CHARACTER_DEVICE,
+        kind::BLOCK => provider::FS_KIND_BLOCK_DEVICE,
         _ => return Err(Error::InvalidArgument),
     };
     let node = Arc::new(Node {
@@ -427,22 +923,33 @@ pub unsafe fn create_node(
         devfs: Mutex::new(None),
         opens: AtomicU64::new(0),
     });
-    let id = filesystem()?.create_device(
-        owner_token(owner),
-        parent,
+    let operations: Arc<dyn DeviceNodeOps> = node.clone();
+    let endpoint = endpoint_receipt(owner, name, operations)?;
+    let id = match provider::devfs_create(
+        owner_id(owner),
+        parent.get(),
         name.as_bytes(),
         devfs_kind,
         mode,
-        node.clone(),
-    )?;
+        endpoint,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            // SAFETY: creation failed and the broker did not consume the
+            // endpoint receipt.
+            unsafe { endpoint_release(endpoint) };
+            return Err(error);
+        }
+    };
+    let id = DevNodeId::from_raw(id);
     *node.devfs.lock() = Some(id);
     Ok((id, node))
 }
 
 /// Publishes an existing filesystem-level device implementation.
 ///
-/// Used by kernel-side classes such as the terminal layer, which supply a Rust
-/// implementation rather than a C operation table.
+/// Used by kernel-side classes such as the terminal layer, which supply a
+/// Rust implementation rather than a C operation table.
 pub fn create_native_node(
     owner: Option<&Arc<Module>>,
     parent: DevNodeId,
@@ -452,52 +959,63 @@ pub fn create_native_node(
     ops: Arc<dyn DeviceNodeOps>,
 ) -> Result<DevNodeId> {
     let devfs_kind = match node_kind {
-        kind::CHARACTER => DeviceNodeKind::Character,
-        kind::BLOCK => DeviceNodeKind::Block,
+        kind::CHARACTER => provider::FS_KIND_CHARACTER_DEVICE,
+        kind::BLOCK => provider::FS_KIND_BLOCK_DEVICE,
         _ => return Err(Error::InvalidArgument),
     };
-    Ok(filesystem()?.create_device(
-        owner_token(owner),
-        parent,
+    let endpoint = endpoint_receipt(owner, name, ops)?;
+    match provider::devfs_create(
+        owner_id(owner),
+        parent.get(),
         name.as_bytes(),
         devfs_kind,
         mode,
-        ops,
-    )?)
+        endpoint,
+    ) {
+        Ok(id) => Ok(DevNodeId::from_raw(id)),
+        Err(error) => {
+            // SAFETY: a failed create leaves ownership with the caller.
+            unsafe { endpoint_release(endpoint) };
+            Err(error)
+        }
+    }
 }
 
 /// Removes a node created by this module.
 pub fn remove(owner: Option<&Arc<Module>>, node: DevNodeId) -> Result<()> {
-    Ok(filesystem()?.remove_node(owner_token(owner), node)?)
+    provider::devfs_remove(owner_id(owner), node.get())
 }
 
 /// Removes every node created by `module`.
 pub fn remove_module_nodes(module: &Arc<Module>) {
-    let Ok(filesystem) = filesystem() else {
-        return;
-    };
-    let _ = filesystem.force_remove_owner(OwnerId::new(module.id().get()));
+    let _ = provider::devfs_remove_owner(module.id().get(), true);
 }
 
-/// Resolves an absolute device-filesystem path to a node identifier.
+/// Removes nodes only if none are busy; returns whether any remain.
+pub fn try_remove_module_nodes(module: &Arc<Module>) -> Result<()> {
+    provider::devfs_remove_owner(module.id().get(), true)
+}
+
+/// Resolves an absolute devfs path to a node identifier.
 pub fn lookup(path: &str) -> Result<DevNodeId> {
-    let mut current = root()?;
-    for component in path.split('/').filter(|part| !part.is_empty()) {
-        current = filesystem()?.lookup_child(current, component.as_bytes())?;
-    }
-    Ok(current)
+    Ok(DevNodeId::from_raw(provider::devfs_lookup(
+        path.as_bytes(),
+    )?))
 }
 
 /// Returns whether the device filesystem is mounted.
 pub fn available() -> bool {
-    fs::devtempfs::global().is_ok()
+    provider::devfs_root().is_ok()
 }
 
 /// Returns the names of the entries directly below `parent`.
 pub fn children(parent: DevNodeId) -> Result<Vec<Box<str>>> {
-    Ok(filesystem()?
-        .child_names(parent)?
+    Ok(provider::devfs_children(parent.get())?
         .into_iter()
-        .map(|name| String::from_utf8_lossy(&name).to_string().into_boxed_str())
+        .map(|entry| {
+            String::from_utf8_lossy(&entry.name[..entry.name_length as usize])
+                .to_string()
+                .into_boxed_str()
+        })
         .collect())
 }

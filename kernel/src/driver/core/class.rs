@@ -102,7 +102,7 @@ impl Class {
 #[repr(C)]
 pub struct ClassDevice {
     header: ObjHeader,
-    class: Arc<Class>,
+    class: Weak<Class>,
     device: Option<Weak<Device>>,
     owner: Option<Arc<Module>>,
     name: Name,
@@ -125,8 +125,8 @@ unsafe impl Sync for ClassDevice {}
 
 impl ClassDevice {
     /// Returns the class this membership belongs to.
-    pub fn class(&self) -> &Arc<Class> {
-        &self.class
+    pub fn class(&self) -> Option<Arc<Class>> {
+        self.class.upgrade()
     }
 
     /// Returns the underlying device, if it still exists.
@@ -232,14 +232,21 @@ pub unsafe fn register(
     if classes.iter().any(|class| &*class.name == name) {
         return Err(Error::AlreadyExists);
     }
+    let header = ObjHeader::new_with(
+        ObjKind::Class,
+        Some(name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let class = Arc::new(Class {
-        header: ObjHeader::new(ObjKind::Class),
+        header,
         name: String::from(name).into_boxed_str(),
         owner: owner.cloned(),
         ops,
         members: Mutex::new(Vec::new()),
         next_index: AtomicU64::new(0),
     });
+    class.header.register()?;
     classes.push(class.clone());
     drop(classes);
     super::probe::retrigger();
@@ -256,6 +263,9 @@ pub fn unregister(class: &Arc<Class>) -> Result<()> {
 }
 
 fn force_unregister(class: &Arc<Class>) {
+    class
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
     for member in class.members() {
         remove_device(&member);
     }
@@ -303,9 +313,15 @@ pub unsafe fn add_device(
     {
         return Err(Error::AlreadyExists);
     }
+    let header = ObjHeader::new_with(
+        ObjKind::ClassDevice,
+        Some(&membership.name),
+        owner.map(|module| module.id().get()),
+        Some(class.header.id()),
+    );
     let member = Arc::new(ClassDevice {
-        header: ObjHeader::new(ObjKind::ClassDevice),
-        class: class.clone(),
+        header,
+        class: Arc::downgrade(class),
         device: device.map(Arc::downgrade),
         owner: owner.cloned(),
         name: Name::new(&membership.name),
@@ -316,12 +332,14 @@ pub unsafe fn add_device(
         class_data: Mutex::new(0),
         live: AtomicBool::new(true),
     });
+    member.header.register()?;
     members.push(member.clone());
     drop(members);
 
     // The member's module now depends on the class provider staying loaded.
     if let Err(error) = module::link(owner, class.owner.as_ref()) {
         detach_member(class, &member);
+        member.header.poison();
         return Err(error);
     }
 
@@ -333,6 +351,7 @@ pub unsafe fn add_device(
         if let Err(error) = error::from_status(status) {
             module::unlink(owner, class.owner.as_ref());
             detach_member(class, &member);
+            member.header.poison();
             return Err(error);
         }
     }
@@ -348,7 +367,13 @@ pub fn remove_device(member: &Arc<ClassDevice>) {
     if !member.live.swap(false, Ordering::AcqRel) {
         return;
     }
-    let class = member.class.clone();
+    member
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
+    let Some(class) = member.class() else {
+        member.header.poison();
+        return;
+    };
     if let Some(detach) = class.ops.detach
         && let Ok(_pin) = module::pin_owner(class.owner.as_ref(), true)
     {

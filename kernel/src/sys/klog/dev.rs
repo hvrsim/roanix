@@ -19,11 +19,8 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    fs::{
-        Error, OpenFlags, PollEvents, Result,
-        devtempfs::{self, DeviceNodeKind, DeviceNodeOps, OwnerId},
-        vnode::IoctlContext,
-    },
+    driver::class::chardev::{self, DeviceNodeOps},
+    fs::{Error, OpenFlags, PollEvents, Result, vnode::IoctlContext},
     mem::{IoSink, IoSource},
     sys::{event::Event, sync::Mutex},
 };
@@ -378,21 +375,21 @@ const MAX_USER_WRITE: usize = 4096;
 
 /// Publishes `/dev/klog` and `/dev/kmsg`.
 pub(crate) fn register() -> Result<()> {
-    let devfs = devtempfs::global()?;
-    let root = devfs.root_id();
+    let root = chardev::root().map_err(Error::from)?;
 
     for (name, encoding, mode) in [
         (&b"klog"[..], Encoding::Packets, 0o600),
         (&b"kmsg"[..], Encoding::Text, 0o600),
     ] {
-        devfs.create_device(
-            OwnerId::KERNEL,
+        chardev::create_native_node(
+            None,
             root,
-            name,
-            DeviceNodeKind::Character,
+            core::str::from_utf8(name).map_err(|_| Error::InvalidArgument)?,
+            chardev::kind::CHARACTER,
             mode,
             Arc::new(LogDevice { encoding }),
-        )?;
+        )
+        .map_err(Error::from)?;
     }
 
     let stats = super::stats();

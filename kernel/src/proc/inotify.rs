@@ -9,8 +9,8 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use crate::{
-    mem::IoSink,
     fs::{self, PollEvents, VnodeKey, VnodeKind},
+    mem::IoSink,
     proc::Descriptor,
     sys::{
         event::Event,

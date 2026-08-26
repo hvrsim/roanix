@@ -560,7 +560,8 @@ impl Vmem {
             let mut index = self.hash[bucket];
             while index != NIL {
                 let next = self.segments[index as usize].link_next;
-                let target = bucket_index(self.segments[index as usize].base, self.quantum, buckets);
+                let target =
+                    bucket_index(self.segments[index as usize].base, self.quantum, buckets);
                 let head = fresh[target];
                 self.segments[index as usize].link_prev = NIL;
                 self.segments[index as usize].link_next = head;
@@ -609,7 +610,11 @@ fn freelist_index(size: u64) -> usize {
 #[inline]
 fn guaranteed_freelist(size: u64) -> usize {
     let floor = freelist_index(size);
-    if size.is_power_of_two() { floor } else { floor + 1 }
+    if size.is_power_of_two() {
+        floor
+    } else {
+        floor + 1
+    }
 }
 
 #[inline]

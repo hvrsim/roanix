@@ -100,6 +100,7 @@ pub struct Module {
     description: Option<Box<str>>,
     state: AtomicU32,
     active: AtomicU64,
+    leases: AtomicU64,
     exit: Option<ExitFn>,
     edges: Mutex<Edges>,
     backing: Mutex<Option<Box<dyn ModuleBacking>>>,
@@ -145,6 +146,11 @@ impl Module {
     pub fn dependent_count(&self) -> usize {
         self.edges.lock().dependents.len()
     }
+
+    /// Returns the number of long-lived consumers keeping this module resident.
+    pub fn lease_count(&self) -> u64 {
+        self.leases.load(Ordering::Acquire)
+    }
 }
 
 /// Pins a module so it cannot finish unloading while a callback runs.
@@ -158,6 +164,36 @@ impl Drop for ModuleGuard {
             let previous = module.active.fetch_sub(1, Ordering::Release);
             debug_assert!(previous != 0, "driver: module callback underflow");
         }
+    }
+}
+
+/// Long-lived reference that prevents a provider module from unloading.
+///
+/// Interfaces already record module dependency edges. A lease is for kernel
+/// adapters that retain a module callback table directly, such as a selected
+/// clocksource or another singleton provider.
+pub struct ModuleLease {
+    module: Option<Arc<Module>>,
+}
+
+impl Drop for ModuleLease {
+    fn drop(&mut self) {
+        if let Some(module) = self.module.take() {
+            let previous = module.leases.fetch_sub(1, Ordering::Release);
+            debug_assert!(previous != 0, "driver: module lease underflow");
+        }
+    }
+}
+
+impl ModuleLease {
+    /// Returns a lease that owns no module, used for kernel providers.
+    pub const fn none() -> Self {
+        Self { module: None }
+    }
+
+    /// Returns the leased module, if the provider is loadable.
+    pub fn module(&self) -> Option<&Arc<Module>> {
+        self.module.as_ref()
     }
 }
 
@@ -200,6 +236,30 @@ pub fn pin_owner(module: Option<&Arc<Module>>, allow_unloading: bool) -> Result<
     }
 }
 
+/// Acquires a long-lived lease on `module`.
+pub fn lease(module: &Arc<Module>) -> Result<ModuleLease> {
+    if !state_allows(module.state.load(Ordering::Acquire), false) {
+        return Err(Error::NoDevice);
+    }
+    module.leases.fetch_add(1, Ordering::AcqRel);
+    if !state_allows(module.state.load(Ordering::Acquire), false) {
+        let previous = module.leases.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous != 0, "driver: module lease underflow");
+        return Err(Error::NoDevice);
+    }
+    Ok(ModuleLease {
+        module: Some(module.clone()),
+    })
+}
+
+/// Leases an optional module owner, succeeding trivially for kernel providers.
+pub fn lease_owner(module: Option<&Arc<Module>>) -> Result<ModuleLease> {
+    match module {
+        Some(module) => lease(module),
+        None => Ok(ModuleLease::none()),
+    }
+}
+
 fn state_allows(current: u32, allow_unloading: bool) -> bool {
     current == state::LIVE
         || current == state::LOADING
@@ -207,16 +267,19 @@ fn state_allows(current: u32, allow_unloading: bool) -> bool {
 }
 
 struct Registry {
-    next_id: AtomicU64,
     modules: Mutex<BTreeMap<ModuleId, Arc<Module>>>,
+    /// Serializes cycle checks with edge insertion: checking unlocked against
+    /// per-module edge locks lets two opposite-direction dependencies race
+    /// into a permanent cycle no module could ever unload.
+    graph: Mutex<()>,
 }
 
 static REGISTRY: Once<Registry> = Once::new();
 
 pub(crate) fn init() {
     REGISTRY.call_once(|| Registry {
-        next_id: AtomicU64::new(1),
         modules: Mutex::new(BTreeMap::new()),
+        graph: Mutex::new(()),
     });
 }
 
@@ -235,24 +298,22 @@ pub unsafe fn load(definition: ModuleDefinition) -> Result<Arc<Module>> {
     if definition.name.is_empty() || definition.name.len() > 64 {
         return Err(Error::InvalidArgument);
     }
-    {
-        let modules = registry.modules.lock();
-        if modules
-            .values()
-            .any(|module| module.name.as_str() == &*definition.name)
-        {
-            return Err(Error::AlreadyExists);
-        }
-    }
 
-    let id = ModuleId(registry.next_id.fetch_add(1, Ordering::Relaxed));
+    let header = ObjHeader::new_with(
+        super::super::obj::ObjKind::Module,
+        Some(&definition.name),
+        None,
+        None,
+    );
+    let id = ModuleId(header.id());
     let module = Arc::new(Module {
-        header: ObjHeader::new(super::super::obj::ObjKind::Module),
+        header,
         id,
         name: Name::new(&definition.name),
         description: definition.description,
         state: AtomicU32::new(state::LOADING),
         active: AtomicU64::new(0),
+        leases: AtomicU64::new(0),
         exit: definition.exit,
         edges: Mutex::new(Edges {
             depends_on: BTreeMap::new(),
@@ -260,15 +321,32 @@ pub unsafe fn load(definition: ModuleDefinition) -> Result<Arc<Module>> {
         }),
         backing: Mutex::new(definition.backing),
     });
-    registry.modules.lock().insert(id, module.clone());
+    {
+        let mut modules = registry.modules.lock();
+        if modules
+            .values()
+            .any(|entry| entry.name.as_str() == module.name.as_str())
+        {
+            return Err(Error::AlreadyExists);
+        }
+        module.header.register()?;
+        modules.insert(id, module.clone());
+    }
 
     let handle = super::super::obj::handle(&module);
     // SAFETY: the module contract guarantees `init` follows the ABI and stays
     // executable, and the handle addresses a live module for the whole call.
     let status = unsafe { (definition.init)(handle) };
     if status < 0 {
-        module.state.store(state::UNLOADING, Ordering::Release);
+        {
+            let _graph = registry.graph.lock();
+            module.state.store(state::UNLOADING, Ordering::Release);
+        }
+        module
+            .header
+            .set_state(super::super::obj::ObjState::Removing);
         teardown(&module);
+        drop_edges(&module);
         module.state.store(state::DEAD, Ordering::Release);
         module.header.poison();
         registry.modules.lock().remove(&id);
@@ -289,26 +367,49 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
     if !module.edges.lock().dependents.is_empty() {
         return Err(Error::Busy);
     }
-
-    if module
-        .state
-        .compare_exchange(
-            state::LIVE,
-            state::UNLOADING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if module.active.load(Ordering::Acquire) != 0 {
         return Err(Error::Busy);
     }
 
-    teardown(module);
+    // Terminal receipts deliberately lease their backends. Release any
+    // backend-owned receipts while the module is still live so the normal
+    // driver teardown below is reachable rather than deadlocking on its own
+    // lease. A busy devfs node remains registered and keeps unload rejected.
+    super::super::class::console::remove_module_terminals(module);
+    super::super::class::chardev::try_remove_module_nodes(module)?;
+    if module.lease_count() != 0 {
+        return Err(Error::Busy);
+    }
 
-    if module.active.load(Ordering::Acquire) != 0 {
+    {
+        // Serialize the final dependent check with edge insertion. Once the
+        // state changes, new links reject this provider before publishing an
+        // edge or callback reference.
+        let _graph = registry.graph.lock();
+        if !module.edges.lock().dependents.is_empty()
+            || module
+                .state
+                .compare_exchange(
+                    state::LIVE,
+                    state::UNLOADING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(Error::Busy);
+        }
+    }
+
+    if module.active.load(Ordering::Acquire) != 0 || module.lease_count() != 0 {
         module.state.store(state::LIVE, Ordering::Release);
         return Err(Error::Busy);
     }
+
+    module
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
+    teardown(module);
 
     if let Some(exit) = module.exit {
         let handle = super::super::obj::handle(module);
@@ -343,6 +444,8 @@ fn teardown(module: &Arc<Module>) {
     super::super::io::dma::remove_module_buffers(module);
     super::super::io::mmio::remove_module_mappings(module);
     super::super::class::chardev::remove_module_nodes(module);
+    crate::fs::provider::remove_module_devfs_broker(module);
+    crate::fs::provider::remove_module_providers(module);
     super::super::abi::events::remove_module_events(module);
 }
 
@@ -369,6 +472,11 @@ fn drop_edges(module: &Arc<Module>) {
 pub fn add_dependency(consumer: &Arc<Module>, provider: &Arc<Module>) -> Result<()> {
     if Arc::ptr_eq(consumer, provider) {
         return Ok(());
+    }
+    let registry = registry()?;
+    let _graph = registry.graph.lock();
+    if !consumer.is_registering() || !provider.is_registering() {
+        return Err(Error::NoDevice);
     }
     if creates_cycle(consumer, provider)? {
         return Err(Error::Deadlock);
@@ -456,6 +564,8 @@ pub struct ModuleInfo {
     pub name: Box<str>,
     /// Number of modules depending on this one.
     pub dependents: usize,
+    /// Number of long-lived kernel consumers retaining this module.
+    pub leases: u64,
     /// Whether the module is fully loaded.
     pub live: bool,
 }
@@ -470,6 +580,7 @@ pub fn list() -> Result<Vec<ModuleInfo>> {
             id: module.id,
             name: String::from(module.name.as_str()).into_boxed_str(),
             dependents: module.edges.lock().dependents.len(),
+            leases: module.lease_count(),
             live: module.is_live(),
         })
         .collect())
@@ -506,10 +617,7 @@ pub fn unload_all() {
         for module in candidates {
             match unload(&module) {
                 Ok(()) => progress = true,
-                Err(error) => warn!(
-                    "module {} could not be unloaded: {error:?}",
-                    module.name
-                ),
+                Err(error) => warn!("module {} could not be unloaded: {error:?}", module.name),
             }
         }
         if !progress {

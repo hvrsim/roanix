@@ -1,9 +1,9 @@
 #! /bin/sh
 
 version=0.1
-revision=5
+revision=8
 source_dir="drivers"
-hostdeps="gcc-host binutils"
+hostdeps=""
 
 configure() {
     cp -a "${source_dir}"/. .
@@ -11,12 +11,7 @@ configure() {
 }
 
 build() {
-    make \
-        ARCH="${JINX_ARCH}" \
-        CC="${OS_TRIPLET}-gcc" \
-        LD="${OS_TRIPLET}-ld" \
-        STRIP="${OS_TRIPLET}-strip" \
-        -j"${parallelism}"
+    make ARCH="${JINX_ARCH}" -j"${parallelism}"
 }
 
 package() {

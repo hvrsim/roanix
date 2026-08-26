@@ -132,6 +132,29 @@ extern "C" {
 #define RDF_NODE_CHARACTER 1u
 #define RDF_NODE_BLOCK 2u
 
+/* Filesystem-provider vnode kinds. */
+#define RDF_FS_KIND_REGULAR 1u
+#define RDF_FS_KIND_DIRECTORY 2u
+#define RDF_FS_KIND_SYMLINK 3u
+#define RDF_FS_KIND_CHARACTER_DEVICE 4u
+#define RDF_FS_KIND_BLOCK_DEVICE 5u
+#define RDF_FS_KIND_FIFO 6u
+#define RDF_FS_KIND_SOCKET 7u
+
+/* Filesystem-provider create kinds. */
+#define RDF_FS_CREATE_REGULAR 1u
+#define RDF_FS_CREATE_DIRECTORY 2u
+#define RDF_FS_CREATE_SYMLINK 3u
+
+/* Bits for struct rdf_fs_setattr::valid. */
+#define RDF_FS_SETATTR_SIZE (UINT32_C(1) << 0)
+#define RDF_FS_SETATTR_MODE (UINT32_C(1) << 1)
+
+/* Device endpoint event selectors. */
+#define RDF_DEVFS_EVENT_READABLE 1u
+#define RDF_DEVFS_EVENT_WRITABLE 2u
+#define RDF_DEVFS_EVENT_HANGUP 3u
+
 /* Open flags visible to node operations. */
 #define RDF_OPEN_READ (UINT32_C(1) << 0)
 #define RDF_OPEN_WRITE (UINT32_C(1) << 1)
@@ -921,6 +944,39 @@ static inline int32_t rdf_event_reset(rdf_event_t event)
     return rdf_api->event_reset(event);
 }
 
+/* Waits until one event in the array is signalled. */
+static inline int32_t rdf_event_wait_any(const rdf_event_t *events, size_t count,
+                                         size_t *out_index)
+{
+    return rdf_api->event_wait_any(events, count, out_index);
+}
+
+/* Waits for an event until the timeout and reports whether it won. */
+static inline int32_t rdf_event_wait_timeout(rdf_event_t event, uint64_t nanoseconds,
+                                             uint8_t *out_signalled)
+{
+    return rdf_api->event_wait_timeout(event, nanoseconds, out_signalled);
+}
+
+/* Starts a worker that must be joined before its callback context is released. */
+static inline int32_t rdf_worker_spawn(rdf_worker_fn callback, void *context,
+                                       struct rdf_worker **out)
+{
+    return rdf_api->worker_spawn(rdf_self, callback, context, out);
+}
+
+/* Waits for a worker and consumes its receipt. */
+static inline int32_t rdf_worker_join(struct rdf_worker *worker)
+{
+    return rdf_api->worker_join(worker);
+}
+
+/* Delivers a signal to every process in a process group. */
+static inline int32_t rdf_process_group_signal(int32_t group, uint8_t signal)
+{
+    return rdf_api->process_group_signal(group, signal);
+}
+
 /* --- Time, entropy, and topology ---------------------------------------- */
 
 /* Returns nanoseconds since boot. */
@@ -1038,6 +1094,197 @@ static inline int32_t rdf_tty_register(const struct rdf_device *device, rdf_devn
 static inline int32_t rdf_tty_unregister(struct rdf_tty *tty)
 {
     return rdf_api->tty_unregister(tty);
+}
+
+/* Registers the shared terminal-semantics provider. */
+static inline int32_t rdf_tty_provider_register(const struct rdf_tty_provider_ops *ops,
+                                                struct rdf_tty_provider **out)
+{
+    return rdf_api->tty_provider_register(rdf_self, ops, out);
+}
+
+/* Unregisters the provider after every terminal receipt is gone. */
+static inline int32_t rdf_tty_provider_unregister(struct rdf_tty_provider *provider)
+{
+    return rdf_api->tty_provider_unregister(provider);
+}
+
+/* --- Filesystem providers ------------------------------------------------ */
+
+/* Registers a loadable filesystem provider under a stable type name. */
+static inline int32_t rdf_fs_provider_register(const char *name,
+                                                const struct rdf_fs_provider_ops *ops,
+                                                struct rdf_fs_provider **out)
+{
+    return rdf_api->fs_provider_register(rdf_self, name, ops, out);
+}
+
+/* Withdraws a filesystem provider after all mounted instances are gone. */
+static inline int32_t rdf_fs_provider_unregister(struct rdf_fs_provider *provider)
+{
+    return rdf_api->fs_provider_unregister(provider);
+}
+
+/* Creates a page account used by a memory-backed filesystem mount. */
+static inline int32_t rdf_fs_page_account_create(uint64_t limit,
+                                                  struct rdf_fs_page_account **out)
+{
+    return rdf_api->fs_page_account_create(limit, out);
+}
+
+static inline void rdf_fs_page_account_release(struct rdf_fs_page_account *account)
+{
+    rdf_api->fs_page_account_release(account);
+}
+
+static inline int32_t rdf_fs_page_account_limit(struct rdf_fs_page_account *account,
+                                                uint64_t *out)
+{
+    return rdf_api->fs_page_account_limit(account, out);
+}
+
+static inline int32_t rdf_fs_page_account_used(struct rdf_fs_page_account *account, uint64_t *out)
+{
+    return rdf_api->fs_page_account_used(account, out);
+}
+
+static inline int32_t rdf_fs_memory_object_create(struct rdf_fs_page_account *account,
+                                                   struct rdf_fs_memory_object **out)
+{
+    return rdf_api->fs_memory_object_create(account, out);
+}
+
+static inline int32_t rdf_fs_memory_object_retain(struct rdf_fs_memory_object *object)
+{
+    return rdf_api->fs_memory_object_retain(object);
+}
+
+static inline void rdf_fs_memory_object_release(struct rdf_fs_memory_object *object)
+{
+    rdf_api->fs_memory_object_release(object);
+}
+
+static inline int64_t rdf_fs_memory_object_read(struct rdf_fs_memory_object *object,
+                                                uint64_t offset, uint8_t *data, size_t length)
+{
+    return rdf_api->fs_memory_object_read(object, offset, data, length);
+}
+
+static inline int64_t rdf_fs_memory_object_write(struct rdf_fs_memory_object *object,
+                                                 uint64_t offset, const uint8_t *data,
+                                                 size_t length)
+{
+    return rdf_api->fs_memory_object_write(object, offset, data, length);
+}
+
+static inline int32_t rdf_fs_memory_object_truncate(struct rdf_fs_memory_object *object,
+                                                    uint64_t size, uint64_t *removed_pages)
+{
+    return rdf_api->fs_memory_object_truncate(object, size, removed_pages);
+}
+
+static inline int32_t rdf_fs_memory_object_page_count(struct rdf_fs_memory_object *object,
+                                                      uint64_t *out)
+{
+    return rdf_api->fs_memory_object_page_count(object, out);
+}
+
+static inline uint64_t rdf_fs_total_physical_pages(void)
+{
+    return rdf_api->fs_total_physical_pages();
+}
+
+/*
+ * Registers the global devfs control plane.  Ordinary hardware drivers retain
+ * their existing rdf_devfs_* API and never call this directly.
+ */
+static inline int32_t rdf_devfs_broker_register(const struct rdf_devfs_broker_ops *ops,
+                                                 struct rdf_devfs_broker **out)
+{
+    return rdf_api->devfs_broker_register(rdf_self, ops, out);
+}
+
+static inline int32_t rdf_devfs_broker_unregister(struct rdf_devfs_broker *broker)
+{
+    return rdf_api->devfs_broker_unregister(broker);
+}
+
+static inline int32_t rdf_devfs_endpoint_open(struct rdf_devfs_endpoint *endpoint,
+                                              uint32_t flags, uintptr_t *out_file)
+{
+    return rdf_api->devfs_endpoint_open(endpoint, flags, out_file);
+}
+
+static inline void rdf_devfs_endpoint_close(struct rdf_devfs_endpoint *endpoint,
+                                            uintptr_t file, uint32_t flags)
+{
+    rdf_api->devfs_endpoint_close(endpoint, file, flags);
+}
+
+static inline int32_t rdf_devfs_endpoint_initial_offset(struct rdf_devfs_endpoint *endpoint,
+                                                        uintptr_t file, uint32_t flags,
+                                                        uint64_t *out)
+{
+    return rdf_api->devfs_endpoint_initial_offset(endpoint, file, flags, out);
+}
+
+static inline int64_t rdf_devfs_endpoint_read(struct rdf_devfs_endpoint *endpoint,
+                                              uintptr_t file, uint64_t offset, uint8_t *data,
+                                              size_t length, uint32_t flags)
+{
+    return rdf_api->devfs_endpoint_read(endpoint, file, offset, data, length, flags);
+}
+
+static inline int64_t rdf_devfs_endpoint_write(struct rdf_devfs_endpoint *endpoint,
+                                               uintptr_t file, uint64_t offset,
+                                               const uint8_t *data, size_t length,
+                                               uint32_t flags)
+{
+    return rdf_api->devfs_endpoint_write(endpoint, file, offset, data, length, flags);
+}
+
+static inline uint64_t rdf_devfs_endpoint_size(struct rdf_devfs_endpoint *endpoint)
+{
+    return rdf_api->devfs_endpoint_size(endpoint);
+}
+
+static inline int32_t rdf_devfs_endpoint_sync(struct rdf_devfs_endpoint *endpoint)
+{
+    return rdf_api->devfs_endpoint_sync(endpoint);
+}
+
+static inline int64_t rdf_devfs_endpoint_poll(struct rdf_devfs_endpoint *endpoint,
+                                              uintptr_t file, uint64_t offset, uint16_t events,
+                                              uint32_t flags)
+{
+    return rdf_api->devfs_endpoint_poll(endpoint, file, offset, events, flags);
+}
+
+static inline rdf_event_t rdf_devfs_endpoint_event(struct rdf_devfs_endpoint *endpoint,
+                                                    uintptr_t file, uint32_t selector)
+{
+    return rdf_api->devfs_endpoint_event(endpoint, file, selector);
+}
+
+static inline int32_t rdf_devfs_endpoint_terminal_state(
+    struct rdf_devfs_endpoint *endpoint, struct rdf_fs_terminal_state *out)
+{
+    return rdf_api->devfs_endpoint_terminal_state(endpoint, out);
+}
+
+static inline int64_t rdf_devfs_endpoint_ioctl(
+    struct rdf_devfs_endpoint *endpoint, uintptr_t file, uint64_t process, int32_t group,
+    int32_t session, uint8_t session_leader, uint64_t request, uint64_t value,
+    uint8_t *argument, size_t argument_length)
+{
+    return rdf_api->devfs_endpoint_ioctl(endpoint, file, process, group, session,
+                                         session_leader, request, value, argument,
+                                         argument_length);
+}
+
+static inline void rdf_devfs_endpoint_release(struct rdf_devfs_endpoint *endpoint)
+{
+    rdf_api->devfs_endpoint_release(endpoint);
 }
 
 /* --- Kernel log --------------------------------------------------------- */

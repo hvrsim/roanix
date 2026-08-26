@@ -9,7 +9,10 @@
 //! driver.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::{ffi::c_void, sync::atomic::{AtomicU64, Ordering}};
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     mem::{PAGE_SIZE, PhysAddr, VirtAddr, phys},
@@ -154,7 +157,10 @@ pub fn alloc_coherent(
     }
     let state = state()?;
     let pages = (size as u64).div_ceil(PAGE_SIZE) as usize;
-    let align_pages = align.div_ceil(PAGE_SIZE as usize).max(1).next_power_of_two();
+    let align_pages = align
+        .div_ceil(PAGE_SIZE as usize)
+        .max(1)
+        .next_power_of_two();
     let limit = address_limit(device, attributes);
 
     let first = phys::alloc_contiguous(phys::PageUse::KernelHeap, pages, align_pages, limit)

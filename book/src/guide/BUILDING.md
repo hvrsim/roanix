@@ -392,16 +392,74 @@ place by hand if you want to keep a populated Jinx tree.
 
 ## Driver modules
 
-Native drivers are freestanding C shared objects built from `drivers/` and
-installed as `.ko` module images. Each module includes `<roanix/driver.h>` and
-declares itself with the `RDF_MODULE` macro.
+Native drivers are freestanding shared objects built from `drivers/` and
+installed as `.ko` module images. Every in-tree driver is a Rust crate; the
+workspace is rooted at `drivers/Cargo.toml` and organized by hardware domain:
 
-There is no driver support library. Every kernel service is reached through a
-service table the kernel hands to the module entry point, and everything that
-does not need the kernel — register access, spin locks, byte-order helpers,
-message formatting — is inlined from the headers. That is what lets the loader
-accept only self-contained images with no undefined symbols and no relocations
-other than position-independent ones.
+```
+drivers/
+├── ddk/                 the no_std driver development kit
+├── platform/acpi/       x86_64 ACPI (MADT) enumerator
+├── platform/fdt/        riscv64 flattened device-tree enumerator
+├── irqchip/ioapic/      I/O APIC interrupt controller
+├── tty/uart8250/        8250/16550 serial port
+├── tty/console/         terminal line discipline and tty provider
+├── tty/pty/             ptmx/pts pseudo-terminals
+├── tty/special/         null, zero, random, urandom
+└── fs/{tmpfs,devfs}/    loadable filesystem providers
+```
+
+All modules use the same C ABI, including `rdf_module_entry`, the service
+table, and C-compatible operation records. The ABI itself is documented by the
+C headers in `drivers/include/roanix/` (`driver.h` and `RDF_MODULE` remain the
+contract for out-of-tree C drivers), while in-tree crates use the no_std `ddk`
+crate.
+
+The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`,
+uses `panic = "abort"`, and links self-contained ET_DYN images with
+`rdf_module_entry` as their ELF entry. xtool builds those images on the host,
+stages them with the `drivers` recipe, and installs them under
+`/usr/lib/roanix/drivers/`. `make -C drivers ARCH=x86_64` builds every module
+directly.
+
+`console.ko` is also built for both targets. It registers the shared terminal
+provider before the lexically later `pty.ko` and `uart8250.ko` modules, and owns
+termios, line discipline, terminal nodes, and the `tty` class. UART and PTY
+backends continue to use the unchanged `rdf_tty_register` ABI.
+
+For RISC-V shared Rust modules that use `alloc`, the module builder rebuilds
+`core`, `alloc`, and `compiler_builtins` with PIC via Cargo's `build-std`
+support; the distributed static runtime is not suitable for a loadable image.
+
+Modules reach kernel services through the table handed to `rdf_module_entry`.
+The Rust DDK can additionally import a small, curated set of versioned C ABI
+names such as `rdf_api_v1_random_fill`; the loader resolves those names only
+from its kernel export table. It never exposes internal Rust symbols or a
+general kernel symbol namespace. Images still have no runtime dependency or
+interpreter, and the loader accepts only relative relocations plus
+architecture-specific relocations for those curated imports.
+
+### Modular filesystem providers
+
+`tmpfs.ko` and `devfs.ko` are required early Rust modules on x86_64 and
+riscv64. They register after memory and driver-core services come up, before
+VFS mounts `/`; the kernel scans their images directly from the initramfs, so
+VFS never loads an ELF image itself. `tmpfs` supplies the root mount and
+`devfs` supplies `/dev`, after which console, PTY, UART, and special-device
+modules load normally.
+
+The append-only C ABI in `<roanix/api.h>` uses opaque mount and vnode receipts.
+A mounted VFS adapter takes one module lease, caches live vnodes by provider
+node ID, and each vnode retains its mount. Device endpoint receipts likewise
+own their hardware module lease, while the devfs broker takes a scoped lease
+for namespace calls. Therefore normal filesystem and device I/O never pins a
+module per callback, but unload cannot unmap a live provider or endpoint.
+
+Tmpfs metadata remains in its module. Its sparse contents use only the
+versioned page-account and memory-object services in the provider table; the
+kernel owns physical pages and VM objects, and transfers use provider buffers
+directly without whole-request bounce copies. C filesystem drivers can use the
+same records and services documented in the headers.
 
 The framework is built from five ideas:
 

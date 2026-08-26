@@ -1,0 +1,21 @@
+[package]
+name = "ddk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+kernel-imports = []
+curated-tmpfs-imports = []
+curated-devfs-imports = []
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

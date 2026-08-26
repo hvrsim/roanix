@@ -1,14 +1,13 @@
 //! Module image loading.
 //!
 //! A module is an ELF shared object with a single entry point. The loader
-//! accepts only self-contained images: no external symbol references, no text
-//! relocations, and no dependence on a runtime linker. That restriction is what
-//! removes the need for a driver support library - everything a module needs
-//! either comes from the service table or is inlined by its own compiler.
+//! accepts only self-contained images: no runtime-library dependencies, no text
+//! relocations, and no general symbol lookup. The only external references it
+//! resolves are versioned names in the curated kernel C ABI export table.
 //!
-//! Segments are placed in kernel memory, position-independent relocations are
-//! applied, and permissions are tightened so that no page is both writable and
-//! executable before the entry point runs.
+//! Segments are placed in kernel memory, position-independent and curated-import
+//! relocations are applied, and permissions are tightened so that no page is
+//! both writable and executable before the entry point runs.
 
 use alloc::{
     alloc::{alloc_zeroed, dealloc},
@@ -22,6 +21,7 @@ use core::{
     alloc::Layout,
     mem,
     ptr::{self, NonNull},
+    slice,
 };
 
 use log::{debug, error};
@@ -52,16 +52,24 @@ pub const MODULE_SUFFIX: &[u8] = b".ko";
 
 const MAX_FILE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_SIZE: u64 = 64 * 1024 * 1024;
+const ELF64_DYN_SIZE: u64 = 16;
 const ELF64_RELA_SIZE: u64 = 24;
+const ELF64_SYM_SIZE: u64 = 24;
 
 const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
 const DT_PLTRELSZ: i64 = 2;
+const DT_HASH: i64 = 4;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
+const DT_STRSZ: i64 = 10;
+const DT_SYMENT: i64 = 11;
 const DT_REL: i64 = 17;
 const DT_RELSZ: i64 = 18;
+const DT_PLTREL: i64 = 20;
 const DT_TEXTREL: i64 = 22;
 const DT_JMPREL: i64 = 23;
 const DT_RELRSZ: i64 = 35;
@@ -72,6 +80,17 @@ const RELATIVE_RELOCATION: u32 = 8;
 #[cfg(target_arch = "riscv64")]
 const RELATIVE_RELOCATION: u32 = 3;
 
+#[cfg(target_arch = "x86_64")]
+const ABSOLUTE_RELOCATION: u32 = 1;
+#[cfg(target_arch = "x86_64")]
+const GLOBAL_DATA_RELOCATION: u32 = 6;
+#[cfg(target_arch = "x86_64")]
+const JUMP_SLOT_RELOCATION: u32 = 7;
+#[cfg(target_arch = "riscv64")]
+const ABSOLUTE_RELOCATION: u32 = 2;
+#[cfg(target_arch = "riscv64")]
+const JUMP_SLOT_RELOCATION: u32 = 5;
+
 #[derive(Copy, Clone)]
 struct Segment {
     virtual_address: u64,
@@ -79,6 +98,21 @@ struct Segment {
     file_size: u64,
     memory_size: u64,
     flags: Flags,
+}
+
+#[derive(Default)]
+struct DynamicInfo {
+    rela_address: Option<u64>,
+    rela_size: u64,
+    rela_entry_size: u64,
+    plt_rela_address: Option<u64>,
+    plt_rela_size: u64,
+    plt_rela_type: Option<u64>,
+    symbol_table: Option<u64>,
+    symbol_entry_size: u64,
+    string_table: Option<u64>,
+    string_table_size: u64,
+    hash_table: Option<u64>,
 }
 
 /// Resident pages holding one module's code and data.
@@ -128,7 +162,27 @@ impl Image {
         let Some(end) = start.checked_add(self.layout.size()) else {
             return false;
         };
-        address >= start && address.checked_add(length).is_some_and(|value| value <= end)
+        address >= start
+            && address
+                .checked_add(length)
+                .is_some_and(|value| value <= end)
+    }
+
+    fn contains_executable(&self, segments: &[Segment], address: usize) -> bool {
+        segments.iter().any(|segment| {
+            if !segment.flags.is_execute() || segment.memory_size == 0 {
+                return false;
+            }
+            let Ok(start) = self.address(segment.virtual_address, segment.memory_size) else {
+                return false;
+            };
+            let Ok(length) = usize::try_from(segment.memory_size) else {
+                return false;
+            };
+            start
+                .checked_add(length)
+                .is_some_and(|end| address >= start && address < end)
+        })
     }
 
     /// Returns whether a NUL-terminated string lies entirely inside the image.
@@ -201,6 +255,9 @@ pub fn load_directory(path: &[u8]) -> Result<usize> {
                 debug!("loaded module {}", module.name());
                 loaded += 1;
             }
+            Err(Error::AlreadyExists) => {
+                debug!("module {name} was loaded during early boot; skipping packaged copy");
+            }
             Err(failure) => error!("failed to load module {name}: {failure:?}"),
         }
     }
@@ -210,20 +267,32 @@ pub fn load_directory(path: &[u8]) -> Result<usize> {
 
 /// Loads and starts one module image.
 pub fn load_file(path: &[u8]) -> Result<Arc<Module>> {
-    let definition = prepare(path)?;
-    // SAFETY: `prepare` validated that both callbacks lie inside the image, and
-    // the image is owned by the module for as long as it stays loaded.
+    let bytes = read_file(path)?;
+    load_bytes(&bytes)
+}
+
+/// Loads and starts one module image already resident in memory.
+///
+/// The image is copied into resident module memory before this function
+/// returns, so the caller may release its input storage after the load.
+pub fn load_bytes(bytes: &[u8]) -> Result<Arc<Module>> {
+    let definition = prepare_bytes(bytes)?;
+    // SAFETY: `prepare_bytes` validated that both callbacks lie inside the
+    // image, and the image is owned by the module for as long as it stays
+    // loaded.
     unsafe { module::load(definition) }
 }
 
-fn prepare(path: &[u8]) -> Result<ModuleDefinition> {
-    let bytes = read_file(path)?;
-    let elf = ElfFile::new(&bytes).map_err(|_| Error::InvalidArgument)?;
+fn prepare_bytes(bytes: &[u8]) -> Result<ModuleDefinition> {
+    if bytes.is_empty() || bytes.len() > MAX_FILE_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    let elf = ElfFile::new(bytes).map_err(|_| Error::InvalidArgument)?;
     validate_header(&elf)?;
     let (segments, dynamic) = collect_segments(&elf, bytes.len())?;
     let mut image = allocate_image(&segments)?;
-    copy_segments(&mut image, &bytes, &segments)?;
-    apply_relocations(&image, dynamic)?;
+    copy_segments(&mut image, bytes, &segments)?;
+    apply_relocations(&image, &segments, dynamic)?;
     finalize_permissions(&image, &segments)?;
 
     let entry_point = elf.header.pt2.entry_point();
@@ -252,14 +321,18 @@ fn prepare(path: &[u8]) -> Result<ModuleDefinition> {
         return Err(Error::InvalidArgument);
     }
     // SAFETY: the descriptor pointer was just verified to lie inside the image.
-    let definition = validate_descriptor(&image, unsafe { &*descriptor })?;
+    let definition = validate_descriptor(&image, &segments, unsafe { &*descriptor })?;
     Ok(ModuleDefinition {
         backing: Some(Box::new(image)),
         ..definition
     })
 }
 
-fn validate_descriptor(image: &Image, descriptor: &ModuleDef) -> Result<ModuleDefinition> {
+fn validate_descriptor(
+    image: &Image,
+    segments: &[Segment],
+    descriptor: &ModuleDef,
+) -> Result<ModuleDefinition> {
     if (descriptor.size as usize) < mem::size_of::<ModuleDef>() {
         return Err(Error::InvalidArgument);
     }
@@ -273,11 +346,11 @@ fn validate_descriptor(image: &Image, descriptor: &ModuleDef) -> Result<ModuleDe
         return Err(Error::InvalidArgument);
     }
     let init = descriptor.init.ok_or(Error::InvalidArgument)?;
-    if !image.contains_range(init as usize, 1) {
+    if !image.contains_executable(segments, init as usize) {
         return Err(Error::InvalidArgument);
     }
     if let Some(exit) = descriptor.exit
-        && !image.contains_range(exit as usize, 1)
+        && !image.contains_executable(segments, exit as usize)
     {
         return Err(Error::InvalidArgument);
     }
@@ -329,10 +402,9 @@ fn validate_header(elf: &ElfFile<'_>) -> Result<()> {
     Ok(())
 }
 
-fn collect_segments(
-    elf: &ElfFile<'_>,
-    file_size: usize,
-) -> Result<(Vec<Segment>, Option<(u64, u64)>)> {
+type DynamicRange = Option<(u64, u64)>;
+
+fn collect_segments(elf: &ElfFile<'_>, file_size: usize) -> Result<(Vec<Segment>, DynamicRange)> {
     let mut segments = Vec::new();
     let mut dynamic = None;
     for index in 0..elf.header.pt2.ph_count() {
@@ -443,19 +515,25 @@ fn copy_segments(image: &mut Image, bytes: &[u8], segments: &[Segment]) -> Resul
     Ok(())
 }
 
-fn apply_relocations(image: &Image, dynamic: Option<(u64, u64)>) -> Result<()> {
+fn apply_relocations(
+    image: &Image,
+    segments: &[Segment],
+    dynamic: Option<(u64, u64)>,
+) -> Result<()> {
     let Some((dynamic_address, dynamic_size)) = dynamic else {
         return Ok(());
     };
-    if !dynamic_size.is_multiple_of(16) {
+    if !dynamic_size.is_multiple_of(ELF64_DYN_SIZE) {
         return Err(Error::InvalidArgument);
     }
     let dynamic = image.address(dynamic_address, dynamic_size)?;
-    let mut rela_address = None;
-    let mut rela_size = 0u64;
-    let mut rela_entry_size = ELF64_RELA_SIZE;
+    let mut info = DynamicInfo {
+        rela_entry_size: ELF64_RELA_SIZE,
+        symbol_entry_size: ELF64_SYM_SIZE,
+        ..DynamicInfo::default()
+    };
 
-    for offset in (0..dynamic_size).step_by(16) {
+    for offset in (0..dynamic_size).step_by(ELF64_DYN_SIZE as usize) {
         let entry = dynamic
             .checked_add(usize::try_from(offset).map_err(|_| Error::InvalidArgument)?)
             .ok_or(Error::InvalidArgument)?;
@@ -466,28 +544,59 @@ fn apply_relocations(image: &Image, dynamic: Option<(u64, u64)>) -> Result<()> {
         let value = unsafe { ptr::read_unaligned((entry + 8) as *const u64) };
         match tag {
             DT_NULL => break,
-            DT_RELA => rela_address = Some(value),
-            DT_RELASZ => rela_size = value,
-            DT_RELAENT => rela_entry_size = value,
-            DT_NEEDED | DT_REL | DT_RELSZ | DT_TEXTREL | DT_JMPREL | DT_PLTRELSZ | DT_RELR
-            | DT_RELRSZ => {
-                if value != 0 || matches!(tag, DT_NEEDED | DT_TEXTREL) {
-                    return Err(Error::Unsupported);
-                }
+            DT_RELA => info.rela_address = Some(value),
+            DT_RELASZ => info.rela_size = value,
+            DT_RELAENT => info.rela_entry_size = value,
+            DT_JMPREL => info.plt_rela_address = Some(value),
+            DT_PLTRELSZ => info.plt_rela_size = value,
+            DT_PLTREL => info.plt_rela_type = Some(value),
+            DT_SYMTAB => info.symbol_table = Some(value),
+            DT_SYMENT => info.symbol_entry_size = value,
+            DT_STRTAB => info.string_table = Some(value),
+            DT_STRSZ => info.string_table_size = value,
+            DT_HASH => info.hash_table = Some(value),
+            DT_NEEDED | DT_REL | DT_RELSZ | DT_TEXTREL | DT_RELR | DT_RELRSZ => {
+                return Err(Error::Unsupported);
             }
             _ => {}
         }
     }
 
-    if rela_size == 0 {
+    apply_rela_table(image, segments, &info, info.rela_address, info.rela_size)?;
+    if info.plt_rela_size != 0 {
+        if info.plt_rela_type != Some(DT_RELA as u64) {
+            return Err(Error::Unsupported);
+        }
+        apply_rela_table(
+            image,
+            segments,
+            &info,
+            info.plt_rela_address,
+            info.plt_rela_size,
+        )?;
+    } else if info.plt_rela_address.is_some() || info.plt_rela_type.is_some() {
+        return Err(Error::InvalidArgument);
+    }
+
+    Ok(())
+}
+
+fn apply_rela_table(
+    image: &Image,
+    segments: &[Segment],
+    dynamic: &DynamicInfo,
+    address: Option<u64>,
+    size: u64,
+) -> Result<()> {
+    if size == 0 {
         return Ok(());
     }
-    if rela_entry_size != ELF64_RELA_SIZE || !rela_size.is_multiple_of(ELF64_RELA_SIZE) {
+    if dynamic.rela_entry_size != ELF64_RELA_SIZE || !size.is_multiple_of(ELF64_RELA_SIZE) {
         return Err(Error::Unsupported);
     }
-    let rela_address = rela_address.ok_or(Error::InvalidArgument)?;
-    let table = image.address(rela_address, rela_size)?;
-    for offset in (0..rela_size).step_by(ELF64_RELA_SIZE as usize) {
+    let address = address.ok_or(Error::InvalidArgument)?;
+    let table = image.address(address, size)?;
+    for offset in (0..size).step_by(ELF64_RELA_SIZE as usize) {
         let entry = table
             .checked_add(usize::try_from(offset).map_err(|_| Error::InvalidArgument)?)
             .ok_or(Error::InvalidArgument)?;
@@ -502,16 +611,103 @@ fn apply_relocations(image: &Image, dynamic: Option<(u64, u64)>) -> Result<()> {
         if relocation_type == 0 {
             continue;
         }
-        if relocation_type != RELATIVE_RELOCATION || symbol != 0 {
+        if !relocation_target_is_writable(segments, relocation_offset) {
             return Err(Error::Unsupported);
         }
         let target = image.address(relocation_offset, mem::size_of::<u64>() as u64)?;
-        let value = add_signed(image.load_bias()?, addend).ok_or(Error::InvalidArgument)?;
+        let value = if relocation_type == RELATIVE_RELOCATION && symbol == 0 {
+            add_signed(image.load_bias()?, addend).ok_or(Error::InvalidArgument)?
+        } else if is_import_relocation(relocation_type) && symbol != 0 {
+            let export = resolve_import_symbol(image, dynamic, symbol)?;
+            add_signed(export as u64, addend).ok_or(Error::InvalidArgument)?
+        } else {
+            return Err(Error::Unsupported);
+        };
         // SAFETY: the target is an eight-byte writable range inside the private
         // image, and the store is explicitly unaligned.
         unsafe { ptr::write_unaligned(target as *mut u64, value) };
     }
     Ok(())
+}
+
+fn relocation_target_is_writable(segments: &[Segment], address: u64) -> bool {
+    let Some(end) = address.checked_add(mem::size_of::<u64>() as u64) else {
+        return false;
+    };
+    segments.iter().any(|segment| {
+        if !segment.flags.is_write() {
+            return false;
+        }
+        let Some(segment_end) = segment.virtual_address.checked_add(segment.memory_size) else {
+            return false;
+        };
+        address >= segment.virtual_address && end <= segment_end
+    })
+}
+
+fn is_import_relocation(relocation: u32) -> bool {
+    relocation == ABSOLUTE_RELOCATION || relocation == JUMP_SLOT_RELOCATION || {
+        #[cfg(target_arch = "x86_64")]
+        {
+            relocation == GLOBAL_DATA_RELOCATION
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            false
+        }
+    }
+}
+
+fn resolve_import_symbol(image: &Image, dynamic: &DynamicInfo, index: u64) -> Result<usize> {
+    if dynamic.symbol_entry_size != ELF64_SYM_SIZE {
+        return Err(Error::Unsupported);
+    }
+    let symbol_table = dynamic.symbol_table.ok_or(Error::Unsupported)?;
+    let hash_table = dynamic.hash_table.ok_or(Error::Unsupported)?;
+    let hash = image.address(hash_table, 8)?;
+    // SAFETY: the two fields lie inside the validated module image.
+    let symbol_count = unsafe { ptr::read_unaligned((hash + 4) as *const u32) } as u64;
+    if index >= symbol_count {
+        return Err(Error::InvalidArgument);
+    }
+    let symbol_offset = index
+        .checked_mul(ELF64_SYM_SIZE)
+        .and_then(|offset| symbol_table.checked_add(offset))
+        .ok_or(Error::InvalidArgument)?;
+    let symbol = image.address(symbol_offset, ELF64_SYM_SIZE)?;
+    // SAFETY: the fixed-width ELF symbol record lies inside the image.
+    let name_offset = unsafe { ptr::read_unaligned(symbol as *const u32) } as u64;
+    // SAFETY: `st_info` is the one-byte field at offset four in Elf64_Sym.
+    let info = unsafe { ptr::read_unaligned((symbol + 4) as *const u8) };
+    // SAFETY: `st_shndx` is the two-byte field at offset six in Elf64_Sym.
+    let section = unsafe { ptr::read_unaligned((symbol + 6) as *const u16) };
+    let binding = info >> 4;
+    // Rust's linker emits `STT_NOTYPE` for an `extern "C"` function
+    // declaration, so the curated export name—not the optional ELF type—is
+    // authoritative here.
+    if section != 0 || !matches!(binding, 1 | 2) {
+        return Err(Error::Unsupported);
+    }
+    let string_table = dynamic.string_table.ok_or(Error::Unsupported)?;
+    if name_offset >= dynamic.string_table_size {
+        return Err(Error::InvalidArgument);
+    }
+    let remaining = dynamic
+        .string_table_size
+        .checked_sub(name_offset)
+        .ok_or(Error::InvalidArgument)?;
+    let string_address = string_table
+        .checked_add(name_offset)
+        .ok_or(Error::InvalidArgument)?;
+    let string = image.address(string_address, remaining)?;
+    let length = usize::try_from(remaining).map_err(|_| Error::InvalidArgument)?;
+    // SAFETY: `string` spans the checked string-table tail in the module image.
+    let bytes = unsafe { slice::from_raw_parts(string as *const u8, length) };
+    let name_end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(Error::InvalidArgument)?;
+    super::api::resolve_import(&bytes[..name_end]).ok_or(Error::Unsupported)
 }
 
 fn finalize_permissions(image: &Image, segments: &[Segment]) -> Result<()> {

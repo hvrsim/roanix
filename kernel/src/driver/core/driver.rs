@@ -3,7 +3,7 @@
 use alloc::{
     boxed::Box,
     string::{String, ToString},
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{
@@ -16,7 +16,7 @@ use crate::sys::sync::{Mutex, Once};
 use super::{
     super::{
         error::{self, Error, Result},
-        obj::{ObjHeader, ObjKind, framework_object},
+        obj::{ObjHeader, ObjKind, ObjState, Object, framework_object},
     },
     bus::Bus,
     device::Device,
@@ -28,11 +28,8 @@ use super::{
 pub const MAX_NAME: usize = 64;
 
 /// Claims a device. Returning [`Error::Deferred`] parks the device for retry.
-pub type ProbeFn = unsafe extern "C" fn(
-    context: *mut c_void,
-    device: *const c_void,
-    match_data: usize,
-) -> i32;
+pub type ProbeFn =
+    unsafe extern "C" fn(context: *mut c_void, device: *const c_void, match_data: usize) -> i32;
 /// Releases a device previously claimed by [`ProbeFn`].
 pub type RemoveFn = unsafe extern "C" fn(context: *mut c_void, device: *const c_void);
 
@@ -59,6 +56,9 @@ pub struct Driver {
     matches: Box<[MatchEntry]>,
     ops: DriverOps,
     bound: AtomicU64,
+    /// Set at registration; lets `evaluate` clone a handle without a registry
+    /// lock and linear scan on every match attempt.
+    self_ref: Mutex<Weak<Driver>>,
 }
 
 framework_object!(Driver, Driver);
@@ -99,6 +99,10 @@ impl Driver {
 
     /// Scores this driver against `device`.
     pub(super) fn evaluate(&self, device: &Arc<Device>) -> Result<Option<MatchResult>> {
+        // A snapshot taken before an unregister claim must not match.
+        if self.header.state() != ObjState::Live {
+            return Ok(None);
+        }
         if let Some(bus) = device.bus() {
             match self.bus.as_ref() {
                 Some(required) if !Arc::ptr_eq(required, bus) => return Ok(None),
@@ -108,7 +112,6 @@ impl Driver {
             if let Some(result) = bus.match_device(device, &self.arc()?) {
                 let score = result?;
                 return Ok((score > 0).then_some(MatchResult {
-                    index: 0,
                     data: 0,
                     score: score + self.priority,
                 }));
@@ -124,16 +127,7 @@ impl Driver {
     }
 
     fn arc(&self) -> Result<Arc<Driver>> {
-        let Ok(registry) = registry() else {
-            return Err(Error::NotInitialized);
-        };
-        registry
-            .drivers
-            .lock()
-            .iter()
-            .find(|driver| core::ptr::eq(Arc::as_ptr(driver), self))
-            .cloned()
-            .ok_or(Error::NotFound)
+        self.self_ref.lock().upgrade().ok_or(Error::NotFound)
     }
 
     pub(super) fn probe(&self, device: &Arc<Device>, match_data: usize) -> Result<()> {
@@ -222,8 +216,14 @@ pub unsafe fn register(
     {
         return Err(Error::AlreadyExists);
     }
+    let header = ObjHeader::new_with(
+        ObjKind::Driver,
+        Some(&registration.name),
+        owner.map(|module| module.id().get()),
+        registration.bus.as_ref().map(|bus| bus.object_id()),
+    );
     let driver = Arc::new(Driver {
-        header: ObjHeader::new(ObjKind::Driver),
+        header,
         name: registration.name,
         owner: owner.cloned(),
         bus: registration.bus,
@@ -231,7 +231,10 @@ pub unsafe fn register(
         matches: registration.matches,
         ops: registration.ops,
         bound: AtomicU64::new(0),
+        self_ref: Mutex::new(Weak::new()),
     });
+    *driver.self_ref.lock() = Arc::downgrade(&driver);
+    driver.header.register()?;
     drivers.push(driver.clone());
     drop(drivers);
 
@@ -241,16 +244,36 @@ pub unsafe fn register(
 
 /// Unregisters a driver, unbinding every device it claimed.
 pub fn unregister(driver: &Arc<Driver>) -> Result<()> {
+    let registry = registry()?;
+    // Claim the driver out of the match registry while holding the registry
+    // lock, so no concurrent evaluation can select it between the detach and
+    // the final unregister. A rescan holding an older snapshot still sees the
+    // Removing state and declines through `evaluate`.
+    {
+        let mut drivers = registry.drivers.lock();
+        if !drivers.iter().any(|entry| Arc::ptr_eq(entry, driver)) {
+            return Ok(());
+        }
+        driver.header.set_state(ObjState::Removing);
+        drivers.retain(|entry| !Arc::ptr_eq(entry, driver));
+    }
     super::probe::detach_driver(driver);
     if driver.bound_count() != 0 {
+        // Restore availability: a bind that raced the claim completed after
+        // the detach sweep, so the driver keeps its remaining devices.
+        driver.header.set_state(ObjState::Live);
+        registry.drivers.lock().push(driver.clone());
         return Err(Error::Busy);
     }
-    force_unregister(driver);
+    driver.header.poison();
     super::probe::retrigger();
     Ok(())
 }
 
 fn force_unregister(driver: &Arc<Driver>) {
+    driver
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
     if let Ok(registry) = registry() {
         registry
             .drivers
@@ -287,6 +310,15 @@ pub(super) fn remove_module_drivers(module: &Arc<Module>) {
         })
         .collect();
     for driver in owned {
+        // Teardown is not cancellable, so claim first and detach after; a
+        // racing rescan must never rebind a driver that is being removed.
+        if let Ok(registry) = registry() {
+            driver.header.set_state(ObjState::Removing);
+            registry
+                .drivers
+                .lock()
+                .retain(|entry| !Arc::ptr_eq(entry, &driver));
+        }
         super::probe::detach_driver(&driver);
         force_unregister(&driver);
     }

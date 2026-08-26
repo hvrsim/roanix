@@ -13,7 +13,7 @@ use super::super::error::{Error, Result};
 /// version is rejected.
 pub const ABI_MAJOR: u16 = 1;
 /// Append-only ABI revision. A module may request at most the kernel's value.
-pub const ABI_MINOR: u16 = 0;
+pub const ABI_MINOR: u16 = 3;
 
 /// Longest string accepted across the boundary.
 pub const MAX_STRING: usize = 4096;
@@ -44,8 +44,7 @@ pub struct ModuleDef {
 /// The kernel calls this once with the service table so the module can record
 /// it before any framework call is made, then uses the returned descriptor to
 /// load the module.
-pub type ModuleEntryFn =
-    unsafe extern "C" fn(api: *const super::api::Api) -> *const ModuleDef;
+pub type ModuleEntryFn = unsafe extern "C" fn(api: *const super::api::Api) -> *const ModuleDef;
 
 /// Borrows a NUL-terminated string supplied by a module.
 ///

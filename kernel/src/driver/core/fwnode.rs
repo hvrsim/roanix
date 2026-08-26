@@ -77,11 +77,14 @@ pub fn create(
     if !(kind::DEVICE_TREE..=kind::SYNTHETIC).contains(&kind) {
         return Err(Error::InvalidArgument);
     }
-    Ok(Arc::new(Fwnode {
-        header: ObjHeader::new(ObjKind::Fwnode),
+    let header = ObjHeader::new_with(ObjKind::Fwnode, path.or(provider), None, None);
+    let node = Arc::new(Fwnode {
+        header,
         kind,
         token,
         provider: provider.map(|name| String::from(name).into_boxed_str()),
         path: path.map(|value| value.to_string().into_boxed_str()),
-    }))
+    });
+    node.header.register()?;
+    Ok(node)
 }

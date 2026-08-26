@@ -208,9 +208,10 @@ pub(super) fn publish_async(address: VirtAddr) -> u64 {
         let mut next = ENGINE.producer.lock();
         let sequence = next.checked_add(1).expect("mem/tlb: sequence wrapped");
         publish_record(sequence, ROOT_GLOBAL, address.align_down().as_u64());
-        ENGINE
-            .overflow
-            .fetch_max(sequence.saturating_sub(RING_CAPACITY as u64), Ordering::AcqRel);
+        ENGINE.overflow.fetch_max(
+            sequence.saturating_sub(RING_CAPACITY as u64),
+            Ordering::AcqRel,
+        );
         *next = sequence;
         ENGINE.published.store(sequence, Ordering::Release);
         sequence

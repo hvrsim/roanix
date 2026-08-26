@@ -1,7 +1,7 @@
 //!
 //! # Driver Framework
 //!
-//! Roanix drivers are C modules that run in the kernel and may implement any
+//! Roanix drivers are modules that run in the kernel and may implement any
 //! kernel-visible functionality, not just device access. The framework is
 //! organized around five ideas:
 //!
@@ -50,18 +50,125 @@ pub use error::{Error, Result};
 
 pub mod work;
 
+struct BootModuleSpec {
+    name: &'static str,
+    path: &'static [u8],
+}
+
+// Keep this list deliberately small: these modules must be usable before the
+// VFS, scheduler, and architecture platform bring-up are complete.
+#[cfg(target_arch = "x86_64")]
+const BOOT_MODULES: &[BootModuleSpec] = &[
+    BootModuleSpec {
+        name: "acpi",
+        path: b"usr/lib/roanix/drivers/acpi.ko",
+    },
+    BootModuleSpec {
+        name: "ioapic",
+        path: b"usr/lib/roanix/drivers/ioapic.ko",
+    },
+    BootModuleSpec {
+        name: "tmpfs",
+        path: b"usr/lib/roanix/drivers/tmpfs.ko",
+    },
+    BootModuleSpec {
+        name: "devfs",
+        path: b"usr/lib/roanix/drivers/devfs.ko",
+    },
+];
+
+#[cfg(target_arch = "riscv64")]
+const BOOT_MODULES: &[BootModuleSpec] = &[
+    BootModuleSpec {
+        name: "fdt",
+        path: b"usr/lib/roanix/drivers/fdt.ko",
+    },
+    BootModuleSpec {
+        name: "tmpfs",
+        path: b"usr/lib/roanix/drivers/tmpfs.ko",
+    },
+    BootModuleSpec {
+        name: "devfs",
+        path: b"usr/lib/roanix/drivers/devfs.ko",
+    },
+];
+
 /// Initializes the driver framework.
 ///
 /// Runs after memory services are available and before any address space other
 /// than the kernel's exists, which is what lets the register window's page
 /// tables be shared by every process created later.
 pub fn init() {
+    obj::init();
     core::init();
     irq::init();
     io::init();
     work::init();
     class::init();
     platform::init();
+    // Filesystem providers register through the driver ABI during the early
+    // boot-module phase, before VFS mounts its root.
+    crate::fs::provider::init();
+    crate::fs::provider::init_broker();
+}
+
+/// Loads the architecture-specific modules needed during early platform boot.
+///
+/// The archive is scanned directly, so this path does not depend on the VFS or
+/// scheduler. Every listed module is required; a missing or broken image is a
+/// boot failure.
+pub fn load_boot_modules() -> Result<usize> {
+    let Some(files) = crate::sys::initramfs::regular_files() else {
+        log::error!("boot: no initramfs archive; cannot load boot modules");
+        return Err(Error::NotFound);
+    };
+
+    let mut images: [Option<&[u8]>; BOOT_MODULES.len()] = [None; BOOT_MODULES.len()];
+    for file in files {
+        let (path, bytes) = match file {
+            Ok(file) => file,
+            Err(error) => {
+                log::error!("boot: failed to scan initramfs for boot modules: {error}");
+                return Err(Error::InvalidArgument);
+            }
+        };
+
+        for (index, spec) in BOOT_MODULES.iter().enumerate() {
+            if path.as_bytes() != spec.path {
+                continue;
+            }
+            if images[index].replace(bytes).is_some() {
+                log::error!("boot: duplicate required boot module {}", spec.name);
+                return Err(Error::InvalidArgument);
+            }
+        }
+    }
+
+    let mut loaded = 0usize;
+    for (index, spec) in BOOT_MODULES.iter().enumerate() {
+        let Some(bytes) = images[index] else {
+            log::error!(
+                "boot: required {} boot module is absent from initramfs",
+                spec.name
+            );
+            return Err(Error::NotFound);
+        };
+        match abi::loader::load_bytes(bytes) {
+            Ok(module) => {
+                log::info!("boot: loaded required module {}", module.name());
+                loaded += 1;
+            }
+            Err(error) => {
+                log::error!(
+                    "boot: failed to load required {} module: {error:?}",
+                    spec.name
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(loaded)
 }
 
 /// Loads the modules packaged in the initial filesystem.

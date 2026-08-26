@@ -513,6 +513,41 @@ impl VmSpace {
         self.pmap.extract(address).ok_or(Error::NotMapped)
     }
 
+    /// Resolves one user page for `access` and wires its resident frame.
+    ///
+    /// Returns the logical page and its frame's physical address. The wire
+    /// blocks reclamation, which is what makes a direct-map alias of the
+    /// returned address safe to hold across an arbitrary-length operation;
+    /// [`Self::fault_and_extract`] offers no such guarantee. Release the pin
+    /// with `VmPage::release_window` while still holding the page handle.
+    pub(super) fn pin_user_page(
+        &self,
+        address: VirtAddr,
+        access: FaultAccess,
+    ) -> Result<(Arc<VmPage>, PhysAddr)> {
+        // Always fault first, like the copy paths do: a mapping whose
+        // protection already grants `access` may still be lazily backed
+        // (zero-fill or COW), so its PTE does not necessarily reference the
+        // frame the logical page will commit to. Faulting forces that
+        // commitment before the alias is taken.
+        self.fault(address, access)?;
+        let aligned = address.align_down();
+        let required = required_protection(access);
+        let (page, protection) = self.pmap.mapped_page(aligned).ok_or(Error::NotMapped)?;
+        if !protection.contains(required) {
+            return Err(Error::Protection);
+        }
+        // The frame base plus the intra-page offset of `address`: callers
+        // expect an alias of exactly this byte onward, matching what a PTE
+        // walk of `address` would have produced.
+        let physical = page
+            .acquire_window()?
+            .as_u64()
+            .checked_add(address.as_u64() % super::PAGE_SIZE)
+            .map(PhysAddr::new)
+            .ok_or(Error::InvalidAddress)?;
+        Ok((page, physical))
+    }
     /// Copies bytes from this address space into a kernel buffer.
     ///
     /// Each page is resolved to its logical page and copied through it, so the

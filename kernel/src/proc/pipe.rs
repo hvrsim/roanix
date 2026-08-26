@@ -146,7 +146,7 @@ impl PipeEnd {
                     if window.is_empty() {
                         break;
                     }
-                    state.buffer.extend(window);
+                    state.buffer.extend(&*window);
                     copied += window.len();
                 }
                 if state.buffer.len() == PIPE_CAPACITY {

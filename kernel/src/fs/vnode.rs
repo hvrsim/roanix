@@ -154,7 +154,7 @@ pub struct IoctlContext {
 
 /// Job-control state exposed by terminal vnodes.
 #[derive(Copy, Clone)]
-pub(crate) struct TerminalState {
+pub struct TerminalState {
     /// Session that owns the controlling terminal.
     pub session: i32,
     /// Foreground process group.
@@ -209,7 +209,7 @@ pub trait FileSystem: Send + Sync {
     fn id(&self) -> FilesystemId;
 
     /// Returns a short human-readable filesystem type name.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Returns the filesystem root vnode.
     fn root(&self) -> Vnode;

@@ -141,7 +141,5 @@ unsafe fn dtb_length(pointer: *const u8) -> Option<usize> {
 
 #[cfg(target_arch = "x86_64")]
 fn checksum(bytes: &[u8]) -> u8 {
-    bytes
-        .iter()
-        .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+    bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
 }

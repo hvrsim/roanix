@@ -9,19 +9,22 @@
 //! header, which is why the framework ships no driver library.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::ffi::{c_char, c_void};
+use core::{
+    ffi::{c_char, c_void},
+    mem::size_of,
+};
 
 use crate::{
-    fs::devtempfs::DevNodeId,
+    fs::provider::{DevfsBrokerOps, FsProviderOps, FsTerminalState},
     mem::VirtAddr,
-    sys::{clock, klog, random, smp},
+    sys::{clock, event::Event, klog, random, smp},
 };
 
 use super::{
     super::{
         class::{
-            chardev::{self, NodeOps},
-            console::{self, ConsoleOps},
+            chardev::{self, DevNodeId, NodeOps},
+            console::{self, ConsoleOps, TtyProviderOps},
         },
         core::{
             bus::{self, Bus, BusOps},
@@ -31,7 +34,7 @@ use super::{
             fwnode,
             iface::{self, Interface, InterfaceRef, Publication},
             match_table::MatchEntry,
-            module::Module,
+            module::{self, Module, ModuleLease},
             probe,
             property::PropValue,
             resource::Resource,
@@ -182,14 +185,12 @@ pub struct Api {
     pub device_add_cells:
         unsafe extern "C" fn(*mut c_void, *const c_char, *const u64, usize, u32) -> i32,
     /// Adds an opaque byte property.
-    pub device_add_bytes:
-        unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32,
+    pub device_add_bytes: unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32,
     /// Adds a hardware resource.
     pub device_add_resource:
         unsafe extern "C" fn(*mut c_void, u32, u32, u64, u64, *const c_char) -> i32,
     /// Adds a firmware-described interrupt specifier.
-    pub device_add_irq:
-        unsafe extern "C" fn(*mut c_void, *const c_void, *const u32, usize) -> i32,
+    pub device_add_irq: unsafe extern "C" fn(*mut c_void, *const c_void, *const u32, usize) -> i32,
     /// Publishes a described device and offers it to drivers.
     pub device_add: unsafe extern "C" fn(*mut c_void, *mut *const c_void) -> i32,
     /// Discards a description without publishing it.
@@ -373,8 +374,7 @@ pub struct Api {
     /// Releases an architecture vector.
     pub irq_free_vector: unsafe extern "C" fn(u32) -> i32,
     /// Returns the message address and payload that raise an interrupt.
-    pub irq_compose_message:
-        unsafe extern "C" fn(*const c_void, u64, *mut u64, *mut u32) -> i32,
+    pub irq_compose_message: unsafe extern "C" fn(*const c_void, u64, *mut u64, *mut u32) -> i32,
 
     // Register windows, ports, and DMA.
     /// Maps a physical range into the kernel's device window.
@@ -423,9 +423,13 @@ pub struct Api {
     /// Destroys a work queue.
     pub work_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
     /// Creates a timer.
-    pub timer_create:
-        unsafe extern "C" fn(*const c_void, Option<WorkFn>, *mut c_void, u64, *mut *mut c_void)
-            -> i32,
+    pub timer_create: unsafe extern "C" fn(
+        *const c_void,
+        Option<WorkFn>,
+        *mut c_void,
+        u64,
+        *mut *mut c_void,
+    ) -> i32,
     /// Arms a timer.
     pub timer_arm: unsafe extern "C" fn(*mut c_void, u64, u64) -> i32,
     /// Disarms a timer.
@@ -512,6 +516,107 @@ pub struct Api {
     pub klog_console_level: unsafe extern "C" fn() -> u32,
     /// Changes the mirrored severity and returns the previous one.
     pub klog_set_console_level: unsafe extern "C" fn(u32) -> u32,
+
+    // Modular terminal provider support, appended in ABI minor 1.
+    /// Registers the single terminal-semantics provider.
+    pub tty_provider_register:
+        unsafe extern "C" fn(*const c_void, *const TtyProviderOps, *mut *mut c_void) -> i32,
+    /// Removes the terminal provider after its receipts are gone.
+    pub tty_provider_unregister: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Waits until any supplied event is signalled and returns its index.
+    pub event_wait_any: unsafe extern "C" fn(*const usize, usize, *mut usize) -> i32,
+    /// Waits for an event until a timeout and reports whether it was signalled.
+    pub event_wait_timeout: unsafe extern "C" fn(usize, u64, *mut u8) -> i32,
+    /// Starts a joinable module worker.
+    pub worker_spawn: unsafe extern "C" fn(
+        *const c_void,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+        *mut c_void,
+        *mut *mut c_void,
+    ) -> i32,
+    /// Joins a worker and releases its receipt.
+    pub worker_join: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Delivers a signal to a process group.
+    pub process_group_signal: unsafe extern "C" fn(i32, u8) -> i32,
+
+    // Filesystem providers, appended in ABI minor 2.
+    /// Registers a C-compatible filesystem provider table.
+    pub fs_provider_register: unsafe extern "C" fn(
+        *const c_void,
+        *const c_char,
+        *const FsProviderOps,
+        *mut *mut c_void,
+    ) -> i32,
+    /// Removes a filesystem-provider registration.
+    pub fs_provider_unregister: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Creates a page-account receipt for a memory-backed provider.
+    pub fs_page_account_create: unsafe extern "C" fn(u64, *mut *mut c_void) -> i32,
+    /// Drops a page-account receipt.
+    pub fs_page_account_release: unsafe extern "C" fn(*mut c_void),
+    /// Returns a page-account limit.
+    pub fs_page_account_limit: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    /// Returns a page-account committed-page count.
+    pub fs_page_account_used: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    /// Creates a kernel-owned page-cache object.
+    pub fs_memory_object_create: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32,
+    /// Retains a page-cache object receipt.
+    pub fs_memory_object_retain: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Drops a page-cache object receipt.
+    pub fs_memory_object_release: unsafe extern "C" fn(*mut c_void),
+    /// Reads a page-cache object directly into a provider buffer.
+    pub fs_memory_object_read: unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> i64,
+    /// Writes a page-cache object directly from a provider buffer.
+    pub fs_memory_object_write: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> i64,
+    /// Truncates a page-cache object.
+    pub fs_memory_object_truncate: unsafe extern "C" fn(*mut c_void, u64, *mut u64) -> i32,
+    /// Returns a page-cache object's committed-page count.
+    pub fs_memory_object_page_count: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    /// Returns usable physical memory pages for provider default limits.
+    pub fs_total_physical_pages: unsafe extern "C" fn() -> u64,
+    /// Registers the global devfs broker table.
+    pub devfs_broker_register:
+        unsafe extern "C" fn(*const c_void, *const DevfsBrokerOps, *mut *mut c_void) -> i32,
+    /// Removes a devfs broker registration.
+    pub devfs_broker_unregister: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Opens a kernel-owned device endpoint.
+    pub devfs_endpoint_open: unsafe extern "C" fn(*mut c_void, u32, *mut usize) -> i32,
+    /// Closes one endpoint file context.
+    pub devfs_endpoint_close: unsafe extern "C" fn(*mut c_void, usize, u32),
+    /// Returns a new endpoint file offset.
+    pub devfs_endpoint_initial_offset:
+        unsafe extern "C" fn(*mut c_void, usize, u32, *mut u64) -> i32,
+    /// Reads directly into a devfs-module buffer.
+    pub devfs_endpoint_read:
+        unsafe extern "C" fn(*mut c_void, usize, u64, *mut u8, usize, u32) -> i64,
+    /// Writes directly from a devfs-module buffer.
+    pub devfs_endpoint_write:
+        unsafe extern "C" fn(*mut c_void, usize, u64, *const u8, usize, u32) -> i64,
+    /// Returns an endpoint's logical size.
+    pub devfs_endpoint_size: unsafe extern "C" fn(*mut c_void) -> u64,
+    /// Flushes a device endpoint.
+    pub devfs_endpoint_sync: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Polls a device endpoint.
+    pub devfs_endpoint_poll: unsafe extern "C" fn(*mut c_void, usize, u64, u16, u32) -> i64,
+    /// Returns an endpoint event receipt.
+    pub devfs_endpoint_event: unsafe extern "C" fn(*mut c_void, usize, u32) -> usize,
+    /// Returns terminal state for an endpoint.
+    pub devfs_endpoint_terminal_state:
+        unsafe extern "C" fn(*mut c_void, *mut FsTerminalState) -> i32,
+    /// Performs an endpoint control operation.
+    pub devfs_endpoint_ioctl: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        u64,
+        i32,
+        i32,
+        u8,
+        u64,
+        u64,
+        *mut u8,
+        usize,
+    ) -> i64,
+    /// Drops an endpoint receipt retained by devfs.
+    pub devfs_endpoint_release: unsafe extern "C" fn(*mut c_void),
 }
 
 /// Bus callbacks supplied from C.
@@ -551,9 +656,8 @@ pub struct DomainRegistration {
     /// Size of this record.
     pub size: u32,
     /// Decodes firmware specifier cells.
-    pub translate: Option<
-        unsafe extern "C" fn(*mut c_void, *const u32, usize, *mut u64, *mut u32) -> i32,
-    >,
+    pub translate:
+        Option<unsafe extern "C" fn(*mut c_void, *const u32, usize, *mut u64, *mut u32) -> i32>,
     /// Programs routing for a newly mapped interrupt.
     pub setup: Option<unsafe extern "C" fn(*mut c_void, u64, u32, u32) -> i32>,
     /// Releases routing for an unmapped interrupt.
@@ -598,12 +702,15 @@ mod layout {
         io::dma::DmaOps,
     };
 
-    const _: () = assert!(size_of::<Api>() == 992);
+    const _: () = assert!(size_of::<Api>() == 1272);
     const _: () = assert!(core::mem::offset_of!(Api, log) == 16);
     const _: () = assert!(core::mem::offset_of!(Api, klog_set_console_level) == 984);
+    const _: () = assert!(core::mem::offset_of!(Api, tty_provider_register) == 992);
+    const _: () = assert!(core::mem::offset_of!(Api, fs_provider_register) == 1048);
     const _: () = assert!(size_of::<crate::driver::abi::types::ModuleDef>() == 48);
-    const _: () = assert!(size_of::<NodeOps>() == 112);
+    const _: () = assert!(size_of::<NodeOps>() == 120);
     const _: () = assert!(size_of::<ConsoleOps>() == 160);
+    const _: () = assert!(size_of::<TtyProviderOps>() == 32);
     const _: () = assert!(size_of::<MatchDef>() == 72);
     const _: () = assert!(size_of::<DriverDef>() == 80);
     const _: () = assert!(size_of::<MmioWindow>() == 24);
@@ -618,10 +725,99 @@ mod layout {
 
 include!("shims.rs");
 
+/// Resolves one versioned module import from the curated kernel ABI.
+///
+/// This is intentionally a closed list of C ABI shims. It must never fall
+/// through to the kernel's Rust symbols or permit a module to name arbitrary
+/// internal functions.
+pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
+    match name {
+        b"rdf_api_v1_alloc" => Some(shim_alloc as *const () as usize),
+        b"rdf_api_v1_alloc_zeroed" => Some(shim_alloc_zeroed as *const () as usize),
+        b"rdf_api_v1_free" => Some(shim_free as *const () as usize),
+        b"rdf_api_v1_random_fill" => Some(shim_random_fill as *const () as usize),
+        b"rdf_api_v1_random_mix" => Some(shim_random_mix as *const () as usize),
+        b"rdf_api_v1_devfs_root" => Some(shim_devfs_root as *const () as usize),
+        b"rdf_api_v1_devfs_create" => Some(shim_devfs_create as *const () as usize),
+        b"rdf_api_v1_devfs_remove" => Some(shim_devfs_remove as *const () as usize),
+        b"rdf_api_v1_port_read8" => Some(shim_port_read8 as *const () as usize),
+        b"rdf_api_v1_port_write8" => Some(shim_port_write8 as *const () as usize),
+        b"rdf_api_v1_event_wait" => Some(shim_event_wait as *const () as usize),
+        b"rdf_api_v1_event_signal" => Some(shim_event_signal as *const () as usize),
+        b"rdf_api_v1_event_reset" => Some(shim_event_reset as *const () as usize),
+        b"rdf_api_v1_event_wait_any" => Some(shim_event_wait_any as *const () as usize),
+        b"rdf_api_v1_event_wait_timeout" => Some(shim_event_wait_timeout as *const () as usize),
+        b"rdf_api_v1_time_monotonic" => Some(shim_time_monotonic as *const () as usize),
+        b"rdf_api_v1_worker_spawn" => Some(shim_worker_spawn as *const () as usize),
+        b"rdf_api_v1_worker_join" => Some(shim_worker_join as *const () as usize),
+        b"rdf_api_v1_process_group_signal" => Some(shim_process_group_signal as *const () as usize),
+        b"rdf_api_v1_tty_provider_register" => {
+            Some(shim_tty_provider_register as *const () as usize)
+        }
+        b"rdf_api_v1_tty_provider_unregister" => {
+            Some(shim_tty_provider_unregister as *const () as usize)
+        }
+        b"rdf_api_v1_time_sleep" => Some(shim_time_sleep as *const () as usize),
+        b"rdf_api_v1_fs_page_account_create" => {
+            Some(shim_fs_page_account_create as *const () as usize)
+        }
+        b"rdf_api_v1_fs_page_account_release" => {
+            Some(shim_fs_page_account_release as *const () as usize)
+        }
+        b"rdf_api_v1_fs_page_account_limit" => {
+            Some(shim_fs_page_account_limit as *const () as usize)
+        }
+        b"rdf_api_v1_fs_page_account_used" => Some(shim_fs_page_account_used as *const () as usize),
+        b"rdf_api_v1_fs_memory_object_create" => {
+            Some(shim_fs_memory_object_create as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_retain" => {
+            Some(shim_fs_memory_object_retain as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_release" => {
+            Some(shim_fs_memory_object_release as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_read" => {
+            Some(shim_fs_memory_object_read as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_write" => {
+            Some(shim_fs_memory_object_write as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_truncate" => {
+            Some(shim_fs_memory_object_truncate as *const () as usize)
+        }
+        b"rdf_api_v1_fs_memory_object_page_count" => {
+            Some(shim_fs_memory_object_page_count as *const () as usize)
+        }
+        b"rdf_api_v1_fs_total_physical_pages" => {
+            Some(shim_fs_total_physical_pages as *const () as usize)
+        }
+        b"rdf_api_v1_devfs_endpoint_open" => Some(shim_devfs_endpoint_open as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_close" => Some(shim_devfs_endpoint_close as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_initial_offset" => {
+            Some(shim_devfs_endpoint_initial_offset as *const () as usize)
+        }
+        b"rdf_api_v1_devfs_endpoint_read" => Some(shim_devfs_endpoint_read as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_write" => Some(shim_devfs_endpoint_write as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_size" => Some(shim_devfs_endpoint_size as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_sync" => Some(shim_devfs_endpoint_sync as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_poll" => Some(shim_devfs_endpoint_poll as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_event" => Some(shim_devfs_endpoint_event as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_terminal_state" => {
+            Some(shim_devfs_endpoint_terminal_state as *const () as usize)
+        }
+        b"rdf_api_v1_devfs_endpoint_ioctl" => Some(shim_devfs_endpoint_ioctl as *const () as usize),
+        b"rdf_api_v1_devfs_endpoint_release" => {
+            Some(shim_devfs_endpoint_release as *const () as usize)
+        }
+        _ => None,
+    }
+}
+
 /// The service table handed to every module.
 pub static API: Api = Api {
     size: size_of::<Api>() as u32,
-    revision: 1,
+    revision: 2,
     abi_major: ABI_MAJOR,
     abi_minor: ABI_MINOR,
     reserved: 0,
@@ -760,4 +956,41 @@ pub static API: Api = Api {
     klog_set_level: shim_klog_set_level,
     klog_console_level: shim_klog_console_level,
     klog_set_console_level: shim_klog_set_console_level,
+
+    tty_provider_register: shim_tty_provider_register,
+    tty_provider_unregister: shim_tty_provider_unregister,
+    event_wait_any: shim_event_wait_any,
+    event_wait_timeout: shim_event_wait_timeout,
+    worker_spawn: shim_worker_spawn,
+    worker_join: shim_worker_join,
+    process_group_signal: shim_process_group_signal,
+
+    fs_provider_register: shim_fs_provider_register,
+    fs_provider_unregister: shim_fs_provider_unregister,
+    fs_page_account_create: shim_fs_page_account_create,
+    fs_page_account_release: shim_fs_page_account_release,
+    fs_page_account_limit: shim_fs_page_account_limit,
+    fs_page_account_used: shim_fs_page_account_used,
+    fs_memory_object_create: shim_fs_memory_object_create,
+    fs_memory_object_retain: shim_fs_memory_object_retain,
+    fs_memory_object_release: shim_fs_memory_object_release,
+    fs_memory_object_read: shim_fs_memory_object_read,
+    fs_memory_object_write: shim_fs_memory_object_write,
+    fs_memory_object_truncate: shim_fs_memory_object_truncate,
+    fs_memory_object_page_count: shim_fs_memory_object_page_count,
+    fs_total_physical_pages: shim_fs_total_physical_pages,
+    devfs_broker_register: shim_devfs_broker_register,
+    devfs_broker_unregister: shim_devfs_broker_unregister,
+    devfs_endpoint_open: shim_devfs_endpoint_open,
+    devfs_endpoint_close: shim_devfs_endpoint_close,
+    devfs_endpoint_initial_offset: shim_devfs_endpoint_initial_offset,
+    devfs_endpoint_read: shim_devfs_endpoint_read,
+    devfs_endpoint_write: shim_devfs_endpoint_write,
+    devfs_endpoint_size: shim_devfs_endpoint_size,
+    devfs_endpoint_sync: shim_devfs_endpoint_sync,
+    devfs_endpoint_poll: shim_devfs_endpoint_poll,
+    devfs_endpoint_event: shim_devfs_endpoint_event,
+    devfs_endpoint_terminal_state: shim_devfs_endpoint_terminal_state,
+    devfs_endpoint_ioctl: shim_devfs_endpoint_ioctl,
+    devfs_endpoint_release: shim_devfs_endpoint_release,
 };

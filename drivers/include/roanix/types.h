@@ -20,7 +20,7 @@ extern "C" {
 /* Incompatible ABI generation. */
 #define RDF_ABI_MAJOR 1u
 /* Append-only ABI revision. */
-#define RDF_ABI_MINOR 0u
+#define RDF_ABI_MINOR 3u
 
 /* Success. */
 #define RDF_OK 0
@@ -72,6 +72,24 @@ extern "C" {
 #define RDF_ESPIPE (-20)
 /* The filesystem layer rejected the operation. */
 #define RDF_EFS (-21)
+/* A filesystem operation required a directory. */
+#define RDF_ENOTDIR (-22)
+/* A filesystem operation cannot operate on a directory. */
+#define RDF_EISDIR (-23)
+/* A directory still contains entries. */
+#define RDF_ENOTEMPTY (-24)
+/* A filesystem operation crosses mount boundaries. */
+#define RDF_EXDEV (-25)
+/* A filesystem traversal exceeded its symbolic-link bound. */
+#define RDF_ELOOP (-26)
+/* A filesystem name exceeds its supported length. */
+#define RDF_ENAMETOOLONG (-27)
+/* A file offset or size exceeds its supported range. */
+#define RDF_EFBIG (-28)
+/* A filesystem is read-only. */
+#define RDF_EROFS (-29)
+/* An open file does not permit the requested operation. */
+#define RDF_EBADF (-30)
 
 /* Log levels accepted by rdf_log(). */
 #define RDF_LOG_ERROR 1u
@@ -89,6 +107,12 @@ struct rdf_class;
 struct rdf_class_device;
 struct rdf_iface;
 struct rdf_irq_domain;
+struct rdf_tty_provider;
+struct rdf_fs_provider;
+struct rdf_fs_page_account;
+struct rdf_fs_memory_object;
+struct rdf_devfs_broker;
+struct rdf_devfs_endpoint;
 
 /* Opaque receipts returned by the call that creates a resource. */
 struct rdf_device_builder;
@@ -97,6 +121,7 @@ struct rdf_irq;
 struct rdf_work;
 struct rdf_timer;
 struct rdf_tty;
+struct rdf_worker;
 
 /* Identifier of a node in the device filesystem. */
 typedef uint64_t rdf_devnode_t;

@@ -61,7 +61,10 @@ pub fn destroy(handle: usize) -> Result<()> {
         .iter()
         .position(|entry| Arc::as_ptr(&entry.record) as usize == handle)
         .ok_or(Error::NotFound)?;
-    events[position].record.magic.store(MAGIC_DEAD, Ordering::Release);
+    events[position]
+        .record
+        .magic
+        .store(MAGIC_DEAD, Ordering::Release);
     events.remove(position);
     Ok(())
 }

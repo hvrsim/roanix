@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=0.1
-revision=2
+revision=3
 source_dir="util-roanix"
 hostdeps="gcc-host binutils"
 deps="sys-libs"
@@ -22,6 +22,7 @@ package() {
     install -Dm755 init "${dest_dir}/usr/bin/init"
     install -Dm755 dmesg "${dest_dir}/usr/bin/dmesg"
     install -Dm755 pthread-test "${dest_dir}/usr/bin/pthread-test"
+    install -Dm755 proc-test "${dest_dir}/usr/bin/proc-test"
 
     mkdir -p "${dest_dir}/sbin"
     ln -s ../usr/bin/init "${dest_dir}/sbin/init"

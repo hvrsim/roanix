@@ -301,9 +301,7 @@ pub(super) fn free(handle: SwapHandle) {
                 entry.checksum = 0;
                 let length = data.len() as u64;
                 drop(data);
-                manager
-                    .compressed_bytes
-                    .fetch_sub(length, Ordering::AcqRel);
+                manager.compressed_bytes.fetch_sub(length, Ordering::AcqRel);
                 manager.compressed_pages.fetch_sub(1, Ordering::AcqRel);
                 // Capacity was reserved when the slot was created, so this
                 // cannot allocate and the slot can never be stranded.

@@ -33,9 +33,9 @@ use super::{
     driver::Driver,
     fwnode::Fwnode,
     iface::Interface,
-    module::Module,
+    module::{self, Module},
     name::Name,
-    property::{Properties, PropertyBuilder, PropValue},
+    property::{PropValue, Properties, PropertyBuilder},
     resource::{self, Resource, ResourceBuilder},
 };
 
@@ -44,9 +44,10 @@ pub const MAX_NAME: usize = 96;
 
 /// Device lifecycle state.
 pub mod state {
-    /// Allocated but not yet published.
-    pub const NEW: u32 = 0;
     /// Published and waiting for a driver.
+    ///
+    /// Devices are born directly in this state; there is no unpublished
+    /// device state because `add` constructs and publishes atomically.
     pub const UNBOUND: u32 = 1;
     /// A driver's probe callback is running.
     pub const PROBING: u32 = 2;
@@ -221,12 +222,23 @@ impl Device {
 
     pub(crate) fn set_state(&self, value: u32) {
         self.state.store(value, Ordering::Release);
+        let object_state = match value {
+            state::REMOVING => super::super::obj::ObjState::Removing,
+            state::DEAD => super::super::obj::ObjState::Dead,
+            _ => super::super::obj::ObjState::Live,
+        };
+        self.header.set_state(object_state);
     }
 
     pub(crate) fn transition(&self, from: u32, to: u32) -> bool {
-        self.state
+        let changed = self
+            .state
             .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if changed {
+            self.set_state(to);
+        }
+        changed
     }
 
     /// Returns the driver currently bound to this device.
@@ -273,7 +285,9 @@ impl Device {
             .lock()
             .interfaces
             .iter()
-            .filter(|entry| entry.name() == name && entry.is_live() && entry.version() >= min_version)
+            .filter(|entry| {
+                entry.name() == name && entry.is_live() && entry.version() >= min_version
+            })
             .max_by_key(|entry| entry.version())
             .cloned()
     }
@@ -375,6 +389,7 @@ impl DeviceBuilder {
 
     /// Appends a hardware resource.
     pub fn resource(&mut self, resource: Resource) -> Result<usize> {
+        resource.validate()?;
         self.resources.push(resource)
     }
 
@@ -394,7 +409,6 @@ impl DeviceBuilder {
 }
 
 struct Registry {
-    next_id: AtomicU64,
     root: Arc<Device>,
 }
 
@@ -402,9 +416,11 @@ static REGISTRY: Once<Registry> = Once::new();
 
 pub(crate) fn init() {
     REGISTRY.call_once(|| {
+        let header = ObjHeader::new_with(ObjKind::Device, Some("devices"), None, None);
+        let id = header.id();
         let root = Arc::new(Device {
-            header: ObjHeader::new(ObjKind::Device),
-            id: 1,
+            header,
+            id,
             name: Name::new("devices"),
             path: Box::from("/"),
             parent: None,
@@ -426,10 +442,10 @@ pub(crate) fn init() {
             self_ref: Mutex::new(Weak::new()),
         });
         *root.self_ref.lock() = Arc::downgrade(&root);
-        Registry {
-            next_id: AtomicU64::new(2),
-            root,
-        }
+        root.header
+            .register()
+            .expect("driver/device: failed to register device root");
+        Registry { root }
     });
 }
 
@@ -469,9 +485,16 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
         }
     }
 
+    let header = ObjHeader::new_with(
+        ObjKind::Device,
+        Some(&builder.name),
+        builder.owner.as_ref().map(|owner| owner.id().get()),
+        Some(parent.id()),
+    );
+    let id = header.id();
     let device = Arc::new(Device {
-        header: ObjHeader::new(ObjKind::Device),
-        id: registry.next_id.fetch_add(1, Ordering::Relaxed),
+        header,
+        id,
         name: Name::new(&builder.name),
         path: path.into_boxed_str(),
         parent: Some(Arc::downgrade(&parent)),
@@ -493,7 +516,38 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
         self_ref: Mutex::new(Weak::new()),
     });
     *device.self_ref.lock() = Arc::downgrade(&device);
-    parent.inner.lock().children.push(device.clone());
+    device.header.register()?;
+    {
+        let mut children = parent.inner.lock();
+        // Re-check under the same critical section that publishes the child:
+        // the earlier duplicate check raced with any concurrent sibling add.
+        if children
+            .children
+            .iter()
+            .any(|child| child.name.as_str() == &*builder.name)
+        {
+            device.header.poison();
+            return Err(Error::AlreadyExists);
+        }
+        if parent.state() == state::DEAD {
+            device.header.poison();
+            return Err(Error::NoDevice);
+        }
+        children.children.push(device.clone());
+    }
+
+    // The device keeps its bus handle for its whole lifetime, so its creator
+    // must pin the bus owner's image until removal.
+    let bus_owner = device.bus().and_then(|bus| bus.owner().cloned());
+    if module::link(device.owner(), bus_owner.as_ref()).is_err() {
+        parent
+            .inner
+            .lock()
+            .children
+            .retain(|child| !Arc::ptr_eq(child, &device));
+        device.header.poison();
+        return Err(Error::Deadlock);
+    }
 
     super::probe::attach(&device);
     Ok(device)
@@ -504,10 +558,21 @@ pub fn remove(device: &Arc<Device>) -> Result<()> {
     if Arc::ptr_eq(device, &registry()?.root) {
         return Err(Error::PermissionDenied);
     }
-    if device.state() == state::DEAD {
-        return Ok(());
+    // Claim the device through the same atomic transition protocol the bind
+    // engine uses. Refuse while a probe is in flight instead of overwriting
+    // its state: stealing PROBING used to let removal run concurrently with
+    // a driver probe and resurrect the device as BOUND afterwards.
+    loop {
+        let previous = device.state();
+        match previous {
+            state::DEAD => return Ok(()),
+            state::PROBING => return Err(Error::Busy),
+            _ => {}
+        }
+        if device.transition(previous, state::REMOVING) {
+            break;
+        }
     }
-    device.set_state(state::REMOVING);
 
     for child in device.children() {
         let _ = remove(&child);
@@ -522,6 +587,8 @@ pub fn remove(device: &Arc<Device>) -> Result<()> {
         let _ = super::iface::withdraw(&interface);
     }
     super::super::irq::release_device_interrupts(device);
+
+    module::unlink(device.owner(), device.bus().and_then(|bus| bus.owner()));
 
     if let Some(parent) = device.parent() {
         parent

@@ -51,6 +51,24 @@ pub enum Error {
     IllegalSeek,
     /// The filesystem layer rejected an operation.
     Filesystem,
+    /// A filesystem operation required a directory.
+    NotDirectory,
+    /// A filesystem operation cannot operate on a directory.
+    IsDirectory,
+    /// A directory still contains entries.
+    NotEmpty,
+    /// A filesystem operation crosses mount boundaries.
+    CrossDevice,
+    /// A filesystem traversal exceeded its symbolic-link bound.
+    SymlinkLoop,
+    /// A filesystem name exceeds its supported length.
+    NameTooLong,
+    /// A file offset or size exceeds its supported range.
+    FileTooLarge,
+    /// A filesystem is read-only.
+    ReadOnly,
+    /// An open file does not permit the requested operation.
+    BadFileDescriptor,
     /// A driver callback returned an unmapped negative status.
     Callback(i32),
 }
@@ -102,6 +120,15 @@ status_table! {
     NotTty => -19,
     IllegalSeek => -20,
     Filesystem => -21,
+    NotDirectory => -22,
+    IsDirectory => -23,
+    NotEmpty => -24,
+    CrossDevice => -25,
+    SymlinkLoop => -26,
+    NameTooLong => -27,
+    FileTooLarge => -28,
+    ReadOnly => -29,
+    BadFileDescriptor => -30,
 }
 
 impl Error {
@@ -116,15 +143,20 @@ impl From<crate::fs::Error> for Error {
         match error {
             crate::fs::Error::NotFound => Self::NotFound,
             crate::fs::Error::AlreadyExists => Self::AlreadyExists,
-            crate::fs::Error::Busy | crate::fs::Error::NotEmpty => Self::Busy,
-            crate::fs::Error::PermissionDenied | crate::fs::Error::ReadOnly => {
-                Self::PermissionDenied
-            }
+            crate::fs::Error::Busy => Self::Busy,
+            crate::fs::Error::NotDirectory => Self::NotDirectory,
+            crate::fs::Error::IsDirectory => Self::IsDirectory,
+            crate::fs::Error::NotEmpty => Self::NotEmpty,
+            crate::fs::Error::CrossDevice => Self::CrossDevice,
+            crate::fs::Error::SymlinkLoop => Self::SymlinkLoop,
+            crate::fs::Error::NameTooLong => Self::NameTooLong,
+            crate::fs::Error::FileTooLarge => Self::FileTooLarge,
+            crate::fs::Error::ReadOnly => Self::ReadOnly,
+            crate::fs::Error::BadFileDescriptor => Self::BadFileDescriptor,
+            crate::fs::Error::PermissionDenied => Self::PermissionDenied,
             crate::fs::Error::OutOfMemory => Self::OutOfMemory,
             crate::fs::Error::NoSpace => Self::NoSpace,
-            crate::fs::Error::InvalidArgument | crate::fs::Error::NameTooLong => {
-                Self::InvalidArgument
-            }
+            crate::fs::Error::InvalidArgument => Self::InvalidArgument,
             crate::fs::Error::WouldBlock => Self::WouldBlock,
             crate::fs::Error::Interrupted => Self::Interrupted,
             crate::fs::Error::NotTty => Self::NotTty,
@@ -150,6 +182,15 @@ impl From<Error> for crate::fs::Error {
             Error::Interrupted => Self::Interrupted,
             Error::NotTty => Self::NotTty,
             Error::IllegalSeek => Self::IllegalSeek,
+            Error::NotDirectory => Self::NotDirectory,
+            Error::IsDirectory => Self::IsDirectory,
+            Error::NotEmpty => Self::NotEmpty,
+            Error::CrossDevice => Self::CrossDevice,
+            Error::SymlinkLoop => Self::SymlinkLoop,
+            Error::NameTooLong => Self::NameTooLong,
+            Error::FileTooLarge => Self::FileTooLarge,
+            Error::ReadOnly => Self::ReadOnly,
+            Error::BadFileDescriptor => Self::BadFileDescriptor,
             _ => Self::Io,
         }
     }

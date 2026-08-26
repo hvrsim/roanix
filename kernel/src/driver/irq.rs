@@ -14,7 +14,10 @@
 //!
 //! A handler that must do lengthy work returns [`outcome::WAKE_THREAD`] and the
 //! rest runs on a dedicated thread, which is what a storage or host-controller
-//! driver needs in order to complete requests without blocking delivery.
+//! driver needs in order to complete requests without blocking delivery. On a
+//! level-triggered line the top half must also mask (or otherwise quiet) the
+//! device before returning: until the thread services it, each re-delivery
+//! re-runs every handler and re-raises the wake.
 
 use alloc::{
     boxed::Box,
@@ -27,7 +30,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
-use log::{error, trace};
+use log::error;
 
 use crate::sys::{
     event::Event,
@@ -133,8 +136,12 @@ pub struct DomainOps {
         Option<unsafe extern "C" fn(context: *mut c_void, hwirq: u64, cpu: u32) -> i32>,
     /// Identifies the interrupt currently pending on this CPU.
     pub claim: Option<
-        unsafe extern "C" fn(context: *mut c_void, cpu: u32, platform_id: u64, out_hwirq: *mut u64)
-            -> i32,
+        unsafe extern "C" fn(
+            context: *mut c_void,
+            cpu: u32,
+            platform_id: u64,
+            out_hwirq: *mut u64,
+        ) -> i32,
     >,
     /// Completes an interrupt previously reported by `claim`.
     pub complete:
@@ -253,9 +260,7 @@ impl IrqDomain {
         let mut data = 0u32;
         // SAFETY: registration validated the callback, and the output pointers
         // address local storage that outlives the call.
-        let status = unsafe {
-            compose(self.ops.context, hwirq, &raw mut address, &raw mut data)
-        };
+        let status = unsafe { compose(self.ops.context, hwirq, &raw mut address, &raw mut data) };
         error::from_status(status)?;
         Ok((address, data))
     }
@@ -393,8 +398,13 @@ fn allocate_desc() -> Result<&'static IrqDesc> {
         count: AtomicU64::new(0),
         spurious: AtomicU64::new(0),
     });
-    // Descriptors are immortal so the delivery path can read them without any
-    // lifetime bookkeeping.
+    // Descriptors are immortal by design: the delivery path reads them with a
+    // single atomic load and no lifetime bookkeeping. A failed mapping attempt
+    // therefore consumes one virtual interrupt number even when nothing binds
+    // to it - failure paths clear the domain map so nothing stale is reachable,
+    // and the 1024-number space is sized to make that acceptable. Reclaiming
+    // numbers would need generation-tagged handles; revisit only if a system
+    // ever exhausts the space.
     let pointer = Arc::into_raw(record.clone()).cast_mut();
     registry.descs.lock().push(record);
     DESCS[virq as usize].store(pointer, Ordering::Release);
@@ -429,8 +439,14 @@ pub unsafe fn register_domain(
 
     let mut map = Vec::new();
     map.resize_with(hwirq_count as usize, || AtomicU32::new(0));
+    let header = ObjHeader::new_with(
+        ObjKind::IrqDomain,
+        Some(name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let domain = Arc::new(IrqDomain {
-        header: ObjHeader::new(ObjKind::IrqDomain),
+        header,
         name: String::from(name).into_boxed_str(),
         owner: owner.cloned(),
         flags,
@@ -438,6 +454,7 @@ pub unsafe fn register_domain(
         hwirq_count,
         map: map.into_boxed_slice(),
     });
+    domain.header.register()?;
     domains.push(domain.clone());
     drop(domains);
 
@@ -465,6 +482,7 @@ pub fn unregister_domain(domain: &Arc<IrqDomain>) -> Result<()> {
 }
 
 fn force_unregister_domain(domain: &Arc<IrqDomain>) {
+    domain.header.set_state(super::obj::ObjState::Removing);
     for index in 0..domain.hwirq_count as usize {
         let virq = domain.map[index].swap(0, Ordering::AcqRel);
         if virq != 0 {
@@ -588,6 +606,7 @@ fn inherited_domain() -> Option<Arc<IrqDomain>> {
 ///
 /// `handler` and `thread` must follow the interrupt ABI and stay executable
 /// until the action is released.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn request(
     owner: Option<&Arc<Module>>,
     device: Option<&Arc<Device>>,
@@ -679,10 +698,17 @@ fn start_thread(action: &Arc<IrqAction>) -> Result<()> {
 }
 
 /// Detaches a handler.
+///
+/// The handler must not be released from its own threaded worker: the final
+/// wait observes that thread's exit and would deadlock against itself.
 pub fn release(action: &Arc<IrqAction>) -> Result<()> {
     let record = desc(action.virq).ok_or(Error::NotFound)?;
-    let registration = registry()?.registration.lock();
     let (domain, hwirq, mask) = {
+        // Held only across the list read-modify-write it exists to serialize.
+        // The drain loop below can spin for as long as a dispatch is running,
+        // and holding the global mutex through it stalled every unrelated
+        // request and release in the system.
+        let _registration = registry()?.registration.lock();
         let snapshot = {
             let inner = record.inner.lock();
             inner.actions.clone()
@@ -716,7 +742,6 @@ pub fn release(action: &Arc<IrqAction>) -> Result<()> {
     while record.in_flight.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
-    drop(registration);
 
     if action.threaded.load(Ordering::Acquire) {
         // The worker thread executes module code, so it must be observed to
@@ -821,6 +846,7 @@ pub struct DispatchOutcome {
 }
 
 /// Dispatches an architecture vector. This is the x86 delivery path.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn dispatch_vector(vector: u8) -> DispatchOutcome {
     let virq = VECTOR_MAP[vector as usize].load(Ordering::Acquire);
     if virq == 0 {
@@ -830,6 +856,7 @@ pub(crate) fn dispatch_vector(vector: u8) -> DispatchOutcome {
 }
 
 /// Dispatches a generic external interrupt. This is the RISC-V delivery path.
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
     let pointer = ROOT_DOMAIN.load(Ordering::Acquire);
     if pointer.is_null() {
@@ -859,7 +886,7 @@ pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
             // A device can raise a line nobody claimed, and it will keep
             // doing so every time it fires. Reporting each one at warn would
             // bury the console under a single misbehaving device.
-            trace!("unmapped hardware interrupt {hwirq} on {}", domain.name);
+            log::trace!("unmapped hardware interrupt {hwirq} on {}", domain.name);
         }
         if let Some(complete) = domain.ops.complete {
             // SAFETY: registration validated the callback and `hwirq` was just
@@ -908,6 +935,8 @@ fn run(virq: u32) -> DispatchOutcome {
             result.reschedule = true;
         }
         if status & outcome::WAKE_THREAD != 0 && action.thread.is_some() {
+            // Requests coalesce: two pends raised between the worker's wake
+            // and its next wait yield exactly one thread run.
             wake = Some(action.clone());
         }
     }
@@ -987,7 +1016,12 @@ fn for_each_action<F: Fn(&Arc<IrqAction>) -> bool>(select: F) {
         };
         let matching: Vec<Arc<IrqAction>> = {
             let inner = record.inner.lock();
-            inner.actions.iter().filter(|a| select(a)).cloned().collect()
+            inner
+                .actions
+                .iter()
+                .filter(|a| select(a))
+                .cloned()
+                .collect()
         };
         for action in matching {
             if let Err(error) = release(&action) {

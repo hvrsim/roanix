@@ -4,13 +4,21 @@
 //! Access to and extraction of the userspace archive loaded as a Limine module.
 //!
 
-use alloc::{collections::BTreeSet, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
 use core::{fmt, slice, str};
 
 use limine::request::ModuleRequest;
 use log::{debug, error, info};
 
-use crate::fs::{self, OpenFlags, SetAttr};
+use crate::fs::{
+    self,
+    vfs::{self as vfs_mod, PathAnchor},
+};
 
 const TAR_BLOCK_SIZE: usize = 512;
 const TAR_NAME_RANGE: core::ops::Range<usize> = 0..100;
@@ -200,6 +208,48 @@ impl<'a> TarArchive<'a> {
     }
 }
 
+/// Iterator over regular files in the Limine initramfs.
+///
+/// Archive parsing remains private to this module; callers only see validated
+/// archive paths and their payload bytes.
+pub(crate) struct RegularFileIter<'a> {
+    archive: TarArchive<'a>,
+    failed: bool,
+}
+
+impl<'a> RegularFileIter<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            archive: TarArchive::new(bytes),
+            failed: false,
+        }
+    }
+}
+
+impl<'a> Iterator for RegularFileIter<'a> {
+    type Item = Result<(String, &'a [u8])>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+
+        loop {
+            match self.archive.next() {
+                Ok(Some(entry)) => match entry.kind {
+                    EntryKind::Regular(bytes) => return Some(Ok((entry.path, bytes))),
+                    EntryKind::Directory | EntryKind::Symlink(_) | EntryKind::HardLink(_) => {}
+                },
+                Ok(None) => return None,
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
 /// Returns the initramfs archive decompressed by Limine.
 pub fn archive() -> Option<&'static [u8]> {
     let response = MODULE_REQUEST.get_response()?;
@@ -215,14 +265,26 @@ pub fn archive() -> Option<&'static [u8]> {
     Some(unsafe { slice::from_raw_parts(module.addr(), len) })
 }
 
+/// Returns an iterator over regular files in the Limine initramfs.
+pub(crate) fn regular_files() -> Option<RegularFileIter<'static>> {
+    archive().map(RegularFileIter::new)
+}
+
 /// Imports the Limine initramfs into the mounted root filesystem.
 pub(crate) fn populate() -> Result<usize> {
     let Some(bytes) = archive() else {
         return Ok(0);
     };
 
+    let root = vfs_mod::root_anchor().map_err(Error::from)?;
+
     let mut archive = TarArchive::new(bytes);
     let mut imported = BTreeSet::new();
+    // Anchors for directories whose VFS identity is already resolved. A
+    // typical initramfs has thousands of files sharing a few hundred parent
+    // directories, so caching turns per-entry path walks into a hash lookup.
+    let mut dir_cache: BTreeMap<Box<str>, PathAnchor> = BTreeMap::new();
+    dir_cache.insert(Box::from("/"), root.clone());
     let mut pending_links = Vec::new();
     let mut count = 0usize;
 
@@ -230,41 +292,31 @@ pub(crate) fn populate() -> Result<usize> {
         if !imported.insert(entry.path.clone()) {
             return Err(Error::DuplicatePath);
         }
-        ensure_parent_directories(&entry.path)?;
-        let path = absolute_path(&entry.path);
+
+        let absolute = absolute_path(&entry.path);
 
         match entry.kind {
             EntryKind::Regular(data) => {
-                let vnode = fs::create_file(path.as_bytes(), entry.mode)?;
+                let (dir_anchor, name) = cached_parent(&root, &mut dir_cache, &absolute)?;
+                let vnode = vfs_mod::create_file_at(&dir_anchor, name.as_bytes(), entry.mode)?;
                 write_all(&vnode, data)?;
-                vnode.setattr(SetAttr {
-                    size: None,
-                    mode: Some(entry.mode),
-                })?;
             }
             EntryKind::Directory => {
-                let vnode = match fs::create_dir(path.as_bytes(), entry.mode) {
-                    Ok(vnode) => vnode,
-                    Err(fs::Error::AlreadyExists) => {
-                        let file = fs::open(
-                            path.as_bytes(),
-                            OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
-                            0,
-                        )?;
-                        file.vnode().clone()
+                let (dir_anchor, name) = cached_parent(&root, &mut dir_cache, &absolute)?;
+                match vfs_mod::create_dir_at(&dir_anchor, name.as_bytes(), entry.mode) {
+                    Ok(_) | Err(fs::Error::AlreadyExists) => {
+                        let anchor = vfs_mod::resolve_at(&root, absolute.as_bytes(), true)?;
+                        dir_cache.insert(Box::from(absolute.as_str()), anchor);
                     }
                     Err(error) => return Err(error.into()),
-                };
-                vnode.setattr(SetAttr {
-                    size: None,
-                    mode: Some(entry.mode),
-                })?;
+                }
             }
             EntryKind::Symlink(target) => {
-                fs::symlink(target.as_bytes(), path.as_bytes())?;
+                let (dir_anchor, name) = cached_parent(&root, &mut dir_cache, &absolute)?;
+                vfs_mod::symlink_at(target.as_bytes(), &dir_anchor, name.as_bytes())?;
             }
             EntryKind::HardLink(target) => {
-                pending_links.push((absolute_path(&target), path));
+                pending_links.push((absolute_path(&target), absolute));
             }
         }
         count = count.checked_add(1).ok_or(Error::InvalidNumber)?;
@@ -273,6 +325,55 @@ pub(crate) fn populate() -> Result<usize> {
     resolve_hard_links(pending_links)?;
     info!("imported {count} initramfs entries");
     Ok(count)
+}
+
+/// Splits `path` into a resolved parent anchor and final component name.
+///
+/// Walks only uncached prefix components; once a cached anchor covers the
+/// parent, no VFS lookup is performed at all.
+fn cached_parent<'a>(
+    root: &PathAnchor,
+    cache: &mut BTreeMap<Box<str>, PathAnchor>,
+    path: &'a str,
+) -> Result<(PathAnchor, &'a str)> {
+    // A leading slash means the parent is the root; map "" to "/".
+    let parent = if path.starts_with('/') {
+        match path.rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => "/",
+        }
+    } else {
+        match path.rsplit_once('/') {
+            Some((parent, _)) => parent,
+            None => "/",
+        }
+    };
+
+    let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path);
+
+    if let Some(anchor) = cache.get(parent) {
+        return Ok((anchor.clone(), name));
+    }
+
+    // Walk components from the root, caching each newly seen directory.
+    let mut current = String::new();
+    for component in parent.split('/') {
+        current.push('/');
+        current.push_str(component);
+        if !cache.contains_key(current.as_str()) {
+            let anchor = vfs_mod::resolve_at(root, current.as_bytes(), true).or_else(|_| {
+                vfs_mod::create_dir_at(root, current.as_bytes(), 0o755)?;
+                vfs_mod::resolve_at(root, current.as_bytes(), true)
+            })?;
+            cache.insert(Box::from(current.as_str()), anchor);
+        }
+    }
+
+    match cache.get(parent) {
+        Some(anchor) => Ok((anchor.clone(), name)),
+        None => Err(Error::InvalidPath),
+    }
 }
 
 /// Reports whether Limine supplied an initramfs module.
@@ -371,30 +472,6 @@ fn absolute_path(path: &str) -> String {
     absolute.push('/');
     absolute.push_str(path);
     absolute
-}
-
-fn ensure_parent_directories(path: &str) -> Result<()> {
-    let Some((parent, _)) = path.rsplit_once('/') else {
-        return Ok(());
-    };
-
-    let mut current = String::new();
-    for component in parent.split('/') {
-        current.push('/');
-        current.push_str(component);
-        match fs::open(
-            current.as_bytes(),
-            OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW,
-            0,
-        ) {
-            Ok(_) => {}
-            Err(fs::Error::NotFound) => {
-                fs::create_dir(current.as_bytes(), 0o755)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 fn write_all(vnode: &fs::Vnode, mut data: &[u8]) -> Result<()> {

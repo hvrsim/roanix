@@ -64,6 +64,9 @@ struct WaitGroup {
     wake_next: AtomicPtr<WaitGroup>,
 }
 
+// Keeping the common small wait set inline avoids an allocation on every
+// poll/select wait; the larger stack footprint is deliberate.
+#[allow(clippy::large_enum_variant)]
 enum WaitRegistrations {
     Inline {
         slots: [Option<EventWaiter>; INLINE_WAITERS],
@@ -391,9 +394,8 @@ impl Event {
         let group = core::pin::pin!(WaitGroup::new(current, park_seq));
         let group_ptr = group.as_ref().get_ref() as *const WaitGroup as *mut WaitGroup;
         let waiter = core::pin::pin!(EventWaiter::new(self, group_ptr, 0));
-        let registrations = WaitRegistrations::from_slice(core::slice::from_ref(
-            waiter.as_ref().get_ref(),
-        ));
+        let registrations =
+            WaitRegistrations::from_slice(core::slice::from_ref(waiter.as_ref().get_ref()));
 
         let winner = wait_with_registrations(
             core::slice::from_ref(&self),

@@ -147,7 +147,13 @@ impl Allocator {
             .iter()
             .position(|range| range.start > start)
             .unwrap_or(self.free.len());
-        self.free.insert(position, Range { start, pages: total });
+        self.free.insert(
+            position,
+            Range {
+                start,
+                pages: total,
+            },
+        );
         self.coalesce(position);
     }
 
@@ -210,17 +216,10 @@ fn reserve_window() {
     };
     // SAFETY: the window base is unmapped at this point and the page is owned
     // exclusively by this permanent reservation.
-    unsafe {
-        arch::paging::map_page(
-            root,
-            base,
-            page.paddr(),
-            VmFlags::READ | VmFlags::GLOBAL,
-        )
-    }
-    .unwrap_or_else(|error| {
-        panic!("driver/io: failed to reserve the device window: {error:?}")
-    });
+    unsafe { arch::paging::map_page(root, base, page.paddr(), VmFlags::READ | VmFlags::GLOBAL) }
+        .unwrap_or_else(|error| {
+            panic!("driver/io: failed to reserve the device window: {error:?}")
+        });
 }
 
 fn state() -> Result<&'static State> {

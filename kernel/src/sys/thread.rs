@@ -665,6 +665,7 @@ pub(crate) fn allocate_user_thread(
 }
 
 /// Allocates a child user thread from a copied parent syscall frame.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_forked_user_thread(
     id: usize,
     cpu: usize,
@@ -730,7 +731,7 @@ fn allocate_thread_record(
     } else {
         ThreadState::Ready
     };
-    let thread = Box::leak(Box::new(Thread {
+    Box::leak(Box::new(Thread {
         runq_link: LinkedListLink::new(),
         reap_link: LinkedListLink::new(),
         all_link: LinkedListLink::new(),
@@ -768,8 +769,7 @@ fn allocate_thread_record(
         address_space: IrqSpinLock::new(address_space),
         thread_pointer: AtomicU64::new(0),
         name: IrqSpinLock::new(ThreadName::new()),
-    }));
-    thread
+    }))
 }
 
 /// Reclaims a thread allocation after it has permanently exited.

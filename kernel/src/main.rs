@@ -52,6 +52,7 @@ fn early_init() -> ! {
 
     mem::init();
     driver::init();
+    driver::load_boot_modules().expect("boot: failed to load required boot modules");
     arch::init_platform();
     sys::smp::discover();
     sys::sched::bootstrap(init_thread);

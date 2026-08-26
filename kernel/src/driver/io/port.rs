@@ -4,9 +4,9 @@
 //! report [`Error::Unsupported`] so a driver that is compiled for both can
 //! detect the difference at run time instead of failing to build.
 
-use super::super::error::Result;
 #[cfg(not(target_arch = "x86_64"))]
 use super::super::error::Error;
+use super::super::error::Result;
 
 /// Reads one byte from an I/O port.
 pub fn read8(port: u16) -> Result<u8> {

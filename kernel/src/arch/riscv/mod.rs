@@ -33,8 +33,7 @@ const MAX_ICACHE_CPUS: usize = 256;
 static ICACHE_SYNC_LOCK: Mutex<()> = Mutex::new(());
 static ICACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ICACHE_PUBLISHED: AtomicU64 = AtomicU64::new(0);
-static ICACHE_SEEN: [AtomicU64; MAX_ICACHE_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_ICACHE_CPUS];
+static ICACHE_SEEN: [AtomicU64; MAX_ICACHE_CPUS] = [const { AtomicU64::new(0) }; MAX_ICACHE_CPUS];
 
 /// SBI extension ID for the debug console.
 const DEBUG_EXT_ID: usize = 0x4442434E;
@@ -247,8 +246,7 @@ pub fn sync_instruction_cache() {
 
     loop {
         let complete = (0..smp::cpu_count().min(MAX_ICACHE_CPUS)).all(|target| {
-            !smp::is_online(target)
-                || ICACHE_SEEN[target].load(Ordering::Acquire) >= sequence
+            !smp::is_online(target) || ICACHE_SEEN[target].load(Ordering::Acquire) >= sequence
         });
         if complete {
             return;
@@ -322,9 +320,7 @@ pub fn send_ipi_all_excluding_self() {
             }
         }
 
-        if mask != 0
-            && sbi_call3(mask, base, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND).error != 0
-        {
+        if mask != 0 && sbi_call3(mask, base, 0, SBI_EXT_IPI, SBI_EXT_IPI_SEND).error != 0 {
             // Fall back to unicast delivery when the SBI IPI extension is
             // unavailable on this platform.
             for cpu_id in 0..total {

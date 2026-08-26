@@ -342,7 +342,8 @@ impl Ring {
             slot.header.get().write(header);
         }
 
-        slot.state.store((sequence << 1) | COMMITTED, Ordering::Release);
+        slot.state
+            .store((sequence << 1) | COMMITTED, Ordering::Release);
         sequence
     }
 

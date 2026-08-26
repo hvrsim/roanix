@@ -206,12 +206,7 @@ fn map_slot(slot: usize) -> Option<()> {
         // range is reserved for kernel stacks, and the arena's page tables are
         // serialized by `MAPPING`.
         let mapped = unsafe {
-            arch::paging::map_page(
-                root,
-                virt,
-                page.paddr(),
-                VmFlags::READ | VmFlags::WRITE,
-            )
+            arch::paging::map_page(root, virt, page.paddr(), VmFlags::READ | VmFlags::WRITE)
         };
         if mapped.is_err() {
             unmap_partial(root, base, index);

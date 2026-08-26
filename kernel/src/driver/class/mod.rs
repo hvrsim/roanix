@@ -6,7 +6,6 @@
 
 pub mod chardev;
 pub mod console;
-pub mod tty;
 
 /// Initializes the kernel-provided classes.
 pub(super) fn init() {

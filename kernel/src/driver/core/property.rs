@@ -97,6 +97,11 @@ impl PropValue {
         }
     }
 
+    /// Returns whether this value contains no elements or bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns whether any string in this property equals `text`.
     pub fn contains_string(&self, text: &str) -> bool {
         match self {
@@ -151,7 +156,8 @@ impl PropertyBuilder {
                 if self.entries.len() >= MAX_PROPERTIES {
                     return Err(Error::NoSpace);
                 }
-                self.entries.push((String::from(name).into_boxed_str(), value));
+                self.entries
+                    .push((String::from(name).into_boxed_str(), value));
             }
         }
         Ok(())
@@ -164,7 +170,8 @@ impl PropertyBuilder {
 
     /// Freezes the collection into its published form.
     pub fn build(mut self) -> Properties {
-        self.entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        self.entries
+            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Properties {
             entries: self.entries.into_boxed_slice(),
         }

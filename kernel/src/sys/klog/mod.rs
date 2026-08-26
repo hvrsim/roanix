@@ -24,7 +24,7 @@ pub mod dev;
 pub mod packet;
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::sys::{clock, event::Event, smp::IrqSpinLock};
 
@@ -319,7 +319,8 @@ pub fn stats() -> Stats {
 /// Returns the oldest sequence a reader may observe.
 #[inline]
 pub fn first_sequence() -> u64 {
-    RING.first_sequence().max(VISIBLE_FLOOR.load(Ordering::Acquire))
+    RING.first_sequence()
+        .max(VISIBLE_FLOOR.load(Ordering::Acquire))
 }
 
 /// Returns the sequence that will be given to the next record.
@@ -384,14 +385,7 @@ pub fn unregister_sink(sink: Sink) -> bool {
 ///
 /// This is the single entry point every producer funnels through, including
 /// the [`log`] facade and `/dev/kmsg` writes.
-pub fn emit(
-    level: Level,
-    subsystem: &str,
-    file: &str,
-    line: u32,
-    message: &[u8],
-    flags: u8,
-) {
+pub fn emit(level: Level, subsystem: &str, file: &str, line: u32, message: &[u8], flags: u8) {
     if PANIC_MODE.load(Ordering::Relaxed) && flags & packet::FLAG_EMERGENCY == 0 {
         return;
     }
@@ -719,7 +713,8 @@ impl fmt::Display for Utf8<'_> {
                 Err(error) => {
                     let valid = error.valid_up_to();
                     // SAFETY: `from_utf8` reported this prefix as well-formed.
-                    formatter.write_str(unsafe { core::str::from_utf8_unchecked(&rest[..valid]) })?;
+                    let prefix = unsafe { core::str::from_utf8_unchecked(&rest[..valid]) };
+                    formatter.write_str(prefix)?;
                     formatter.write_char('\u{fffd}')?;
                     rest = &rest[valid + error.error_len().unwrap_or(1)..];
                 }

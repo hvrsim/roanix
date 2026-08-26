@@ -255,6 +255,12 @@ pub fn create_dir(path: &[u8], mode: u16) -> Result<Vnode> {
 }
 
 /// Creates an empty directory relative to a stable directory anchor.
+/// Creates an empty regular file directly below a stable directory anchor.
+pub(crate) fn create_file_at(base: &PathAnchor, name: &[u8], mode: u16) -> Result<Vnode> {
+    base.vnode().create(name, CreateKind::Regular, mode)
+}
+
+/// Creates an empty directory directly below a stable directory anchor.
 pub(crate) fn create_dir_at(base: &PathAnchor, path: &[u8], mode: u16) -> Result<Vnode> {
     let (directory, parent) = resolve_parent(Some(base), path)?;
     directory

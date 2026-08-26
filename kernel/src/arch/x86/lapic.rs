@@ -148,11 +148,7 @@ pub fn init(tsc_hz: u64) {
             lapic_timer_hz
         );
     } else {
-        info!(
-            "{} mode, {} timer",
-            access.name(),
-            timer_mode.name()
-        );
+        info!("{} mode, {} timer", access.name(), timer_mode.name());
     }
 }
 

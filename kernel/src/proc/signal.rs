@@ -11,9 +11,9 @@ use core::{
 };
 
 use crate::{
-    mem::IoSink,
     arch::cpu::TrapFrame,
     fs::PollEvents,
+    mem::IoSink,
     mem::{USER_ADDRESS_MAX, USER_ADDRESS_MIN, VirtAddr},
     proc::{Descriptor, Error, Process, Result},
     sys::{clock, event::Event, sched, sync::Mutex},
@@ -27,12 +27,10 @@ const SIGNAL_MAX: usize = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
-pub(crate) const SIGHUP: u8 = 1;
-pub(crate) const SIGINT: u8 = 2;
-pub(crate) const SIGQUIT: u8 = 3;
 pub(crate) const SIGILL: u8 = 4;
 pub(crate) const SIGTRAP: u8 = 5;
 pub(crate) const SIGBUS: u8 = 7;
+#[cfg(target_arch = "x86_64")]
 pub(crate) const SIGFPE: u8 = 8;
 const SIGKILL: u8 = 9;
 pub(crate) const SIGSEGV: u8 = 11;
@@ -692,14 +690,13 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
         if write_signal_frame(&process, frame_address, &signal_frame).is_err() {
             super::exit_current_signal(SIGSEGV);
         }
-        if let Some(return_slot) = return_slot {
-            if process
+        if let Some(return_slot) = return_slot
+            && process
                 .address_space()
                 .write_user(VirtAddr::new(return_slot), &action.restorer.to_ne_bytes())
                 .is_err()
-            {
-                super::exit_current_signal(SIGSEGV);
-            }
+        {
+            super::exit_current_signal(SIGSEGV);
         }
 
         let info_address = frame_address + offset_of!(UserSignalFrame, info) as u64;

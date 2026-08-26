@@ -168,7 +168,12 @@ impl MatchEntry {
         if self.flags & flags::NO_BONUS != 0 {
             return Some(0);
         }
-        Some(COMPATIBLE_BONUS - i32::try_from(position).unwrap_or(i32::MAX).min(COMPATIBLE_BONUS))
+        Some(
+            COMPATIBLE_BONUS
+                - i32::try_from(position)
+                    .unwrap_or(i32::MAX)
+                    .min(COMPATIBLE_BONUS),
+        )
     }
 
     fn evaluate_name(&self, device: &Arc<Device>) -> Option<i32> {
@@ -236,8 +241,6 @@ impl MatchEntry {
 /// Outcome of matching a driver's table against a device.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MatchResult {
-    /// Index of the winning entry within the driver's table.
-    pub index: usize,
     /// Cookie carried by the winning entry.
     pub data: usize,
     /// Total score, used to choose between competing drivers.
@@ -247,13 +250,12 @@ pub struct MatchResult {
 /// Returns the best-scoring entry of `table` for `device`.
 pub fn best(table: &[MatchEntry], device: &Arc<Device>) -> Option<MatchResult> {
     let mut best: Option<MatchResult> = None;
-    for (index, entry) in table.iter().enumerate() {
+    for entry in table {
         let Some(score) = entry.evaluate(device) else {
             continue;
         };
         if best.is_none_or(|current| score > current.score) {
             best = Some(MatchResult {
-                index,
                 data: entry.data,
                 score,
             });

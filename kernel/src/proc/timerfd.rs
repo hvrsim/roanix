@@ -8,8 +8,8 @@ use core::{
 };
 
 use crate::{
-    mem::IoSink,
     fs::PollEvents,
+    mem::IoSink,
     mem::VirtAddr,
     proc::Descriptor,
     sys::{clock, event::Event, sync::Mutex},

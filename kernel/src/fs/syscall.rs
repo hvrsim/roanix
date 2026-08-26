@@ -197,7 +197,7 @@ crate::syscall_handler! {
         let Descriptor::File(file) = descriptor else {
             return Err(Errno::NotTty);
         };
-        let spec = crate::driver::class::tty::ioctl_spec(request);
+        let spec = crate::driver::class::console::ioctl_spec(request);
         if spec.size > MAX_IOCTL_SIZE {
             return Err(Errno::Invalid);
         }
@@ -208,14 +208,14 @@ crate::syscall_handler! {
                 .read_user(VirtAddr::new(argument), &mut bytes)
                 .map_err(map_memory_error)?;
         }
-        if request == crate::driver::class::tty::TIOCSPGRP {
+        if request == crate::driver::class::console::TIOCSPGRP {
             let group =
                 i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| Errno::Invalid)?);
             if group <= 0 || !proc::process_group_in_session(group as usize, process.session()) {
                 return Err(Errno::Permission);
             }
         }
-        if request == crate::driver::class::tty::TIOCSCTTY
+        if request == crate::driver::class::console::TIOCSCTTY
             && process
                 .controlling_tty_key()
                 .is_some_and(|key| key != file.vnode().key())
@@ -224,13 +224,20 @@ crate::syscall_handler! {
         }
         let result = file
             .ioctl(ioctl_context(&process)?, request, argument, &mut bytes)
-            .map_err(map_fs_error)?;
+            .map_err(|error| match error {
+                // A filesystem that does not implement an ioctl treats the
+                // request as inappropriate for the object. POSIX reports that
+                // as ENOTTY - reporting ENOTSUP instead makes every probe of
+                // a plain file look like a hard failure to libc.
+                fs::Error::Unsupported => Errno::NotTty,
+                other => map_fs_error(other),
+            })?;
         match request {
-            crate::driver::class::tty::TIOCSCTTY => process.set_controlling_tty(file.clone()),
-            crate::driver::class::tty::TIOCNOTTY if process.session() == process.pid() => {
+            crate::driver::class::console::TIOCSCTTY => process.set_controlling_tty(file.clone()),
+            crate::driver::class::console::TIOCNOTTY if process.session() == process.pid() => {
                 proc::clear_session_controlling_tty(process.session(), file.vnode().key());
             }
-            crate::driver::class::tty::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
+            crate::driver::class::console::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
             _ => {}
         }
         if spec.output && spec.size != 0 {
@@ -673,8 +680,10 @@ crate::syscall_handler! {
                 .read_user(VirtAddr::new(poll_fds), &mut bytes)
                 .map_err(map_memory_error)?;
         }
-        let mut entries = bytes
-            .chunks_exact(POLL_FD_SIZE)
+        let (records, remainder) = bytes.as_chunks::<POLL_FD_SIZE>();
+        debug_assert!(remainder.is_empty());
+        let mut entries = records
+            .iter()
             .map(|record| UserPollFd {
                 fd: i32::from_ne_bytes(record[..4].try_into().expect("poll fd width")),
                 events: i16::from_ne_bytes(
@@ -688,7 +697,6 @@ crate::syscall_handler! {
         });
 
         let fds: Vec<i32> = entries.iter().map(|entry| entry.fd).collect();
-
         loop {
             let mut ready = 0usize;
             let descriptors = process.descriptors(&fds);
@@ -710,7 +718,9 @@ crate::syscall_handler! {
 
             let now = clock::monotonic_ns();
             if ready != 0 || timeout_ms == 0 || deadline.is_some_and(|value| now >= value) {
-                for (entry, record) in entries.iter().zip(bytes.chunks_exact_mut(POLL_FD_SIZE)) {
+                let (records, remainder) = bytes.as_chunks_mut::<POLL_FD_SIZE>();
+                debug_assert!(remainder.is_empty());
+                for (entry, record) in entries.iter().zip(records) {
                     record[..4].copy_from_slice(&entry.fd.to_ne_bytes());
                     record[4..6].copy_from_slice(&entry.events.to_ne_bytes());
                     record[6..8].copy_from_slice(&entry.revents.to_ne_bytes());
@@ -745,7 +755,6 @@ crate::syscall_handler! {
             }
             wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
             wait_events.dedup_by_key(|event| *event as *const Event as usize);
-
             if event_driven && wait_events.len() > 1 {
                 if let Some(deadline) = deadline {
                     let remaining = deadline.saturating_sub(now).max(1);
@@ -783,7 +792,7 @@ fn file_open_at(process: &Process, dirfd: i32, path: u64, flags: u64, mode: u64)
         && file
             .ioctl(
                 ioctl_context(process)?,
-                crate::driver::class::tty::TIOCSCTTY,
+                crate::driver::class::console::TIOCSCTTY,
                 0,
                 &mut [],
             )
@@ -832,9 +841,7 @@ fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u6
             write_user_stat(process, output, vnode.getattr().map_err(map_fs_error)?)
         }
         AtPath::Pipe => write_user_stat_record(process, output, UserStat::anonymous(0o666, 6)),
-        AtPath::Anonymous => {
-            write_user_stat_record(process, output, UserStat::anonymous(0o600, 1))
-        }
+        AtPath::Anonymous => write_user_stat_record(process, output, UserStat::anonymous(0o600, 1)),
     }
 }
 
@@ -1246,9 +1253,7 @@ fn check_terminal_job_control(
 /// POSIX allows a short transfer, so an oversized request is truncated rather
 /// than rejected.
 fn clamped_io_size(size: u64) -> Result<usize> {
-    Ok(usize::try_from(size)
-        .unwrap_or(usize::MAX)
-        .min(MAX_IO_SIZE))
+    Ok(usize::try_from(size).unwrap_or(usize::MAX).min(MAX_IO_SIZE))
 }
 
 fn checked_io_size(size: u64) -> Result<usize> {

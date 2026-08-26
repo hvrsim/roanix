@@ -71,7 +71,9 @@ pub struct Bus {
 framework_object!(Bus, Bus);
 
 // SAFETY: bus callbacks and the context pointer stay valid until the owning
-// module is unloaded, which cannot happen while devices reference the bus.
+// module is unloaded. Every device on the bus and every bound driver holds a
+// module dependency edge to the bus owner, so the unload gate refuses while
+// any of them exist.
 unsafe impl Send for Bus {}
 // SAFETY: the framework serialises bus registration, and callbacks are
 // required by the ABI to tolerate concurrent invocation.
@@ -167,11 +169,7 @@ fn registry() -> Result<&'static Registry> {
 ///
 /// Every callback in `ops` must follow the bus ABI and stay executable until
 /// the bus is unregistered.
-pub unsafe fn register(
-    owner: Option<&Arc<Module>>,
-    name: &str,
-    ops: BusOps,
-) -> Result<Arc<Bus>> {
+pub unsafe fn register(owner: Option<&Arc<Module>>, name: &str, ops: BusOps) -> Result<Arc<Bus>> {
     if name.is_empty() || name.len() > MAX_NAME {
         return Err(Error::InvalidArgument);
     }
@@ -180,13 +178,20 @@ pub unsafe fn register(
     if buses.iter().any(|bus| &*bus.name == name) {
         return Err(Error::AlreadyExists);
     }
+    let header = ObjHeader::new_with(
+        ObjKind::Bus,
+        Some(name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let bus = Arc::new(Bus {
-        header: ObjHeader::new(ObjKind::Bus),
+        header,
         name: String::from(name).into_boxed_str(),
         owner: owner.cloned(),
         ops,
         dma_ops: Mutex::new(core::ptr::null()),
     });
+    bus.header.register()?;
     buses.push(bus.clone());
     drop(buses);
     super::probe::retrigger();
@@ -215,6 +220,7 @@ pub fn unregister(bus: &Arc<Bus>) -> Result<()> {
 }
 
 fn force_unregister(bus: &Arc<Bus>) {
+    bus.header.set_state(super::super::obj::ObjState::Removing);
     if let Ok(registry) = registry() {
         registry
             .buses

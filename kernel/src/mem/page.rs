@@ -314,6 +314,40 @@ impl VmPage {
         }
     }
 
+    /// Pins the resident frame of this page for a direct-map window.
+    ///
+    /// The wire blocks reclamation, so the returned physical address stays
+    /// valid for as long as the caller holds the page. Pair every call with
+    /// [`Self::release_window`]; the page must not drop while wired.
+    pub(super) fn acquire_window(self: &Arc<Self>) -> Result<PhysAddr> {
+        let (frame, became_resident) = {
+            let mut backing = self.backing.lock();
+            let became_resident = self.ensure_resident_locked(&mut backing)?;
+            let PageBacking::Resident(frame) = &*backing else {
+                unreachable!("mem/page: window page is not resident");
+            };
+            if !self.permanent {
+                frame.wire();
+            }
+            (*frame, became_resident)
+        };
+        if became_resident {
+            phys::activate_managed(frame, self);
+        }
+        Ok(frame.paddr())
+    }
+
+    /// Releases one direct-map window pinned by [`Self::acquire_window`].
+    pub(super) fn release_window(&self) {
+        if self.permanent {
+            return;
+        }
+        let backing = self.backing.lock();
+        if let PageBacking::Resident(frame) = &*backing {
+            frame.unwire();
+        }
+    }
+
     pub(super) fn add_reverse_mapping(&self, pmap: &Arc<PmapInner>, address: u64) {
         if self.permanent {
             return;
@@ -365,7 +399,6 @@ impl VmPage {
             current.extend(mappings);
         }
     }
-
 
     pub(super) fn try_reclaim(self: &Arc<Self>) -> bool {
         if self.permanent {

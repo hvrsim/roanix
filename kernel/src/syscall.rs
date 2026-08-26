@@ -111,9 +111,9 @@ macro_rules! syscall_handler {
                 let $argument =
                     $frame.syscall_argument($argument_index) as $argument_type;
             )*
-            $crate::syscall::raw_result(
-                (|| -> $crate::syscall::Result<u64> { $body })()
-            )
+            #[allow(clippy::redundant_closure_call)]
+            let result = (|| -> $crate::syscall::Result<u64> { $body })();
+            $crate::syscall::raw_result(result)
         }
     };
 }

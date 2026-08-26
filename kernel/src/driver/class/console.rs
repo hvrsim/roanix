@@ -1,49 +1,136 @@
-//! Terminal registration.
+//! Terminal-provider broker.
 //!
-//! A driver that owns a byte-oriented console - a UART, a pseudo-terminal
-//! endpoint, or later a display console - supplies only the operations in
-//! [`ConsoleOps`]. Everything a terminal owes userspace, from canonical-mode
-//! editing to job control, comes from the shared line discipline in
-//! [`super::tty`].
-//!
-//! Registering a terminal joins the `tty` class, so a driver or a future
-//! subsystem can enumerate every terminal in the system without knowing which
-//! hardware backs it.
+//! The kernel deliberately owns only this C-compatible registration ABI. The
+//! line discipline, terminal nodes, class membership, and backend invocation
+//! live in the loadable `console.ko` provider. A terminal receipt leases both
+//! the provider and its backend module, so neither callback table can vanish
+//! while the provider owns the terminal.
 
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+#![allow(missing_docs)]
+
+use alloc::{sync::Arc, vec::Vec};
 use core::{
-    ffi::c_void,
+    ffi::{c_char, c_void},
+    mem::size_of,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{
-    fs::{Error as FsError, Result as FsResult, devtempfs::DevNodeId},
-    sys::{event::Event, sync::Mutex},
-};
+use crate::sys::sync::{Mutex, Once};
 
-use super::{
-    super::{
-        core::{
-            class::{self, Class, ClassDevice, Membership},
-            device::Device,
-            module::{self, Module},
-        },
-        error::{self, Error, Result},
+use super::super::{
+    core::{
+        device::Device,
+        module::{self, Module, ModuleLease},
     },
-    chardev,
-    tty::{ConsoleBackend, SerialSettings, Tty},
+    error::{Error, Result},
+    obj,
 };
+use super::chardev::DevNodeId;
 
-/// Name of the class every terminal joins.
-pub const CLASS_NAME: &str = "tty";
-
-/// Console behaviour flags.
+/// Console behaviour flags supplied by a byte-stream backend.
 pub mod flags {
-    /// Reset terminal settings when the last file description closes.
+    /// Reset terminal settings after the final close.
     pub const RESET_ON_LAST_CLOSE: u64 = 1 << 0;
 }
 
-/// Byte-level operations a console backend implements.
+/// Terminal ioctl copy metadata retained by the language-neutral broker.
+#[derive(Copy, Clone)]
+pub struct IoctlSpec {
+    /// Bytes copied in from userspace before dispatch.
+    pub input: bool,
+    /// Bytes copied back to userspace after dispatch.
+    pub output: bool,
+    /// Argument-buffer size.
+    pub size: usize,
+}
+
+pub const TCGETS: u64 = 0x5401;
+pub const TCSETS: u64 = 0x5402;
+pub const TCSETSW: u64 = 0x5403;
+pub const TCSETSF: u64 = 0x5404;
+pub const TCSBRK: u64 = 0x5409;
+pub const TCXONC: u64 = 0x540A;
+pub const TCFLSH: u64 = 0x540B;
+pub const TIOCEXCL: u64 = 0x540C;
+pub const TIOCNXCL: u64 = 0x540D;
+pub const TIOCSCTTY: u64 = 0x540E;
+pub const TIOCGPGRP: u64 = 0x540F;
+pub const TIOCSPGRP: u64 = 0x5410;
+pub const TIOCOUTQ: u64 = 0x5411;
+pub const TIOCSTI: u64 = 0x5412;
+pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TIOCSWINSZ: u64 = 0x5414;
+pub const TIOCGSOFTCAR: u64 = 0x5419;
+pub const TIOCSSOFTCAR: u64 = 0x541A;
+pub const FIONREAD: u64 = 0x541B;
+pub const TIOCNOTTY: u64 = 0x5422;
+pub const TIOCGSID: u64 = 0x5429;
+pub const TIOCGPTN: u64 = 0x8004_5430;
+pub const TIOCSPTLCK: u64 = 0x4004_5431;
+pub const TIOCGPATH: u64 = 0x5254_0001;
+
+const TERMIOS_SIZE: usize = 60;
+const WINSIZE_SIZE: usize = 8;
+const TTY_PATH_SIZE: usize = 32;
+
+/// Returns the userspace-copy requirements for a terminal ioctl.
+pub fn ioctl_spec(request: u64) -> IoctlSpec {
+    match request {
+        TCGETS => IoctlSpec {
+            input: false,
+            output: true,
+            size: TERMIOS_SIZE,
+        },
+        TCSETS | TCSETSW | TCSETSF => IoctlSpec {
+            input: true,
+            output: false,
+            size: TERMIOS_SIZE,
+        },
+        TIOCGPGRP | TIOCOUTQ | TIOCGSOFTCAR | FIONREAD | TIOCGSID | TIOCGPTN => IoctlSpec {
+            input: false,
+            output: true,
+            size: 4,
+        },
+        TIOCSPGRP | TIOCSSOFTCAR | TIOCSPTLCK => IoctlSpec {
+            input: true,
+            output: false,
+            size: 4,
+        },
+        TIOCSTI => IoctlSpec {
+            input: true,
+            output: false,
+            size: 1,
+        },
+        TIOCGWINSZ => IoctlSpec {
+            input: false,
+            output: true,
+            size: WINSIZE_SIZE,
+        },
+        TIOCSWINSZ => IoctlSpec {
+            input: true,
+            output: false,
+            size: WINSIZE_SIZE,
+        },
+        TIOCGPATH => IoctlSpec {
+            input: false,
+            output: true,
+            size: TTY_PATH_SIZE,
+        },
+        _ => {
+            let direction = (request >> 30) & 0x3;
+            IoctlSpec {
+                input: direction & 1 != 0,
+                output: direction & 2 != 0,
+                size: ((request >> 16) & 0x3fff) as usize,
+            }
+        }
+    }
+}
+
+/// Byte-level operations a UART, PTY, or other terminal backend implements.
+///
+/// This legacy ABI remains unchanged so C backends continue to register
+/// through `tty_register`.
 #[repr(C)]
 pub struct ConsoleOps {
     /// Size of this table, allowing later revisions to append entries.
@@ -88,7 +175,7 @@ pub struct ConsoleOps {
     pub hangup_event: usize,
 }
 
-/// Serial framing parameters handed to a backend.
+/// Serial framing parameters handed to a terminal backend.
 #[repr(C)]
 pub struct SerialFraming {
     /// Line rate in bits per second.
@@ -99,257 +186,90 @@ pub struct SerialFraming {
     pub stop_bits: u8,
     /// Whether parity generation is enabled.
     pub parity: u8,
-    /// Whether parity is odd rather than even.
+    /// Whether enabled parity is odd rather than even.
     pub odd_parity: u8,
 }
 
-struct Backend {
-    ops: ConsoleOps,
+/// Operations supplied by the modular terminal implementation.
+///
+/// The provider receives the original backend table unchanged. It may copy
+/// that table and call it directly: the broker's backend lease keeps its code
+/// and static callback table resident for the whole terminal lifetime.
+#[repr(C)]
+pub struct TtyProviderOps {
+    /// Size of this table.
+    pub size: u32,
+    /// Context passed to provider callbacks.
+    pub context: *mut c_void,
+    /// Creates a terminal and returns a provider-owned opaque receipt.
+    pub register: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const c_void,
+            *const c_void,
+            u64,
+            *const c_char,
+            u16,
+            u32,
+            *const ConsoleOps,
+            *mut *mut c_void,
+        ) -> i32,
+    >,
+    /// Stops a terminal worker and releases provider-owned terminal state.
+    pub unregister: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
+}
+
+// SAFETY: provider tables are immutable after registration and their context
+// synchronization is the responsibility of the module that supplies them.
+unsafe impl Send for TtyProviderOps {}
+// SAFETY: as above.
+unsafe impl Sync for TtyProviderOps {}
+
+/// Opaque receipt for the registered terminal provider.
+pub struct Provider {
+    ops: TtyProviderOps,
     owner: Option<Arc<Module>>,
+    terminals: AtomicU64,
 }
 
-// SAFETY: the operation table and context belong to the owning module, which
-// cannot unload until the terminal is removed.
-unsafe impl Send for Backend {}
-// SAFETY: the ABI requires console operations to tolerate concurrent use by the
-// line discipline's reader and writer paths.
-unsafe impl Sync for Backend {}
+// SAFETY: callback table execution is serialized by provider-defined state;
+// the broker only reads immutable table entries.
+unsafe impl Send for Provider {}
+// SAFETY: as above.
+unsafe impl Sync for Provider {}
 
-impl Backend {
-    fn pin(&self) -> FsResult<module::ModuleGuard> {
-        module::pin_owner(self.owner.as_ref(), false).map_err(|_| FsError::Io)
-    }
-
-    fn event(pointer: usize) -> Option<&'static Event> {
-        super::super::abi::events::resolve(pointer)
-    }
-}
-
-impl ConsoleBackend for Backend {
-    fn open(&self) -> FsResult<()> {
-        let Some(callback) = self.ops.open else {
-            return Ok(());
-        };
-        let _pin = self.pin()?;
-        // SAFETY: registration validated the callback.
-        error::from_status(unsafe { callback(self.ops.context) }).map_err(FsError::from)
-    }
-
-    fn close(&self) {
-        let Some(callback) = self.ops.close else {
-            return;
-        };
-        let Ok(_pin) = module::pin_owner(self.owner.as_ref(), true) else {
-            return;
-        };
-        // SAFETY: registration validated the callback.
-        unsafe { callback(self.ops.context) };
-    }
-
-    fn try_read(&self) -> Option<u8> {
-        let callback = self.ops.try_read?;
-        let _pin = self.pin().ok()?;
-        let mut byte = 0u8;
-        // SAFETY: registration validated the callback and the output pointer
-        // addresses local storage that outlives the call.
-        let status = unsafe { callback(self.ops.context, &raw mut byte) };
-        (status > 0).then_some(byte)
-    }
-
-    fn read(&self, output: &mut [u8]) -> FsResult<usize> {
-        let Some(callback) = self.ops.read else {
-            return self.read_fallback(output);
-        };
-        let _pin = self.pin()?;
-        // SAFETY: registration validated the callback, and the buffer describes
-        // memory owned by the caller for this call.
-        let value = unsafe { callback(self.ops.context, output.as_mut_ptr(), output.len()) };
-        if value < 0 {
-            return Err(Error::from_status(value as i32).into());
-        }
-        let read = value as usize;
-        if read > output.len() {
-            return Err(FsError::Io);
-        }
-        Ok(read)
-    }
-
-    fn write(&self, bytes: &[u8], nonblocking: bool) -> FsResult<()> {
-        let callback = self.ops.write.ok_or(FsError::Unsupported)?;
-        let _pin = self.pin()?;
-        // SAFETY: registration validated the callback, and the buffer describes
-        // memory owned by the caller for this call.
-        let status = unsafe {
-            callback(
-                self.ops.context,
-                bytes.as_ptr(),
-                bytes.len(),
-                u8::from(nonblocking),
-            )
-        };
-        error::from_status(status).map_err(FsError::from)
-    }
-
-    fn configure(&self, settings: SerialSettings) -> FsResult<()> {
-        let Some(callback) = self.ops.configure else {
-            return Ok(());
-        };
-        let _pin = self.pin()?;
-        let framing = SerialFraming {
-            baud: settings.baud,
-            data_bits: settings.data_bits,
-            stop_bits: settings.stop_bits,
-            parity: u8::from(settings.parity),
-            odd_parity: u8::from(settings.odd_parity),
-        };
-        // SAFETY: registration validated the callback and `framing` outlives
-        // the call.
-        error::from_status(unsafe { callback(self.ops.context, &raw const framing) })
-            .map_err(FsError::from)
-    }
-
-    fn flush(&self) -> FsResult<()> {
-        self.simple(self.ops.flush)
-    }
-
-    fn flush_input(&self) -> FsResult<()> {
-        match self.ops.flush_input {
-            Some(callback) => self.simple(Some(callback)),
-            None => {
-                let mut bytes = [0u8; 512];
-                while self.read(&mut bytes)? != 0 {}
-                Ok(())
-            }
-        }
-    }
-
-    fn flush_output(&self) -> FsResult<()> {
-        self.simple(self.ops.flush_output)
-    }
-
-    fn send_break(&self, duration: u64) -> FsResult<()> {
-        let Some(callback) = self.ops.send_break else {
-            return Ok(());
-        };
-        let _pin = self.pin()?;
-        // SAFETY: registration validated the callback.
-        error::from_status(unsafe { callback(self.ops.context, duration) })
-            .map_err(FsError::from)
-    }
-
-    fn hung_up(&self) -> bool {
-        self.predicate(self.ops.hung_up, false)
-    }
-
-    fn writable(&self) -> bool {
-        self.predicate(self.ops.writable, true)
-    }
-
-    fn queued_output(&self) -> usize {
-        let Some(callback) = self.ops.queued_output else {
-            return 0;
-        };
-        let Ok(_pin) = self.pin() else {
-            return 0;
-        };
-        // SAFETY: registration validated the callback.
-        let value = unsafe { callback(self.ops.context) };
-        if value < 0 { 0 } else { value as usize }
-    }
-
-    fn readable_event(&self) -> Option<&Event> {
-        Self::event(self.ops.readable_event)
-    }
-
-    fn writable_event(&self) -> Option<&Event> {
-        Self::event(self.ops.writable_event)
-    }
-
-    fn hangup_event(&self) -> Option<&Event> {
-        Self::event(self.ops.hangup_event)
-    }
-
-    fn reset_on_last_close(&self) -> bool {
-        self.ops.flags & flags::RESET_ON_LAST_CLOSE != 0
-    }
-}
-
-impl Backend {
-    fn simple(&self, callback: Option<unsafe extern "C" fn(*mut c_void) -> i32>) -> FsResult<()> {
-        let Some(callback) = callback else {
-            return Ok(());
-        };
-        let _pin = self.pin()?;
-        // SAFETY: registration validated the callback.
-        error::from_status(unsafe { callback(self.ops.context) }).map_err(FsError::from)
-    }
-
-    fn predicate(
-        &self,
-        callback: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-        default: bool,
-    ) -> bool {
-        let Some(callback) = callback else {
-            return default;
-        };
-        let Ok(_pin) = self.pin() else {
-            return default;
-        };
-        // SAFETY: registration validated the callback.
-        unsafe { callback(self.ops.context) > 0 }
-    }
-}
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        let Some(callback) = self.ops.destroy else {
-            return;
-        };
-        let Ok(_pin) = module::pin_owner(self.owner.as_ref(), true) else {
-            return;
-        };
-        // SAFETY: registration validated the callback and no further console
-        // operation can start once the backend is being dropped.
-        unsafe { callback(self.ops.context) };
-    }
-}
-
-/// A registered terminal.
+/// Terminal receipt returned to a backend through the preserved ABI.
 pub struct Terminal {
-    tty: Arc<Tty>,
-    node: DevNodeId,
-    member: Mutex<Option<Arc<ClassDevice>>>,
-    owner: Option<Arc<Module>>,
+    provider: Arc<Provider>,
+    receipt: Mutex<TerminalReceipt>,
+    backend_owner: Option<Arc<Module>>,
+    _provider_lease: ModuleLease,
+    _backend_lease: ModuleLease,
 }
 
-impl Terminal {
-    /// Returns the line discipline instance.
-    pub fn tty(&self) -> &Arc<Tty> {
-        &self.tty
-    }
-
-    /// Returns the device-filesystem node identifier.
-    pub const fn node(&self) -> DevNodeId {
-        self.node
-    }
+enum TerminalReceipt {
+    Live(*mut c_void),
+    Removing,
+    Removed,
 }
+
+// SAFETY: receipt teardown is serialized by `receipt`, and callback
+// concurrency is handled by the provider.
+unsafe impl Send for Terminal {}
+// SAFETY: the immutable receipt may be retained in the broker registry.
+unsafe impl Sync for Terminal {}
 
 struct State {
-    class: Arc<Class>,
+    provider: Mutex<Option<Arc<Provider>>>,
     terminals: Mutex<Vec<Arc<Terminal>>>,
-    next_index: AtomicU64,
 }
 
-static STATE: crate::sys::sync::Once<State> = crate::sys::sync::Once::new();
+static STATE: Once<State> = Once::new();
 
 pub(super) fn init() {
-    // SAFETY: the class is kernel-owned and installs no callbacks.
-    let class = unsafe { class::register(None, CLASS_NAME, class::ClassOps::default()) }
-        .expect("driver/tty: failed to register the terminal class");
     STATE.call_once(|| State {
-        class,
+        provider: Mutex::new(None),
         terminals: Mutex::new(Vec::new()),
-        next_index: AtomicU64::new(0),
     });
 }
 
@@ -357,125 +277,191 @@ fn state() -> Result<&'static State> {
     STATE.get().ok_or(Error::NotInitialized)
 }
 
-/// Registers a terminal backed by a driver's console operations.
+/// Registers the one modular terminal provider.
 ///
 /// # Safety
 ///
-/// Every callback in `ops` must follow the console ABI and stay executable
-/// until the terminal is removed.
-pub unsafe fn register(
+/// `ops` must be immutable and executable until [`unregister_provider`]
+/// returns.
+pub unsafe fn register_provider(
     owner: Option<&Arc<Module>>,
-    device: Option<&Arc<Device>>,
-    parent: DevNodeId,
-    name: &str,
-    mode: u16,
-    baud: u32,
-    ops: ConsoleOps,
-) -> Result<Arc<Terminal>> {
-    if (ops.size as usize) < size_of::<ConsoleOps>() {
-        return Err(Error::InvalidArgument);
-    }
-    if name.is_empty() {
+    ops: TtyProviderOps,
+) -> Result<Arc<Provider>> {
+    if (ops.size as usize) < size_of::<TtyProviderOps>()
+        || ops.register.is_none()
+        || ops.unregister.is_none()
+    {
         return Err(Error::InvalidArgument);
     }
     let state = state()?;
-
-    let path = terminal_path(parent, name)?;
-    let backend = Arc::new(Backend {
+    let mut registered = state.provider.lock();
+    if registered.is_some() {
+        return Err(Error::AlreadyExists);
+    }
+    let provider = Arc::new(Provider {
         ops,
         owner: owner.cloned(),
+        terminals: AtomicU64::new(0),
     });
-    let tty = Tty::new(backend, path.into_boxed_str(), baud)?;
-    let node = chardev::create_native_node(
-        owner,
-        parent,
-        name,
-        chardev::kind::CHARACTER,
-        mode,
-        tty.clone(),
-    )?;
+    *registered = Some(provider.clone());
+    Ok(provider)
+}
+
+/// Removes the provider once every backend terminal has gone away.
+pub fn unregister_provider(provider: &Arc<Provider>) -> Result<()> {
+    if provider.terminals.load(Ordering::Acquire) != 0 {
+        return Err(Error::Busy);
+    }
+    let state = state()?;
+    let mut registered = state.provider.lock();
+    let Some(current) = registered.as_ref() else {
+        return Err(Error::NotFound);
+    };
+    if !Arc::ptr_eq(current, provider) {
+        return Err(Error::InvalidArgument);
+    }
+    // Backend registration increments the terminal count while holding this
+    // same lock, so recheck after acquiring it before withdrawing callbacks.
+    if provider.terminals.load(Ordering::Acquire) != 0 {
+        return Err(Error::Busy);
+    }
+    *registered = None;
+    Ok(())
+}
+
+/// Forwards a legacy backend registration to the active provider.
+///
+/// # Safety
+///
+/// `ops` must remain valid for the returned terminal's lifetime.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn register(
+    backend_owner: Option<&Arc<Module>>,
+    device: Option<&Arc<Device>>,
+    parent: DevNodeId,
+    name: *const c_char,
+    mode: u16,
+    baud: u32,
+    ops: *const ConsoleOps,
+) -> Result<Arc<Terminal>> {
+    if ops.is_null() {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: the backend registration ABI requires a readable operation
+    // table. The provider receives this same immutable table.
+    //
+    // Unlike `NodeOps`, which still accepts legacy 112-byte prefixes so old
+    // modules keep loading, the console table is required at its full current
+    // size: the console ABI froze before any module shipped against a shorter
+    // prefix, so there is nothing to stay compatible with.
+    if unsafe { (*ops).size as usize } < size_of::<ConsoleOps>() {
+        return Err(Error::InvalidArgument);
+    }
+    let state = state()?;
+    let (provider, provider_lease, backend_lease) = {
+        let registered = state.provider.lock();
+        let provider = registered.clone().ok_or(Error::NoDevice)?;
+        let provider_lease = module::lease_owner(provider.owner.as_ref())?;
+        let backend_lease = module::lease_owner(backend_owner)?;
+        provider.terminals.fetch_add(1, Ordering::AcqRel);
+        (provider, provider_lease, backend_lease)
+    };
+
+    let mut provider_receipt = core::ptr::null_mut();
+    let callback = provider.ops.register.expect("validated provider callback");
+    // SAFETY: table lifetimes are protected by the leases acquired above; all
+    // remaining pointers come from validated framework handles or the caller.
+    let status = unsafe {
+        callback(
+            provider.ops.context,
+            backend_owner.map_or(core::ptr::null(), obj::handle),
+            device.map_or(core::ptr::null(), obj::handle),
+            parent.get(),
+            name,
+            mode,
+            baud,
+            ops,
+            &raw mut provider_receipt,
+        )
+    };
+    if status < 0 || provider_receipt.is_null() {
+        provider.terminals.fetch_sub(1, Ordering::Release);
+        return Err(if status < 0 {
+            Error::from_status(status)
+        } else {
+            Error::InvalidArgument
+        });
+    }
 
     let terminal = Arc::new(Terminal {
-        tty,
-        node,
-        member: Mutex::new(None),
-        owner: owner.cloned(),
+        provider,
+        receipt: Mutex::new(TerminalReceipt::Live(provider_receipt)),
+        backend_owner: backend_owner.cloned(),
+        _provider_lease: provider_lease,
+        _backend_lease: backend_lease,
     });
-
-    let membership = Membership {
-        name: String::from(name).into_boxed_str(),
-        ops: Arc::as_ptr(&terminal).cast(),
-        ops_size: size_of::<Terminal>(),
-        context: core::ptr::null_mut(),
-    };
-    // SAFETY: the membership table is the terminal itself, which outlives the
-    // membership because the terminal list holds a reference.
-    match unsafe { class::add_device(owner, &state.class, device, membership) } {
-        Ok(member) => *terminal.member.lock() = Some(member),
-        Err(error) => {
-            let _ = chardev::remove(owner, node);
-            return Err(error);
-        }
-    }
-    state.next_index.fetch_add(1, Ordering::Relaxed);
     state.terminals.lock().push(terminal.clone());
     Ok(terminal)
 }
 
-fn terminal_path(parent: DevNodeId, name: &str) -> Result<String> {
-    if parent == chardev::root()? {
-        return Ok(format!("/dev/{name}"));
-    }
-    // Nested terminal directories are rare; the only current case is the
-    // pseudo-terminal slave directory.
-    Ok(format!("/dev/pts/{name}"))
-}
-
-/// Removes a registered terminal.
+/// Releases a terminal through its provider before either module lease drops.
 pub fn unregister(terminal: &Arc<Terminal>) -> Result<()> {
-    let state = state()?;
-    terminal.tty.shutdown();
-    if let Some(member) = terminal.member.lock().take() {
-        class::remove_device(&member);
+    let receipt = {
+        let mut receipt = terminal.receipt.lock();
+        match *receipt {
+            TerminalReceipt::Live(value) => {
+                *receipt = TerminalReceipt::Removing;
+                value
+            }
+            TerminalReceipt::Removing => return Err(Error::Busy),
+            TerminalReceipt::Removed => return Ok(()),
+        }
+    };
+    let callback = terminal
+        .provider
+        .ops
+        .unregister
+        .expect("validated provider callback");
+    // SAFETY: the terminal keeps both provider and backend callback tables
+    // resident until this callback has completed.
+    let status = unsafe { callback(terminal.provider.ops.context, receipt) };
+    if status < 0 {
+        *terminal.receipt.lock() = TerminalReceipt::Live(receipt);
+        return Err(Error::from_status(status));
     }
-    chardev::remove(terminal.owner.as_ref(), terminal.node)?;
-    state
-        .terminals
-        .lock()
-        .retain(|entry| !Arc::ptr_eq(entry, terminal));
+    *terminal.receipt.lock() = TerminalReceipt::Removed;
+    terminal.provider.terminals.fetch_sub(1, Ordering::Release);
+    if let Ok(state) = state() {
+        state
+            .terminals
+            .lock()
+            .retain(|entry| !Arc::ptr_eq(entry, terminal));
+    }
     Ok(())
 }
 
-/// Returns every registered terminal.
-pub fn list() -> Vec<Arc<Terminal>> {
-    STATE
-        .get()
-        .map(|state| state.terminals.lock().clone())
-        .unwrap_or_default()
-}
-
+/// Releases terminals owned by an unloading backend module.
+///
+/// This is a last-resort lifecycle hook. Normal backend removal should invoke
+/// `tty_unregister` itself; the broker path guarantees workers stop before its
+/// callback tables and module leases are released.
 pub(in super::super) fn remove_module_terminals(module: &Arc<Module>) {
     let Ok(state) = state() else {
         return;
     };
-    let owned: Vec<Arc<Terminal>> = state
+    let terminals: Vec<Arc<Terminal>> = state
         .terminals
         .lock()
         .iter()
         .filter(|terminal| {
             terminal
-                .owner
+                .backend_owner
                 .as_ref()
                 .is_some_and(|owner| Arc::ptr_eq(owner, module))
         })
         .cloned()
         .collect();
-    for terminal in owned {
+    for terminal in terminals {
         let _ = unregister(&terminal);
     }
-}
-
-/// Returns the class every terminal joins.
-pub fn class() -> Result<Arc<Class>> {
-    Ok(state()?.class.clone())
 }

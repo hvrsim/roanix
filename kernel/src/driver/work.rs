@@ -16,11 +16,11 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::time::Duration;
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use core::time::Duration;
 
 use crate::sys::{
     clock,
@@ -133,8 +133,14 @@ pub fn create_queue(owner: Option<&Arc<Module>>, name: &str) -> Result<Arc<WorkQ
         return Err(Error::InvalidArgument);
     }
     let registry = registry()?;
+    let header = ObjHeader::new_with(
+        ObjKind::WorkQueue,
+        Some(name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let queue = Arc::new(WorkQueue {
-        header: ObjHeader::new(ObjKind::WorkQueue),
+        header,
         name: String::from(name).into_boxed_str(),
         owner: owner.cloned(),
         state: Mutex::new(QueueState {
@@ -147,6 +153,7 @@ pub fn create_queue(owner: Option<&Arc<Module>>, name: &str) -> Result<Arc<WorkQ
         finished: Event::new(),
         processed: AtomicU64::new(0),
     });
+    queue.header.register()?;
     registry.queues.lock().push(queue.clone());
 
     let worker = queue.clone();
@@ -197,11 +204,14 @@ pub unsafe fn queue_work(
     context: *mut c_void,
     argument: u64,
 ) -> Result<()> {
-    if queue.stopping.load(Ordering::Acquire) {
-        return Err(Error::NoDevice);
-    }
     {
         let mut state = queue.state.lock();
+        // Checked under the same lock as the push: checking it outside let an
+        // item land in a queue whose flush had already observed emptiness,
+        // stranding the callback past worker exit.
+        if queue.stopping.load(Ordering::Acquire) {
+            return Err(Error::NoDevice);
+        }
         if state.pending.len() >= MAX_PENDING {
             return Err(Error::NoSpace);
         }
@@ -218,6 +228,9 @@ pub unsafe fn queue_work(
 
 /// Waits until a queue has no pending or running callbacks.
 pub fn flush_queue(queue: &Arc<WorkQueue>) {
+    // One signal is enough to set the worker draining; re-signaling on every
+    // retry only interrupted a worker that was already making progress.
+    queue.wake.signal();
     loop {
         {
             let state = queue.state.lock();
@@ -225,7 +238,6 @@ pub fn flush_queue(queue: &Arc<WorkQueue>) {
                 return;
             }
         }
-        queue.wake.signal();
         queue.idle.wait();
     }
 }
@@ -235,6 +247,7 @@ pub fn destroy_queue(queue: &Arc<WorkQueue>) -> Result<()> {
     if queue.stopping.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
+    queue.header.set_state(super::obj::ObjState::Removing);
     flush_queue(queue);
     queue.wake.signal();
     queue.finished.wait();
@@ -261,8 +274,14 @@ pub unsafe fn create_timer(
     argument: u64,
 ) -> Result<Arc<Timer>> {
     let registry = registry()?;
+    let header = ObjHeader::new_with(
+        ObjKind::Timer,
+        None,
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let timer = Arc::new(Timer {
-        header: ObjHeader::new(ObjKind::Timer),
+        header,
         owner: owner.cloned(),
         callback,
         context,
@@ -274,6 +293,7 @@ pub unsafe fn create_timer(
         wake: Event::new(),
         finished: Event::new(),
     });
+    timer.header.register()?;
     registry.timers.lock().push(timer.clone());
 
     let worker = timer.clone();
@@ -306,9 +326,10 @@ pub unsafe fn create_timer(
 
             let period = worker.period_ns.load(Ordering::Acquire);
             if period != 0 && !worker.stopping.load(Ordering::Acquire) {
-                worker
-                    .deadline_ns
-                    .store(clock::monotonic_ns() + period, Ordering::Release);
+                worker.deadline_ns.store(
+                    clock::monotonic_ns().saturating_add(period),
+                    Ordering::Release,
+                );
                 worker.armed.store(true, Ordering::Release);
             }
         }
@@ -324,9 +345,10 @@ pub fn arm_timer(timer: &Arc<Timer>, delay_ns: u64, period_ns: u64) -> Result<()
         return Err(Error::NoDevice);
     }
     timer.period_ns.store(period_ns, Ordering::Release);
-    timer
-        .deadline_ns
-        .store(clock::monotonic_ns() + delay_ns, Ordering::Release);
+    timer.deadline_ns.store(
+        clock::monotonic_ns().saturating_add(delay_ns),
+        Ordering::Release,
+    );
     timer.armed.store(true, Ordering::Release);
     timer.wake.signal();
     Ok(())
@@ -344,6 +366,7 @@ pub fn destroy_timer(timer: &Arc<Timer>) -> Result<()> {
     if timer.stopping.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
+    timer.header.set_state(super::obj::ObjState::Removing);
     timer.armed.store(false, Ordering::Release);
     timer.period_ns.store(0, Ordering::Release);
     timer.wake.signal();

@@ -163,7 +163,12 @@ const _: () = assert!(
     "mem/phys: a frame database entry must occupy exactly one cache line"
 );
 
-const fn pack_status(state: PageState, usage: PageUse, queue: PageQueue, owner: PageOwnerKind) -> u32 {
+const fn pack_status(
+    state: PageState,
+    usage: PageUse,
+    queue: PageQueue,
+    owner: PageOwnerKind,
+) -> u32 {
     (state as u32) << STATE_SHIFT
         | (usage as u32) << USAGE_SHIFT
         | (queue as u32) << QUEUE_SHIFT
@@ -831,9 +836,7 @@ pub fn alloc_contiguous(
     // per-frame assertions and the owner lock run without interrupts masked.
     let (base, zeroed) = claimed?;
     for offset in 0..count {
-        let Some(page) = page_by_index(base + offset) else {
-            return None;
-        };
+        let page = page_by_index(base + offset)?;
         page.prepare_allocation(usage);
     }
     FREE_PAGES.fetch_sub(count, Ordering::AcqRel);
@@ -871,10 +874,10 @@ fn is_linked_free(page: &'static Page) -> bool {
 
 /// Returns every per-CPU cached frame to the shared free lists.
 fn drain_page_caches() {
-    for cache_id in 0..MAX_PAGE_CPUS {
+    for cache_lock in &PAGE_CACHES {
         loop {
             let entry = {
-                let mut cache = PAGE_CACHES[cache_id].lock();
+                let mut cache = cache_lock.lock();
                 match cache.pop(false) {
                     Some(pfn) => Some((pfn, false)),
                     None => cache.pop(true).map(|pfn| (pfn, true)),

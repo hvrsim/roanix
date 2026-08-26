@@ -32,7 +32,7 @@ use crate::sys::sync::{Mutex, Once};
 use super::{
     super::{
         error::{Error, Result},
-        obj::{ObjHeader, ObjKind, framework_object},
+        obj::{ObjHeader, ObjKind, Object, framework_object},
     },
     device::Device,
     module::Module,
@@ -216,13 +216,17 @@ pub unsafe fn publish_global(
     let registry = registry()?;
     let mut global = registry.global.lock();
     let entries = global.entry(publication.name.clone()).or_default();
-    if publication.flags & flags::SINGLETON != 0
-        && entries.iter().any(|entry| entry.is_live())
-    {
+    if publication.flags & flags::SINGLETON != 0 && entries.iter().any(|entry| entry.is_live()) {
         return Err(Error::AlreadyExists);
     }
+    let header = ObjHeader::new_with(
+        ObjKind::Interface,
+        Some(&publication.name),
+        owner.map(|module| module.id().get()),
+        None,
+    );
     let interface = Arc::new(Interface {
-        header: ObjHeader::new(ObjKind::Interface),
+        header,
         name: publication.name,
         version: publication.version,
         flags: publication.flags,
@@ -234,6 +238,7 @@ pub unsafe fn publish_global(
         revoked: AtomicBool::new(false),
         binds: AtomicU64::new(0),
     });
+    interface.header.register()?;
     entries.push(interface.clone());
     drop(global);
     super::probe::retrigger();
@@ -251,8 +256,14 @@ pub unsafe fn publish_device(
     publication: Publication,
 ) -> Result<Arc<Interface>> {
     validate(&publication)?;
+    let header = ObjHeader::new_with(
+        ObjKind::Interface,
+        Some(&publication.name),
+        owner.map(|module| module.id().get()),
+        Some(device.object_id()),
+    );
     let interface = Arc::new(Interface {
-        header: ObjHeader::new(ObjKind::Interface),
+        header,
         name: publication.name,
         version: publication.version,
         flags: publication.flags,
@@ -265,6 +276,10 @@ pub unsafe fn publish_device(
         binds: AtomicU64::new(0),
     });
     device.attach_interface(interface.clone())?;
+    if let Err(error) = interface.header.register() {
+        device.detach_interface(&interface);
+        return Err(error);
+    }
     super::probe::retrigger();
     Ok(interface)
 }
@@ -281,8 +296,14 @@ pub fn withdraw(interface: &Arc<Interface>) -> Result<()> {
     {
         return Err(Error::NotFound);
     }
+    interface
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
     if interface.binds.load(Ordering::Acquire) != 0 {
         interface.revoked.store(false, Ordering::Release);
+        interface
+            .header
+            .set_state(super::super::obj::ObjState::Live);
         return Err(Error::Busy);
     }
     detach(interface);
@@ -295,6 +316,9 @@ pub fn withdraw(interface: &Arc<Interface>) -> Result<()> {
 /// Used only while tearing a module down, where consumers are being removed in
 /// the same pass.
 fn force_withdraw(interface: &Arc<Interface>) {
+    interface
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
     interface.revoked.store(true, Ordering::Release);
     detach(interface);
     interface.header.poison();
@@ -317,10 +341,7 @@ fn detach(interface: &Arc<Interface>) {
     }
 }
 
-fn attach_ref(
-    consumer: Option<&Arc<Module>>,
-    interface: Arc<Interface>,
-) -> Result<InterfaceRef> {
+fn attach_ref(consumer: Option<&Arc<Module>>, interface: Arc<Interface>) -> Result<InterfaceRef> {
     super::module::link(consumer, interface.owner.as_ref())?;
     interface.binds.fetch_add(1, Ordering::AcqRel);
     if !interface.is_live() {

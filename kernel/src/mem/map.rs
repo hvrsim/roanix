@@ -301,8 +301,7 @@ impl VmMap {
 
     /// Returns whether `[start, start + length)` is entirely unmapped.
     pub fn is_free(&self, start: VirtAddr, length: u64) -> bool {
-        checked_page_length(length)
-            .is_ok_and(|length| self.space.is_free(start.as_u64(), length))
+        checked_page_length(length).is_ok_and(|length| self.space.is_free(start.as_u64(), length))
     }
 
     /// Inserts a private zero-fill anonymous mapping.

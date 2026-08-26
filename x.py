@@ -51,6 +51,27 @@ VERSION = "3.0"
 ROOT = Path(__file__).resolve().parent
 KERNEL_DIR = ROOT / "kernel"
 DRIVERS_DIR = ROOT / "drivers"
+RUST_DRIVER_MODULES = {
+    "x86_64": (
+        ("acpi", "acpi.ko", True),
+        ("ioapic", "ioapic.ko", True),
+        ("tmpfs", "tmpfs.ko", True),
+        ("devfs", "devfs.ko", True),
+        ("console", "console.ko", True),
+        ("pty", "pty.ko", True),
+        ("uart8250", "uart8250.ko", True),
+        ("special", "special.ko", True),
+    ),
+    "riscv64": (
+        ("fdt", "fdt.ko", True),
+        ("tmpfs", "tmpfs.ko", True),
+        ("devfs", "devfs.ko", True),
+        ("console", "console.ko", True),
+        ("pty", "pty.ko", True),
+        ("uart8250", "uart8250.ko", True),
+        ("special", "special.ko", True),
+    ),
+}
 BOOK_DIR = ROOT / "book"
 USERLAND_DIR = ROOT / "userland"
 RECIPES_DIR = USERLAND_DIR / "recipes"
@@ -1437,7 +1458,24 @@ class Jinx:
     def sync_in_tree_sources(self) -> None:
         """Mirror in-repo source trees into the places recipes expect."""
         staged = USERLAND_DIR / "drivers"
-        digest = fingerprint("drivers-source", paths=(DRIVERS_DIR,))
+        rust_modules = tuple(
+            (
+                output_name,
+                build_rust_module(
+                    self.ctx,
+                    self.run,
+                    Cache(self.ctx),
+                    package=package,
+                    output_name=output_name,
+                    imports=imports,
+                ),
+            )
+            for package, output_name, imports in RUST_DRIVER_MODULES[self.ctx.arch.name]
+        )
+        digest = fingerprint(
+            "drivers-source",
+            paths=(DRIVERS_DIR, *(source for _, source in rust_modules)),
+        )
         marker = staged / ".xtool-source.sha256"
         if staged.is_dir() and marker.is_file():
             if marker.read_text(encoding="utf-8").strip() == digest:
@@ -1447,8 +1485,13 @@ class Jinx:
         shutil.copytree(
             DRIVERS_DIR,
             temporary,
-            ignore=shutil.ignore_patterns("build", "out", "*.o", "*.d", "*.ko"),
+            ignore=shutil.ignore_patterns("build", "out", "target", "*.o", "*.d", "*.ko"),
         )
+        if not self.ctx.dry_run:
+            prebuilt_dir = temporary / "prebuilt" / self.ctx.arch.name
+            ensure_dir(prebuilt_dir)
+            for output_name, source in rust_modules:
+                copy(source, prebuilt_dir / output_name)
         write_file(temporary / ".xtool-source.sha256", digest + "\n")
         remove(staged)
         temporary.rename(staged)
@@ -1578,6 +1621,63 @@ def cargo(
         argv += ["--jobs", str(ctx.jobs)]
     argv += list(arguments)
     run(argv, cwd=KERNEL_DIR, env=rust_env(ctx), mode=mode, filter=cargo_filter)
+
+
+def rust_driver_digest(
+    ctx: Context, package: str, output_name: str, *, imports: bool
+) -> str:
+    """Fingerprint the Rust module workspace independently from the kernel."""
+    return fingerprint(
+        f"rust-driver-{package}",
+        values=(
+            ctx.arch.name,
+            ctx.arch.rust_target,
+            output_name,
+            "release",
+            f"imports={imports}",
+        ),
+        paths=(DRIVERS_DIR,),
+    )
+
+
+def build_rust_module(
+    ctx: Context, run: Runner, cache: Cache, *, package: str, output_name: str, imports: bool
+) -> Path:
+    """Build one Rust module before staging the drivers source tree."""
+    output = ctx.arch_root / "drivers-rust" / output_name
+    key = f"rust-driver-{package}-release"
+    digest = rust_driver_digest(ctx, package, output_name, imports=imports)
+    if cache.is_current(key, digest, (output,)):
+        return output
+
+    ctx.log.msg2(f"Building Rust {package} driver ({ctx.arch.name})")
+    target_dir = ctx.cargo_target / "drivers" / package
+    run(
+        [
+            "python3",
+            "build-module.py",
+            "--package",
+            package,
+            "--target",
+            ctx.arch.rust_target,
+            "--output",
+            str(output),
+            "--target-dir",
+            str(target_dir),
+            "--profile",
+            "release",
+            *(["--imports"] if imports else []),
+        ],
+        cwd=DRIVERS_DIR,
+        mode="stream",
+        filter=cargo_filter,
+    )
+    if ctx.dry_run:
+        return output
+    if not output.is_file():
+        raise Failure(f"Cargo produced no Rust driver at {rel(output)}")
+    cache.record(key, digest, (output,))
+    return output
 
 
 def build_kernel(ctx: Context, run: Runner, cache: Cache) -> Path:
@@ -2088,8 +2188,8 @@ def qemu_command(ctx: Context, run: Runner, image: Path, options: QemuOptions) -
         argv += [
             "-drive",
             f"if=pflash,unit=0,format=raw,file={ovmf / f'ovmf-code-{arch.name}.fd'},readonly=on",
-            "-drive",
-            f"if=pflash,unit=1,format=raw,file={variables}",
+            #"-drive",
+            #f"if=pflash,unit=1,format=raw,file={variables}",
         ]
         if arch.name == "x86_64":
             argv += ["-M", "q35"]

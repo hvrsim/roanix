@@ -1,9 +1,10 @@
 //! The C application binary interface.
 //!
-//! Modules see the kernel through exactly two things: the entry point signature
-//! in [`types`] and the service table in [`api`]. Everything else a driver uses
-//! is either inlined by its own compiler or reached through that table, which
-//! is why the framework ships no driver support library.
+//! Modules enter through [`types`] and receive the C-compatible service table
+//! in [`api`], which is also the contract documented by the C headers in
+//! `drivers/include/roanix/`. Rust modules additionally import a small,
+//! versioned set of C ABI shims selected by [`api`]'s curated export resolver;
+//! no internal Rust symbol is exposed.
 
 pub mod api;
 pub mod events;

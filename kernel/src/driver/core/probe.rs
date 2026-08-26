@@ -96,15 +96,19 @@ pub fn retrigger() {
     let Some(engine) = engine() else {
         return;
     };
-    if engine.active.load(Ordering::Acquire) != 0 {
-        engine.pending.store(true, Ordering::Release);
-        return;
-    }
-    rescan(engine);
+    // Join the activity count BEFORE publishing the request. Checking the
+    // count first and storing afterwards used to lose requests that landed
+    // between the last worker's drain and its exit. With this ordering, any
+    // concurrent worker observing a nonzero count is guaranteed to observe
+    // our flag (or be followed by our own slot draining it on exit).
+    engine.active.fetch_add(1, Ordering::AcqRel);
+    engine.pending.store(true, Ordering::Release);
+    finish_activity(engine);
 }
 
 fn finish_activity(engine: &'static Engine) {
     let previous = engine.active.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous != 0, "driver/probe: activity underflow");
     if previous == 1 && engine.pending.swap(false, Ordering::AcqRel) {
         rescan(engine);
     }
@@ -120,8 +124,7 @@ fn rescan(engine: &'static Engine) {
     for _ in 0..MAX_PASSES {
         let parked: Vec<Arc<Device>> = {
             let mut deferred = engine.deferred.lock();
-            let devices: Vec<Arc<Device>> =
-                deferred.iter().filter_map(Weak::upgrade).collect();
+            let devices: Vec<Arc<Device>> = deferred.iter().filter_map(Weak::upgrade).collect();
             deferred.clear();
             devices
         };
@@ -143,8 +146,10 @@ fn rescan(engine: &'static Engine) {
             break;
         }
     }
-    let previous = engine.active.fetch_sub(1, Ordering::AcqRel);
-    debug_assert!(previous != 0, "driver/probe: activity underflow");
+    // Drain through finish_activity rather than a bare decrement: a request
+    // stored after the final in-loop swap used to be dropped here, parking
+    // devices until some unrelated topology change happened to retrigger.
+    finish_activity(engine);
 }
 
 fn park(device: &Arc<Device>) {
@@ -209,7 +214,7 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
         }
         return;
     }
-    candidates.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_unstable_by_key(|candidate| core::cmp::Reverse(candidate.0));
 
     for (_, match_data, candidate) in candidates {
         match bind_one(device, &candidate, match_data) {
@@ -229,11 +234,9 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
             // normal outcome of probing a static device list, so it stays out
             // of the way at debug. Anything else means a driver that matched
             // the device could not drive it, which someone has to see.
-            Err(Error::NoDevice) => debug!(
-                "{} found no device at {}",
-                candidate.name(),
-                device.path()
-            ),
+            Err(Error::NoDevice) => {
+                debug!("{} found no device at {}", candidate.name(), device.path())
+            }
             Err(error) => {
                 warn!(
                     "{} failed to probe {}: {error:?}",
@@ -258,10 +261,19 @@ fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Re
     let provider = device.owner().cloned();
     module::link(driver.owner(), provider.as_ref())?;
 
+    // The bound driver keeps calling bus callbacks (cleanup, DMA ops), so its
+    // module must pin the bus owner's image for as long as the binding lasts.
+    let bus_owner = device.bus().and_then(|bus| bus.owner().cloned());
+    if module::link(driver.owner(), bus_owner.as_ref()).is_err() {
+        module::unlink(driver.owner(), provider.as_ref());
+        return Err(Error::Deadlock);
+    }
+
     let bus_prepared = match device.bus() {
         Some(bus) => match bus.prepare(device) {
             Ok(()) => true,
             Err(error) => {
+                module::unlink(driver.owner(), bus_owner.as_ref());
                 module::unlink(driver.owner(), provider.as_ref());
                 return Err(error);
             }
@@ -286,6 +298,7 @@ fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Re
             {
                 bus.cleanup(device);
             }
+            module::unlink(driver.owner(), bus_owner.as_ref());
             module::unlink(driver.owner(), provider.as_ref());
             Err(error)
         }
@@ -317,6 +330,7 @@ fn unbind(device: &Arc<Device>) {
         bus.cleanup(device);
     }
     module::unlink(driver.owner(), device.owner());
+    module::unlink(driver.owner(), device.bus().and_then(|bus| bus.owner()));
     driver.note_unbound();
 
     if previous == state::BOUND {

@@ -1,3 +1,5 @@
+//! Kernel linker and build metadata setup.
+
 use std::process::Command;
 
 fn main() {
@@ -7,8 +9,8 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tlinker-{arch}.ld");
     println!("cargo:rerun-if-changed=linker-{arch}.ld");
 
-    let git_hash = git_output(&["rev-parse", "--short=12", "HEAD"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let git_hash =
+        git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=ROANIX_GIT_HASH={git_hash}");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"]) {

@@ -1,33 +1,118 @@
-//! The terminal line discipline.
-//!
-//! This is the shared cooked-mode, job-control, and `termios` implementation
-//! that sits between a hardware console and userspace. A driver supplies only
-//! the byte-level backend through [`ConsoleBackend`]; everything userspace
-//! expects from a terminal lives here so that a UART, a pseudo-terminal, and a
-//! future console over a display all behave identically.
+#![no_std]
+#![allow(unsafe_code)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::explicit_auto_deref,
+    clippy::ignored_unit_patterns,
+    clippy::must_use_candidate,
+    clippy::obfuscated_if_else,
+    clippy::redundant_closure_for_method_calls,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unreadable_literal,
+    clippy::unused_self
+)]
 
-use alloc::{
-    boxed::Box,
-    collections::VecDeque,
-    sync::{Arc, Weak},
-};
+//! Shared terminal line discipline loadable module.
+
+extern crate alloc;
+
+use alloc::{boxed::Box, collections::VecDeque, format};
 use core::{
+    ffi::{CStr, c_char, c_void},
     ptr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
-use super::super::error::{Error, Result};
-use crate::{
-    fs::{
-        Error as FsError, IoctlContext, OpenFlags, PollEvents, Result as FsResult,
-        devtempfs::{DeviceNodeOps, read_windows, write_windows},
-        vnode::TerminalState,
-    },
-    mem::{IoSink, IoSource},
-    proc,
-    sys::{clock, event::Event, sched, sync::Mutex},
+use ddk::{
+    self, Class, ClassDevice, Devfs, Device, Event, Module, Result as DdkResult, TicketLock,
+    TtyProvider, Worker, raw,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FsError {
+    Unsupported,
+    WouldBlock,
+    Interrupted,
+    Io,
+    Busy,
+    InvalidArgument,
+    PermissionDenied,
+    NotTty,
+}
+
+type FsResult<T> = core::result::Result<T, FsError>;
+
+impl FsError {
+    const fn status(self) -> i32 {
+        match self {
+            Self::Unsupported => ddk::ENOTSUP,
+            Self::WouldBlock => ddk::EAGAIN,
+            Self::Interrupted => ddk::EINTR,
+            Self::Io => ddk::EIO,
+            Self::Busy => ddk::EBUSY,
+            Self::InvalidArgument => ddk::EINVAL,
+            Self::PermissionDenied => ddk::EPERM,
+            Self::NotTty => ddk::ENOTTY,
+        }
+    }
+
+    const fn from_status(status: i32) -> Self {
+        match status {
+            ddk::EAGAIN => Self::WouldBlock,
+            ddk::EINTR => Self::Interrupted,
+            ddk::EBUSY => Self::Busy,
+            ddk::EINVAL => Self::InvalidArgument,
+            ddk::EPERM => Self::PermissionDenied,
+            ddk::ENOTTY => Self::NotTty,
+            ddk::ENOTSUP => Self::Unsupported,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<ddk::Error> for FsError {
+    fn from(error: ddk::Error) -> Self {
+        Self::from_status(error.status())
+    }
+}
+
+const SIGHUP: u8 = 1;
+const SIGINT: u8 = 2;
+const SIGQUIT: u8 = 3;
+const SIGCONT: u8 = 18;
+const SIGTSTP: u8 = 20;
+const SIGWINCH: u8 = 28;
+
+fn signal_group(group: i32, signal: u8) {
+    if group > 0 {
+        let _ = ddk::signal_process_group(group, signal);
+    }
+}
+
+mod clock {
+    use core::time::Duration;
+
+    use ddk::Event;
+
+    pub fn sleep(duration: Duration) {
+        ddk::sleep_ns(duration.as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
+
+    pub fn monotonic_ns() -> u64 {
+        ddk::monotonic_ns()
+    }
+
+    pub fn wait_timeout(event: &Event, duration: Duration) -> bool {
+        event
+            .wait_timeout(duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(false)
+    }
+}
 
 const INPUT_CAPACITY: usize = 4096;
 const ECHO_CAPACITY: usize = 4096;
@@ -179,100 +264,205 @@ pub struct SerialSettings {
     pub odd_parity: bool,
 }
 
-/// Hardware backend consumed by the shared TTY line discipline.
-pub trait ConsoleBackend: Send + Sync {
-    /// Opens one TTY file description.
-    fn open(&self) -> FsResult<()> {
-        Ok(())
-    }
+/// Direct adapter over a backend's stable C operation table.
+struct Backend {
+    ops: raw::ConsoleOps,
+    destroyed: AtomicBool,
+}
 
-    /// Closes one TTY file description.
-    fn close(&self) {}
+// SAFETY: the broker holds a module lease for this terminal, and backend
+// callback synchronization is defined by the backend ABI.
+unsafe impl Send for Backend {}
+// SAFETY: as above.
+unsafe impl Sync for Backend {}
 
-    /// Returns one immediately available byte.
-    fn try_read(&self) -> Option<u8>;
-
-    /// Reads immediately available input bytes.
-    fn read(&self, output: &mut [u8]) -> FsResult<usize> {
-        self.read_fallback(output)
-    }
-
-    /// Compatibility implementation for byte-oriented backends.
-    fn read_fallback(&self, output: &mut [u8]) -> FsResult<usize> {
-        let mut read = 0;
-        while read < output.len() {
-            let Some(byte) = self.try_read() else {
-                break;
-            };
-            output[read] = byte;
-            read += 1;
+impl Backend {
+    unsafe fn copy(ops: *const raw::ConsoleOps) -> FsResult<Self> {
+        if ops.is_null() {
+            return Err(FsError::InvalidArgument);
         }
-        Ok(read)
+        // SAFETY: the provider callback receives a readable backend table that
+        // remains resident under the broker's backend lease.
+        let ops = unsafe { ptr::read(ops) };
+        if (ops.size as usize) < core::mem::size_of::<raw::ConsoleOps>() {
+            return Err(FsError::InvalidArgument);
+        }
+        Ok(Self {
+            ops,
+            destroyed: AtomicBool::new(false),
+        })
     }
 
-    /// Writes every supplied byte or reports why no progress was possible.
-    fn write(&self, bytes: &[u8], nonblocking: bool) -> FsResult<()>;
-
-    /// Applies UART framing settings.
-    fn configure(&self, _settings: SerialSettings) -> FsResult<()> {
-        Ok(())
+    fn open(&self) -> FsResult<()> {
+        self.ops.open.map_or(Ok(()), |callback| {
+            // SAFETY: the broker keeps this immutable callback table resident.
+            let status = unsafe { callback(self.ops.context) };
+            (status >= 0)
+                .then_some(())
+                .ok_or(FsError::from_status(status))
+        })
     }
 
-    /// Waits for pending output to reach the hardware.
+    fn close(&self) {
+        if let Some(callback) = self.ops.close {
+            // SAFETY: the broker keeps this immutable callback table resident.
+            unsafe { callback(self.ops.context) };
+        }
+    }
+
+    fn try_read(&self) -> Option<u8> {
+        let callback = self.ops.try_read?;
+        let mut byte = 0;
+        // SAFETY: `byte` is writable output storage for this callback.
+        (unsafe { callback(self.ops.context, &raw mut byte) } > 0).then_some(byte)
+    }
+
+    fn read(&self, output: &mut [u8]) -> FsResult<usize> {
+        if let Some(callback) = self.ops.read {
+            // SAFETY: `output` is writable for exactly its length.
+            let value = unsafe { callback(self.ops.context, output.as_mut_ptr(), output.len()) };
+            if value < 0 {
+                return Err(FsError::from_status(value as i32));
+            }
+            let count = value as usize;
+            return (count <= output.len()).then_some(count).ok_or(FsError::Io);
+        }
+        let mut count = 0;
+        while count < output.len() {
+            let Some(byte) = self.try_read() else { break };
+            output[count] = byte;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn write(&self, bytes: &[u8], nonblocking: bool) -> FsResult<()> {
+        let callback = self.ops.write.ok_or(FsError::Unsupported)?;
+        // SAFETY: `bytes` is readable for exactly its length.
+        let status = unsafe {
+            callback(
+                self.ops.context,
+                bytes.as_ptr(),
+                bytes.len(),
+                u8::from(nonblocking),
+            )
+        };
+        (status >= 0)
+            .then_some(())
+            .ok_or(FsError::from_status(status))
+    }
+
+    fn configure(&self, settings: SerialSettings) -> FsResult<()> {
+        let Some(callback) = self.ops.configure else {
+            return Ok(());
+        };
+        let framing = raw::SerialFraming {
+            baud: settings.baud,
+            data_bits: settings.data_bits,
+            stop_bits: settings.stop_bits,
+            parity: u8::from(settings.parity),
+            odd_parity: u8::from(settings.odd_parity),
+        };
+        // SAFETY: `framing` remains valid through the immediate callback.
+        let status = unsafe { callback(self.ops.context, &raw const framing) };
+        (status >= 0)
+            .then_some(())
+            .ok_or(FsError::from_status(status))
+    }
+
+    fn simple(&self, callback: Option<unsafe extern "C" fn(*mut c_void) -> i32>) -> FsResult<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        // SAFETY: the broker keeps this immutable callback table resident.
+        let status = unsafe { callback(self.ops.context) };
+        (status >= 0)
+            .then_some(())
+            .ok_or(FsError::from_status(status))
+    }
+
     fn flush(&self) -> FsResult<()> {
-        Ok(())
+        self.simple(self.ops.flush)
+    }
+    fn flush_output(&self) -> FsResult<()> {
+        self.simple(self.ops.flush_output)
     }
 
-    /// Discards queued hardware or backend input.
     fn flush_input(&self) -> FsResult<()> {
-        let mut bytes = [0u8; INPUT_BATCH_SIZE];
+        if self.ops.flush_input.is_some() {
+            return self.simple(self.ops.flush_input);
+        }
+        let mut bytes = [0; INPUT_BATCH_SIZE];
         while self.read(&mut bytes)? != 0 {}
         Ok(())
     }
 
-    /// Discards queued hardware or backend output.
-    fn flush_output(&self) -> FsResult<()> {
-        Ok(())
+    fn send_break(&self, duration: u64) -> FsResult<()> {
+        let Some(callback) = self.ops.send_break else {
+            return Ok(());
+        };
+        // SAFETY: the broker keeps this immutable callback table resident.
+        let status = unsafe { callback(self.ops.context, duration) };
+        (status >= 0)
+            .then_some(())
+            .ok_or(FsError::from_status(status))
     }
 
-    /// Generates a serial break condition.
-    fn send_break(&self, _duration: u64) -> FsResult<()> {
-        Ok(())
+    fn predicate(
+        &self,
+        callback: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+        default: bool,
+    ) -> bool {
+        callback.map_or(default, |callback| {
+            // SAFETY: the broker keeps this immutable callback table resident.
+            unsafe { callback(self.ops.context) > 0 }
+        })
     }
 
-    /// Returns whether the peer or hardware endpoint has disconnected.
     fn hung_up(&self) -> bool {
-        false
+        self.predicate(self.ops.hung_up, false)
     }
-
-    /// Returns whether one output byte can be accepted without waiting.
     fn writable(&self) -> bool {
-        true
+        self.predicate(self.ops.writable, true)
     }
 
-    /// Returns output bytes still queued in the backend.
     fn queued_output(&self) -> usize {
-        0
+        let Some(callback) = self.ops.queued_output else {
+            return 0;
+        };
+        // SAFETY: the broker keeps this immutable callback table resident.
+        let value = unsafe { callback(self.ops.context) };
+        (value.max(0)) as usize
     }
 
-    /// Persistent event signaled while input may be read.
-    fn readable_event(&self) -> Option<&Event> {
-        None
+    fn readable_event(&self) -> Option<Event> {
+        Event::from_id(self.ops.readable_event)
     }
-
-    /// Persistent event signaled while output queue space is available.
-    fn writable_event(&self) -> Option<&Event> {
-        None
+    fn writable_event(&self) -> Option<Event> {
+        Event::from_id(self.ops.writable_event)
     }
-
-    /// Persistent event signaled after endpoint disconnection.
-    fn hangup_event(&self) -> Option<&Event> {
-        None
+    fn hangup_event(&self) -> Option<Event> {
+        Event::from_id(self.ops.hangup_event)
     }
-
-    /// Returns whether terminal state should reset after the final close.
     fn reset_on_last_close(&self) -> bool {
-        false
+        self.ops.flags & ddk::CONSOLE_RESET_ON_LAST_CLOSE != 0
+    }
+
+    fn destroy(&self) {
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(callback) = self.ops.destroy {
+            // SAFETY: the broker holds the backend module lease until terminal
+            // teardown completes, after all terminal workers have stopped.
+            unsafe { callback(self.ops.context) };
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 
@@ -321,39 +511,67 @@ struct TtyState {
 }
 
 struct InputWorker {
+    control: Box<InputControl>,
+    worker: Worker,
+}
+
+struct InputControl {
+    tty: *const Tty,
     stop: Event,
-    exited: Event,
+}
+
+unsafe extern "C" fn input_worker_entry(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: `context` points to an `InputControl` owned by `InputWorker`
+    // until `Worker::join` has observed this callback return.
+    let control = unsafe { &*context.cast::<InputControl>() };
+    // SAFETY: the terminal allocation outlives the joined worker.
+    let tty = unsafe { &*control.tty };
+    tty.input_worker_loop(control.stop);
 }
 
 /// Character terminal layered over a platform console backend.
 pub struct Tty {
-    backend: Arc<dyn ConsoleBackend>,
+    backend: Backend,
     path: Box<str>,
-    state: Mutex<TtyState>,
-    lifecycle_lock: Mutex<()>,
-    output_lock: Mutex<usize>,
+    state: TicketLock<TtyState>,
+    lifecycle_lock: TicketLock<()>,
+    output_lock: TicketLock<usize>,
     input_flushing: AtomicBool,
     input_generation: AtomicU64,
     input_ready: Event,
     output_resumed: Event,
-    self_ref: Weak<Tty>,
-    input_worker: Mutex<Option<Arc<InputWorker>>>,
+    input_worker: TicketLock<Option<InputWorker>>,
+    node: TicketLock<Option<u64>>,
+    member: TicketLock<Option<ClassDevice>>,
     opens: AtomicU64,
     initial_baud: u32,
 }
 
+// SAFETY: all mutable terminal state is protected by ticket locks; backend
+// callback synchronization is part of the backend ABI.
+unsafe impl Send for Tty {}
+// SAFETY: as above.
+unsafe impl Sync for Tty {}
+
 impl Tty {
     /// Creates a terminal with cooked defaults at the hardware's initial baud.
-    pub fn new(
-        backend: Arc<dyn ConsoleBackend>,
-        path: Box<str>,
-        baud: u32,
-    ) -> Result<Arc<Self>> {
-        let termios = Termios::with_baud(baud).ok_or(Error::Unsupported)?;
-        Ok(Arc::new_cyclic(|weak| Self {
+    fn new(backend: Backend, path: Box<str>, baud: u32) -> DdkResult<Box<Self>> {
+        let termios = Termios::with_baud(baud).ok_or(ddk::Error::from_status(ddk::EINVAL))?;
+        let input_ready = Event::create()?;
+        let output_resumed = match Event::create() {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = input_ready.destroy();
+                return Err(error);
+            }
+        };
+        Ok(Box::new(Self {
             backend,
             path,
-            state: Mutex::new(TtyState {
+            state: TicketLock::new(TtyState {
                 termios,
                 winsize: WinSize::default(),
                 input: VecDeque::with_capacity(INPUT_CAPACITY),
@@ -369,14 +587,15 @@ impl Tty {
                 session: 0,
                 hung_up: false,
             }),
-            lifecycle_lock: Mutex::new(()),
-            output_lock: Mutex::new(0),
+            lifecycle_lock: TicketLock::new(()),
+            output_lock: TicketLock::new(0),
             input_flushing: AtomicBool::new(false),
             input_generation: AtomicU64::new(0),
-            input_ready: Event::new(),
-            output_resumed: Event::new(),
-            self_ref: weak.clone(),
-            input_worker: Mutex::new(None),
+            input_ready,
+            output_resumed,
+            input_worker: TicketLock::new(None),
+            node: TicketLock::new(None),
+            member: TicketLock::new(None),
             opens: AtomicU64::new(0),
             initial_baud: baud,
         }))
@@ -390,17 +609,25 @@ impl Tty {
         if worker.is_some() {
             return;
         }
-        let control = Arc::new(InputWorker {
-            stop: Event::new(),
-            exited: Event::new(),
+        let control = Box::new(InputControl {
+            tty: self,
+            stop: match Event::create() {
+                Ok(event) => event,
+                Err(_) => return,
+            },
         });
-        let tty = self
-            .self_ref
-            .upgrade()
-            .expect("console: live TTY lost its self reference");
-        let task_control = control.clone();
-        sched::run(move || tty.input_worker_loop(task_control));
-        *worker = Some(control);
+        let context = (&raw const *control).cast_mut().cast();
+        // SAFETY: `control` remains owned by `input_worker` until its worker
+        // has stopped and joined.
+        let Ok(worker_receipt) = (unsafe { Worker::spawn(Some(input_worker_entry), context) })
+        else {
+            let _ = control.stop.destroy();
+            return;
+        };
+        *worker = Some(InputWorker {
+            control,
+            worker: worker_receipt,
+        });
     }
 
     /// Marks the terminal disconnected and stops its input worker.
@@ -409,18 +636,21 @@ impl Tty {
     /// up and the worker thread stops executing driver code.
     pub fn shutdown(&self) {
         self.state.lock().hung_up = true;
+        let _ = self.input_ready.signal();
+        let _ = self.output_resumed.signal();
         self.stop_input_worker();
     }
 
     fn stop_input_worker(&self) {
-        let Some(worker) = self.input_worker.lock().take() else {
+        let Some(mut worker) = self.input_worker.lock().take() else {
             return;
         };
-        worker.stop.signal();
-        worker.exited.wait();
+        let _ = worker.control.stop.signal();
+        let _ = worker.worker.join();
+        let _ = worker.control.stop.destroy();
     }
 
-    fn input_worker_loop(&self, worker: Arc<InputWorker>) {
+    fn input_worker_loop(&self, stop: Event) {
         loop {
             self.pump_input(true);
             if self.observe_hangup() {
@@ -431,7 +661,7 @@ impl Tty {
             let hangup = self
                 .backend
                 .hangup_event()
-                .filter(|hangup| readable.is_none_or(|readable| !ptr::eq(readable, *hangup)));
+                .filter(|hangup| readable.is_none_or(|readable| readable.id() != hangup.id()));
             let writable = if self.state.lock().echo.is_empty() {
                 None
             } else {
@@ -439,21 +669,26 @@ impl Tty {
             };
             let stopped = match (readable, hangup, writable) {
                 (Some(readable), Some(hangup), Some(writable)) => {
-                    Event::wait_any(&[&worker.stop, readable, hangup, writable]) == 0
+                    Event::wait_any(&[stop, readable, hangup, writable])
+                        .map_or(true, |index| index == 0)
                 }
                 (Some(readable), Some(hangup), None) => {
-                    Event::wait_any(&[&worker.stop, readable, hangup]) == 0
+                    Event::wait_any(&[stop, readable, hangup]).map_or(true, |index| index == 0)
                 }
                 (Some(readable), None, Some(writable)) => {
-                    Event::wait_any(&[&worker.stop, readable, writable]) == 0
+                    Event::wait_any(&[stop, readable, writable]).map_or(true, |index| index == 0)
                 }
                 (None, Some(hangup), Some(writable)) => {
-                    Event::wait_any(&[&worker.stop, hangup, writable]) == 0
+                    Event::wait_any(&[stop, hangup, writable]).map_or(true, |index| index == 0)
                 }
-                (Some(readable), None, None) => Event::wait_any(&[&worker.stop, readable]) == 0,
-                (None, Some(hangup), None) => Event::wait_any(&[&worker.stop, hangup]) == 0,
+                (Some(readable), None, None) => {
+                    Event::wait_any(&[stop, readable]).map_or(true, |index| index == 0)
+                }
+                (None, Some(hangup), None) => {
+                    Event::wait_any(&[stop, hangup]).map_or(true, |index| index == 0)
+                }
                 (None, None, Some(writable)) => {
-                    Event::wait_any(&[&worker.stop, writable]) == 0
+                    Event::wait_any(&[stop, writable]).map_or(true, |index| index == 0)
                 }
                 (None, None, None) => true,
             };
@@ -461,7 +696,6 @@ impl Tty {
                 break;
             }
         }
-        worker.exited.signal();
     }
 
     fn observe_hangup(&self) -> bool {
@@ -477,17 +711,11 @@ impl Tty {
             state.output_stopped = false;
             state.foreground_group
         };
-        self.input_ready.signal();
-        self.output_resumed.signal();
+        let _ = self.input_ready.signal();
+        let _ = self.output_resumed.signal();
         if foreground_group > 0 {
-            proc::signal::send_kernel_process_group(
-                foreground_group as usize,
-                proc::signal::SIGHUP,
-            );
-            proc::signal::send_kernel_process_group(
-                foreground_group as usize,
-                proc::signal::SIGCONT,
-            );
+            signal_group(foreground_group, SIGHUP);
+            signal_group(foreground_group, SIGCONT);
         }
         true
     }
@@ -548,7 +776,7 @@ impl Tty {
             state.canonical_ready = state.input.len();
             drop(state);
             if accepted != 0 {
-                self.input_ready.signal();
+                let _ = self.input_ready.signal();
             }
             return;
         }
@@ -568,16 +796,12 @@ impl Tty {
         }
         self.flush_echo(nonblocking_echo);
         if wake {
-            self.input_ready.signal();
+            let _ = self.input_ready.signal();
         }
         if foreground_group > 0 {
-            for signal in [
-                proc::signal::SIGINT,
-                proc::signal::SIGQUIT,
-                proc::signal::SIGTSTP,
-            ] {
+            for signal in [SIGINT, SIGQUIT, SIGTSTP] {
                 if signals & (1u64 << signal) != 0 {
-                    proc::signal::send_kernel_process_group(foreground_group as usize, signal);
+                    signal_group(foreground_group, signal);
                 }
             }
         }
@@ -609,7 +833,7 @@ impl Tty {
             if control_matches(&termios, VSTOP, byte) {
                 if !state.output_stopped {
                     state.output_stopped = true;
-                    self.output_resumed.reset();
+                    let _ = self.output_resumed.reset();
                     return;
                 }
                 if !control_matches(&termios, VSTART, byte) {
@@ -620,7 +844,7 @@ impl Tty {
                 || (state.output_stopped && termios.input_flags & IXANY != 0)
             {
                 state.output_stopped = false;
-                self.output_resumed.signal();
+                let _ = self.output_resumed.signal();
                 if control_matches(&termios, VSTART, byte) {
                     return;
                 }
@@ -664,11 +888,11 @@ impl Tty {
         let signal = if termios.local_flags & ISIG == 0 {
             None
         } else if control_matches(&termios, VINTR, byte) {
-            Some(proc::signal::SIGINT)
+            Some(SIGINT)
         } else if control_matches(&termios, VQUIT, byte) {
-            Some(proc::signal::SIGQUIT)
+            Some(SIGQUIT)
         } else if control_matches(&termios, VSUSP, byte) {
-            Some(proc::signal::SIGTSTP)
+            Some(SIGTSTP)
         } else {
             None
         };
@@ -680,7 +904,7 @@ impl Tty {
                 *flush_output = true;
             }
             state.output_stopped = false;
-            self.output_resumed.signal();
+            let _ = self.output_resumed.signal();
             state.interrupted = true;
             if termios.local_flags & ECHO != 0 {
                 echo_input(state, &termios, byte);
@@ -850,10 +1074,10 @@ impl Tty {
                 if nonblocking {
                     return Err(FsError::WouldBlock);
                 }
-                self.input_ready.reset();
+                let _ = self.input_ready.reset();
             }
             if self.input_worker.lock().is_some() {
-                self.input_ready.wait();
+                let _ = self.input_ready.wait();
             } else {
                 clock::sleep(FALLBACK_POLL_INTERVAL);
             }
@@ -923,7 +1147,7 @@ impl Tty {
                     refresh_input_event(&state, &self.input_ready);
                     return Ok(read);
                 }
-                self.input_ready.reset();
+                let _ = self.input_ready.reset();
             }
 
             let now = clock::monotonic_ns();
@@ -947,7 +1171,7 @@ impl Tty {
                     ));
                 }
             } else if self.input_worker.lock().is_some() {
-                self.input_ready.wait();
+                let _ = self.input_ready.wait();
             } else {
                 clock::sleep(FALLBACK_POLL_INTERVAL);
             }
@@ -970,7 +1194,7 @@ impl Tty {
             if self.input_worker.lock().is_none() {
                 self.pump_input(false);
             } else {
-                self.output_resumed.wait();
+                let _ = self.output_resumed.wait();
             }
         }
         let (output_flags, discard_output) = {
@@ -1149,7 +1373,7 @@ impl Tty {
             state.interrupted = false;
         }
         let _ = self.backend.flush_input();
-        self.input_ready.reset();
+        let _ = self.input_ready.reset();
         self.input_flushing.store(false, Ordering::Release);
     }
 
@@ -1167,7 +1391,7 @@ impl Tty {
     }
 }
 
-impl DeviceNodeOps for Tty {
+impl Tty {
     fn open(&self, _flags: u32) -> FsResult<usize> {
         let _lifecycle = self.lifecycle_lock.lock();
         if self.state.lock().exclusive && self.opens.load(Ordering::Acquire) != 0 {
@@ -1212,60 +1436,29 @@ impl DeviceNodeOps for Tty {
                 hung_up: false,
             };
             *self.output_lock.lock() = 0;
-            self.input_ready.reset();
-            self.output_resumed.signal();
+            let _ = self.input_ready.reset();
+            let _ = self.output_resumed.signal();
         }
     }
 
-    fn read_at_with_flags(
-        &self,
-        _file_context: usize,
-        offset: u64,
-        sink: &mut IoSink<'_>,
-        flags: u32,
-    ) -> FsResult<usize> {
-        if sink.is_empty() {
+    fn read(&self, buffer: &mut [u8], flags: u32) -> FsResult<usize> {
+        if buffer.is_empty() {
             return Ok(0);
         }
         let canonical = self.state.lock().termios.local_flags & ICANON != 0;
-        read_windows(sink, offset, flags, |_, window, flags| {
-            let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
-            if canonical {
-                self.read_canonical(window, nonblocking)
-            } else {
-                self.read_raw(window, nonblocking)
-            }
-        })
+        let nonblocking = flags & ddk::OPEN_NONBLOCK != 0;
+        if canonical {
+            self.read_canonical(buffer, nonblocking)
+        } else {
+            self.read_raw(buffer, nonblocking)
+        }
     }
 
-    fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> FsResult<usize> {
-        self.read_at_with_flags(0, offset, sink, 0)
+    fn write(&self, input: &[u8], flags: u32) -> FsResult<usize> {
+        self.write_transformed(input, flags & ddk::OPEN_NONBLOCK != 0)
     }
 
-    fn write_at(&self, offset: u64, source: &IoSource<'_>) -> FsResult<usize> {
-        self.write_at_with_flags(0, offset, source, 0)
-    }
-
-    fn write_at_with_flags(
-        &self,
-        _file_context: usize,
-        offset: u64,
-        source: &IoSource<'_>,
-        flags: u32,
-    ) -> FsResult<usize> {
-        write_windows(source, offset, flags, |_, window, flags| {
-            let nonblocking = OpenFlags::from_bits_retain(flags).contains(OpenFlags::NONBLOCK);
-            self.write_transformed(window, nonblocking)
-        })
-    }
-
-    fn poll(
-        &self,
-        _file_context: usize,
-        _offset: u64,
-        events: PollEvents,
-        flags: u32,
-    ) -> FsResult<PollEvents> {
+    fn poll(&self, events: u16, flags: u32) -> u16 {
         if self.input_worker.lock().is_none() {
             self.pump_input(true);
             self.observe_hangup();
@@ -1283,59 +1476,49 @@ impl DeviceNodeOps for Tty {
                 state.output_stopped,
             )
         };
-        let mut ready = PollEvents::empty();
-        let flags = OpenFlags::from_bits_retain(flags);
-        let read_events = if flags.contains(OpenFlags::READ) {
-            events & (PollEvents::IN | PollEvents::RDNORM)
+        let mut ready = 0u16;
+        let read_events = if flags & 1 != 0 {
+            events & (ddk::POLL_IN | ddk::POLL_RDNORM)
         } else {
-            PollEvents::empty()
+            0
         };
         if interrupted || readable {
             ready |= read_events;
         }
         if hung_up {
-            ready |= PollEvents::HUP;
+            ready |= ddk::POLL_HUP;
         }
-        if flags.contains(OpenFlags::WRITE) && !output_stopped && self.backend.writable() {
-            ready |= events & (PollEvents::OUT | PollEvents::WRNORM);
+        if flags & 2 != 0 && !output_stopped && self.backend.writable() {
+            ready |= events & (ddk::POLL_OUT | ddk::POLL_WRNORM);
         }
-        Ok(ready)
+        ready
     }
 
-    fn poll_events<'a>(
-        &'a self,
-        _file_context: usize,
-        events: PollEvents,
-        output: &mut alloc::vec::Vec<&'a Event>,
-    ) -> bool {
-        let state = self.state.lock();
-        let mut complete = true;
-        if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) {
-            if self.input_worker.lock().is_some() {
-                output.push(&self.input_ready);
-            } else {
-                complete = false;
-            }
-        }
-        if events.intersects(PollEvents::OUT | PollEvents::WRNORM) {
-            if state.output_stopped {
-                output.push(&self.output_resumed);
-            } else if let Some(event) = self.backend.writable_event() {
-                output.push(event);
-            } else {
-                complete = false;
-            }
-        }
-        complete
+    fn readable_event(&self) -> usize {
+        self.input_worker
+            .lock()
+            .is_some()
+            .then_some(self.input_ready.id())
+            .unwrap_or(0)
     }
 
-    fn terminal_state(&self) -> Option<TerminalState> {
+    fn writable_event(&self) -> usize {
         let state = self.state.lock();
-        Some(TerminalState {
+        if state.output_stopped {
+            self.output_resumed.id()
+        } else {
+            self.backend.writable_event().map_or(0, Event::id)
+        }
+    }
+
+    fn terminal_state(&self) -> raw::TerminalState {
+        let state = self.state.lock();
+        raw::TerminalState {
             session: state.session,
             foreground_group: state.foreground_group,
-            stop_background_output: state.termios.local_flags & TOSTOP != 0,
-        })
+            stop_background_output: u8::from(state.termios.local_flags & TOSTOP != 0),
+            reserved: [0; 3],
+        }
     }
 
     fn sync(&self) -> FsResult<()> {
@@ -1345,8 +1528,7 @@ impl DeviceNodeOps for Tty {
 
     fn ioctl(
         &self,
-        _file_context: usize,
-        context: IoctlContext,
+        context: raw::IoctlIdentity,
         request: u64,
         value: u64,
         argument: &mut [u8],
@@ -1372,11 +1554,11 @@ impl DeviceNodeOps for Tty {
             TCXONC => match value {
                 0 => {
                     self.state.lock().output_stopped = true;
-                    self.output_resumed.reset();
+                    let _ = self.output_resumed.reset();
                 }
                 1 => {
                     self.state.lock().output_stopped = false;
-                    self.output_resumed.signal();
+                    let _ = self.output_resumed.signal();
                 }
                 2 => {
                     let byte = self.state.lock().termios.control[VSTOP];
@@ -1406,43 +1588,37 @@ impl DeviceNodeOps for Tty {
             TIOCEXCL => self.state.lock().exclusive = true,
             TIOCNXCL => self.state.lock().exclusive = false,
             TIOCSCTTY => {
-                if !context.is_session_leader {
+                if context.session_leader == 0 {
                     return Err(FsError::PermissionDenied);
                 }
                 let mut state = self.state.lock();
-                if state.session != 0 && state.session != context.session_id && value == 0 {
+                if state.session != 0 && state.session != context.session && value == 0 {
                     return Err(FsError::PermissionDenied);
                 }
-                state.session = context.session_id;
+                state.session = context.session;
                 if state.foreground_group == 0 {
-                    state.foreground_group = context.process_group;
+                    state.foreground_group = context.group;
                 }
             }
             TIOCNOTTY => {
                 let mut state = self.state.lock();
-                if state.session != context.session_id {
+                if state.session != context.session {
                     return Err(FsError::PermissionDenied);
                 }
-                if context.is_session_leader {
+                if context.session_leader != 0 {
                     let foreground_group = state.foreground_group;
                     state.session = 0;
                     state.foreground_group = 0;
                     drop(state);
                     if foreground_group > 0 {
-                        proc::signal::send_kernel_process_group(
-                            foreground_group as usize,
-                            proc::signal::SIGHUP,
-                        );
-                        proc::signal::send_kernel_process_group(
-                            foreground_group as usize,
-                            proc::signal::SIGCONT,
-                        );
+                        signal_group(foreground_group, SIGHUP);
+                        signal_group(foreground_group, SIGCONT);
                     }
                 }
             }
             TIOCGPGRP => {
                 let state = self.state.lock();
-                if state.session != context.session_id {
+                if state.session != context.session {
                     return Err(FsError::NotTty);
                 }
                 put_i32(argument, state.foreground_group)?;
@@ -1453,7 +1629,7 @@ impl DeviceNodeOps for Tty {
                     return Err(FsError::InvalidArgument);
                 }
                 let mut state = self.state.lock();
-                if state.session != context.session_id {
+                if state.session != context.session {
                     return Err(FsError::NotTty);
                 }
                 state.foreground_group = group;
@@ -1479,10 +1655,7 @@ impl DeviceNodeOps for Tty {
                     }
                 };
                 if foreground_group > 0 {
-                    proc::signal::send_kernel_process_group(
-                        foreground_group as usize,
-                        proc::signal::SIGWINCH,
-                    );
+                    signal_group(foreground_group, SIGWINCH);
                 }
             }
             TIOCGSOFTCAR => put_i32(argument, i32::from(self.state.lock().soft_carrier))?,
@@ -1508,6 +1681,13 @@ impl DeviceNodeOps for Tty {
             _ => return Err(FsError::NotTty),
         }
         Ok(0)
+    }
+
+    fn destroy(&self) {
+        self.shutdown();
+        self.backend.destroy();
+        let _ = self.input_ready.destroy();
+        let _ = self.output_resumed.destroy();
     }
 }
 
@@ -1698,9 +1878,9 @@ fn input_ready(state: &TtyState) -> bool {
 
 fn refresh_input_event(state: &TtyState, event: &Event) {
     if state.interrupted || state.hung_up || input_ready(state) {
-        event.signal();
+        let _ = event.signal();
     } else {
-        event.reset();
+        let _ = event.reset();
     }
 }
 
@@ -1768,10 +1948,7 @@ fn discard_current_line(input: &mut VecDeque<InputItem>, termios: &Termios) -> u
     removed
 }
 
-fn erase_last_character(
-    input: &mut VecDeque<InputItem>,
-    termios: &Termios,
-) -> (usize, usize) {
+fn erase_last_character(input: &mut VecDeque<InputItem>, termios: &Termios) -> (usize, usize) {
     let Some(item) = input.back().copied() else {
         return (0, 0);
     };
@@ -1969,3 +2146,350 @@ fn baud_code(baud: u32) -> Option<u32> {
         _ => return None,
     })
 }
+
+fn callback_status(result: FsResult<()>) -> i32 {
+    result.map_or_else(|error| error.status(), |_| ddk::OK)
+}
+
+fn callback_count(result: FsResult<usize>) -> i64 {
+    result.map_or_else(
+        |error| i64::from(error.status()),
+        |count| i64::try_from(count).unwrap_or(i64::MAX),
+    )
+}
+
+unsafe fn terminal_from_context<'terminal>(context: *mut c_void) -> Option<&'terminal Tty> {
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: provider registration stores a `Box<Tty>` address in the copied
+    // node table and frees it only after devfs has revoked the node.
+    Some(unsafe { &*context.cast::<Tty>() })
+}
+
+unsafe extern "C" fn node_open(context: *mut c_void, flags: u32, out: *mut usize) -> i32 {
+    if out.is_null() {
+        return ddk::EINVAL;
+    }
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return ddk::EINVAL;
+    };
+    match terminal.open(flags) {
+        Ok(file) => {
+            // SAFETY: checked non-null above and points to caller output.
+            unsafe { out.write(file) };
+            ddk::OK
+        }
+        Err(error) => error.status(),
+    }
+}
+
+unsafe extern "C" fn node_close(context: *mut c_void, file: usize, flags: u32) {
+    let _ = (file, flags);
+    // SAFETY: the node table supplies a live terminal context.
+    if let Some(terminal) = unsafe { terminal_from_context(context) } {
+        terminal.close(file, flags);
+    }
+}
+
+unsafe extern "C" fn node_read(
+    context: *mut c_void,
+    _file: usize,
+    _offset: u64,
+    data: *mut u8,
+    length: usize,
+    flags: u32,
+) -> i64 {
+    if length != 0 && data.is_null() {
+        return i64::from(ddk::EINVAL);
+    }
+    let output = if length == 0 {
+        &mut []
+    } else {
+        // SAFETY: the node ABI guarantees writable `length` bytes.
+        unsafe { core::slice::from_raw_parts_mut(data, length) }
+    };
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return i64::from(ddk::EINVAL);
+    };
+    callback_count(terminal.read(output, flags))
+}
+
+unsafe extern "C" fn node_write(
+    context: *mut c_void,
+    _file: usize,
+    _offset: u64,
+    data: *const u8,
+    length: usize,
+    flags: u32,
+) -> i64 {
+    if length != 0 && data.is_null() {
+        return i64::from(ddk::EINVAL);
+    }
+    let input = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: the node ABI guarantees readable `length` bytes.
+        unsafe { core::slice::from_raw_parts(data, length) }
+    };
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return i64::from(ddk::EINVAL);
+    };
+    callback_count(terminal.write(input, flags))
+}
+
+unsafe extern "C" fn node_sync(context: *mut c_void) -> i32 {
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return ddk::EINVAL;
+    };
+    callback_status(terminal.sync())
+}
+
+unsafe extern "C" fn node_poll(
+    context: *mut c_void,
+    _file: usize,
+    _offset: u64,
+    events: u16,
+    flags: u32,
+) -> i64 {
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return i64::from(ddk::EINVAL);
+    };
+    i64::from(terminal.poll(events, flags))
+}
+
+unsafe extern "C" fn node_ioctl(
+    context: *mut c_void,
+    _file: usize,
+    identity: *const raw::IoctlIdentity,
+    request: u64,
+    value: u64,
+    argument: *mut u8,
+    argument_length: usize,
+) -> i64 {
+    if identity.is_null() || (argument_length != 0 && argument.is_null()) {
+        return i64::from(ddk::EINVAL);
+    }
+    // SAFETY: the node ABI guarantees these argument records for the callback.
+    let identity = unsafe { *identity };
+    // SAFETY: the node ABI guarantees writable `argument_length` bytes when
+    // nonzero; null is accepted for the empty slice.
+    let argument = if argument_length == 0 {
+        &mut []
+    } else {
+        // SAFETY: validated non-null above and writable for this exact range.
+        unsafe { core::slice::from_raw_parts_mut(argument, argument_length) }
+    };
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return i64::from(ddk::EINVAL);
+    };
+    terminal
+        .ioctl(identity, request, value, argument)
+        .map_or_else(|error| i64::from(error.status()), |result| result as i64)
+}
+
+unsafe extern "C" fn node_readable_event(context: *mut c_void, _file: usize) -> usize {
+    // SAFETY: the node table supplies a live terminal context.
+    unsafe { terminal_from_context(context) }.map_or(0, Tty::readable_event)
+}
+
+unsafe extern "C" fn node_writable_event(context: *mut c_void, _file: usize) -> usize {
+    // SAFETY: the node table supplies a live terminal context.
+    unsafe { terminal_from_context(context) }.map_or(0, Tty::writable_event)
+}
+
+unsafe extern "C" fn node_hangup_event(context: *mut c_void, _file: usize) -> usize {
+    // SAFETY: the node table supplies a live terminal context.
+    unsafe { terminal_from_context(context) }.map_or(0, Tty::readable_event)
+}
+
+unsafe extern "C" fn node_terminal_state(
+    context: *mut c_void,
+    out: *mut raw::TerminalState,
+) -> i32 {
+    if out.is_null() {
+        return ddk::EINVAL;
+    }
+    // SAFETY: the node table supplies a live terminal context.
+    let Some(terminal) = (unsafe { terminal_from_context(context) }) else {
+        return ddk::EINVAL;
+    };
+    // SAFETY: checked non-null above and points to caller output.
+    unsafe { out.write(terminal.terminal_state()) };
+    ddk::OK
+}
+
+fn terminal_node_ops(context: *mut c_void) -> raw::NodeOps {
+    raw::NodeOps {
+        size: raw::NODE_OPS_SIZE,
+        context,
+        open: Some(node_open),
+        close: Some(node_close),
+        initial_offset: None,
+        read: Some(node_read),
+        write: Some(node_write),
+        size_bytes: None,
+        sync: Some(node_sync),
+        poll: Some(node_poll),
+        ioctl: Some(node_ioctl),
+        readable_event: Some(node_readable_event),
+        writable_event: Some(node_writable_event),
+        hangup_event: Some(node_hangup_event),
+        terminal_state: Some(node_terminal_state),
+    }
+}
+
+struct ProviderState {
+    class: Class,
+    provider: TtyProvider,
+}
+
+static PROVIDER: TicketLock<Option<ProviderState>> = TicketLock::new(None);
+
+static CLASS_DEFINITION: raw::ClassDef = raw::ClassDef {
+    size: raw::CLASS_DEF_SIZE,
+    attach: None,
+    detach: None,
+    context: ptr::null_mut(),
+};
+
+static PROVIDER_OPERATIONS: raw::TtyProviderOps = raw::TtyProviderOps {
+    size: raw::TTY_PROVIDER_OPS_SIZE,
+    context: ptr::null_mut(),
+    register: Some(provider_register),
+    unregister: Some(provider_unregister),
+};
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn provider_register(
+    _context: *mut c_void,
+    _backend_module: *const raw::Module,
+    device: *const raw::Device,
+    parent: u64,
+    name: *const c_char,
+    mode: u16,
+    baud: u32,
+    operations: *const raw::ConsoleOps,
+    out: *mut *mut c_void,
+) -> i32 {
+    if name.is_null() || out.is_null() {
+        return ddk::EINVAL;
+    }
+    // SAFETY: the broker validates the C string before invoking this callback.
+    let c_name = unsafe { CStr::from_ptr(name) };
+    let Ok(name) = c_name.to_str() else {
+        return ddk::EINVAL;
+    };
+    // SAFETY: the provider ABI keeps the operation prefix readable for this
+    // callback; `copy` validates its size and required entries.
+    let Ok(backend) = (unsafe { Backend::copy(operations) }) else {
+        return ddk::EINVAL;
+    };
+    let Ok(devfs) = Devfs::current() else {
+        return ddk::ENODEV;
+    };
+    let Ok(root) = devfs.root() else {
+        return ddk::ENODEV;
+    };
+    let path: Box<str> = if parent == root {
+        format!("/dev/{name}").into_boxed_str()
+    } else {
+        format!("/dev/pts/{name}").into_boxed_str()
+    };
+    let Ok(mut terminal) = Tty::new(backend, path, baud) else {
+        return ddk::EINVAL;
+    };
+    let context = (&raw mut *terminal).cast::<c_void>();
+    let node_ops = terminal_node_ops(context);
+    // SAFETY: `node_ops` refers to the boxed terminal, which remains live until
+    // node removal joins its worker.
+    let Ok(node) = (unsafe { devfs.create_character(parent, c_name, mode, &node_ops) }) else {
+        terminal.destroy();
+        return ddk::EIO;
+    };
+    // SAFETY: the optional device pointer comes from the kernel registration
+    // callback and stays live for its duration.
+    let device = unsafe { Device::from_raw(device) };
+    let member = {
+        let provider = PROVIDER.lock();
+        let Some(provider) = provider.as_ref() else {
+            let _ = devfs.remove(node);
+            terminal.destroy();
+            return ddk::ENODEV;
+        };
+        // SAFETY: no class member operations are exposed; the terminal
+        // allocation remains valid until the membership is removed.
+        unsafe { provider.class.add(device, c_name, ptr::null(), 0, context) }
+    };
+    let Ok(member) = member else {
+        let _ = devfs.remove(node);
+        terminal.destroy();
+        return ddk::EIO;
+    };
+    *terminal.node.lock() = Some(node);
+    *terminal.member.lock() = Some(member);
+    // SAFETY: checked non-null above and the broker consumes this receipt
+    // through `provider_unregister`.
+    unsafe { out.write(Box::into_raw(terminal).cast()) };
+    ddk::OK
+}
+
+unsafe extern "C" fn provider_unregister(_context: *mut c_void, receipt: *mut c_void) -> i32 {
+    if receipt.is_null() {
+        return ddk::EINVAL;
+    }
+    // SAFETY: the broker calls this at most once for the receipt returned from
+    // `provider_register`; devfs has no active callbacks after removal.
+    let terminal = unsafe { &mut *receipt.cast::<Tty>() };
+    let Some(node) = terminal.node.lock().take() else {
+        return ddk::EINVAL;
+    };
+    let Ok(devfs) = Devfs::current() else {
+        *terminal.node.lock() = Some(node);
+        return ddk::ENODEV;
+    };
+    if devfs.remove(node).is_err() {
+        *terminal.node.lock() = Some(node);
+        return ddk::EBUSY;
+    }
+    if let Some(mut member) = terminal.member.lock().take() {
+        member.remove();
+    }
+    terminal.destroy();
+    // SAFETY: the devfs node is gone and its worker was joined by `destroy`.
+    drop(unsafe { Box::from_raw(receipt.cast::<Tty>()) });
+    ddk::OK
+}
+
+fn console_init(_module: Module) -> DdkResult<()> {
+    // SAFETY: the class definition and its callback table are static.
+    let class = unsafe { Class::register(c"tty", &CLASS_DEFINITION) }?;
+    // SAFETY: the provider definition and its callback table are static.
+    let provider = unsafe { TtyProvider::register(&PROVIDER_OPERATIONS) }?;
+    *PROVIDER.lock() = Some(ProviderState { class, provider });
+    Ok(())
+}
+
+fn console_exit(_module: Module) {
+    let Some(mut state) = PROVIDER.lock().take() else {
+        return;
+    };
+    if state.provider.unregister().is_err() {
+        *PROVIDER.lock() = Some(state);
+        return;
+    }
+    let _ = state.class.unregister();
+}
+
+ddk::module!(
+    b"console\0",
+    b"Shared terminal line discipline\0",
+    console_init,
+    console_exit,
+);

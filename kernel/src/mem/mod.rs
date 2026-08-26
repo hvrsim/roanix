@@ -20,10 +20,7 @@ use log::{debug, info};
 
 use crate::{
     arch,
-    sys::{
-        clock, sched, smp,
-        sync::Once,
-    },
+    sys::{clock, sched, smp, sync::Once},
 };
 
 pub mod addr;
@@ -42,13 +39,13 @@ mod tlb;
 pub mod vmem;
 
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
+pub(crate) use alloc::HEAP_BASE;
 pub use error::{Error, Result};
+pub use io::{IoSink, IoSource, SinkWindow, SourceWindow};
 pub use map::{
     FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmInheritance, VmMap,
     VmMapEntry, VmPlacement, VmProtection,
 };
-pub(crate) use alloc::HEAP_BASE;
-pub use io::{IoSink, IoSource};
 pub use object::{ObjectKind, PageAccount, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};
 pub use pmap::{Pmap, VmSpace};
@@ -291,9 +288,7 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
         return;
     };
     let root = space.pmap().root();
-    let active = arch::thiscpu()
-        .active_address_root
-        .load(Ordering::Acquire);
+    let active = arch::thiscpu().active_address_root.load(Ordering::Acquire);
     if active == root.as_u64() {
         debug_assert_eq!(arch::paging::active_root(), root);
         return;
@@ -320,9 +315,8 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
 /// Returns whether any CPU still has `root` installed.
 pub(crate) fn address_space_root_active(root: u64) -> bool {
     (0..smp::cpu_count()).any(|cpu_id| {
-        smp::core_local(cpu_id).is_some_and(|cpu| {
-            cpu.active_address_root.load(Ordering::Acquire) == root
-        })
+        smp::core_local(cpu_id)
+            .is_some_and(|cpu| cpu.active_address_root.load(Ordering::Acquire) == root)
     })
 }
 

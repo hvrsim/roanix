@@ -79,7 +79,25 @@ impl Resource {
         })
     }
 
+    /// Re-checks the construction invariants.
+    ///
+    /// Fields are public for ABI-friendly construction, so the builder runs
+    /// this before publishing a device; a hand-built resource with a zero
+    /// size, an out-of-range kind, or an overflowing range is rejected there
+    /// instead of corrupting later arithmetic such as [`Self::end`].
+    pub fn validate(&self) -> Result<()> {
+        if !(kind::MEM..=kind::BUS).contains(&self.kind) {
+            return Err(Error::InvalidArgument);
+        }
+        if self.size == 0 || self.start.checked_add(self.size - 1).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
     /// Returns the last address, port, or line in the range.
+    ///
+    /// Callers must have passed the resource through [`Self::validate`].
     pub const fn end(&self) -> u64 {
         self.start + self.size - 1
     }
@@ -143,16 +161,8 @@ pub fn find(resources: &[Resource], kind: u32, index: usize) -> Option<&Resource
 }
 
 /// Returns the resource of `kind` labelled `name`.
-pub fn find_named<'a>(
-    resources: &'a [Resource],
-    kind: u32,
-    name: &str,
-) -> Option<&'a Resource> {
+pub fn find_named<'a>(resources: &'a [Resource], kind: u32, name: &str) -> Option<&'a Resource> {
     resources.iter().find(|resource| {
-        resource.kind == kind
-            && resource
-                .name
-                .as_ref()
-                .is_some_and(|label| &**label == name)
+        resource.kind == kind && resource.name.as_ref().is_some_and(|label| &**label == name)
     })
 }

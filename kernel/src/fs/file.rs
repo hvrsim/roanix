@@ -183,9 +183,9 @@ impl OpenFile {
             return Err(Error::BadFileDescriptor);
         }
         let mut offset = self.offset.read().lock();
-        let read =
-            self.vnode
-                .read_at_with_flags(self.file_context, *offset, sink, flags.bits())?;
+        let read = self
+            .vnode
+            .read_at_with_flags(self.file_context, *offset, sink, flags.bits())?;
         *offset = offset.saturating_add(read as u64);
         self.offset.publish_read(*offset);
         Ok(read)
@@ -273,11 +273,7 @@ impl OpenFile {
     }
 
     /// Appends events that can wake a readiness rescan.
-    pub fn poll_events<'a>(
-        &'a self,
-        mut events: PollEvents,
-        output: &mut Vec<&'a Event>,
-    ) -> bool {
+    pub fn poll_events<'a>(&'a self, mut events: PollEvents, output: &mut Vec<&'a Event>) -> bool {
         let flags = self.flags();
         if !flags.contains(OpenFlags::READ) {
             events.remove(PollEvents::IN | PollEvents::RDNORM);

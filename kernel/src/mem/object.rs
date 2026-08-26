@@ -177,7 +177,9 @@ impl VmObject {
 
             // Pages are resolved a batch at a time so a bulk transfer takes one
             // index acquisition per batch instead of one per page.
-            if batch_index == u64::MAX || page_index < batch_index || page_index - batch_index >= LOOKUP_BATCH as u64
+            if batch_index == u64::MAX
+                || page_index < batch_index
+                || page_index - batch_index >= LOOKUP_BATCH as u64
             {
                 batch_index = page_index;
                 let pages = self.pages.lock();
@@ -189,13 +191,13 @@ impl VmObject {
             // The page reference is taken before the sink window is resolved so
             // that no page backing lock is held across a user page fault.
             let page = batch[(page_index - batch_index) as usize].clone();
-            let window = sink.window(read, limit)?;
+            let mut window = sink.window(read, limit)?;
             if window.is_empty() {
                 return Err(Error::InvalidAddress);
             }
             let count = window.len();
             match page {
-                Some(page) => page.read(page_offset, window)?,
+                Some(page) => page.read(page_offset, &mut window)?,
                 None => window.fill(0),
             }
             read += count;
@@ -233,7 +235,7 @@ impl VmObject {
             let count = window.len();
             let existing = self.pages.lock().get(&page_index).cloned();
             if let Some(page) = existing {
-                if let Err(error) = page.write(page_offset, window) {
+                if let Err(error) = page.write(page_offset, &window) {
                     if written != 0 {
                         return Ok(written);
                     }
@@ -250,7 +252,7 @@ impl VmObject {
                 }
                 let page =
                     VmPage::new_zero(page_index, super::page::owner_kind_for_object(self.kind));
-                if let Err(error) = page.write(page_offset, window) {
+                if let Err(error) = page.write(page_offset, &window) {
                     if let Some(account) = &self.account {
                         account.release(1);
                     }
@@ -264,7 +266,7 @@ impl VmObject {
                     if let Some(account) = &self.account {
                         account.release(1);
                     }
-                    existing.write(page_offset, window)?;
+                    existing.write(page_offset, &window)?;
                 } else {
                     pages.insert(page_index, page);
                 }

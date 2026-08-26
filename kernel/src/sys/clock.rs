@@ -176,7 +176,11 @@ impl Timer {
     }
 
     fn for_event(deadline_ns: u64, cpu_id: usize, event: &Event) -> Self {
-        Self::new(deadline_ns, cpu_id, TimerTarget::Event(NonNull::from(event)))
+        Self::new(
+            deadline_ns,
+            cpu_id,
+            TimerTarget::Event(NonNull::from(event)),
+        )
     }
 
     fn for_thread(deadline_ns: u64, cpu_id: usize, thread: *mut Thread, park_seq: u64) -> Self {
@@ -218,7 +222,7 @@ impl ClockScale {
             let mut shift = CLOCK_SCALE_MAX_SHIFT;
             loop {
                 let unit = 1u128 << shift;
-                let multiplier = (frequency * unit + NSEC_PER_SEC - 1) / NSEC_PER_SEC;
+                let multiplier = (frequency * unit).div_ceil(NSEC_PER_SEC);
                 if (1..=u64::MAX as u128).contains(&multiplier) {
                     break (multiplier as u64, shift);
                 }
@@ -515,10 +519,7 @@ pub fn monotonic_ns_or_zero() -> u64 {
 
 #[inline]
 fn elapsed_ns(registered: &RegisteredClockSource) -> u64 {
-    let elapsed = registered
-        .source
-        .counter()
-        .wrapping_sub(registered.epoch);
+    let elapsed = registered.source.counter().wrapping_sub(registered.epoch);
     registered.scale.cycles_to_ns(elapsed)
 }
 

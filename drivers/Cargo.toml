@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "ddk",
+    "platform/acpi",
+    "platform/fdt",
+    "irqchip/ioapic",
+    "tty/uart8250",
+    "tty/console",
+    "tty/pty",
+    "tty/special",
+    "fs/tmpfs",
+    "fs/devfs",
+]
+resolver = "3"
+
+[profile.dev]
+opt-level = 2
+codegen-units = 1
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
