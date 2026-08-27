@@ -681,21 +681,24 @@ impl Process {
             clear_session_controlling_tty(self.session(), terminal.vnode().key());
         }
         self.reparent_children();
-        let parent_guard = self.parent.lock();
-        let parent = parent_guard.upgrade();
-        if let Some(parent) = parent {
+
+        let parent = self.parent.lock().upgrade();
+        self.files.lock().clear();
+        if let Some(parent) = &parent {
             let _children = parent.children.lock();
             self.exit_status.store(encoded_status, Ordering::Release);
             self.exited.store(true, Ordering::Release);
-            self.files.lock().clear();
-            signal::send_kernel(&parent, signal::SIGCHLD);
-            parent.child_event.signal();
         } else {
             self.exit_status.store(encoded_status, Ordering::Release);
             self.exited.store(true, Ordering::Release);
-            self.files.lock().clear();
         }
-        drop(parent_guard);
+
+        // Waking a local waiter can synchronously reschedule on x86. Keep all
+        // process locks out of that path so the waiter can inspect children.
+        if let Some(parent) = parent {
+            signal::send_kernel(&parent, signal::SIGCHLD);
+            parent.child_event.signal();
+        }
     }
 
     fn reparent_children(self: &Arc<Self>) {
@@ -1051,7 +1054,7 @@ pub(crate) fn exit_current(status: i32) -> ! {
     if let Some(process) = current() {
         trace!("pid {} exited with status {status}", process.pid());
         process.mark_exited((status & 0xff) << 8);
-        process.unregister_thread();
+        finish_current_process_thread_exit(&process);
     }
     sched::exit_current()
 }
@@ -1064,7 +1067,7 @@ pub(crate) fn exit_current_signal(signal: u8) -> ! {
         // has reported the exit status.
         debug!("pid {} killed by signal {signal}", process.pid());
         process.mark_exited(i32::from(signal & 0x7f));
-        process.unregister_thread();
+        finish_current_process_thread_exit(&process);
     }
     sched::exit_current()
 }
@@ -1086,7 +1089,14 @@ pub(crate) fn exit_current_thread_if_process_exited() {
         return;
     };
     if process.is_exited() {
-        process.unregister_thread();
-        sched::exit_current();
+        finish_current_process_thread_exit(&process);
     }
+}
+
+fn finish_current_process_thread_exit(process: &Process) -> ! {
+    // The active-thread decrement and scheduler removal must be atomic with
+    // trap return, which also retires threads belonging to an exited process.
+    crate::arch::irqset(false);
+    process.unregister_thread();
+    sched::exit_current()
 }
