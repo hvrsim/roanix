@@ -242,6 +242,11 @@ pub fn sync_instruction_cache() {
     if cpu_id < MAX_ICACHE_CPUS {
         ICACHE_SEEN[cpu_id].store(sequence, Ordering::Release);
     }
+
+    if !smp::is_initialized() {
+        return;
+    }
+
     let _ = smp::send_ipi(sync_remote_instruction_cache, IpiTarget::All);
 
     loop {

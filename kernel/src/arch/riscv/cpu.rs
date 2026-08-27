@@ -36,6 +36,7 @@ const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
 pub(crate) const SSTATUS_SIE: u64 = 1 << 1;
 const SSTATUS_SPIE: u64 = 1 << 5;
 const SSTATUS_SPP: u64 = 1 << 8;
+const SSTATUS_FS_INITIAL: u64 = 1 << 13;
 pub(crate) const SIE_SSIE: u64 = 1 << 1;
 pub(crate) const SIE_STIE: u64 = 1 << 5;
 const SIE_SEIE: u64 = 1 << 9;
@@ -136,7 +137,7 @@ impl TrapFrame {
             return false;
         }
         *self = *saved;
-        self.sstatus = SSTATUS_SPIE;
+        self.sstatus = SSTATUS_SPIE | SSTATUS_FS_INITIAL;
         true
     }
 
@@ -247,7 +248,7 @@ pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64)
             scause: 0,
             stval: 0,
             ip,
-            sstatus: SSTATUS_SPIE,
+            sstatus: SSTATUS_SPIE | SSTATUS_FS_INITIAL,
             reserved: 0,
         };
     }
@@ -497,6 +498,13 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 | SCAUSE_STORE_PAGE_FAULT => crate::proc::signal::SIGSEGV,
                 _ => crate::proc::signal::SIGILL,
             };
+            log::error!(
+                "riscv/trap: user trap ip=0x{:X} stval=0x{:X} cause=0x{:X} signal={}",
+                frame.ip,
+                frame.stval,
+                frame.scause,
+                signal
+            );
             crate::proc::signal::send_current(signal);
             return frame;
         }

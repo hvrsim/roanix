@@ -2,7 +2,7 @@
 
 skip_pkg_check=yes
 version="$(. "${base_dir}/host-recipes/gcc-host/recipe" && echo ${version})"
-revision=2
+revision=3
 hostdeps="gcc-host pkg-config"
 imagedeps="build-essential"
 deps="mlibc"
@@ -29,4 +29,8 @@ package() {
         tmp_libgcc_dir/usr/local/lib/gcc/${OS_TRIPLET}/${version}/* \
         "${dest_dir}${prefix}/lib/"
     cp -r tmp_libgcc_dir/usr/local/${OS_TRIPLET}/* "${dest_dir}${prefix}"/
+
+    # mlibc owns the generic CRT init/fini objects. GCC may still stage copies
+    # from older configured build trees, but packaging them conflicts with mlibc.
+    rm -f "${dest_dir}${prefix}/lib/crti.o" "${dest_dir}${prefix}/lib/crtn.o"
 }

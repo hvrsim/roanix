@@ -2022,7 +2022,6 @@ case $os in
 	| ios* \
 	| iris* \
 	| irix* \
-	| ironclad* \
 	| isc* \
 	| its* \
 	| l4re* \

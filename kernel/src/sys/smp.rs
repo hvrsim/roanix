@@ -353,6 +353,11 @@ fn smp_state() -> &'static SmpState {
     SMP_STATE.get().expect("smp: init required before use")
 }
 
+/// Returns whether CPU discovery has initialized the SMP registry.
+pub fn is_initialized() -> bool {
+    SMP_STATE.get().is_some()
+}
+
 /// Compact spinlock that masks local interrupts while held.
 ///
 /// Unlike [`crate::sys::sync::Mutex`], this lock is valid in interrupt

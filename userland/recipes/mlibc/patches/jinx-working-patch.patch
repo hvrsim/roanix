@@ -2111,16 +2111,20 @@ new file mode 100644
 index 0000000..1baada4
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,15 @@
 +.section .init
 +.global _init
++.type _init, @function
 +_init:
-+    nop
++    addi sp, sp, -16
++    sd ra, 8(sp)
 +
 +.section .fini
 +.global _fini
++.type _fini, @function
 +_fini:
-+    nop
++    addi sp, sp, -16
++    sd ra, 8(sp)
 +
 +.section .note.GNU-stack,"",%progbits
 diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
@@ -2128,12 +2132,16 @@ new file mode 100644
 index 0000000..76a4b87
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +.section .init
-+    nop
++    ld ra, 8(sp)
++    addi sp, sp, 16
++    ret
 +
 +.section .fini
-+    nop
++    ld ra, 8(sp)
++    addi sp, sp, 16
++    ret
 +
 +.section .note.GNU-stack,"",%progbits
 diff --git mlibc-workdir/sysdeps/roanix/riscv64/thread.S mlibc-workdir/sysdeps/roanix/riscv64/thread.S

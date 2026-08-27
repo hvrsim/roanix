@@ -2,7 +2,7 @@ diff --git openssl-clean/Configurations/10-main.conf openssl-workdir/Configurati
 index 7e93968..4de7b1f 100644
 --- openssl-clean/Configurations/10-main.conf
 +++ openssl-workdir/Configurations/10-main.conf
-@@ -1010,6 +1010,51 @@ my %targets = (
+@@ -1010,6 +1010,52 @@ my %targets = (
          ranlib           => "true",
      },
  
@@ -17,6 +17,7 @@ index 7e93968..4de7b1f 100644
 +                         release     => "-O3"),
 +        cflags           => threads("-pthread"),
 +        cxxflags         => combine("-std=c++11", threads("-pthread")),
++        ARFLAGS          => "rc",
 +        lib_cppflags     => combine("-DOPENSSL_USE_NODELETE", "-DL_ENDIAN"),
 +        bn_ops           => "SIXTY_FOUR_BIT_LONG RC4_CHAR",
 +        thread_scheme    => "pthreads",
@@ -41,7 +42,7 @@ index 7e93968..4de7b1f 100644
 +
 +    },
 +    "riscv64-roanix" => {
-+        inherit_from     => [ "ironclad-generic64" ],
++        inherit_from     => [ "roanix-generic64" ],
 +        asm_arch         => 'riscv64',
 +        perlasm_scheme   => "elf",
 +

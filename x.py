@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""xtool - the Roanix developer build system.
-
-xtool is a single-file front-end that knows how to build the Roanix kernel,
-drive the Jinx userland package manager, assemble bootable images, and boot
-the result in QEMU.  It is designed around what an OS developer actually does
-all day, so the common workflows are one command each:
-
-    ./x.py                    build whatever changed and boot it
-    ./x.py pkg bash           rebuild a userland package into the sysroot
-    ./x.py port zstd --url…   scaffold a brand new port
-    ./x.py shell python       drop into that port's Jinx build container
-    ./x.py status             see what is stale before committing to a build
-
-Run ``./x.py --help`` for the complete command list, or ``./x.py help
-<command>`` for details on one command.
-"""
 
 from __future__ import annotations
 
@@ -80,10 +64,6 @@ SYSTEM_MANIFEST = USERLAND_DIR / "system.list"
 
 BUILD_DIR = ROOT / "build"
 
-# Everything under build/ obeys one rule: anything that depends on the target
-# architecture lives in build/<arch>/, and anything shared by every
-# architecture lives beside it. That makes "what does riscv64 cost me?" a
-# `du -sh build/riscv64` away and "forget riscv64" an `rm -rf` away.
 CACHE_DIR = BUILD_DIR / "cache"          # pinned, immutable, arch independent
 DOWNLOADS_DIR = CACHE_DIR / "downloads"
 CARGO_DIR = BUILD_DIR / "cargo"          # CARGO_TARGET_DIR; Cargo namespaces
@@ -162,7 +142,7 @@ class Failure(Exception):
 
 
 # --------------------------------------------------------------------------
-# Logging - modelled on makepkg's output style
+# Logging
 # --------------------------------------------------------------------------
 
 QUIET, NORMAL, VERBOSE = -1, 0, 1
@@ -349,7 +329,7 @@ def age(path: Path) -> str:
 
 
 # --------------------------------------------------------------------------
-# Persistent settings - so nobody has to retype --arch all day
+# Persistent settings
 # --------------------------------------------------------------------------
 
 SETTINGS_KEYS = {
@@ -1040,10 +1020,10 @@ def ensure_limine(ctx: Context, run: Runner) -> Path:
 
 def ensure_ovmf(ctx: Context, run: Runner) -> Path:
     ovmf = install_tarball(ctx, TARBALLS["ovmf"], run)
-    for kind in ("code", "vars"):
-        candidate = ovmf / f"ovmf-{kind}-{ctx.arch.name}.fd"
-        if not candidate.is_file():
-            raise Failure(f"the pinned OVMF release is missing {candidate.name}")
+
+    candidate = ovmf / f"ovmf-code-{ctx.arch.name}.fd"
+    if not candidate.is_file():
+        raise Failure(f"the pinned OVMF release is missing {candidate.name}")
     return ovmf
 
 
@@ -1077,7 +1057,7 @@ def ensure_jinx(ctx: Context, run: Runner) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Recipes - a light-weight reader for Jinx recipe metadata
+# Recipes
 # --------------------------------------------------------------------------
 
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -1300,9 +1280,8 @@ def _glob_match(pattern: str, name: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# The system manifest - which packages make up the Roanix image
+# Image Manifest
 # --------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class Manifest:
@@ -1401,7 +1380,7 @@ exec "$@" "$url"
 
 
 class Jinx:
-    """Everything xtool knows about driving the userland package manager."""
+    """Driver for the Jinx tool."""
 
     def __init__(self, ctx: Context, run: Runner, recipes: Recipes) -> None:
         self.ctx = ctx
@@ -1931,8 +1910,6 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
     ctx.log.msg(f"Packing the initramfs ({ctx.arch.name})")
     if ctx.dry_run:
         return ctx.initramfs
-    # The dev loop repacks this on every userland change, so trade a few
-    # megabytes for a much shorter wait; release builds still compress hard.
     level = 1 if ctx.profile == "dev" else 9
     ctx.log.msg3(f"gzip level {level} from {rel(ctx.sysroot)}")
     ensure_dir(ctx.initramfs.parent)
@@ -2188,8 +2165,6 @@ def qemu_command(ctx: Context, run: Runner, image: Path, options: QemuOptions) -
         argv += [
             "-drive",
             f"if=pflash,unit=0,format=raw,file={ovmf / f'ovmf-code-{arch.name}.fd'},readonly=on",
-            #"-drive",
-            #f"if=pflash,unit=1,format=raw,file={variables}",
         ]
         if arch.name == "x86_64":
             argv += ["-M", "q35"]
@@ -3159,7 +3134,7 @@ def header(ctx: Context, manifest: Manifest) -> None:
 
 OVERVIEW = """xtool builds, packages, and boots the Roanix operating system.
 
-everyday commands:
+basic commands:
   run                 build whatever changed and boot it in QEMU  (default)
   build               build one or more targets without booting
   pkg                 rebuild userland package(s) and reinstall the sysroot

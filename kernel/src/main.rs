@@ -74,9 +74,10 @@ fn init_thread() {
         sys::clock::monotonic_ns() / 1_000_000
     );
 
+    proc::spawn_init().expect("boot: failed to start /sbin/init");
+
     // The console is the user's terminal from here on. Routine kernel chatter
     // would fight with the shell for it, so only failures stay on screen while
     // the full log remains available through /dev/klog and dmesg.
     sys::klog::set_console_level(sys::klog::Level::Error);
-    proc::spawn_init().expect("boot: failed to start /sbin/init");
 }

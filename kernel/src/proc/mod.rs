@@ -1053,6 +1053,9 @@ pub(crate) fn create_session() -> Result<usize> {
 pub(crate) fn exit_current(status: i32) -> ! {
     if let Some(process) = current() {
         trace!("pid {} exited with status {status}", process.pid());
+        if process.pid() == 1 {
+            panic!("init exited with status {status}");
+        }
         process.mark_exited((status & 0xff) << 8);
         finish_current_process_thread_exit(&process);
     }
@@ -1066,6 +1069,9 @@ pub(crate) fn exit_current_signal(signal: u8) -> ! {
         // in that process, and it is invisible from userspace once the shell
         // has reported the exit status.
         debug!("pid {} killed by signal {signal}", process.pid());
+        if process.pid() == 1 {
+            panic!("init killed by signal {signal}");
+        }
         process.mark_exited(i32::from(signal & 0x7f));
         finish_current_process_thread_exit(&process);
     }
