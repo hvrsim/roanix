@@ -10,9 +10,8 @@ use alloc::{
     string::String,
     vec::Vec,
 };
-use core::{fmt, slice, str};
+use core::{fmt, str};
 
-use limine::request::ModuleRequest;
 use log::{debug, error, info};
 
 use crate::fs::{
@@ -29,11 +28,6 @@ const TAR_TYPE_OFFSET: usize = 156;
 const TAR_LINK_RANGE: core::ops::Range<usize> = 157..257;
 const TAR_MAGIC_RANGE: core::ops::Range<usize> = 257..263;
 const TAR_PREFIX_RANGE: core::ops::Range<usize> = 345..500;
-
-#[used]
-#[doc(hidden)]
-#[unsafe(link_section = ".requests")]
-static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 /// Failure while parsing or importing the initial RAM filesystem.
 #[derive(Debug)]
@@ -252,17 +246,7 @@ impl<'a> Iterator for RegularFileIter<'a> {
 
 /// Returns the initramfs archive decompressed by Limine.
 pub fn archive() -> Option<&'static [u8]> {
-    let response = MODULE_REQUEST.get_response()?;
-    let module = response
-        .modules()
-        .iter()
-        .copied()
-        .find(|module| module.string().to_bytes() == b"initramfs")?;
-    let len = usize::try_from(module.size()).ok()?;
-
-    // SAFETY: Limine keeps module data mapped for the kernel lifetime and
-    // reports the exact byte length in the module response.
-    Some(unsafe { slice::from_raw_parts(module.addr(), len) })
+    crate::sys::firmware::boot_module(b"initramfs")
 }
 
 /// Returns an iterator over regular files in the Limine initramfs.

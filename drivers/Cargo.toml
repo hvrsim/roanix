@@ -4,6 +4,7 @@ members = [
     "platform/acpi",
     "platform/fdt",
     "irqchip/ioapic",
+    "irqchip/plic",
     "tty/uart8250",
     "tty/console",
     "tty/pty",

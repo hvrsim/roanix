@@ -321,6 +321,22 @@ Useful emulator options:
 | `--monitor` | Multiplex the QEMU monitor onto the serial console |
 | `--display` | QEMU display backend, e.g. `none` |
 
+### RISC-V device-tree modules
+
+If RISC-V UEFI firmware does not publish a device tree, add the board DTB as
+an uncompressed Limine module:
+
+```text
+    module_path: boot():/boot/k1-milkv-jupiter.dtb
+    module_string: dtb
+```
+
+Roanix prefers a valid module tagged `dtb`, `devicetree`, or `device-tree`
+over Limine's device-tree response. It next considers modules whose path ends
+in `.dtb`, then any module with a valid FDT header. Do not prefix the path with
+`$` unless the file itself is gzip-compressed; Limine uses that marker to
+request transparent decompression.
+
 ### Debugging the kernel
 
 ```bash
@@ -402,6 +418,7 @@ drivers/
 ├── platform/acpi/       x86_64 ACPI (MADT) enumerator
 ├── platform/fdt/        riscv64 flattened device-tree enumerator
 ├── irqchip/ioapic/      I/O APIC interrupt controller
+├── irqchip/plic/        RISC-V platform-level interrupt controller
 ├── tty/uart8250/        8250/16550 serial port
 ├── tty/console/         terminal line discipline and tty provider
 ├── tty/pty/             ptmx/pts pseudo-terminals

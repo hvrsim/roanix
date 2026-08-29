@@ -31,7 +31,7 @@ TARGET := x86_64-unknown-none
 MODULES := acpi ioapic tmpfs devfs console pty uart8250 special
 else ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
-MODULES := fdt tmpfs devfs console pty uart8250 special
+MODULES := fdt plic tmpfs devfs console pty uart8250 special
 else
 $(error Unsupported ARCH "$(ARCH)"; pass ARCH=x86_64 or ARCH=riscv64)
 endif

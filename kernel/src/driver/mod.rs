@@ -84,6 +84,10 @@ const BOOT_MODULES: &[BootModuleSpec] = &[
         path: b"usr/lib/roanix/drivers/fdt.ko",
     },
     BootModuleSpec {
+        name: "plic",
+        path: b"usr/lib/roanix/drivers/plic.ko",
+    },
+    BootModuleSpec {
         name: "tmpfs",
         path: b"usr/lib/roanix/drivers/tmpfs.ko",
     },

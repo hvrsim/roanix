@@ -1019,6 +1019,7 @@ pub const IRQ_EDGE: u32 = 1;
 pub const IRQ_LEVEL: u32 = 1 << 1;
 pub const IRQ_ACTIVE_HIGH: u32 = 1 << 2;
 pub const IRQ_ACTIVE_LOW: u32 = 1 << 3;
+pub const IRQ_DOMAIN_ROOT: u32 = 1 << 0;
 pub const IRQ_DOMAIN_DEFAULT: u32 = 1 << 2;
 pub const IRQ_NONE: u32 = 0;
 pub const IRQ_HANDLED: u32 = 1;
@@ -1094,6 +1095,8 @@ const SERVICE_DEVICE_REMOVE: usize = 20;
 const SERVICE_DEVICE_DATA: usize = 26;
 const SERVICE_DEVICE_SET_DATA: usize = 27;
 const SERVICE_DEVICE_INT: usize = 28;
+const SERVICE_DEVICE_CELL: usize = 29;
+const SERVICE_DEVICE_PROPERTY_LEN: usize = 32;
 const SERVICE_DEVICE_RESOURCE: usize = 33;
 const SERVICE_BUS_FIND: usize = 37;
 const SERVICE_DRIVER_REGISTER: usize = 39;
@@ -1129,6 +1132,7 @@ const SERVICE_TIME_SLEEP: usize = 102;
 const SERVICE_RANDOM_FILL: usize = 103;
 #[allow(dead_code)]
 const SERVICE_RANDOM_MIX: usize = 104;
+const SERVICE_CPU_COUNT: usize = 105;
 const SERVICE_CPU_PLATFORM_ID: usize = 107;
 const SERVICE_FIRMWARE_ACPI: usize = 109;
 const SERVICE_FIRMWARE_DT: usize = 110;
@@ -1406,6 +1410,37 @@ impl Device {
         // `value` is writable for this immediate call.
         unsafe { result(function(self.0, name.as_ptr(), &raw mut value))? };
         Ok(value)
+    }
+
+    pub fn cell(self, name: &CStr, index: usize) -> Result<u64> {
+        let function: unsafe extern "C" fn(
+            *const raw::Device,
+            *const c_char,
+            usize,
+            *mut u64,
+        ) -> i32 = service_fn!(
+            SERVICE_DEVICE_CELL,
+            unsafe extern "C" fn(*const raw::Device, *const c_char, usize, *mut u64) -> i32
+        );
+        let mut value = 0;
+        // SAFETY: device and property name are live kernel handles, and
+        // `value` is writable for this immediate call.
+        unsafe { result(function(self.0, name.as_ptr(), index, &raw mut value))? };
+        Ok(value)
+    }
+
+    #[must_use]
+    pub fn property_len(self, name: &CStr) -> usize {
+        let function =
+            (|| -> Result<unsafe extern "C" fn(*const raw::Device, *const c_char) -> usize> {
+                Ok(service_fn!(
+                    SERVICE_DEVICE_PROPERTY_LEN,
+                    unsafe extern "C" fn(*const raw::Device, *const c_char) -> usize
+                ))
+            })()
+            .expect("service table was installed at module entry");
+        // SAFETY: device and property name remain valid for the call.
+        unsafe { function(self.0, name.as_ptr()) }
     }
 
     pub fn resource(self, kind: u32, index: usize) -> Result<Resource> {
@@ -2566,6 +2601,19 @@ pub fn cpu_platform_id(cpu: u32) -> Result<u64> {
     // SAFETY: id is writable local output storage.
     unsafe { result(function(cpu, &raw mut id))? };
     Ok(id)
+}
+
+#[must_use]
+pub fn cpu_count() -> u32 {
+    let function = (|| -> Result<unsafe extern "C" fn() -> u32> {
+        Ok(service_fn!(
+            SERVICE_CPU_COUNT,
+            unsafe extern "C" fn() -> u32
+        ))
+    })()
+    .expect("service table was installed at module entry");
+    // SAFETY: the service takes no pointers and returns the current topology size.
+    unsafe { function() }
 }
 
 pub fn firmware_acpi(bytes: &mut [u8]) -> Result<usize> {

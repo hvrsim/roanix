@@ -12,7 +12,7 @@
     clippy::large_stack_arrays
 )]
 
-//! Interrupt-driven 8250/16550 UARTs with the legacy polled fallback.
+//! Interrupt-driven 8250/16550 UARTs.
 
 use core::{
     ffi::{CStr, c_void},
@@ -33,15 +33,17 @@ const MSR: u32 = 6;
 const SCR: u32 = 7;
 const IER_RX: u8 = 5;
 const IER_TX: u8 = 2;
+const IER_UUE: u8 = 1 << 6;
 const LSR_DR: u8 = 1;
 const LSR_THRE: u8 = 1 << 5;
-const LSR_TEMT: u8 = 1 << 6;
 const LCR_DLAB: u8 = 0x80;
 const LCR_BREAK: u8 = 1 << 6;
 const FIFO: usize = 16;
 const RX: usize = 8192;
 const TX: usize = 64 * 1024;
 const MAX_PORTS: usize = 8;
+const MATCH_PXA: usize = 1;
+const PXA_CLOCK: u64 = 14_745_600;
 const WAKE_RX: u32 = 1;
 const WAKE_TX: u32 = 2;
 const WAKE_DRAIN: u32 = 4;
@@ -129,11 +131,12 @@ struct Port {
     width: u32,
     clock: u32,
     mapped: bool,
-    virq: u32,
     irq: Option<Irq>,
     tty: Option<Tty>,
-    enabled: bool,
     ier: u8,
+    required_ier: u8,
+    character_ns: u64,
+    in_flight: usize,
     rx: Ring,
     tx: Ring,
     rx_store: [u8; RX],
@@ -153,11 +156,12 @@ impl Port {
             width: 1,
             clock: 1_843_200,
             mapped: false,
-            virq: 0,
             irq: None,
             tty: None,
-            enabled: false,
             ier: 0,
+            required_ier: 0,
+            character_ns: 0,
+            in_flight: 0,
             rx: Ring::new(),
             tx: Ring::new(),
             rx_store: [0; RX],
@@ -177,11 +181,12 @@ impl Port {
         self.width = 1;
         self.clock = 1_843_200;
         self.mapped = false;
-        self.virq = 0;
         self.irq = None;
         self.tty = None;
-        self.enabled = false;
         self.ier = 0;
+        self.required_ier = 0;
+        self.character_ns = 0;
+        self.in_flight = 0;
         self.rx = Ring::new();
         self.tx = Ring::new();
         self.readable = None;
@@ -215,6 +220,7 @@ impl Port {
         }
     }
     fn set_ier(&mut self, value: u8) {
+        let value = value | self.required_ier;
         if self.ier != value {
             self.ier = value;
             self.reg_write(IER, value);
@@ -247,7 +253,12 @@ impl Port {
                 line |= 16;
             }
         }
-        let ier = if self.enabled { self.ier } else { 0 };
+        let bits = 1
+            + u64::from(framing.data_bits)
+            + u64::from(framing.stop_bits)
+            + u64::from(framing.parity != 0);
+        self.character_ns = (bits * 1_000_000_000).div_ceil(u64::from(framing.baud));
+        let ier = self.ier;
         self.reg_write(IER, 0);
         self.reg_write(LCR, LCR_DLAB);
         self.reg_write(DATA, divisor as u8);
@@ -284,6 +295,7 @@ impl Port {
             for byte in &buffer[..count] {
                 self.reg_write(DATA, *byte);
             }
+            self.in_flight = count;
         }
         if was_full && self.tx.available(TX) != 0 {
             wake |= WAKE_TX;
@@ -338,7 +350,43 @@ impl Port {
 static PORTS: [TicketLock<Port>; MAX_PORTS] = [const { TicketLock::new(Port::new()) }; MAX_PORTS];
 static ALLOCATED_PORTS: TicketLock<[bool; MAX_PORTS]> = TicketLock::new([false; MAX_PORTS]);
 static REGISTRATION: TicketLock<Option<DriverRegistration>> = TicketLock::new(None);
-static MATCHES: [raw::Match; 5] = [
+static MATCHES: [raw::Match; 8] = [
+    raw::Match {
+        kind: ddk::MATCH_COMPATIBLE,
+        flags: 0,
+        key: c"spacemit,k1-uart".as_ptr(),
+        value: ptr::null(),
+        id0: 0,
+        mask0: 0,
+        id1: 0,
+        mask1: 0,
+        data: MATCH_PXA,
+        score: 0,
+    },
+    raw::Match {
+        kind: ddk::MATCH_COMPATIBLE,
+        flags: 0,
+        key: c"spacemit,pxa-uart".as_ptr(),
+        value: ptr::null(),
+        id0: 0,
+        mask0: 0,
+        id1: 0,
+        mask1: 0,
+        data: MATCH_PXA,
+        score: 0,
+    },
+    raw::Match {
+        kind: ddk::MATCH_COMPATIBLE,
+        flags: 0,
+        key: c"intel,xscale-uart".as_ptr(),
+        value: ptr::null(),
+        id0: 0,
+        mask0: 0,
+        id1: 0,
+        mask1: 0,
+        data: MATCH_PXA,
+        score: 0,
+    },
     raw::Match {
         kind: ddk::MATCH_COMPATIBLE,
         flags: 0,
@@ -455,7 +503,6 @@ fn cleanup_port(lock: &'static TicketLock<Port>) {
         if port.mapped {
             port.reg_write(IER, 0);
         }
-        port.enabled = false;
         port.ier = 0;
         port.mapped = false;
         (
@@ -509,7 +556,7 @@ unsafe extern "C" fn irq(context_pointer: *mut c_void, _virq: u32) -> u32 {
     };
     let (wake, events) = {
         let mut port = lock.lock_irqsave();
-        let wake = if port.enabled { port.service() } else { 0 };
+        let wake = port.service();
         (wake, (port.readable, port.writable, port.drained))
     };
     if wake == 0 {
@@ -544,7 +591,6 @@ unsafe extern "C" fn read(context_pointer: *mut c_void, out: *mut u8, length: us
     let output = unsafe { slice::from_raw_parts_mut(out, length) };
     let count = {
         let mut port = lock.lock_irqsave();
-        port.drain_rx();
         let count = {
             let Port { rx, rx_store, .. } = &mut *port;
             rx.read(rx_store, output)
@@ -564,37 +610,6 @@ unsafe extern "C" fn try_read(context_pointer: *mut c_void, out: *mut u8) -> i32
     // callback contract.
     i32::from(unsafe { read(context_pointer, out, 1) } == 1)
 }
-fn write_polled(lock: &TicketLock<Port>, data: &[u8], nonblocking: bool) -> Result<()> {
-    if nonblocking {
-        let port = lock.lock_irqsave();
-        if data.len() > FIFO || port.reg_read(LSR) & LSR_THRE == 0 {
-            return Err(ddk::Error::from_status(ddk::EAGAIN));
-        }
-        for byte in data {
-            port.reg_write(DATA, *byte);
-        }
-        return Ok(());
-    }
-
-    let mut offset = 0;
-    while offset < data.len() {
-        if lock.lock_irqsave().reg_read(LSR) & LSR_THRE == 0 {
-            ddk::cpu_relax();
-            continue;
-        }
-
-        let port = lock.lock_irqsave();
-        if port.reg_read(LSR) & LSR_THRE == 0 {
-            continue;
-        }
-        let count = (data.len() - offset).min(FIFO);
-        for byte in &data[offset..offset + count] {
-            port.reg_write(DATA, *byte);
-        }
-        offset += count;
-    }
-    Ok(())
-}
 unsafe extern "C" fn write(
     context_pointer: *mut c_void,
     input: *const u8,
@@ -612,11 +627,6 @@ unsafe extern "C" fn write(
     };
     // SAFETY: the non-null console buffer is readable for `length` bytes.
     let data = unsafe { slice::from_raw_parts(input, length) };
-    if !lock.lock_irqsave().enabled {
-        return write_polled(lock, data, nonblocking != 0)
-            .map_or_else(ddk::Error::status, |()| ddk::OK);
-    }
-
     let mut offset = 0;
     loop {
         let mut wait = None;
@@ -691,22 +701,14 @@ unsafe extern "C" fn writable(context_pointer: *mut c_void) -> i32 {
         return 0;
     };
     let port = lock.lock_irqsave();
-    if port.enabled {
-        i32::from(port.tx.available(TX) != 0)
-    } else {
-        i32::from(port.reg_read(LSR) & LSR_THRE != 0)
-    }
+    i32::from(port.tx.available(TX) != 0)
 }
 unsafe extern "C" fn queued(context_pointer: *mut c_void) -> i64 {
     let Some(lock) = context(context_pointer) else {
         return 0;
     };
     let port = lock.lock_irqsave();
-    if port.enabled {
-        port.tx.length as i64
-    } else {
-        0
-    }
+    port.tx.length as i64
 }
 unsafe extern "C" fn flush_input(context_pointer: *mut c_void) -> i32 {
     let Some(lock) = context(context_pointer) else {
@@ -741,19 +743,17 @@ unsafe extern "C" fn flush(context_pointer: *mut c_void) -> i32 {
     let Some(lock) = context(context_pointer) else {
         return ddk::EINVAL;
     };
-    loop {
+    let delay = loop {
         let event = {
             let port = lock.lock_irqsave();
             if port.tx.length == 0 {
-                break;
+                break port.character_ns.saturating_mul(port.in_flight as u64);
             }
             port.drained
         };
         let _ = event.map(Event::wait);
-    }
-    while lock.lock_irqsave().reg_read(LSR) & LSR_TEMT == 0 {
-        ddk::sleep_ns(50_000);
-    }
+    };
+    ddk::sleep_ns(delay);
     ddk::OK
 }
 unsafe extern "C" fn send_break(context_pointer: *mut c_void, duration: u64) -> i32 {
@@ -805,7 +805,7 @@ fn name(index: u32, buffer: &mut [u8; 16]) -> &CStr {
 // The probe path maps registers, programs the line, and publishes a
 // terminal; its steps share the port lock and ordering.
 #[allow(clippy::too_many_lines)]
-unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize) -> i32 {
+unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_data: usize) -> i32 {
     // SAFETY: the driver core supplies a live device for the probe callback.
     let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
         return ddk::EINVAL;
@@ -817,15 +817,22 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
     {
         let mut port = lock.lock_irqsave();
         port.reset();
+        let pxa = match_data == MATCH_PXA;
+        if pxa {
+            port.shift = 2;
+            port.width = 4;
+            port.required_ier = IER_UUE;
+            port.ier = IER_UUE;
+        }
         port.clock = device
             .integer(c"clock-frequency")
             .ok()
             .filter(|v| *v != 0)
-            .unwrap_or(1_843_200) as u32;
+            .unwrap_or(if pxa { PXA_CLOCK } else { 1_843_200 }) as u32;
         if let Ok(resource) = device.resource(ddk::RESOURCE_MEMORY, 0) {
             port.memory = true;
-            port.shift = device.integer(c"reg-shift").unwrap_or(0) as u32;
-            port.width = device.integer(c"reg-io-width").unwrap_or(1) as u32;
+            port.shift = device.integer(c"reg-shift").unwrap_or(port.shift.into()) as u32;
+            port.width = device.integer(c"reg-io-width").unwrap_or(port.width.into()) as u32;
             if port.shift > 8 || !matches!(port.width, 1 | 2 | 4) {
                 drop(port);
                 return fail_probe(index, ddk::EINVAL);
@@ -885,21 +892,24 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
     }
     signal(Some(writable));
     signal(Some(drained));
-    if let Ok(virq) = ddk::irq_of_device(device, 0) {
-        let context = core::ptr::from_ref(lock) as *mut c_void;
-        if let Ok(irq_receipt) = Irq::request(device, virq, c"uart", ddk::IRQ_SHARED, irq, context)
-        {
-            let mut port = lock.lock_irqsave();
-            port.virq = virq;
-            port.irq = Some(irq_receipt);
-            let received = port.drain_rx() != 0;
-            port.reg_read(LSR);
-            port.reg_read(MSR);
-            port.enabled = true;
-            port.set_ier(IER_RX);
-            if received {
-                signal(port.readable);
-            }
+    let virq = match ddk::irq_of_device(device, 0) {
+        Ok(value) => value,
+        Err(error) => return fail_probe(index, error.status()),
+    };
+    let context = core::ptr::from_ref(lock) as *mut c_void;
+    let irq_receipt = match Irq::request(device, virq, c"uart", ddk::IRQ_SHARED, irq, context) {
+        Ok(value) => value,
+        Err(error) => return fail_probe(index, error.status()),
+    };
+    {
+        let mut port = lock.lock_irqsave();
+        port.irq = Some(irq_receipt);
+        let received = port.drain_rx() != 0;
+        port.reg_read(LSR);
+        port.reg_read(MSR);
+        port.set_ier(IER_RX);
+        if received {
+            signal(port.readable);
         }
     }
     let root = match ddk::Devfs::current().and_then(|devfs| devfs.root()) {
@@ -913,16 +923,8 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
     {
         let mut port = lock.lock_irqsave();
         port.ops.context = core::ptr::from_ref(lock) as *mut c_void;
-        port.ops.readable_event = if port.enabled {
-            port.readable.map_or(0, Event::id)
-        } else {
-            0
-        };
-        port.ops.writable_event = if port.enabled {
-            port.writable.map_or(0, Event::id)
-        } else {
-            0
-        }
+        port.ops.readable_event = port.readable.map_or(0, Event::id);
+        port.ops.writable_event = port.writable.map_or(0, Event::id);
     }
     let registration = {
         let port = lock.lock_irqsave();

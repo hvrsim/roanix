@@ -29,7 +29,8 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_DEPTH: usize = 32;
-const MAX_DEVICES: usize = 64;
+const MAX_DEVICES: usize = 256;
+const MAX_CONTROLLERS: usize = 32;
 const MAX_STRINGS: usize = 16;
 const MAX_CELLS: usize = 32;
 const MAX_BLOB: usize = 2 * 1024 * 1024;
@@ -38,6 +39,7 @@ const MAX_BLOB: usize = 2 * 1024 * 1024;
 struct Level {
     address_cells: u32,
     size_cells: u32,
+    interrupt_parent: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -46,10 +48,13 @@ struct Node {
     reg: Option<(usize, usize)>,
     compatible: Option<(usize, usize)>,
     interrupts: Option<(usize, usize)>,
+    interrupts_extended: Option<(usize, usize)>,
     reg_shift: u32,
     reg_width: u32,
     clock: u32,
+    phandle: u32,
     interrupt_cells: u32,
+    riscv_ndev: u32,
     enabled: bool,
 }
 
@@ -60,14 +65,30 @@ impl Node {
             reg: None,
             compatible: None,
             interrupts: None,
+            interrupts_extended: None,
             reg_shift: 0,
             reg_width: 0,
             clock: 0,
+            phandle: 0,
             interrupt_cells: 0,
+            riscv_ndev: 0,
             enabled: true,
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct Controller {
+    phandle: u32,
+    interrupt_cells: u32,
+    platform_id: u64,
+}
+
+const EMPTY_CONTROLLER: Controller = Controller {
+    phandle: 0,
+    interrupt_cells: 0,
+    platform_id: u64::MAX,
+};
 
 struct State {
     blob: [u8; MAX_BLOB],
@@ -181,7 +202,73 @@ fn read_cells(state: &State, offset: usize, length: usize, cells: u32) -> Option
     Some(value)
 }
 
-fn publish(state: &mut State, node: Node, parent: Level) -> Result<()> {
+fn add_cell_list(
+    state: &State,
+    builder: &mut DeviceBuilder,
+    name: &CStr,
+    offset: usize,
+    length: usize,
+) -> Result<usize> {
+    if !length.is_multiple_of(4) || length / 4 > MAX_CELLS {
+        return Err(Error::from_status(ddk::EINVAL));
+    }
+    let count = length / 4;
+    let mut values = [0u64; MAX_CELLS];
+    for (index, value) in values[..count].iter_mut().enumerate() {
+        *value = state.be32(offset + index * 4)?.into();
+    }
+    builder.add_u32_list(name, &values[..count])?;
+    Ok(count)
+}
+
+fn interrupt_cells(controllers: &[Controller], phandle: u32) -> Option<u32> {
+    controllers
+        .iter()
+        .find(|controller| controller.phandle == phandle)
+        .map(|controller| controller.interrupt_cells)
+}
+
+fn add_interrupt_harts(
+    state: &State,
+    builder: &mut DeviceBuilder,
+    offset: usize,
+    length: usize,
+    controllers: &[Controller],
+) -> Result<()> {
+    if !length.is_multiple_of(4) || length / 4 > MAX_CELLS {
+        return Err(Error::from_status(ddk::EINVAL));
+    }
+    let cell_count = length / 4;
+    let mut values = [0u64; MAX_CELLS];
+    let mut value_count = 0;
+    let mut index = 0;
+    while index < cell_count {
+        let phandle = state.be32(offset + index * 4)?;
+        let Some(controller) = controllers
+            .iter()
+            .find(|controller| controller.phandle == phandle)
+        else {
+            return Ok(());
+        };
+        let stride = 1usize.saturating_add(controller.interrupt_cells as usize);
+        if controller.platform_id == u64::MAX || index + stride > cell_count {
+            return Ok(());
+        }
+        values[value_count] = controller.platform_id;
+        value_count += 1;
+        index += stride;
+    }
+    builder.add_u32_list(c"roanix,interrupt-harts", &values[..value_count])
+}
+
+#[allow(clippy::too_many_lines)]
+fn publish(
+    state: &mut State,
+    node: Node,
+    parent: Level,
+    interrupt_parent: u32,
+    controllers: &[Controller],
+) -> Result<()> {
     let Some((reg_offset, reg_length)) = node.reg else {
         return Ok(());
     };
@@ -244,35 +331,73 @@ fn publish(state: &mut State, node: Node, parent: Level) -> Result<()> {
     if node.clock != 0 {
         builder.add_u32(c"clock-frequency", node.clock)?;
     }
+    if node.phandle != 0 {
+        builder.add_u32(c"phandle", node.phandle)?;
+    }
+    if node.interrupt_cells != 0 {
+        builder.add_u32(c"#interrupt-cells", node.interrupt_cells)?;
+    }
+    if node.riscv_ndev != 0 {
+        builder.add_u32(c"riscv,ndev", node.riscv_ndev)?;
+    }
+    if interrupt_parent != 0 {
+        builder.add_u32(c"interrupt-parent", interrupt_parent)?;
+    }
+    if let Some((extended_offset, extended_length)) = node.interrupts_extended {
+        add_cell_list(
+            state,
+            &mut builder,
+            c"interrupts-extended",
+            extended_offset,
+            extended_length,
+        )?;
+        add_interrupt_harts(
+            state,
+            &mut builder,
+            extended_offset,
+            extended_length,
+            controllers,
+        )?;
+    }
 
     if let Some((interrupt_offset, interrupt_length)) =
         node.interrupts.filter(|(_, length)| *length >= 4)
     {
-        let stride = node.interrupt_cells.max(1) as usize;
-        let count = (interrupt_length / 4).min(MAX_CELLS);
-        let mut values = [0u64; MAX_CELLS];
+        let stride = interrupt_cells(controllers, interrupt_parent)
+            .filter(|cells| *cells != 0)
+            .ok_or(Error::from_status(ddk::EINVAL))? as usize;
+        if !interrupt_length.is_multiple_of(stride * 4) || interrupt_length / 4 > MAX_CELLS {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let count = interrupt_length / 4;
         let mut cells = [0u32; MAX_CELLS];
-        for index in 0..count {
-            cells[index] = state.be32(interrupt_offset + index * 4)?;
-            values[index] = cells[index].into();
+        for (index, cell) in cells[..count].iter_mut().enumerate() {
+            *cell = state.be32(interrupt_offset + index * 4)?;
         }
         for index in (0..count).step_by(stride) {
-            if index + stride > count {
-                break;
-            }
             builder.add_irq(&cells[index..index + stride])?;
         }
-        builder.add_u32_list(c"interrupts", &values[..count])?;
+        add_cell_list(
+            state,
+            &mut builder,
+            c"interrupts",
+            interrupt_offset,
+            interrupt_length,
+        )?;
     }
     state.remember(builder.publish()?)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn walk(
     state: &mut State,
     structure: usize,
     structure_size: usize,
     strings: usize,
     strings_size: usize,
+    controllers: &mut [Controller; MAX_CONTROLLERS],
+    controller_count: &mut usize,
+    collect_controllers: bool,
 ) -> Result<()> {
     let end = structure
         .checked_add(structure_size)
@@ -281,12 +406,14 @@ fn walk(
     let mut levels = [Level {
         address_cells: 0,
         size_cells: 0,
+        interrupt_parent: 0,
     }; MAX_DEPTH];
     levels[0] = Level {
         address_cells: 2,
         size_cells: 1,
+        interrupt_parent: 0,
     };
-    let mut current = Node::empty();
+    let mut nodes = [Node::empty(); MAX_DEPTH];
     let mut depth = 0usize;
     let mut offset = structure;
 
@@ -313,16 +440,51 @@ fn walk(
             }
             depth += 1;
             levels[depth] = levels[depth - 1];
-            current = Node::empty();
-            current.name = start;
+            nodes[depth] = Node::empty();
+            nodes[depth].name = start;
             continue;
         }
         if token == FDT_END_NODE {
             if depth == 0 {
                 return Err(Error::from_status(ddk::EINVAL));
             }
-            publish(state, current, levels[depth - 1])?;
-            current = Node::empty();
+            let node = nodes[depth];
+            if collect_controllers {
+                if node.enabled && node.phandle != 0 && node.interrupt_cells != 0 {
+                    if *controller_count == MAX_CONTROLLERS {
+                        return Err(Error::from_status(ddk::ENOSPC));
+                    }
+                    controllers[*controller_count] = Controller {
+                        phandle: node.phandle,
+                        interrupt_cells: node.interrupt_cells,
+                        platform_id: if depth > 1 {
+                            nodes[depth - 1]
+                                .reg
+                                .and_then(|(offset, length)| {
+                                    read_cells(
+                                        state,
+                                        offset,
+                                        length,
+                                        levels[depth - 2].address_cells,
+                                    )
+                                })
+                                .unwrap_or(u64::MAX)
+                        } else {
+                            u64::MAX
+                        },
+                    };
+                    *controller_count += 1;
+                }
+            } else {
+                publish(
+                    state,
+                    node,
+                    levels[depth - 1],
+                    levels[depth].interrupt_parent,
+                    &controllers[..*controller_count],
+                )?;
+            }
+            nodes[depth] = Node::empty();
             depth -= 1;
             continue;
         }
@@ -344,28 +506,43 @@ fn walk(
         if depth == 0 {
             continue;
         }
+        let current = &mut nodes[depth];
 
         if property_is(state, name, b"#address-cells") {
             levels[depth].address_cells = cell_or(state, value, length, 2);
         } else if property_is(state, name, b"#size-cells") {
             levels[depth].size_cells = cell_or(state, value, length, 1);
+        } else if property_is(state, name, b"interrupt-parent") {
+            levels[depth].interrupt_parent = cell_or(state, value, length, 0);
         } else if property_is(state, name, b"#interrupt-cells") {
             current.interrupt_cells = cell_or(state, value, length, 1);
+        } else if property_is(state, name, b"phandle") || property_is(state, name, b"linux,phandle")
+        {
+            current.phandle = cell_or(state, value, length, 0);
         } else if property_is(state, name, b"reg") {
             current.reg = Some((value, length));
         } else if property_is(state, name, b"compatible") {
             current.compatible = Some((value, length));
         } else if property_is(state, name, b"interrupts") {
             current.interrupts = Some((value, length));
+        } else if property_is(state, name, b"interrupts-extended") {
+            current.interrupts_extended = Some((value, length));
         } else if property_is(state, name, b"reg-shift") {
             current.reg_shift = cell_or(state, value, length, 0);
         } else if property_is(state, name, b"reg-io-width") {
             current.reg_width = cell_or(state, value, length, 1);
-        } else if property_is(state, name, b"clock-frequency") {
+        } else if property_is(state, name, b"clock-frequency")
+            || (property_is(state, name, b"clk-fpga") && current.clock == 0)
+        {
             current.clock = cell_or(state, value, length, 0);
+        } else if property_is(state, name, b"riscv,ndev") {
+            current.riscv_ndev = cell_or(state, value, length, 0);
         } else if property_is(state, name, b"status") {
             current.enabled = status_enabled(state, value, length);
         }
+    }
+    if depth != 0 {
+        return Err(Error::from_status(ddk::EINVAL));
     }
     Ok(())
 }
@@ -399,7 +576,28 @@ fn init(_module: Module) -> Result<()> {
         return Err(Error::from_status(ddk::EINVAL));
     }
     state.bus = Some(Bus::find(c"platform")?);
-    walk(&mut state, structure, structure_size, strings, strings_size)
+    let mut controllers = [EMPTY_CONTROLLER; MAX_CONTROLLERS];
+    let mut controller_count = 0;
+    walk(
+        &mut state,
+        structure,
+        structure_size,
+        strings,
+        strings_size,
+        &mut controllers,
+        &mut controller_count,
+        true,
+    )?;
+    walk(
+        &mut state,
+        structure,
+        structure_size,
+        strings,
+        strings_size,
+        &mut controllers,
+        &mut controller_count,
+        false,
+    )
 }
 
 fn exit(_module: Module) {

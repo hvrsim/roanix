@@ -54,6 +54,10 @@ fn early_init() -> ! {
     driver::init();
     driver::load_boot_modules().expect("boot: failed to load required boot modules");
     arch::init_platform();
+    #[cfg(target_arch = "riscv64")]
+    if let Some(source) = sys::firmware::dtb_source() {
+        info!(target: "boot", "device tree source: {source}");
+    }
     sys::smp::discover();
     sys::sched::bootstrap(init_thread);
     sys::sched::start()
