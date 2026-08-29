@@ -18,7 +18,7 @@ import time
 import urllib.request
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 
 if sys.version_info < (3, 11):
@@ -48,6 +48,7 @@ RUST_DRIVER_MODULES = {
     ),
     "riscv64": (
         ("fdt", "fdt.ko", True),
+        ("plic", "plic.ko", True),
         ("tmpfs", "tmpfs.ko", True),
         ("devfs", "devfs.ko", True),
         ("console", "console.ko", True),
@@ -84,13 +85,6 @@ FALLBACK_SYSTEM_PACKAGES = (
     "drivers",
 )
 FALLBACK_EXTRA_BUILD_PACKAGES = ("mlibc-headers", "mlibc", "ncurses", "readline")
-
-# Recipes whose sources live in this repository rather than being downloaded.
-# Editing these directories makes the corresponding package stale.
-IN_TREE_SOURCES: Mapping[str, Path] = {
-    "drivers": DRIVERS_DIR,
-    "util-roanix": USERLAND_DIR / "util-roanix",
-}
 
 # Distro package names for the host tools xtool needs, used by `x.py doctor`.
 TOOL_PACKAGES = {
@@ -1073,19 +1067,12 @@ class Recipe:
     deps: tuple[str, ...]
     builddeps: tuple[str, ...]
     from_source: str | None
-    source_dir: str | None
 
     @property
     def version_revision(self) -> str:
         if not self.version:
             return f"?-{self.revision}"
         return f"{self.version}-{self.revision}"
-
-    @property
-    def in_tree_source(self) -> Path | None:
-        if self.source_dir and self.source_dir in IN_TREE_SOURCES:
-            return IN_TREE_SOURCES[self.source_dir]
-        return None
 
 
 def _expand(value: str, variables: Mapping[str, str]) -> str:
@@ -1127,7 +1114,6 @@ def read_recipe(name: str) -> Recipe:
         deps=tuple(variables.get("deps", "").split()),
         builddeps=tuple(variables.get("builddeps", "").split()),
         from_source=variables.get("from_source") or None,
-        source_dir=variables.get("source_dir") or None,
     )
 
 
@@ -1212,67 +1198,6 @@ class Recipes:
                     pending.append(dependency)
         return tuple(sorted(seen))
 
-    def dependents(self, names: Sequence[str]) -> tuple[str, ...]:
-        """Every package that must be rebuilt when ``names`` change."""
-        closure = set(names)
-        changed = True
-        while changed:
-            changed = False
-            shared_sources = {
-                self.get(item).from_source
-                for item in closure
-                if self.get(item).from_source
-            } | closure
-            for candidate in self.names:
-                if candidate in closure:
-                    continue
-                recipe = self.get(candidate)
-                if recipe.from_source in shared_sources or closure.intersection(
-                    self.requires(candidate)
-                ):
-                    closure.add(candidate)
-                    changed = True
-        return tuple(sorted(closure))
-
-    def order(self, names: Iterable[str]) -> tuple[str, ...]:
-        """Topologically sort ``names`` so dependencies build first."""
-        wanted = set(names)
-        ordered: list[str] = []
-        visiting: set[str] = set()
-
-        def visit(name: str) -> None:
-            if name in ordered:
-                return
-            if name in visiting:
-                raise Failure(f"dependency cycle in the userland recipes at {name!r}")
-            visiting.add(name)
-            for dependency in self.requires(name):
-                if dependency in wanted:
-                    visit(dependency)
-            visiting.discard(name)
-            ordered.append(name)
-
-        for name in sorted(wanted):
-            visit(name)
-        return tuple(ordered)
-
-    # -- change detection --------------------------------------------------
-
-    def digest(self, name: str) -> str:
-        """Hash everything that would change this package's contents."""
-        recipe = self.get(name)
-        paths = [recipe.directory]
-        source = recipe.in_tree_source
-        if source is not None:
-            paths.append(source)
-        if recipe.from_source and recipe.from_source in self.names:
-            source_recipe = self.get(recipe.from_source)
-            paths.append(source_recipe.directory)
-            if source_recipe.in_tree_source is not None:
-                paths.append(source_recipe.in_tree_source)
-        return fingerprint(f"recipe:{name}", values=(recipe.version_revision,), paths=paths)
-
-
 def _glob_match(pattern: str, name: str) -> bool:
     import fnmatch
 
@@ -1321,28 +1246,6 @@ def load_manifest(log: Log) -> Manifest:
             hint="add at least 'util-roanix' so the image can boot",
         )
     return Manifest(tuple(buckets["install"]), tuple(buckets["build"]), False)
-
-
-def add_to_manifest(name: str) -> bool:
-    """Append ``name`` to the [install] section; returns False if already there."""
-    if not SYSTEM_MANIFEST.is_file():
-        return False
-    lines = SYSTEM_MANIFEST.read_text(encoding="utf-8").splitlines()
-    section = "install"
-    last_install = None
-    for index, line in enumerate(lines):
-        text = line.split("#", 1)[0].strip()
-        if text.startswith("[") and text.endswith("]"):
-            section = text[1:-1].strip().lower()
-            continue
-        if text and section == "install":
-            if text == name:
-                return False
-            last_install = index
-    insert_at = (last_install + 1) if last_install is not None else len(lines)
-    lines.insert(insert_at, name)
-    SYSTEM_MANIFEST.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return True
 
 
 # --------------------------------------------------------------------------
@@ -1504,23 +1407,15 @@ class Jinx:
             arguments.append("-b")
         self(arguments + list(names))
 
-    def rebuild(self, names: Sequence[str]) -> None:
-        self(["rebuild", *names])
+    def download(self, names: Sequence[str]) -> None:
+        self(["download", *names])
 
-    def revbump(self, names: Sequence[str]) -> None:
-        self(["revbump", *names], mode="stream")
+    def build(self, name: str, *, force: bool = False) -> None:
+        command = "rebuild" if force else "build"
+        self([command, name])
 
     def regen(self, name: str) -> None:
         self(["regen", name], mode="stream")
-
-    def run_in(self, name: str, command: Sequence[str]) -> None:
-        binary = self.prepare()
-        self.run(
-            [binary, "run-in", name, *command],
-            cwd=self.ctx.jinx_build,
-            env=self._environment(),
-            mode="raw",
-        )
 
     def install(self, sysroot: Path, names: Sequence[str], *, force: bool = False) -> None:
         arguments = ["install"]
@@ -1703,45 +1598,22 @@ def build_kernel(ctx: Context, run: Runner, cache: Cache) -> Path:
 # --------------------------------------------------------------------------
 
 
-def global_userland_digest() -> str:
-    """Inputs that affect every userland package."""
-    return fingerprint(
-        "userland-global",
-        values=(JINX_PIN.commit,),
-        paths=(USERLAND_DIR / "Jinxfile", USERLAND_DIR / "build-support"),
-    )
-
-
-def stale_packages(
-    ctx: Context, jinx: Jinx, recipes: Recipes, wanted: Sequence[str]
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split ``wanted`` into (never built, changed since last build).
-
-    A package with no recorded digest is adopted as-is rather than reported as
-    changed; otherwise the first run of a new xtool would rebuild a perfectly
-    good userland from scratch.
-    """
-    state = Cache(ctx).read("recipes")
-    recorded = state.get("digests", {})
-    built = jinx.built()
-    missing: list[str] = []
-    changed: list[str] = []
-    for name in wanted:
-        if not jinx.has_package(recipes.get(name), built):
-            missing.append(name)
-        elif name in recorded and recorded[name] != recipes.digest(name):
-            changed.append(name)
-    return tuple(missing), tuple(changed)
-
-
-def record_recipe_digests(ctx: Context, recipes: Recipes, names: Sequence[str]) -> None:
-    cache = Cache(ctx)
-    key = "recipes"
-    state = cache.read(key)
-    digests = dict(state.get("digests", {}))
-    for name in names:
-        digests[name] = recipes.digest(name)
-    cache.record(key, global_userland_digest(), (), digests=digests)
+def prefetch_packages(ctx: Context, jinx: Jinx, names: Sequence[str]) -> None:
+    """Populate Jinx's local repositories from the public binary cache."""
+    enabled = os.environ.get("ROANIX_BINARY_PACKAGES", "1").strip().lower()
+    if ctx.offline or enabled in ("0", "false", "no", "off"):
+        return
+    ctx.log.msg2("checking the Roanix binary package repository")
+    try:
+        jinx.download(names)
+    except Failure as error:
+        message = str(error).lower()
+        if "sha256" in message or "checksum" in message:
+            raise
+        ctx.log.warn("prebuilt packages are unavailable; falling back to local builds")
+        if ctx.log.level >= VERBOSE:
+            for line in str(error).splitlines():
+                ctx.log.debug(line)
 
 
 def announce_plan(ctx: Context, jinx: Jinx, targets: Sequence[str]) -> None:
@@ -1779,92 +1651,57 @@ def install_sysroot(
 def build_userland(
     ctx: Context,
     jinx: Jinx,
-    recipes: Recipes,
     manifest: Manifest,
-    *,
-    only: Sequence[str] | None = None,
-    with_dependents: bool = True,
 ) -> Path:
-    """Bring the sysroot in line with the recipes.
-
-    With ``only`` set this rebuilds exactly those packages (plus, unless
-    ``with_dependents`` is off, everything that links against them).  Without
-    it, xtool works out which recipes changed and rebuilds just those.
-    """
+    """Ask Jinx to update the manifest packages and assemble the sysroot."""
     started = time.monotonic()
     jinx.prepare()
-
-    if only is not None:
-        targets = recipes.order(
-            recipes.dependents(only) if with_dependents else only
-        )
-        extra = [name for name in targets if name not in only]
-        ctx.log.msg(
-            f"Rebuilding {len(only)} package{'s' if len(only) != 1 else ''}"
-            + (f" and {len(extra)} dependent{'s' if len(extra) != 1 else ''}" if extra else "")
-        )
-        ctx.log.msg2(" ".join(targets))
-        if ctx.dry_run:
-            ctx.log.msg3("these would be rebuilt from scratch, in that order")
-            return ctx.sysroot
-        # Dependencies that were never built still need to exist first.
-        jinx.update(recipes.dependency_closure(targets))
-        jinx.rebuild(targets)
-        rebuilt = targets
+    wanted = manifest.build
+    # Host tools use a separate repository. Fetch them first so a target
+    # package missing from the server can still be built locally without also
+    # compiling the cross-toolchain from scratch.
+    prefetch_packages(ctx, jinx, ("host:*",))
+    prefetch_packages(ctx, jinx, wanted)
+    planned = jinx.preview(wanted)
+    if not planned and not ctx.force and ctx.sysroot.is_dir():
+        ctx.log.msg2(f"userland is up to date ({len(jinx.built())} packages built)")
+        return ctx.sysroot
+    if ctx.dry_run:
+        announce_plan(ctx, jinx, wanted)
+        return ctx.sysroot
+    if ctx.force:
+        for name in wanted:
+            jinx.build(name, force=True)
     else:
-        wanted = recipes.order(recipes.dependency_closure(manifest.build))
-        missing, changed = stale_packages(ctx, jinx, recipes, wanted)
-        if ctx.force:
-            missing, changed = wanted, ()
-        if not missing and not changed:
-            ctx.log.msg2(f"userland is up to date ({len(wanted)} packages)")
-            if ctx.sysroot.is_dir():
-                if not ctx.dry_run:
-                    record_recipe_digests(ctx, recipes, wanted)
-                return ctx.sysroot
-        if changed:
-            targets = recipes.order(recipes.dependents(changed))
-            extra = [name for name in targets if name not in changed]
-            ctx.log.msg(
-                f"{len(changed)} recipe{'s' if len(changed) != 1 else ''} changed: "
-                + " ".join(changed)
-            )
-            if extra:
-                ctx.log.msg2(f"also rebuilding {len(extra)} dependent(s): " + " ".join(extra))
-            jinx.update(recipes.dependency_closure(targets))
-            jinx.rebuild(targets)
-        if missing:
-            ctx.log.msg(f"Building {len(missing)} new package(s)")
-            ctx.log.msg2(" ".join(missing))
-        if ctx.dry_run:
-            announce_plan(ctx, jinx, wanted)
-            return ctx.sysroot
         jinx.update(wanted)
-        rebuilt = wanted
 
     ctx.log.msg(f"Installing the sysroot ({ctx.arch.name})")
-    install_sysroot(ctx, jinx, manifest, force=only is not None or ctx.force)
+    install_sysroot(ctx, jinx, manifest, force=ctx.force)
     if not ctx.dry_run:
-        record_recipe_digests(ctx, recipes, rebuilt)
         Cache(ctx).record(
             "sysroot",
-            sysroot_digest(ctx, recipes, manifest),
+            sysroot_digest(ctx, manifest),
             (ctx.sysroot,),
         )
     ctx.log.finished("the userland", time.monotonic() - started)
     return ctx.sysroot
 
 
-def sysroot_digest(ctx: Context, recipes: Recipes, manifest: Manifest) -> str:
-    wanted = recipes.order(recipes.dependency_closure(manifest.build))
+def sysroot_digest(ctx: Context, manifest: Manifest) -> str:
+    packages = ctx.jinx_build / "pkgs"
+    package_stamps = tuple(
+        f"{item.name}:{stamp(item)}" for item in sorted(packages.glob("*.xbps"))
+    )
     return fingerprint(
         "sysroot",
         values=(
             ctx.arch.name,
-            global_userland_digest(),
-            *(f"{name}:{recipes.digest(name)}" for name in wanted),
+            JINX_PIN.commit,
+            *manifest.build,
             *manifest.install,
+            *package_stamps,
         ),
+        paths=(USERLAND_DIR / "Jinxfile",),
     )
 
 
@@ -1899,7 +1736,7 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
             return ctx.initramfs
         raise Failure(
             f"the {ctx.arch.name} sysroot does not exist yet",
-            hint=f"run './x.py build sysroot --arch {ctx.arch.name}'",
+            hint=f"run './x.py run --arch {ctx.arch.name}' to assemble it",
         )
     key = f"initramfs-{ctx.profile}"
     digest = initramfs_digest(ctx)
@@ -2257,7 +2094,6 @@ class Component:
 def survey(
     ctx: Context,
     jinx: Jinx,
-    recipes: Recipes,
     manifest: Manifest,
     *,
     default_image: str = "hdd",
@@ -2280,20 +2116,15 @@ def survey(
     if not jinx.is_initialised() or not ctx.sysroot.is_dir():
         components.append(Component("userland", "missing", "sysroot not built"))
     else:
-        wanted = recipes.order(recipes.dependency_closure(manifest.build))
-        missing, changed = stale_packages(ctx, jinx, recipes, wanted)
-        if missing or changed:
-            parts = []
-            if changed:
-                shown = " ".join(changed[:4]) + (" ..." if len(changed) > 4 else "")
-                parts.append(f"{len(changed)} changed: {shown}")
-            if missing:
-                shown = " ".join(missing[:4]) + (" ..." if len(missing) > 4 else "")
-                parts.append(f"{len(missing)} not built: {shown}")
-            components.append(Component("userland", "stale", "; ".join(parts)))
+        planned = jinx.preview(manifest.build)
+        if planned:
+            shown = " ".join(planned[:4]) + (" ..." if len(planned) > 4 else "")
+            components.append(
+                Component("userland", "stale", f"{len(planned)} pending in Jinx: {shown}")
+            )
         else:
             components.append(
-                Component("userland", "ready", f"{len(wanted)} packages, "
+                Component("userland", "ready", f"{len(jinx.built())} packages built, "
                           f"{human_size(tree_size(ctx.sysroot))}")
             )
 
@@ -2330,7 +2161,6 @@ def build_chain(
     ctx: Context,
     run: Runner,
     jinx: Jinx,
-    recipes: Recipes,
     manifest: Manifest,
     target: str,
 ) -> list[Path]:
@@ -2339,13 +2169,13 @@ def build_chain(
     if target == "kernel":
         return [build_kernel(ctx, run, cache)]
     if target == "sysroot":
-        return [build_userland(ctx, jinx, recipes, manifest)]
+        return [build_userland(ctx, jinx, manifest)]
     if target == "initramfs":
-        build_userland(ctx, jinx, recipes, manifest)
+        build_userland(ctx, jinx, manifest)
         return [build_initramfs(ctx, cache)]
     if target in ("iso", "hdd", "all"):
         build_kernel(ctx, run, cache)
-        build_userland(ctx, jinx, recipes, manifest)
+        build_userland(ctx, jinx, manifest)
         build_initramfs(ctx, cache)
         if target == "iso":
             return [build_iso(ctx, run, cache)]
@@ -2356,99 +2186,6 @@ def build_chain(
 
 
 # --------------------------------------------------------------------------
-# Recipe templates for `x.py port`
-# --------------------------------------------------------------------------
-
-PORT_TEMPLATES: Mapping[str, str] = {
-    "autotools": """prepare() {
-    autotools_recursive_regen
-}
-
-configure() {
-    autotools_configure
-}
-
-build() {
-    make -j${parallelism}
-}
-
-package() {
-    make install DESTDIR="${dest_dir}"
-
-    post_package_strip
-}
-""",
-    "meson": """configure() {
-    meson_configure
-}
-
-build() {
-    ninja -j${parallelism}
-}
-
-package() {
-    DESTDIR="${dest_dir}" ninja install
-
-    post_package_strip
-}
-""",
-    "cmake": """configure() {
-    cmake_configure
-}
-
-build() {
-    ninja -j${parallelism}
-}
-
-package() {
-    DESTDIR="${dest_dir}" ninja install
-
-    post_package_strip
-}
-""",
-    "make": """configure() {
-    cp -a "${source_dir}"/. .
-}
-
-build() {
-    make \\
-        CC="${OS_TRIPLET}-gcc" \\
-        CFLAGS="${TARGET_CFLAGS}" \\
-        LDFLAGS="${TARGET_LDFLAGS}" \\
-        -j${parallelism}
-}
-
-package() {
-    make install DESTDIR="${dest_dir}" PREFIX="${prefix}"
-
-    post_package_strip
-}
-""",
-}
-
-PORT_IMAGEDEPS = {
-    "autotools": "build-essential",
-    "meson": "build-essential meson ninja-build",
-    "cmake": "build-essential cmake ninja-build",
-    "make": "build-essential",
-}
-
-PORT_HOSTDEPS = {
-    "autotools": "gcc-host pkg-config",
-    "meson": "gcc-host pkg-config",
-    "cmake": "cmake gcc-host pkg-config",
-    "make": "gcc-host binutils",
-}
-
-
-def blake2b_of(path: Path) -> str:
-    digest = hashlib.blake2b()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -2504,7 +2241,7 @@ def cmd_run(world: World, args: argparse.Namespace, settings: Mapping[str, str])
             )
     else:
         header(ctx, world.manifest)
-        build_chain(ctx, world.run, world.jinx, world.recipes, world.manifest, options.image)
+        build_chain(ctx, world.run, world.jinx, world.manifest, options.image)
     if ctx.dry_run:
         ctx.log.msg2("would boot: " + shlex.join(qemu_command(ctx, world.run, image, options)))
         return 0
@@ -2512,175 +2249,73 @@ def cmd_run(world: World, args: argparse.Namespace, settings: Mapping[str, str])
     return 0
 
 
+def jinx_recipe_paths(name: str) -> tuple[Path, Path, bool]:
+    """Return (work tree, working patch, is host recipe) for one Jinx package."""
+    is_host = name.startswith("host:")
+    package = name.removeprefix("host:")
+    if (
+        not package
+        or "/" in package
+        or package in (".", "..")
+        or any(character in package for character in "*?[")
+    ):
+        raise Failure(f"invalid package name: {name!r}")
+    recipes_dir = USERLAND_DIR / ("host-recipes" if is_host else "recipes")
+    sources_dir = USERLAND_DIR / ("host-sources" if is_host else "sources")
+    recipe = recipes_dir / package / "recipe"
+    if not recipe.is_file():
+        raise Failure(
+            f"no such {'host ' if is_host else ''}recipe: {package}",
+            hint="run './x.py list' to see the available target packages",
+        )
+    return (
+        sources_dir / f"{package}-workdir",
+        recipes_dir / package / "patches" / "jinx-working-patch.patch",
+        is_host,
+    )
+
+
 def cmd_build(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
     ctx = world.ctx
-    default_image = str(setting(settings, "image", None, "hdd"))
-    targets = list(args.targets) or [default_image]
-    if args.run and not any(target in ("hdd", "iso", "all") for target in targets):
-        # `build kernel --run` should still produce something bootable.
-        targets.append(default_image)
-    header(ctx, world.manifest)
-    produced: list[Path] = []
-    for target in targets:
-        produced += build_chain(ctx, world.run, world.jinx, world.recipes, world.manifest, target)
-    ctx.log.msg("Build complete")
-    for artifact in produced:
-        ctx.log.msg2(rel(artifact))
-    ctx.log.finished(f"{', '.join(targets)}", time.monotonic() - ctx.started)
-    if args.run:
-        options = qemu_options_from(args, ctx, settings)
-        bootable = [target for target in targets if target in ("hdd", "iso")]
-        options.image = bootable[-1] if bootable else default_image
-        run_qemu(ctx, world.run, ctx.image(options.image), options)
-    return 0
-
-
-def cmd_pkg(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
-    ctx = world.ctx
-    names = world.recipes.resolve(args.packages)
-    header(ctx, world.manifest)
-
-    if args.revbump:
-        ctx.log.msg("Bumping the revision of every dependent recipe")
-        world.jinx.revbump(names)
-
-    build_userland(
-        ctx,
-        world.jinx,
-        world.recipes,
-        world.manifest,
-        only=names,
-        with_dependents=not args.only,
-    )
-    not_installed = [
-        name for name in names if name not in world.recipes.dependency_closure(world.manifest.install)
-    ]
-    if not_installed:
-        ctx.log.warn(
-            f"not part of the system image: {' '.join(not_installed)}"
-        )
-        ctx.log.hint(f"add it to {rel(SYSTEM_MANIFEST)} under [install] to ship it")
-
-    if args.run or args.image_target:
-        target = args.image_target or setting(settings, "image", None, "hdd")
-        cache = Cache(ctx)
-        build_kernel(ctx, world.run, cache)
-        build_initramfs(ctx, cache)
-        image = build_iso(ctx, world.run, cache) if target == "iso" else build_hdd(ctx, world.run, cache)
-        if args.run:
-            options = qemu_options_from(args, ctx, settings)
-            options.image = target
-            run_qemu(ctx, world.run, image, options)
-            return 0
-    ctx.log.finished("the package rebuild", time.monotonic() - ctx.started)
-    if not args.run:
-        ctx.log.note("boot it with: ./x.py run")
-    return 0
-
-
-def cmd_port(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
-    ctx = world.ctx
-    name = args.name
-    directory = RECIPES_DIR / name
-    recipe_path = directory / "recipe"
-    if recipe_path.exists() and not ctx.force:
-        raise Failure(
-            f"{rel(recipe_path)} already exists",
-            hint="pass --force to overwrite it, or pick another name",
-        )
-
-    ctx.log.msg(f"Creating a new port: {name}")
-    checksum = ""
-    url = args.url or ""
-    version = args.version or "0.0.0"
-    if url:
-        url = url.replace(version, "${version}") if version in url else url
-        concrete = url.replace("${version}", version)
-        cached = USERLAND_DIR / "sources" / Path(concrete.split("?", 1)[0]).name
-        if not cached.is_file():
-            ctx.log.msg2(f"downloading {concrete}")
-            ensure_dir(cached.parent)
-            try:
-                request = urllib.request.Request(
-                    concrete, headers={"User-Agent": f"xtool/{VERSION}"}
-                )
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    cached.write_bytes(response.read())
-            except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                remove(cached)
-                raise Failure(f"could not download the tarball: {exc}") from exc
-        checksum = blake2b_of(cached)
-        ctx.log.msg2(f"blake2b: {checksum[:32]}...")
-
-    template = PORT_TEMPLATES[args.template]
-    lines = ["#! /bin/sh", "", f"version={version}", "revision=1"]
-    if url:
-        lines.append(f'tarball_url="{url}"')
-        lines.append(f'tarball_blake2b="{checksum}"')
-    else:
-        lines.append(f'source_dir="{name}"')
-    lines.append(f'imagedeps="{PORT_IMAGEDEPS[args.template]}"')
-    lines.append(f'hostdeps="{PORT_HOSTDEPS[args.template]}"')
-    lines.append(f'deps="{args.deps}"')
-    lines.append("")
-    lines.append(template)
-    if ctx.dry_run:
-        ctx.log.plain("\n".join(lines))
-        return 0
-    ensure_dir(directory)
-    write_file(recipe_path, "\n".join(lines))
-    ctx.log.msg2(f"wrote {rel(recipe_path)}")
-
-    if args.install and add_to_manifest(name):
-        ctx.log.msg2(f"added {name} to {rel(SYSTEM_MANIFEST)}")
-
-    ctx.log.msg("Next steps")
-    ctx.log.msg2(f"edit {rel(recipe_path)} to match the project's build system")
-    ctx.log.msg2(f"./x.py pkg {name}".ljust(28) + "build it into the sysroot")
-    ctx.log.msg2(f"./x.py shell {name}".ljust(28) + "debug the build inside its container")
-    ctx.log.msg2("./x.py run".ljust(28) + f"boot Roanix with {name} installed")
-    return 0
-
-
-def cmd_shell(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
-    ctx = world.ctx
     name = args.package
-    if not name.startswith("host:"):
-        world.recipes.resolve([name])
-    command = list(args.shell_command) or ["bash"]
-    ctx.log.msg(f"Entering the Jinx build container for {name}")
-    ctx.log.note("the sysroot, host tools, and image dependencies are all present")
-    ctx.log.plain()
-    world.jinx.run_in(name, command)
+    _, _, is_host = jinx_recipe_paths(name)
+    header(ctx, world.manifest)
+    prefetch_packages(ctx, world.jinx, ("host:*",))
+    prefetch_packages(ctx, world.jinx, (name,))
+    action = "Rebuilding" if ctx.force else "Building"
+    ctx.log.msg(f"{action} package {name}")
+    world.jinx.build(name, force=ctx.force)
+    if is_host:
+        ctx.log.msg2("host package built; host packages are consumed by Jinx, not the target sysroot")
+    else:
+        ctx.log.msg(f"Installing package {name} into {rel(ctx.sysroot)}")
+        if not ctx.dry_run:
+            ensure_dir(ctx.sysroot)
+        world.jinx.install(ctx.sysroot, [name], force=ctx.force)
+        if not ctx.dry_run:
+            Cache(ctx).record(
+                "sysroot",
+                fingerprint(
+                    "package-install",
+                    values=(ctx.arch.name, name, str(time.time_ns())),
+                ),
+                (ctx.sysroot,),
+            )
+    ctx.log.finished(f"package {name}", time.monotonic() - ctx.started)
+    if not is_host:
+        ctx.log.note("test the installed result with: ./x.py run")
     return 0
 
 
 def cmd_regen(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
     ctx = world.ctx
     name = args.package
-    ctx.log.msg(f"Regenerating patches for {name}")
-    ctx.log.note(
-        f"reading local edits from {rel(USERLAND_DIR / 'sources' / (name + '-workdir'))}"
-    )
+    work_tree, patch, _ = jinx_recipe_paths(name)
+    ctx.log.msg(f"Regenerating the working patch for {name}")
+    ctx.log.note(f"reading local edits from {rel(work_tree)}")
     world.jinx.regen(name)
-    ctx.log.msg2(f"patch written to {rel(RECIPES_DIR / name / 'patches')}")
-    ctx.log.note(f"rebuild it with: ./x.py pkg {name}")
-    return 0
-
-
-def cmd_revbump(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
-    names = world.recipes.resolve(args.packages)
-    world.ctx.log.msg(f"Bumping revisions of everything that depends on {' '.join(names)}")
-    world.jinx.revbump(names)
-    world.ctx.log.note("apply the rebuilds with: ./x.py build sysroot")
-    return 0
-
-
-def cmd_jinx(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
-    arguments = list(args.args)
-    if not arguments:
-        arguments = ["help"]
-    world.jinx(arguments, mode="stream" if world.ctx.log.level >= NORMAL else "quiet")
+    ctx.log.msg2(f"updated {rel(patch)}")
+    ctx.log.note(f"verify it with: ./x.py build -f {name}")
     return 0
 
 
@@ -2690,7 +2325,6 @@ def cmd_status(world: World, args: argparse.Namespace, settings: Mapping[str, st
     components = survey(
         ctx,
         world.jinx,
-        world.recipes,
         world.manifest,
         default_image=str(setting(settings, "image", None, "hdd")),
     )
@@ -3136,17 +2770,13 @@ OVERVIEW = """xtool builds, packages, and boots the Roanix operating system.
 
 basic commands:
   run                 build whatever changed and boot it in QEMU  (default)
-  build               build one or more targets without booting
-  pkg                 rebuild userland package(s) and reinstall the sysroot
+  build               build and install one Jinx package
   status              show what is built, what is stale, and what is next
 
 userland and Jinx:
-  port                scaffold a brand new package recipe
-  shell               open a shell inside a package's Jinx build container
-  regen               regenerate a package's patches from its work tree
-  revbump             bump the revision of every dependent recipe
+  build               build/install a package; -f rebuilds from prepared sources
+  regen               update jinx-working-patch.patch from the package work tree
   list                list userland packages or build targets
-  jinx                run Jinx directly in the configured build directory
 
 kernel:
   check               cargo check the kernel
@@ -3166,11 +2796,9 @@ EXAMPLES = """workflow examples:
   ./x.py -a riscv64                   the same, targeting riscv64
   ./x.py -r                           build and boot a release kernel
 
-  ./x.py pkg bash --run               rebuild Bash, reinstall it, boot
-  ./x.py pkg mlibc --run              rebuild mlibc and everything linked to it
-  ./x.py port zstd --url https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz --version 1.5.7
-  ./x.py shell python                 debug a failing build interactively
-  ./x.py regen python                 turn local source edits into a patch
+  ./x.py build bash                   build Bash and install it into the sysroot
+  ./x.py build -f bash                rebuild Bash from the prepared source tree
+  ./x.py regen bash                   turn local source edits into the working patch
 
   ./x.py run --gdb                    boot halted with a GDB stub on :1234
   ./x.py run iso --firmware bios      boot the ISO through SeaBIOS
@@ -3184,15 +2812,15 @@ Run './x.py help <command>' for the full options of one command.
 """
 
 COMMANDS = (
-    "run", "build", "pkg", "status", "port", "shell", "regen", "revbump",
-    "list", "jinx", "check", "lint", "fmt", "docs", "doctor", "config",
+    "run", "build", "status", "regen", "list", "check", "lint", "fmt",
+    "docs", "doctor", "config",
     "fetch", "clean", "help",
 )
-ALIASES = {"r": "run", "b": "build", "p": "pkg", "st": "status", "ls": "list"}
+ALIASES = {"r": "run", "b": "build", "st": "status", "ls": "list"}
 VALUE_OPTIONS = {
     "-a", "--arch", "-p", "--profile", "-j", "--jobs", "--color", "-m",
     "--memory", "--smp", "--gdb-port", "--display", "--serial-log", "--trace",
-    "--image", "--firmware", "-F", "--port", "--template", "--url", "--deps",
+    "--image", "--firmware", "-F", "--port",
 }
 
 
@@ -3220,7 +2848,7 @@ def global_options() -> argparse.ArgumentParser:
     )
     group.add_argument("-j", "--jobs", type=int, help="parallel jobs for Cargo and Jinx")
     group.add_argument(
-        "-f", "--force", action="store_true", help="rebuild even if nothing changed"
+        "-f", "--force", action="store_true", help="discard build/install outputs before rebuilding"
     )
     group.add_argument("-q", "--quiet", action="store_true", help="only print warnings and errors")
     group.add_argument("-v", "--verbose", action="store_true", help="show every command and all output")
@@ -3292,101 +2920,32 @@ def build_cli() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentPar
     run.add_argument("--no-build", action="store_true", help="boot the existing image without rebuilding")
 
     build = add(
-        "build", ["b"], parents=[common, emulator],
-        description="Build one or more targets: " + ", ".join(TARGETS) + ".",
-        epilog="examples:\n"
-               "  ./x.py build kernel\n"
-               "  ./x.py build sysroot --arch riscv64\n"
-               "  ./x.py build iso --profile release\n"
-               "  ./x.py build hdd --run\n",
-    )
-    build.add_argument("targets", nargs="*", choices=(*TARGETS, []), help="what to build")
-    build.add_argument("--run", action="store_true", help="boot the result when the build finishes")
-
-    pkg = add(
-        "pkg", ["p"], parents=[common, emulator],
+        "build", ["b"],
         description=(
-            "Rebuild userland package(s) with Jinx and reinstall the sysroot.\n"
-            "By default everything that depends on the named packages is rebuilt too,\n"
-            "which is what you want after changing a library."
+            "Build one Jinx package and install it into the target sysroot.\n"
+            "With -f, discard its build/install outputs and rebuild from the prepared source tree."
         ),
         epilog="examples:\n"
-               "  ./x.py pkg bash                rebuild Bash into the sysroot\n"
-               "  ./x.py pkg bash --run          ...then boot it\n"
-               "  ./x.py pkg mlibc               rebuild mlibc and every dependent\n"
-               "  ./x.py pkg drivers --only      rebuild just the drivers package\n"
-               "  ./x.py pkg 'lib*'              globs work too\n",
+               "  ./x.py build bash\n"
+               "  ./x.py build -f bash\n"
+               "  ./x.py build host:cmake\n",
     )
-    pkg.add_argument("packages", nargs="+", help="recipe name(s); shell globs are allowed")
-    pkg.add_argument("-1", "--only", action="store_true", help="do not rebuild dependents")
-    pkg.add_argument("-R", "--run", action="store_true", help="build an image and boot it afterwards")
-    pkg.add_argument("--image", dest="image_target", choices=("hdd", "iso"), help="image to refresh")
-    pkg.add_argument("--revbump", action="store_true", help="also bump dependent recipe revisions")
-
-    port = add(
-        "port",
-        description="Scaffold a new userland port and wire it into the system image.",
-        epilog="examples:\n"
-               "  ./x.py port zstd --url https://.../zstd-1.5.7.tar.gz --version 1.5.7\n"
-               "  ./x.py port mytool --template make --deps 'sys-libs ncurses'\n",
-    )
-    port.add_argument("name", help="package name, which becomes userland/recipes/<name>")
-    port.add_argument("--url", help="tarball URL; xtool downloads it and records the blake2b sum")
-    port.add_argument("--version", dest="version", help="upstream version")
-    port.add_argument(
-        "--template", choices=tuple(PORT_TEMPLATES), default="autotools", help="build system template"
-    )
-    port.add_argument("--deps", default="sys-libs", help="space separated runtime dependencies")
-    port.add_argument(
-        "--no-install", dest="install", action="store_false",
-        help="do not add the package to the system image",
-    )
-
-    shell = add(
-        "shell",
-        description="Run a command inside the container Jinx would use to build a package.",
-        epilog="examples:\n"
-               "  ./x.py shell python            interactive Bash in python's build tree\n"
-               "  ./x.py shell mlibc meson test  run a one-off command there\n"
-               "  ./x.py shell host:gcc-host     host recipes work with the host: prefix\n",
-    )
-    shell.add_argument("package", help="recipe name, optionally prefixed with host:")
-    shell.add_argument(
-        "shell_command",
-        nargs=argparse.REMAINDER,
-        metavar="command",
-        help="command to run (default: bash)",
-    )
+    build.add_argument("package", help="recipe name, optionally prefixed with host:")
 
     regen = add(
         "regen",
         description=(
-            "Regenerate a package's patch from edits made in userland/sources/<pkg>-workdir,\n"
-            "then re-run the recipe's prepare() step."
+            "Regenerate jinx-working-patch.patch from edits in the package's work tree,\n"
+            "then re-run the recipe's prepare() step. Host recipes use the host: prefix."
         ),
     )
     regen.add_argument("package", help="recipe whose patches should be regenerated")
-
-    revbump = add(
-        "revbump",
-        description="Bump the revision of every recipe that depends on the named package(s).",
-    )
-    revbump.add_argument("packages", nargs="+", help="recipe name(s)")
 
     listing = add("list", ["ls"], description="List userland packages or build targets.")
     listing.add_argument(
         "what", nargs="?", choices=("packages", "targets"), default="packages", help="what to list"
     )
     listing.add_argument("--json", dest="json_output", action="store_true", help="emit JSON")
-
-    jinx = add(
-        "jinx",
-        description="Run Jinx directly, in the build directory for the selected architecture.",
-        epilog="examples:\n"
-               "  ./x.py jinx dry-run '*'\n"
-               "  ./x.py jinx build host:gcc-host\n",
-    )
-    jinx.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed straight to jinx")
 
     status = add("status", ["st"], description="Report what is built and what is stale.")
     status.add_argument("--json", dest="json_output", action="store_true", help="emit JSON")
@@ -3443,12 +3002,7 @@ def build_cli() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentPar
 HANDLERS: Mapping[str, Callable[[World, argparse.Namespace, Mapping[str, str]], int]] = {
     "run": cmd_run,
     "build": cmd_build,
-    "pkg": cmd_pkg,
-    "port": cmd_port,
-    "shell": cmd_shell,
     "regen": cmd_regen,
-    "revbump": cmd_revbump,
-    "jinx": cmd_jinx,
     "status": cmd_status,
     "list": cmd_list,
     "check": cmd_check,
@@ -3465,7 +3019,7 @@ HANDLERS: Mapping[str, Callable[[World, argparse.Namespace, Mapping[str, str]], 
 LIGHTWEIGHT = {"doctor", "config", "fetch", "check", "lint", "fmt", "docs", "clean"}
 
 #: Commands that can sensibly act on several architectures in one invocation.
-MULTI_ARCH = {"build", "pkg", "status", "list", "clean", "fetch", "check", "lint", "doctor"}
+MULTI_ARCH = {"build", "status", "list", "clean", "fetch", "check", "lint", "doctor"}
 
 
 def locate_command(argv: Sequence[str]) -> str | None:
@@ -3485,8 +3039,8 @@ def locate_command(argv: Sequence[str]) -> str | None:
 
 
 def split_qemu_arguments(argv: Sequence[str], command: str | None) -> tuple[list[str], list[str]]:
-    """Everything after a bare ``--`` goes to QEMU, unless Jinx owns it."""
-    if command in ("jinx", "shell") or "--" not in argv:
+    """Everything after a bare ``--`` goes to QEMU."""
+    if "--" not in argv:
         return list(argv), []
     index = list(argv).index("--")
     return list(argv[:index]), list(argv[index + 1 :])
@@ -3543,12 +3097,13 @@ def command_suggestions(token: str) -> list[str]:
 
     hints: list[str] = []
     if token in TARGETS:
-        hints.append(f"to build it, run: ./x.py build {token}")
         if token in ("hdd", "iso"):
             hints.append(f"to boot it, run: ./x.py run {token}")
+        else:
+            hints.append("that OS component is assembled by: ./x.py run")
         return hints
     if (RECIPES_DIR / token / "recipe").is_file():
-        hints.append(f"that is a userland package; run: ./x.py pkg {token}")
+        hints.append(f"that is a userland package; run: ./x.py build {token}")
         return hints
     close = difflib.get_close_matches(token, COMMANDS, n=3, cutoff=0.4)
     if close:
@@ -3598,8 +3153,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 hint=f"run it once per architecture, or use a command from: "
                 f"{', '.join(sorted(MULTI_ARCH))}",
             )
-        if qemu_extra and name not in ("run", "build", "pkg"):
-            raise Failure("arguments after '--' are only understood by run, build, and pkg")
+        if qemu_extra and name != "run":
+            raise Failure("arguments after '--' are only understood by run")
 
         manifest = Manifest((), (), True) if name in LIGHTWEIGHT else load_manifest(log)
         status = 0

@@ -4,6 +4,10 @@ JINX_MAJOR_VER=0.10
 JINX_DEBIAN_SNAPSHOT=20260601T202527Z
 JINX_BASE_PACKAGES="autoconf automake bison file flex gawk make meson ninja-build patch perl pkg-config texinfo"
 
+ROANIX_PACKAGE_REPO="${ROANIX_PACKAGE_REPO:-https://packages.hvrsim.com/roanix/main}"
+JINX_REPO_URL="${ROANIX_PACKAGE_REPO}/${JINX_ARCH}"
+JINX_HOST_REPO_URL="${ROANIX_PACKAGE_REPO}/host/${JINX_ARCH}"
+
 case "${JINX_ARCH}" in
     x86_64)
         TARGET_CFLAGS="-O2 -pipe -march=x86-64 -mtune=generic"
