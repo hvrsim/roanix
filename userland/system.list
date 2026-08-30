@@ -25,7 +25,6 @@ coreutils
 python
 stress-ng
 util-roanix
-drivers
 
 [build]
 mlibc-headers

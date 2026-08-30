@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 #![allow(unsafe_code)]
 // Values crossing the module boundary carry the C ABI widths fixed by
 // include/roanix/api.h, and both supported targets use 64-bit pointers, so
@@ -95,7 +96,7 @@ enum NodeData {
 
 struct Endpoint(*mut raw::DevfsEndpoint);
 
-// SAFETY: this opaque receipt is only called through the kernel service table.
+// SAFETY: this opaque receipt is only passed through the versioned kernel ABI.
 unsafe impl Send for Endpoint {}
 // SAFETY: as above.
 unsafe impl Sync for Endpoint {}

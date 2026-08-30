@@ -1,9 +1,5 @@
 # build artifacts
 build/
-/drivers/out/
-/drivers/build/
-/drivers/target/
-/drivers/prebuilt/
 iso_root
 *.hdd
 *.iso
@@ -11,7 +7,6 @@ store/
 kernel/roanix-*
 kernel/target/
 userland/.jinx-cache/
-userland/drivers/
 userland/host-sources/
 userland/sources/
 __pycache__/

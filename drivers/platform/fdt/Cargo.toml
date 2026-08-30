@@ -3,15 +3,17 @@ name = "fdt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
+autolib = false
 
-[lib]
-crate-type = ["staticlib"]
+[[bin]]
+name = "fdt"
+path = "src/lib.rs"
 
 [dependencies]
 ddk = { path = "../../ddk" }
 
-[features]
-kernel-imports = ["ddk/kernel-imports"]
+[build-dependencies]
+ddk = { path = "../../ddk", features = ["module-build"] }
 
 [lints.rust]
 unsafe_code = "warn"

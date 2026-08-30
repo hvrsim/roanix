@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 #![allow(unsafe_code)]
 // Values crossing the module boundary carry the C ABI widths fixed by
 // include/roanix/api.h, and both supported targets use 64-bit pointers, so

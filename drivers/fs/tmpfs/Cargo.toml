@@ -3,15 +3,17 @@ name = "tmpfs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.87"
+autolib = false
 
-[lib]
-crate-type = ["staticlib"]
+[[bin]]
+name = "tmpfs"
+path = "src/lib.rs"
 
 [dependencies]
 ddk = { path = "../../ddk" }
 
-[features]
-kernel-imports = ["ddk/curated-tmpfs-imports"]
+[build-dependencies]
+ddk = { path = "../../ddk", features = ["module-build"] }
 
 [lints.rust]
 unsafe_code = "warn"

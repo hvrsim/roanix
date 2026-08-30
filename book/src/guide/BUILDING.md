@@ -220,9 +220,10 @@ $ ./x.py pkg mlibc --only
 $ ./x.py pkg 'lib*'
 ```
 
-You usually do not even need `pkg`: editing a recipe (or the in-tree sources
-under `drivers/` and `userland/util-roanix/`) marks that package stale, so a plain
-`./x.py` rebuilds it, reinstalls the sysroot, and boots.
+You usually do not even need `pkg`: editing a recipe or `userland/util-roanix/`
+marks its package stale, while editing `drivers/` marks the directly installed
+driver modules stale. A plain `./x.py` rebuilds what changed, reinstalls the
+sysroot, and boots.
 
 Use `./x.py list` to see every recipe, its version, whether it has been built,
 and whether it is part of the system image.
@@ -434,27 +435,26 @@ crate.
 
 The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`,
 uses `panic = "abort"`, and links self-contained ET_DYN images with
-`rdf_module_entry` as their ELF entry. xtool builds those images on the host,
-stages them with the `drivers` recipe, and installs them under
-`/usr/lib/roanix/drivers/`. `make -C drivers ARCH=x86_64` builds every module
-directly.
+`rdf_module_entry` as their ELF entry. Each module's build script asks the DDK
+to configure Cargo's final link, and xtool installs the resulting images
+directly under `/usr/lib/roanix/drivers/` in the staged sysroot. Kernel calls
+use versioned `rdf_api_v1_*` imports that the module loader resolves before
+entry; modules carry imports only for services they use.
 
 `console.ko` is also built for both targets. It registers the shared terminal
 provider before the lexically later `pty.ko` and `uart8250.ko` modules, and owns
 termios, line discipline, terminal nodes, and the `tty` class. UART and PTY
 backends continue to use the unchanged `rdf_tty_register` ABI.
 
-For RISC-V shared Rust modules that use `alloc`, the module builder rebuilds
+For RISC-V shared Rust modules that use `alloc`, xtool rebuilds
 `core`, `alloc`, and `compiler_builtins` with PIC via Cargo's `build-std`
 support; the distributed static runtime is not suitable for a loadable image.
 
-Modules reach kernel services through the table handed to `rdf_module_entry`.
-The Rust DDK can additionally import a small, curated set of versioned C ABI
-names such as `rdf_api_v1_random_fill`; the loader resolves those names only
-from its kernel export table. It never exposes internal Rust symbols or a
-general kernel symbol namespace. Images still have no runtime dependency or
-interpreter, and the loader accepts only relative relocations plus
-architecture-specific relocations for those curated imports.
+Modules reach kernel services through versioned C ABI imports such as
+`rdf_api_v1_random_fill`. The loader resolves only its closed export list; it
+never exposes internal Rust symbols or a general kernel symbol namespace.
+Images still have no runtime dependency or interpreter, and the loader accepts
+only relative relocations plus architecture-specific import relocations.
 
 ### Modular filesystem providers
 
@@ -512,19 +512,21 @@ drivers/include/roanix/   the API headers, installed to /usr/include/roanix
 drivers/platform/         firmware enumerators (ACPI, device tree)
 drivers/irqchip/          interrupt controllers
 drivers/tty/              serial ports and pseudo-terminals
-drivers/char/             character devices
+drivers/tty/special/      null, zero, random, and urandom devices
 ```
 
-xtool mirrors `drivers/` into the Jinx workspace and treats it as an input to
-the `drivers` package, so editing a driver is enough to make `./x.py` rebuild
+xtool fingerprints `drivers/`, builds changed modules with Cargo, and installs
+them directly into the staged sysroot, so editing a driver is enough to rebuild
 and reinstall it:
 
 ```bash
-$ vim drivers/tty/pty.c
-$ ./x.py                # rebuilds the drivers package and boots the result
+$ vim drivers/tty/pty/src/lib.rs
+$ ./x.py                # rebuilds the module and boots the result
 ```
 
-Do not maintain a second generated driver tree; always build through `x.py`.
+Cargo intermediates live under `build/cargo/drivers`, and finished modules live
+under `build/<arch>/drivers-rust`; no generated driver tree belongs under the
+source directory.
 
 ## Notes on the sysroot
 

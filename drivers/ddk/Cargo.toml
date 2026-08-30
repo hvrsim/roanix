@@ -8,9 +8,7 @@ rust-version = "1.87"
 path = "src/lib.rs"
 
 [features]
-kernel-imports = []
-curated-tmpfs-imports = []
-curated-devfs-imports = []
+module-build = []
 
 [lints.rust]
 unsafe_code = "warn"

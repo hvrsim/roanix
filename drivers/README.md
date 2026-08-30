@@ -1,11 +1,11 @@
 # Roanix drivers
 
-Every in-tree driver is a Rust crate in this Cargo workspace, linked into a
-freestanding `.ko` shared object by `build-module.py` and loaded by the kernel
-from `/usr/lib/roanix/drivers`. Modules use the C ABI described by
-`include/roanix/`: they enter through `rdf_module_entry`, receive a
-size-prefixed service table, and expose operation records made of plain
-function pointers.
+Every in-tree driver is a Rust crate in this Cargo workspace. Its `build.rs`
+asks the DDK to configure Cargo's final link as a freestanding `.ko` shared
+object loaded by the kernel from `/usr/lib/roanix/drivers`. Modules use the C
+ABI described by `include/roanix/`: they enter through `rdf_module_entry`,
+import only the versioned `rdf_api_v1_*` functions they call, and expose
+operation records made of plain function pointers.
 
 ## Layout
 
@@ -30,20 +30,16 @@ other modules consume.
 ## Building
 
 ```
-make ARCH=x86_64            # build out/x86_64/*.ko
-make ARCH=riscv64           # build out/riscv64/*.ko
-make ARCH=x86_64 install    # install modules and headers under DESTDIR/PREFIX
-make clean                  # remove build and output trees
+./x.py --arch x86_64        # build, install, and boot x86_64
+./x.py --arch riscv64       # build, install, and boot RISC-V
 ```
 
 The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`
 with the pinned nightly toolchain in `rust-toolchain.toml`. RISC-V builds
 rebuild `core` and `alloc` with `-Z build-std` so every image stays position
-independent.
-
-A module image may instead be dropped into `prebuilt/<arch>/<name>.ko`; the
-Makefile prefers prebuilt images, which is how xtool stages host-built modules
-for packaging without requiring a toolchain in the packaging environment.
+independent. xtool keeps Cargo intermediates under `build/cargo/drivers`,
+copies finished modules to `build/<arch>/drivers-rust`, and installs them
+directly into the staged sysroot alongside the public headers.
 
 ## Writing a driver
 
@@ -54,6 +50,5 @@ and finish with:
 ddk::module!("my-driver", "What it does", init, exit);
 ```
 
-Build the crate with `--features kernel-imports` (as the Makefile does) so
-kernel services resolve to the curated versioned `rdf_api_v1_*` imports
-instead of runtime service-table lookups.
+The kernel resolves every used `rdf_api_v1_*` import before calling the module
+entry point; unknown or internal kernel symbols make the module fail to load.

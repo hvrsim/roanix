@@ -1,0 +1,8 @@
+[build]
+target-dir = "../../build/cargo/drivers"
+
+[target.x86_64-unknown-none]
+rustflags = ["-Crelocation-model=pic"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-Crelocation-model=pic"]

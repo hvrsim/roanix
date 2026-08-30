@@ -41,10 +41,10 @@ pub struct ModuleDef {
 
 /// A module image's entry point.
 ///
-/// The kernel calls this once with the service table so the module can record
-/// it before any framework call is made, then uses the returned descriptor to
-/// load the module.
-pub type ModuleEntryFn = unsafe extern "C" fn(api: *const super::api::Api) -> *const ModuleDef;
+/// The kernel calls this once after resolving every versioned import, then uses
+/// the returned descriptor to load the module. The argument is reserved and
+/// currently null.
+pub type ModuleEntryFn = unsafe extern "C" fn(reserved: *const c_void) -> *const ModuleDef;
 
 /// Borrows a NUL-terminated string supplied by a module.
 ///

@@ -3,9 +3,9 @@
 //! A module is an ELF shared object with a single entry point. The loader
 //! accepts only self-contained images: no runtime-library dependencies, no text
 //! relocations, and no general symbol lookup. The only external references it
-//! resolves are versioned names in the curated kernel C ABI export table.
+//! resolves are versioned names in the kernel C ABI export list.
 //!
-//! Segments are placed in kernel memory, position-independent and curated-import
+//! Segments are placed in kernel memory, position-independent and import
 //! relocations are applied, and permissions are tightened so that no page is
 //! both writable and executable before the entry point runs.
 
@@ -43,7 +43,6 @@ use super::{
         core::module::{self, Module, ModuleBacking, ModuleDefinition},
         error::{Error, Result},
     },
-    api::API,
     types::{ABI_MAJOR, ABI_MINOR, ModuleDef, ModuleEntryFn, borrow_opt_str, borrow_str},
 };
 
@@ -314,9 +313,9 @@ fn prepare_bytes(bytes: &[u8]) -> Result<ModuleDefinition> {
     // SAFETY: the entry address lies inside an executable segment and the
     // module contract fixes this exact signature.
     let entry: ModuleEntryFn = unsafe { mem::transmute(entry_address as usize) };
-    // SAFETY: upheld by the module entry contract above. The service table is
-    // static and immutable.
-    let descriptor = unsafe { entry(&raw const API) };
+    // SAFETY: upheld by the module entry contract above. The reserved argument
+    // remains null so legacy table-based modules reject themselves safely.
+    let descriptor = unsafe { entry(ptr::null()) };
     if !image.contains(descriptor) {
         return Err(Error::InvalidArgument);
     }
@@ -683,7 +682,7 @@ fn resolve_import_symbol(image: &Image, dynamic: &DynamicInfo, index: u64) -> Re
     let section = unsafe { ptr::read_unaligned((symbol + 6) as *const u16) };
     let binding = info >> 4;
     // Rust's linker emits `STT_NOTYPE` for an `extern "C"` function
-    // declaration, so the curated export name—not the optional ELF type—is
+    // declaration, so the versioned export name—not the optional ELF type—is
     // authoritative here.
     if section != 0 || !matches!(binding, 1 | 2) {
         return Err(Error::Unsupported);

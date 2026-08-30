@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 #![allow(unsafe_code)]
 #![allow(
     clippy::cast_possible_truncation,

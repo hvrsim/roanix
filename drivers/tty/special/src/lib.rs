@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 // Device-node callbacks are C ABI entry points and document each raw access.
 #![allow(unsafe_code)]
 // Values crossing the module boundary carry the C ABI widths fixed by

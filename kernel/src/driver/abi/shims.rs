@@ -1,4 +1,4 @@
-// Included by `api.rs`. These are the entry points named in [`API`]; each one
+// Included by `api.rs`. These are the entry points in its export list; each one
 // validates its arguments, performs the framework operation, and converts the
 // result into the ABI's status convention.
 

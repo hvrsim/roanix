@@ -37,24 +37,24 @@ KERNEL_DIR = ROOT / "kernel"
 DRIVERS_DIR = ROOT / "drivers"
 RUST_DRIVER_MODULES = {
     "x86_64": (
-        ("acpi", "acpi.ko", True),
-        ("ioapic", "ioapic.ko", True),
-        ("tmpfs", "tmpfs.ko", True),
-        ("devfs", "devfs.ko", True),
-        ("console", "console.ko", True),
-        ("pty", "pty.ko", True),
-        ("uart8250", "uart8250.ko", True),
-        ("special", "special.ko", True),
+        ("acpi", "acpi.ko"),
+        ("ioapic", "ioapic.ko"),
+        ("tmpfs", "tmpfs.ko"),
+        ("devfs", "devfs.ko"),
+        ("console", "console.ko"),
+        ("pty", "pty.ko"),
+        ("uart8250", "uart8250.ko"),
+        ("special", "special.ko"),
     ),
     "riscv64": (
-        ("fdt", "fdt.ko", True),
-        ("plic", "plic.ko", True),
-        ("tmpfs", "tmpfs.ko", True),
-        ("devfs", "devfs.ko", True),
-        ("console", "console.ko", True),
-        ("pty", "pty.ko", True),
-        ("uart8250", "uart8250.ko", True),
-        ("special", "special.ko", True),
+        ("fdt", "fdt.ko"),
+        ("plic", "plic.ko"),
+        ("tmpfs", "tmpfs.ko"),
+        ("devfs", "devfs.ko"),
+        ("console", "console.ko"),
+        ("pty", "pty.ko"),
+        ("uart8250", "uart8250.ko"),
+        ("special", "special.ko"),
     ),
 }
 BOOK_DIR = ROOT / "book"
@@ -82,7 +82,6 @@ FALLBACK_SYSTEM_PACKAGES = (
     "stress-ng",
     "python",
     "util-roanix",
-    "drivers",
 )
 FALLBACK_EXTRA_BUILD_PACKAGES = ("mlibc-headers", "mlibc", "ncurses", "readline")
 
@@ -1271,7 +1270,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 [ -n "$url" ] || { echo "wget shim: no URL given" >&2; exit 2; }
-set -- CURL -fL
+set -- CURL -fsSL
 [ -n "$output" ] && set -- "$@" -o "$output"
 [ -n "$agent" ] && set -- "$@" -A "$agent"
 [ -n "$insecure" ] && set -- "$@" "$insecure"
@@ -1320,7 +1319,6 @@ class Jinx:
         """Make sure Jinx exists and its build directory is initialised."""
         if self._binary is not None:
             return self._binary
-        self.sync_in_tree_sources()
         checkout = ensure_jinx(self.ctx, self.run)
         binary = checkout / "jinx"
         build = self.ctx.jinx_build
@@ -1336,47 +1334,6 @@ class Jinx:
             )
         self._binary = binary
         return binary
-
-    def sync_in_tree_sources(self) -> None:
-        """Mirror in-repo source trees into the places recipes expect."""
-        staged = USERLAND_DIR / "drivers"
-        rust_modules = tuple(
-            (
-                output_name,
-                build_rust_module(
-                    self.ctx,
-                    self.run,
-                    Cache(self.ctx),
-                    package=package,
-                    output_name=output_name,
-                    imports=imports,
-                ),
-            )
-            for package, output_name, imports in RUST_DRIVER_MODULES[self.ctx.arch.name]
-        )
-        digest = fingerprint(
-            "drivers-source",
-            paths=(DRIVERS_DIR, *(source for _, source in rust_modules)),
-        )
-        marker = staged / ".xtool-source.sha256"
-        if staged.is_dir() and marker.is_file():
-            if marker.read_text(encoding="utf-8").strip() == digest:
-                return
-        temporary = USERLAND_DIR / ".drivers.xtool-tmp"
-        remove(temporary)
-        shutil.copytree(
-            DRIVERS_DIR,
-            temporary,
-            ignore=shutil.ignore_patterns("build", "out", "target", "*.o", "*.d", "*.ko"),
-        )
-        if not self.ctx.dry_run:
-            prebuilt_dir = temporary / "prebuilt" / self.ctx.arch.name
-            ensure_dir(prebuilt_dir)
-            for output_name, source in rust_modules:
-                copy(source, prebuilt_dir / output_name)
-        write_file(temporary / ".xtool-source.sha256", digest + "\n")
-        remove(staged)
-        temporary.rename(staged)
 
     # -- raw invocation ----------------------------------------------------
 
@@ -1497,9 +1454,7 @@ def cargo(
     run(argv, cwd=KERNEL_DIR, env=rust_env(ctx), mode=mode, filter=cargo_filter)
 
 
-def rust_driver_digest(
-    ctx: Context, package: str, output_name: str, *, imports: bool
-) -> str:
+def rust_driver_digest(ctx: Context, package: str, output_name: str) -> str:
     """Fingerprint the Rust module workspace independently from the kernel."""
     return fingerprint(
         f"rust-driver-{package}",
@@ -1508,50 +1463,82 @@ def rust_driver_digest(
             ctx.arch.rust_target,
             output_name,
             "release",
-            f"imports={imports}",
         ),
         paths=(DRIVERS_DIR,),
     )
 
 
 def build_rust_module(
-    ctx: Context, run: Runner, cache: Cache, *, package: str, output_name: str, imports: bool
+    ctx: Context, run: Runner, cache: Cache, *, package: str, output_name: str
 ) -> Path:
-    """Build one Rust module before staging the drivers source tree."""
+    """Build one Rust module for direct installation into the sysroot."""
     output = ctx.arch_root / "drivers-rust" / output_name
     key = f"rust-driver-{package}-release"
-    digest = rust_driver_digest(ctx, package, output_name, imports=imports)
+    digest = rust_driver_digest(ctx, package, output_name)
     if cache.is_current(key, digest, (output,)):
         return output
 
     ctx.log.msg2(f"Building Rust {package} driver ({ctx.arch.name})")
-    target_dir = ctx.cargo_target / "drivers" / package
+    target_dir = ctx.cargo_target / "drivers"
+    arguments = [
+        "cargo",
+        "build",
+        "--package",
+        package,
+        "--target",
+        ctx.arch.rust_target,
+        "--release",
+        "--target-dir",
+        str(target_dir),
+    ]
+    if ctx.arch.name == "riscv64":
+        arguments += [
+            "-Z",
+            "build-std=core,alloc,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ]
     run(
-        [
-            "python3",
-            "build-module.py",
-            "--package",
-            package,
-            "--target",
-            ctx.arch.rust_target,
-            "--output",
-            str(output),
-            "--target-dir",
-            str(target_dir),
-            "--profile",
-            "release",
-            *(["--imports"] if imports else []),
-        ],
+        arguments,
         cwd=DRIVERS_DIR,
         mode="stream",
         filter=cargo_filter,
     )
     if ctx.dry_run:
         return output
+    produced = target_dir / ctx.arch.rust_target / "release" / package
+    if not produced.is_file():
+        raise Failure(f"Cargo produced no Rust driver at {rel(produced)}")
+    copy(produced, output)
     if not output.is_file():
         raise Failure(f"Cargo produced no Rust driver at {rel(output)}")
     cache.record(key, digest, (output,))
     return output
+
+
+def build_rust_drivers(ctx: Context, run: Runner, cache: Cache) -> tuple[Path, ...]:
+    return tuple(
+        build_rust_module(
+            ctx,
+            run,
+            cache,
+            package=package,
+            output_name=output_name,
+        )
+        for package, output_name in RUST_DRIVER_MODULES[ctx.arch.name]
+    )
+
+
+def stale_rust_drivers(ctx: Context, cache: Cache) -> tuple[str, ...]:
+    return tuple(
+        output_name
+        for package, output_name in RUST_DRIVER_MODULES[ctx.arch.name]
+        if not cache.is_current(
+            f"rust-driver-{package}-release",
+            rust_driver_digest(ctx, package, output_name),
+            (ctx.arch_root / "drivers-rust" / output_name,),
+        )
+    )
 
 
 def build_kernel(ctx: Context, run: Runner, cache: Cache) -> Path:
@@ -1610,7 +1597,7 @@ def prefetch_packages(ctx: Context, jinx: Jinx, names: Sequence[str]) -> None:
         message = str(error).lower()
         if "sha256" in message or "checksum" in message:
             raise
-        ctx.log.warn("prebuilt packages are unavailable; falling back to local builds")
+        ctx.log.warn("package download incomplete, falling back to local builds")
         if ctx.log.level >= VERBOSE:
             for line in str(error).splitlines():
                 ctx.log.debug(line)
@@ -1626,8 +1613,22 @@ def announce_plan(ctx: Context, jinx: Jinx, targets: Sequence[str]) -> None:
         ctx.log.msg2("Jinx has nothing to build")
 
 
+def install_rust_drivers(root: Path, modules: Sequence[Path]) -> None:
+    module_dir = root / "usr/lib/roanix/drivers"
+    include_dir = root / "usr/include/roanix"
+    for module in modules:
+        copy(module, module_dir / module.name)
+    for header in sorted((DRIVERS_DIR / "include/roanix").glob("*.h")):
+        copy(header, include_dir / header.name)
+
+
 def install_sysroot(
-    ctx: Context, jinx: Jinx, manifest: Manifest, *, force: bool = False
+    ctx: Context,
+    jinx: Jinx,
+    manifest: Manifest,
+    modules: Sequence[Path],
+    *,
+    force: bool = False,
 ) -> Path:
     """Assemble a fresh sysroot from the built packages, then swap it in."""
     ensure_dir(ctx.arch_root)
@@ -1638,6 +1639,7 @@ def install_sysroot(
         jinx.install(staging, manifest.install, force=force)
         if ctx.dry_run:
             return ctx.sysroot
+        install_rust_drivers(staging, modules)
         swap_directory(staging, ctx.sysroot)
     finally:
         remove(staging)
@@ -1655,6 +1657,8 @@ def build_userland(
 ) -> Path:
     """Ask Jinx to update the manifest packages and assemble the sysroot."""
     started = time.monotonic()
+    cache = Cache(ctx)
+    modules = build_rust_drivers(ctx, jinx.run, cache)
     jinx.prepare()
     wanted = manifest.build
     # Host tools use a separate repository. Fetch them first so a target
@@ -1663,7 +1667,8 @@ def build_userland(
     prefetch_packages(ctx, jinx, ("host:*",))
     prefetch_packages(ctx, jinx, wanted)
     planned = jinx.preview(wanted)
-    if not planned and not ctx.force and ctx.sysroot.is_dir():
+    digest = sysroot_digest(ctx, manifest, modules)
+    if not planned and cache.is_current("sysroot", digest, (ctx.sysroot,)):
         ctx.log.msg2(f"userland is up to date ({len(jinx.built())} packages built)")
         return ctx.sysroot
     if ctx.dry_run:
@@ -1672,22 +1677,18 @@ def build_userland(
     if ctx.force:
         for name in wanted:
             jinx.build(name, force=True)
-    else:
+    elif planned:
         jinx.update(wanted)
 
     ctx.log.msg(f"Installing the sysroot ({ctx.arch.name})")
-    install_sysroot(ctx, jinx, manifest, force=ctx.force)
+    install_sysroot(ctx, jinx, manifest, modules, force=ctx.force)
     if not ctx.dry_run:
-        Cache(ctx).record(
-            "sysroot",
-            sysroot_digest(ctx, manifest),
-            (ctx.sysroot,),
-        )
+        cache.record("sysroot", digest, (ctx.sysroot,))
     ctx.log.finished("the userland", time.monotonic() - started)
     return ctx.sysroot
 
 
-def sysroot_digest(ctx: Context, manifest: Manifest) -> str:
+def sysroot_digest(ctx: Context, manifest: Manifest, modules: Sequence[Path]) -> str:
     packages = ctx.jinx_build / "pkgs"
     package_stamps = tuple(
         f"{item.name}:{stamp(item)}" for item in sorted(packages.glob("*.xbps"))
@@ -1700,8 +1701,9 @@ def sysroot_digest(ctx: Context, manifest: Manifest) -> str:
             *manifest.build,
             *manifest.install,
             *package_stamps,
+            *(f"{module.name}:{stamp(module)}" for module in modules),
         ),
-        paths=(USERLAND_DIR / "Jinxfile",),
+        paths=(USERLAND_DIR / "Jinxfile", DRIVERS_DIR / "include/roanix"),
     )
 
 
@@ -2117,10 +2119,16 @@ def survey(
         components.append(Component("userland", "missing", "sysroot not built"))
     else:
         planned = jinx.preview(manifest.build)
-        if planned:
-            shown = " ".join(planned[:4]) + (" ..." if len(planned) > 4 else "")
+        drivers = stale_rust_drivers(ctx, cache)
+        if planned or drivers:
+            details = []
+            if planned:
+                shown = " ".join(planned[:4]) + (" ..." if len(planned) > 4 else "")
+                details.append(f"{len(planned)} pending in Jinx: {shown}")
+            if drivers:
+                details.append("drivers changed: " + " ".join(drivers))
             components.append(
-                Component("userland", "stale", f"{len(planned)} pending in Jinx: {shown}")
+                Component("userland", "stale", "; ".join(details))
             )
         else:
             components.append(

@@ -1,4 +1,5 @@
 #![no_std]
+#![no_main]
 #![allow(unsafe_code)]
 // The module ABI fixes integer widths, and all controller indices are checked
 // against bounded static arrays before conversion.
