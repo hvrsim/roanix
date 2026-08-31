@@ -9,9 +9,17 @@
 //! address-space lock. Resolving before the copy is what keeps the page-cache
 //! locks and the address-space lock strictly ordered: a caller holding a page
 //! backing lock must never fault, and a window is already faulted in.
+//!
+//! # Aliasing invariant
+//!
+//! These windows follow the kernel's user-memory convention: userspace may
+//! mutate a wired frame concurrently, so its direct-map alias is externally
+//! mutable memory. The `IoSink` borrow prevents competing kernel windows made
+//! through the same sink, while the page wire proves only that the frame stays
+//! resident. Code that needs strict Rust aliasing must copy through raw-pointer
+//! primitives rather than retain one of these slice views.
 
 use core::{
-    marker::PhantomData,
     ops::{Deref, DerefMut},
     slice,
 };
@@ -20,63 +28,69 @@ use alloc::sync::Arc;
 
 use super::{Error, PAGE_SIZE, Result, VirtAddr, map::FaultAccess, page::VmPage, pmap::VmSpace};
 
-/// Resolves one page-bounded window of a user range.
-///
-/// Faults the page in for `access` and wires its frame, so the returned alias
-/// stays valid until the paired window guard drops - however long the caller
-/// keeps it, including across blocking driver callbacks.
-#[allow(clippy::type_complexity)]
-fn resolve_window(
-    space: &VmSpace,
-    address: VirtAddr,
-    offset: usize,
-    maximum: usize,
-    access: FaultAccess,
-) -> Result<(Arc<VmPage>, *mut u8, usize)> {
-    let current = address
-        .as_u64()
-        .checked_add(offset as u64)
-        .map(VirtAddr::new)
-        .ok_or(Error::InvalidAddress)?;
-    let page_remaining = (PAGE_SIZE - (current.as_u64() % PAGE_SIZE)) as usize;
-    let length = maximum.min(page_remaining);
-    let (page, physical) = space.pin_user_page(current, access)?;
-    let pointer = super::phys_to_virt(physical).as_mut_ptr::<u8>();
-    Ok((page, pointer, length))
+/// Wired, page-bounded HHDM alias shared by readable and writable guards.
+struct PinnedWindow {
+    page: Arc<VmPage>,
+    pointer: *mut u8,
+    length: usize,
+}
+
+impl PinnedWindow {
+    /// Faults and wires one user page without allocating or copying payload data.
+    fn resolve(
+        space: &VmSpace,
+        address: VirtAddr,
+        offset: usize,
+        maximum: usize,
+        access: FaultAccess,
+    ) -> Result<Self> {
+        let current = address
+            .as_u64()
+            .checked_add(offset as u64)
+            .map(VirtAddr::new)
+            .ok_or(Error::InvalidAddress)?;
+        let remaining = (PAGE_SIZE - current.as_u64() % PAGE_SIZE) as usize;
+        let (page, physical) = space.pin_user_page(current, access)?;
+        Ok(Self {
+            page,
+            pointer: super::phys_to_virt(physical).as_mut_ptr(),
+            length: maximum.min(remaining),
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `resolve` produced this page-bounded direct-map alias and the
+        // retained wire keeps all bytes live. See the aliasing invariant above.
+        unsafe { slice::from_raw_parts(self.pointer, self.length) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the retained wire keeps this page-bounded alias live; the
+        // guard's mutable borrow excludes another view through the same sink.
+        unsafe { slice::from_raw_parts_mut(self.pointer, self.length) }
+    }
+}
+
+impl Drop for PinnedWindow {
+    fn drop(&mut self) {
+        self.page.release_window();
+    }
+}
+
+enum Window<B> {
+    Kernel(B),
+    User(PinnedWindow),
 }
 
 /// A writable window produced by [`IoSink::window`].
 ///
 /// Dereferences to the window bytes. Dropping it releases the user-frame pin,
 /// so keep the guard alive for exactly as long as the memory is in use.
-pub enum SinkWindow<'a> {
-    /// Kernel-resident window; no pin is required.
-    Kernel(&'a mut [u8]),
-    /// Direct-map alias of one wired user frame.
-    User {
-        /// Holds the frame's logical page, which owns the wire.
-        page: Arc<VmPage>,
-        /// Direct-map start of the window.
-        pointer: *mut u8,
-        /// Window length in bytes, bounded by one page.
-        length: usize,
-        /// Ties the guard to the sink borrow.
-        marker: PhantomData<&'a mut [u8]>,
-    },
-}
+pub struct SinkWindow<'a>(Window<&'a mut [u8]>);
 
 impl SinkWindow<'_> {
     fn empty() -> Self {
-        Self::Kernel(&mut [])
-    }
-}
-
-impl Drop for SinkWindow<'_> {
-    fn drop(&mut self) {
-        if let Self::User { page, .. } = self {
-            // Releases the reclamation wire taken by `pin_user_page`.
-            page.release_window();
-        }
+        Self(Window::Kernel(&mut []))
     }
 }
 
@@ -84,30 +98,18 @@ impl Deref for SinkWindow<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match self {
-            Self::Kernel(buffer) => buffer,
-            Self::User {
-                pointer, length, ..
-            } => {
-                // SAFETY: `resolve_window` produced this aligned direct-map
-                // alias and the retained page keeps all `length` bytes live.
-                unsafe { slice::from_raw_parts_mut(*pointer, *length) }
-            }
+        match &self.0 {
+            Window::Kernel(buffer) => buffer,
+            Window::User(window) => window.as_slice(),
         }
     }
 }
 
 impl DerefMut for SinkWindow<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        match self {
-            Self::Kernel(buffer) => buffer,
-            Self::User {
-                pointer, length, ..
-            } => {
-                // SAFETY: the retained page keeps this unique, page-bounded
-                // direct-map alias writable for `length` bytes.
-                unsafe { slice::from_raw_parts_mut(*pointer, *length) }
-            }
+        match &mut self.0 {
+            Window::Kernel(buffer) => buffer,
+            Window::User(window) => window.as_mut_slice(),
         }
     }
 }
@@ -116,34 +118,11 @@ impl DerefMut for SinkWindow<'_> {
 ///
 /// Dereferences to the window bytes. Dropping it releases the user-frame pin,
 /// so keep the guard alive for exactly as long as the memory is in use.
-pub enum SourceWindow<'a> {
-    /// Kernel-resident window; no pin is required.
-    Kernel(&'a [u8]),
-    /// Direct-map alias of one wired user frame.
-    User {
-        /// Holds the frame's logical page, which owns the wire.
-        page: Arc<VmPage>,
-        /// Direct-map start of the window.
-        pointer: *const u8,
-        /// Window length in bytes, bounded by one page.
-        length: usize,
-        /// Ties the guard to the source borrow.
-        marker: PhantomData<&'a [u8]>,
-    },
-}
+pub struct SourceWindow<'a>(Window<&'a [u8]>);
 
 impl SourceWindow<'_> {
     fn empty() -> Self {
-        Self::Kernel(&[])
-    }
-}
-
-impl Drop for SourceWindow<'_> {
-    fn drop(&mut self) {
-        if let Self::User { page, .. } = self {
-            // Releases the reclamation wire taken by `pin_user_page`.
-            page.release_window();
-        }
+        Self(Window::Kernel(&[]))
     }
 }
 
@@ -151,58 +130,86 @@ impl Deref for SourceWindow<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match self {
-            Self::Kernel(buffer) => buffer,
-            Self::User {
-                pointer, length, ..
-            } => {
-                // SAFETY: `resolve_window` produced this aligned direct-map
-                // alias and the retained page keeps all `length` bytes live.
-                unsafe { slice::from_raw_parts(*pointer, *length) }
-            }
+        match &self.0 {
+            Window::Kernel(buffer) => buffer,
+            Window::User(window) => window.as_slice(),
         }
     }
 }
 
-/// Destination for bytes produced by a read-style operation.
-pub enum IoSink<'a> {
-    /// Kernel-resident destination buffer.
-    Kernel(&'a mut [u8]),
-    /// Range in a user address space.
-    User {
-        /// Address space owning the range.
-        space: &'a VmSpace,
-        /// First byte of the range.
-        address: VirtAddr,
-        /// Range length in bytes.
-        length: usize,
-        /// Ties the borrow to the address space.
-        marker: PhantomData<&'a mut [u8]>,
-    },
+/// Validated userspace range shared by source and sink wrappers.
+struct UserRange<'a> {
+    space: &'a VmSpace,
+    address: VirtAddr,
+    length: usize,
 }
+
+impl<'a> UserRange<'a> {
+    fn new(space: &'a VmSpace, address: VirtAddr, length: usize) -> Result<Self> {
+        space.validate_user(address, length)?;
+        Ok(Self {
+            space,
+            address,
+            length,
+        })
+    }
+
+    fn slice(&self, offset: usize, length: usize) -> Result<UserRange<'_>> {
+        checked_subrange(self.length, offset, length)?;
+        let address = self
+            .address
+            .checked_add(offset as u64)
+            .ok_or(Error::InvalidAddress)?;
+        Ok(UserRange {
+            space: self.space,
+            address,
+            length,
+        })
+    }
+
+    fn window(&self, offset: usize, maximum: usize, access: FaultAccess) -> Result<PinnedWindow> {
+        PinnedWindow::resolve(self.space, self.address, offset, maximum, access)
+    }
+}
+
+fn checked_subrange(total: usize, offset: usize, length: usize) -> Result<core::ops::Range<usize>> {
+    let end = offset.checked_add(length).ok_or(Error::InvalidAddress)?;
+    (end <= total)
+        .then_some(offset..end)
+        .ok_or(Error::InvalidAddress)
+}
+
+fn window_length(total: usize, offset: usize, maximum: usize) -> Result<usize> {
+    total
+        .checked_sub(offset)
+        .map(|available| maximum.min(available))
+        .ok_or(Error::InvalidAddress)
+}
+
+enum Buffer<'a, B> {
+    Kernel(B),
+    User(UserRange<'a>),
+}
+
+/// Destination for bytes produced by a read-style operation.
+pub struct IoSink<'a>(Buffer<'a, &'a mut [u8]>);
 
 impl<'a> IoSink<'a> {
     /// Creates a sink targeting kernel memory.
     pub fn kernel(buffer: &'a mut [u8]) -> Self {
-        Self::Kernel(buffer)
+        Self(Buffer::Kernel(buffer))
     }
 
     /// Creates a sink targeting a validated user range.
     pub fn user(space: &'a VmSpace, address: VirtAddr, length: usize) -> Result<Self> {
-        space.validate_user(address, length)?;
-        Ok(Self::User {
-            space,
-            address,
-            length,
-            marker: PhantomData,
-        })
+        UserRange::new(space, address, length).map(|range| Self(Buffer::User(range)))
     }
 
     /// Returns the total transfer length.
     pub fn len(&self) -> usize {
-        match self {
-            Self::Kernel(buffer) => buffer.len(),
-            Self::User { length, .. } => *length,
+        match &self.0 {
+            Buffer::Kernel(buffer) => buffer.len(),
+            Buffer::User(range) => range.length,
         }
     }
 
@@ -213,23 +220,12 @@ impl<'a> IoSink<'a> {
 
     /// Borrows a shorter sink covering `offset..offset + length`.
     pub fn slice(&mut self, offset: usize, length: usize) -> Result<IoSink<'_>> {
-        let end = offset.checked_add(length).ok_or(Error::InvalidAddress)?;
-        if end > self.len() {
-            return Err(Error::InvalidAddress);
-        }
-        Ok(match self {
-            Self::Kernel(buffer) => IoSink::Kernel(&mut buffer[offset..end]),
-            Self::User { space, address, .. } => IoSink::User {
-                space,
-                address: VirtAddr::new(
-                    address
-                        .as_u64()
-                        .checked_add(offset as u64)
-                        .ok_or(Error::InvalidAddress)?,
-                ),
-                length,
-                marker: PhantomData,
-            },
+        Ok(match &mut self.0 {
+            Buffer::Kernel(buffer) => {
+                let range = checked_subrange(buffer.len(), offset, length)?;
+                IoSink(Buffer::Kernel(&mut buffer[range]))
+            }
+            Buffer::User(range) => IoSink(Buffer::User(range.slice(offset, length)?)),
         })
     }
 
@@ -239,26 +235,19 @@ impl<'a> IoSink<'a> {
     /// the requested count is satisfied. The returned guard pins a user frame
     /// against reclamation; drop it as soon as the bytes are no longer in use.
     pub fn window(&mut self, offset: usize, maximum: usize) -> Result<SinkWindow<'_>> {
-        let available = self
-            .len()
-            .checked_sub(offset)
-            .ok_or(Error::InvalidAddress)?;
-        let maximum = maximum.min(available);
+        let maximum = window_length(self.len(), offset, maximum)?;
         if maximum == 0 {
             return Ok(SinkWindow::empty());
         }
-        match self {
-            Self::Kernel(buffer) => Ok(SinkWindow::Kernel(&mut buffer[offset..offset + maximum])),
-            Self::User { space, address, .. } => {
-                let (page, pointer, length) =
-                    resolve_window(space, *address, offset, maximum, FaultAccess::Write)?;
-                Ok(SinkWindow::User {
-                    page,
-                    pointer,
-                    length,
-                    marker: PhantomData,
-                })
-            }
+        match &mut self.0 {
+            Buffer::Kernel(buffer) => Ok(SinkWindow(Window::Kernel(
+                &mut buffer[offset..offset + maximum],
+            ))),
+            Buffer::User(range) => Ok(SinkWindow(Window::User(range.window(
+                offset,
+                maximum,
+                FaultAccess::Write,
+            )?))),
         }
     }
 
@@ -294,44 +283,24 @@ impl<'a> IoSink<'a> {
 }
 
 /// Source of bytes consumed by a write-style operation.
-pub enum IoSource<'a> {
-    /// Kernel-resident source buffer.
-    Kernel(&'a [u8]),
-    /// Range in a user address space.
-    User {
-        /// Address space owning the range.
-        space: &'a VmSpace,
-        /// First byte of the range.
-        address: VirtAddr,
-        /// Range length in bytes.
-        length: usize,
-        /// Ties the borrow to the address space.
-        marker: PhantomData<&'a [u8]>,
-    },
-}
+pub struct IoSource<'a>(Buffer<'a, &'a [u8]>);
 
 impl<'a> IoSource<'a> {
     /// Creates a source backed by kernel memory.
     pub fn kernel(buffer: &'a [u8]) -> Self {
-        Self::Kernel(buffer)
+        Self(Buffer::Kernel(buffer))
     }
 
     /// Creates a source backed by a validated user range.
     pub fn user(space: &'a VmSpace, address: VirtAddr, length: usize) -> Result<Self> {
-        space.validate_user(address, length)?;
-        Ok(Self::User {
-            space,
-            address,
-            length,
-            marker: PhantomData,
-        })
+        UserRange::new(space, address, length).map(|range| Self(Buffer::User(range)))
     }
 
     /// Returns the total transfer length.
     pub fn len(&self) -> usize {
-        match self {
-            Self::Kernel(buffer) => buffer.len(),
-            Self::User { length, .. } => *length,
+        match &self.0 {
+            Buffer::Kernel(buffer) => buffer.len(),
+            Buffer::User(range) => range.length,
         }
     }
 
@@ -342,23 +311,11 @@ impl<'a> IoSource<'a> {
 
     /// Borrows a shorter source covering `offset..offset + length`.
     pub fn slice(&self, offset: usize, length: usize) -> Result<IoSource<'_>> {
-        let end = offset.checked_add(length).ok_or(Error::InvalidAddress)?;
-        if end > self.len() {
-            return Err(Error::InvalidAddress);
-        }
-        Ok(match self {
-            Self::Kernel(buffer) => IoSource::Kernel(&buffer[offset..end]),
-            Self::User { space, address, .. } => IoSource::User {
-                space,
-                address: VirtAddr::new(
-                    address
-                        .as_u64()
-                        .checked_add(offset as u64)
-                        .ok_or(Error::InvalidAddress)?,
-                ),
-                length,
-                marker: PhantomData,
-            },
+        Ok(match &self.0 {
+            Buffer::Kernel(buffer) => IoSource(Buffer::Kernel(
+                &buffer[checked_subrange(buffer.len(), offset, length)?],
+            )),
+            Buffer::User(range) => IoSource(Buffer::User(range.slice(offset, length)?)),
         })
     }
 
@@ -368,26 +325,19 @@ impl<'a> IoSource<'a> {
     /// the requested count is satisfied. The returned guard pins a user frame
     /// against reclamation; drop it as soon as the bytes are no longer in use.
     pub fn window(&self, offset: usize, maximum: usize) -> Result<SourceWindow<'_>> {
-        let available = self
-            .len()
-            .checked_sub(offset)
-            .ok_or(Error::InvalidAddress)?;
-        let maximum = maximum.min(available);
+        let maximum = window_length(self.len(), offset, maximum)?;
         if maximum == 0 {
             return Ok(SourceWindow::empty());
         }
-        match self {
-            Self::Kernel(buffer) => Ok(SourceWindow::Kernel(&buffer[offset..offset + maximum])),
-            Self::User { space, address, .. } => {
-                let (page, pointer, length) =
-                    resolve_window(space, *address, offset, maximum, FaultAccess::Read)?;
-                Ok(SourceWindow::User {
-                    page,
-                    pointer,
-                    length,
-                    marker: PhantomData,
-                })
-            }
+        match &self.0 {
+            Buffer::Kernel(buffer) => Ok(SourceWindow(Window::Kernel(
+                &buffer[offset..offset + maximum],
+            ))),
+            Buffer::User(range) => Ok(SourceWindow(Window::User(range.window(
+                offset,
+                maximum,
+                FaultAccess::Read,
+            )?))),
         }
     }
 

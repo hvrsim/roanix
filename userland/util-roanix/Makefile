@@ -2,7 +2,7 @@
 CFLAGS ?= -O2 -pipe
 LDFLAGS ?=
 
-PROGRAMS = init dmesg pthread-test proc-test
+PROGRAMS = init dmesg pthread-test proc-test vm-test vm-swap-test
 
 all: $(PROGRAMS)
 

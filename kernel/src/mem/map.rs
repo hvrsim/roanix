@@ -4,7 +4,7 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use bitflags::bitflags;
 
 use crate::mem::{
-    PAGE_SIZE, VirtAddr, align_up,
+    PAGE_SIZE, VirtAddr,
     vmem::{Vmem, VmemError, VmemFit},
 };
 
@@ -63,6 +63,37 @@ pub enum VmPlacement {
     Hint(VirtAddr),
     /// Exactly at the given address; the range must already be free.
     Fixed(VirtAddr),
+}
+
+/// Physical/logical backing selected for a new mapping.
+pub enum VmBacking {
+    /// Private zero-fill memory.
+    Anonymous,
+    /// Pages supplied by a VM object, optionally overlaid for private COW.
+    Object {
+        /// Object providing base pages.
+        object: Arc<VmObject>,
+        /// Byte offset into `object`; must be page aligned.
+        offset: u64,
+        /// Whether writes use a private anonymous overlay.
+        private: bool,
+    },
+}
+
+/// Complete, validated-at-install description of a virtual mapping.
+pub struct VmMapping {
+    /// Address selection policy.
+    pub placement: VmPlacement,
+    /// Requested byte length, rounded up to pages during installation.
+    pub length: u64,
+    /// Initial access permissions.
+    pub protection: VmProtection,
+    /// Permissions later `mprotect` calls may grant.
+    pub maximum_protection: VmProtection,
+    /// Fork inheritance policy.
+    pub inheritance: VmInheritance,
+    /// Source of faulted pages.
+    pub backing: VmBacking,
 }
 
 /// Access-pattern hint associated with a mapping.
@@ -131,7 +162,7 @@ impl AnonMap {
             return Ok(page);
         }
 
-        let page = if Arc::ptr_eq(source, &super::shared_zero_page()) {
+        let page = if super::is_shared_zero_page(source) {
             VmPage::new_zero(index, super::phys::PageOwnerKind::Anonymous)
         } else {
             source.copy_to(index)?
@@ -255,7 +286,7 @@ impl VmMap {
 
     /// Reserves `length` bytes of address space according to `placement`.
     fn reserve(&mut self, placement: VmPlacement, length: u64) -> Result<u64> {
-        let length = checked_page_length(length)?;
+        debug_assert!(length != 0 && length.is_multiple_of(PAGE_SIZE));
         let result = match placement {
             VmPlacement::Any => {
                 let mut entropy = [0u8; 8];
@@ -264,13 +295,24 @@ impl VmMap {
                     .alloc_random(length, PAGE_SIZE, u64::from_ne_bytes(entropy))
             }
             VmPlacement::Hint(hint) => {
-                let hint = align_up(hint.as_u64().max(USER_ADDRESS_MIN), PAGE_SIZE);
-                self.space
-                    .xalloc(length, PAGE_SIZE, hint, USER_ADDRESS_MAX, VmemFit::Instant)
-                    .or_else(|_| self.space.alloc(length, PAGE_SIZE, VmemFit::Instant))
+                let hint = hint.as_u64().max(USER_ADDRESS_MIN);
+                let hinted = hint
+                    .checked_add(PAGE_SIZE - 1)
+                    .map(|value| value & !(PAGE_SIZE - 1))
+                    .filter(|hint| *hint < USER_ADDRESS_MAX)
+                    .and_then(|hint| {
+                        self.space
+                            .xalloc(length, PAGE_SIZE, hint, USER_ADDRESS_MAX, VmemFit::Instant)
+                            .ok()
+                    });
+                hinted.map_or_else(|| self.space.alloc(length, PAGE_SIZE, VmemFit::Instant), Ok)
             }
             VmPlacement::Fixed(start) => {
-                validate_range(start.as_u64(), start.as_u64().saturating_add(length))?;
+                let end = start
+                    .as_u64()
+                    .checked_add(length)
+                    .ok_or(Error::InvalidAddress)?;
+                validate_range(start.as_u64(), end)?;
                 self.space
                     .alloc_fixed(start.as_u64(), length)
                     .map(|()| start.as_u64())
@@ -304,56 +346,42 @@ impl VmMap {
         checked_page_length(length).is_ok_and(|length| self.space.is_free(start.as_u64(), length))
     }
 
-    /// Inserts a private zero-fill anonymous mapping.
-    pub fn map_anonymous(
-        &mut self,
-        placement: VmPlacement,
-        length: u64,
-        protection: VmProtection,
-        maximum_protection: VmProtection,
-        inheritance: VmInheritance,
-    ) -> Result<VirtAddr> {
-        let start = self.reserve(placement, length)?;
-        self.insert(VmMapEntry {
-            start,
-            end: start + checked_page_length(length)?,
-            object: None,
-            object_offset: 0,
-            amap: Some(AnonMap::new()),
-            amap_offset: 0,
+    /// Reserves and inserts a mapping.
+    pub fn map(&mut self, mapping: VmMapping) -> Result<VirtAddr> {
+        let VmMapping {
+            placement,
+            length,
             protection,
             maximum_protection,
             inheritance,
-            advice: VmAdvice::Normal,
-            private: true,
-            needs_copy: false,
-            wired_count: 0,
-        })
-    }
-
-    /// Inserts an object mapping.
-    #[allow(clippy::too_many_arguments)]
-    pub fn map_object(
-        &mut self,
-        placement: VmPlacement,
-        length: u64,
-        object: Arc<VmObject>,
-        object_offset: u64,
-        protection: VmProtection,
-        maximum_protection: VmProtection,
-        inheritance: VmInheritance,
-        private: bool,
-    ) -> Result<VirtAddr> {
-        if !object_offset.is_multiple_of(PAGE_SIZE) {
-            return Err(Error::InvalidAddress);
-        }
+            backing,
+        } = mapping;
+        let length = checked_page_length(length)?;
+        let (object, object_offset, amap, private) = match backing {
+            VmBacking::Anonymous => (None, 0, Some(AnonMap::new()), true),
+            VmBacking::Object {
+                object,
+                offset,
+                private,
+            } => {
+                if !offset.is_multiple_of(PAGE_SIZE) {
+                    return Err(Error::InvalidAddress);
+                }
+                (
+                    Some(object),
+                    offset / PAGE_SIZE,
+                    private.then(AnonMap::new),
+                    private,
+                )
+            }
+        };
         let start = self.reserve(placement, length)?;
         self.insert(VmMapEntry {
             start,
-            end: start + checked_page_length(length)?,
-            object: Some(object),
-            object_offset: object_offset / PAGE_SIZE,
-            amap: private.then(AnonMap::new),
+            end: start + length,
+            object,
+            object_offset,
+            amap,
             amap_offset: 0,
             protection,
             maximum_protection,
@@ -417,62 +445,17 @@ impl VmMap {
     ) -> Result<()> {
         let start = start.as_u64();
         let end = checked_end(start, length)?;
-        let keys = self.overlapping_keys(start, end);
-        if keys.is_empty() {
-            return Err(Error::NotMapped);
-        }
-        let mut covered = start;
+        let keys = self.covered_keys(start, end)?;
         for key in &keys {
             let entry = self
                 .entries
                 .get(key)
                 .expect("mem/map: protected entry vanished during validation");
-            if entry.start > covered {
-                return Err(Error::NotMapped);
-            }
             if !entry.maximum_protection.contains(protection) {
                 return Err(Error::Protection);
             }
-            covered = covered.max(entry.end);
         }
-        if covered < end {
-            return Err(Error::NotMapped);
-        }
-
-        for key in keys {
-            let entry = self
-                .entries
-                .remove(&key)
-                .expect("mem/map: overlapping entry vanished");
-            let middle_start = entry.start.max(start);
-            let middle_end = entry.end.min(end);
-
-            let mut pieces = [(0u64, 0u64); 3];
-            let mut count = 0;
-            if entry.start < start {
-                pieces[count] = (entry.start, start);
-                count += 1;
-            }
-            pieces[count] = (middle_start, middle_end);
-            count += 1;
-            if entry.end > end {
-                pieces[count] = (end, entry.end);
-                count += 1;
-            }
-            self.reserve_clipped(entry.start, &pieces[..count]);
-
-            if entry.start < start {
-                let left = entry.clipped(entry.start, start);
-                self.entries.insert(left.start, left);
-            }
-            let mut middle = entry.clipped(middle_start, middle_end);
-            middle.protection = protection;
-            self.entries.insert(middle.start, middle);
-            if entry.end > end {
-                let right = entry.clipped(end, entry.end);
-                self.entries.insert(right.start, right);
-            }
-        }
+        self.rewrite_range(start, end, keys, |entry| entry.protection = protection);
         self.bump_timestamp();
         Ok(())
     }
@@ -481,17 +464,8 @@ impl VmMap {
     pub fn advise(&mut self, start: VirtAddr, length: u64, advice: VmAdvice) -> Result<()> {
         let start = start.as_u64();
         let end = checked_end(start, length)?;
-        let keys = self.overlapping_keys(start, end);
-        if keys.is_empty() {
-            return Err(Error::NotMapped);
-        }
-        for key in keys {
-            let entry = self
-                .entries
-                .get_mut(&key)
-                .expect("mem/map: advised entry vanished");
-            entry.advice = advice;
-        }
+        let keys = self.covered_keys(start, end)?;
+        self.rewrite_range(start, end, keys, |entry| entry.advice = advice);
         self.bump_timestamp();
         Ok(())
     }
@@ -574,7 +548,7 @@ impl VmMap {
             super::shared_zero_page()
         };
         let mut protection = entry.protection;
-        if entry.private || Arc::ptr_eq(&page, &super::shared_zero_page()) {
+        if entry.private || super::is_shared_zero_page(&page) {
             protection.remove(VmProtection::WRITE);
         }
         Ok(ResolvedPage {
@@ -656,6 +630,9 @@ impl VmMap {
     fn reserve_clipped(&mut self, original: u64, pieces: &[(u64, u64)]) {
         self.release(original);
         for (start, end) in pieces {
+            if start == end {
+                continue;
+            }
             self.space
                 .alloc_fixed(*start, end - start)
                 .expect("mem/map: reclaiming a just-released range must succeed");
@@ -667,6 +644,59 @@ impl VmMap {
             .range(..end)
             .filter_map(|(key, entry)| (entry.end > start).then_some(*key))
             .collect()
+    }
+
+    /// Returns every intersecting entry after proving the range has no holes.
+    fn covered_keys(&self, start: u64, end: u64) -> Result<alloc::vec::Vec<u64>> {
+        let keys = self.overlapping_keys(start, end);
+        let mut covered = start;
+        for key in &keys {
+            let entry = &self.entries[key];
+            if entry.start > covered {
+                return Err(Error::NotMapped);
+            }
+            covered = covered.max(entry.end);
+        }
+        if covered < end {
+            return Err(Error::NotMapped);
+        }
+        Ok(keys)
+    }
+
+    /// Clips each intersecting entry and updates only the requested middle.
+    fn rewrite_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        keys: alloc::vec::Vec<u64>,
+        mut update: impl FnMut(&mut VmMapEntry),
+    ) {
+        for key in keys {
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("mem/map: rewritten entry vanished");
+            let middle_start = entry.start.max(start);
+            let middle_end = entry.end.min(end);
+            let pieces = [
+                (entry.start, middle_start),
+                (middle_start, middle_end),
+                (middle_end, entry.end),
+            ];
+            self.reserve_clipped(entry.start, &pieces);
+
+            if entry.start < middle_start {
+                let left = entry.clipped(entry.start, middle_start);
+                self.entries.insert(left.start, left);
+            }
+            let mut middle = entry.clipped(middle_start, middle_end);
+            update(&mut middle);
+            self.entries.insert(middle.start, middle);
+            if middle_end < entry.end {
+                let right = entry.clipped(middle_end, entry.end);
+                self.entries.insert(right.start, right);
+            }
+        }
     }
 
     fn bump_timestamp(&mut self) {

@@ -3,7 +3,8 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use lz4_flex::block::{compress_into, decompress_into};
+use log::trace;
+use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 
 use crate::{
     mem::PAGE_SIZE,
@@ -11,12 +12,13 @@ use crate::{
 };
 
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
-const MAX_COMPRESSED_PAGE_BYTES: usize = PAGE_BYTES + PAGE_BYTES / 255 + 16;
+const MAX_COMPRESSED_PAGE_BYTES: usize = get_maximum_output_size(PAGE_BYTES);
 
 // The kernel allocator serves requests above half a page from whole pages.
 // Rejecting larger compressed payloads guarantees that front-swap frees more
 // physical memory than its payload allocation consumes.
 const MAX_USEFUL_COMPRESSED_BYTES: usize = PAGE_BYTES / 2;
+const TRACE_SAMPLE_INTERVAL: u64 = 256;
 
 /// Opaque slot allocated by an external swap backend.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -63,8 +65,8 @@ pub trait SwapBackend: Send + Sync {
 }
 
 struct CompressedSlot {
-    /// Reference counted so a page-in can decompress without holding the lock.
-    data: Option<Arc<[u8]>>,
+    /// Temporarily taken during page-in so decompression does not hold the lock.
+    data: Option<Vec<u8>>,
     checksum: u64,
 }
 
@@ -93,7 +95,13 @@ impl SwapState {
             return None;
         }
         self.compressed.try_reserve(1).ok()?;
-        self.free_slots.try_reserve(1).ok()?;
+        // Every live slot can eventually be released without another store
+        // consuming an earlier free entry. Reserve for the complete slot
+        // table, not merely one element beyond the free list's current length.
+        let required = self.compressed.len().checked_add(1)?;
+        self.free_slots
+            .try_reserve(required.saturating_sub(self.free_slots.len()))
+            .ok()?;
         self.compressed.push(CompressedSlot {
             data: None,
             checksum: 0,
@@ -111,6 +119,7 @@ struct SwapManager {
     pageins: AtomicU64,
     pageouts: AtomicU64,
     rejected_pages: AtomicU64,
+    configuration_generation: AtomicU64,
     state: Mutex<SwapState>,
 }
 
@@ -150,6 +159,8 @@ pub(super) fn init(maximum_compressed_bytes: u64, maximum_slots: usize) {
             pageins: AtomicU64::new(0),
             pageouts: AtomicU64::new(0),
             rejected_pages: AtomicU64::new(0),
+            // Zero is reserved for "not rejected" in each logical page.
+            configuration_generation: AtomicU64::new(1),
             state: Mutex::new(SwapState {
                 compressed: Vec::new(),
                 free_slots: Vec::new(),
@@ -169,6 +180,9 @@ pub fn register_backend(backend: Arc<dyn SwapBackend>) -> core::result::Result<(
         return Err(SwapError::Io);
     }
     state.backend = Some(backend);
+    manager
+        .configuration_generation
+        .fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -176,10 +190,16 @@ pub fn register_backend(backend: Arc<dyn SwapBackend>) -> core::result::Result<(
 pub fn unregister_backend() -> core::result::Result<Option<Arc<dyn SwapBackend>>, SwapError> {
     let manager = manager();
     let mut state = manager.state.lock();
-    if manager.external_pages.load(Ordering::Acquire) != 0 || state.external_ops != 0 {
+    if manager.external_pages.load(Ordering::Relaxed) != 0 || state.external_ops != 0 {
         return Err(SwapError::Full);
     }
-    Ok(state.backend.take())
+    let backend = state.backend.take();
+    if backend.is_some() {
+        manager
+            .configuration_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(backend)
 }
 
 pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle, SwapError> {
@@ -191,47 +211,52 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
         .iter()
         .all(|word| u64::from_ne_bytes(*word) == fill)
     {
-        manager.same_fill_pages.fetch_add(1, Ordering::AcqRel);
-        manager.pageouts.fetch_add(1, Ordering::Relaxed);
-        return Ok(SwapHandle::Fill(fill));
+        manager.same_fill_pages.fetch_add(1, Ordering::Relaxed);
+        let handle = SwapHandle::Fill(fill);
+        trace_page_out(manager, handle, 0);
+        return Ok(handle);
     }
 
     let mut output = [0u8; MAX_COMPRESSED_PAGE_BYTES];
     let compressed_len = compress_into(page, &mut output).map_err(|_| SwapError::Incompressible)?;
 
-    if compressed_len <= MAX_USEFUL_COMPRESSED_BYTES {
+    let compressed_error = if compressed_len <= MAX_USEFUL_COMPRESSED_BYTES {
         let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(compressed_len)
-            .map_err(|_| SwapError::Full)?;
-        payload.extend_from_slice(&output[..compressed_len]);
-        let checksum = page_checksum(page);
-        let payload: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
-        let mut state = manager.state.lock();
-        let current = manager.compressed_bytes.load(Ordering::Acquire);
-        let next = current
-            .checked_add(compressed_len as u64)
-            .ok_or(SwapError::Full)?;
-
-        if next <= manager.maximum_compressed_bytes
-            && let Some(slot) = state.take_slot()
-        {
-            let entry = &mut state.compressed[slot as usize];
-            debug_assert!(entry.data.is_none());
-            entry.data = Some(payload);
-            entry.checksum = checksum;
-            manager.compressed_bytes.store(next, Ordering::Release);
-            manager.compressed_pages.fetch_add(1, Ordering::AcqRel);
-            manager.pageouts.fetch_add(1, Ordering::Relaxed);
-            return Ok(SwapHandle::Compressed(u64::from(slot)));
+        if payload.try_reserve_exact(compressed_len).is_ok() {
+            payload.extend_from_slice(&output[..compressed_len]);
+            let checksum = page_checksum(page);
+            let Some(mut state) = manager.state.try_lock() else {
+                return Err(SwapError::Full);
+            };
+            let current = manager.compressed_bytes.load(Ordering::Relaxed);
+            if let Some(next) = current.checked_add(compressed_len as u64)
+                && next <= manager.maximum_compressed_bytes
+                && let Some(slot) = state.take_slot()
+            {
+                let entry = &mut state.compressed[slot as usize];
+                debug_assert!(entry.data.is_none());
+                entry.data = Some(payload);
+                entry.checksum = checksum;
+                manager.compressed_bytes.store(next, Ordering::Relaxed);
+                manager.compressed_pages.fetch_add(1, Ordering::Relaxed);
+                let handle = SwapHandle::Compressed(u64::from(slot));
+                drop(state);
+                trace_page_out(manager, handle, compressed_len);
+                return Ok(handle);
+            }
         }
-    }
+        SwapError::Full
+    } else {
+        manager.rejected_pages.fetch_add(1, Ordering::Relaxed);
+        SwapError::Incompressible
+    };
 
-    manager.rejected_pages.fetch_add(1, Ordering::Relaxed);
     let backend = {
-        let mut state = manager.state.lock();
+        let Some(mut state) = manager.state.try_lock() else {
+            return Err(SwapError::Full);
+        };
         let Some(backend) = state.backend.clone() else {
-            return Err(SwapError::Incompressible);
+            return Err(compressed_error);
         };
         state.external_ops += 1;
         backend
@@ -241,15 +266,17 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
         let mut state = manager.state.lock();
         state.external_ops -= 1;
         if result.is_ok() {
-            manager.external_pages.fetch_add(1, Ordering::AcqRel);
+            manager.external_pages.fetch_add(1, Ordering::Relaxed);
         }
     }
     let slot = result?;
-    manager.pageouts.fetch_add(1, Ordering::Relaxed);
-    Ok(SwapHandle::External(slot))
+    let handle = SwapHandle::External(slot);
+    trace_page_out(manager, handle, PAGE_BYTES);
+    Ok(handle)
 }
 
-pub(super) fn load(
+/// Restores a page and releases its swap storage as one logical operation.
+pub(super) fn load_and_free(
     handle: SwapHandle,
     page: &mut [u8; PAGE_BYTES],
 ) -> core::result::Result<(), SwapError> {
@@ -259,30 +286,58 @@ pub(super) fn load(
             for word in page.as_chunks_mut::<8>().0 {
                 *word = fill.to_ne_bytes();
             }
+            manager.same_fill_pages.fetch_sub(1, Ordering::Relaxed);
         }
         SwapHandle::Compressed(slot) => {
-            // Decompression is the expensive part of a page-in, so the payload
-            // is claimed by reference and expanded with the lock released.
+            // Claim the payload but leave the slot unavailable until decoding
+            // succeeds. On corruption the bytes are restored, so a later drop
+            // cannot accidentally free a slot that has already been reused.
             let (data, checksum) = {
-                let state = manager.state.lock();
+                let mut state = manager.state.lock();
                 let entry = state
                     .compressed
-                    .get(slot as usize)
+                    .get_mut(slot as usize)
                     .ok_or(SwapError::Corrupt)?;
-                let data = entry.data.clone().ok_or(SwapError::Corrupt)?;
+                let data = entry.data.take().ok_or(SwapError::Corrupt)?;
                 (data, entry.checksum)
             };
-            let written = decompress_into(&data, page).map_err(|_| SwapError::Corrupt)?;
-            if written != PAGE_BYTES || page_checksum(page) != checksum {
+            let result = decompress_into(&data, page);
+            if !matches!(result, Ok(PAGE_BYTES)) || page_checksum(page) != checksum {
+                let mut state = manager.state.lock();
+                let entry = state
+                    .compressed
+                    .get_mut(slot as usize)
+                    .ok_or(SwapError::Corrupt)?;
+                debug_assert!(entry.data.is_none());
+                entry.data = Some(data);
                 return Err(SwapError::Corrupt);
             }
+
+            let length = data.len() as u64;
+            let mut state = manager.state.lock();
+            let entry = state
+                .compressed
+                .get_mut(slot as usize)
+                .ok_or(SwapError::Corrupt)?;
+            debug_assert!(entry.data.is_none());
+            entry.checksum = 0;
+            debug_assert!(state.free_slots.len() < state.free_slots.capacity());
+            state.free_slots.push(slot as u32);
+            manager
+                .compressed_bytes
+                .fetch_sub(length, Ordering::Relaxed);
+            manager.compressed_pages.fetch_sub(1, Ordering::Relaxed);
+            drop(state);
+            drop(data);
         }
         SwapHandle::External(slot) => {
             let backend = manager.state.lock().backend.clone().ok_or(SwapError::Io)?;
             backend.load(slot, page)?;
+            backend.free(slot);
+            manager.external_pages.fetch_sub(1, Ordering::Relaxed);
         }
     }
-    manager.pageins.fetch_add(1, Ordering::Relaxed);
+    trace_page_in(manager, handle);
     Ok(())
 }
 
@@ -290,7 +345,7 @@ pub(super) fn free(handle: SwapHandle) {
     let manager = manager();
     match handle {
         SwapHandle::Fill(_) => {
-            manager.same_fill_pages.fetch_sub(1, Ordering::AcqRel);
+            manager.same_fill_pages.fetch_sub(1, Ordering::Relaxed);
         }
         SwapHandle::Compressed(slot) => {
             let mut state = manager.state.lock();
@@ -300,13 +355,16 @@ pub(super) fn free(handle: SwapHandle) {
             if let Some(data) = entry.data.take() {
                 entry.checksum = 0;
                 let length = data.len() as u64;
-                drop(data);
-                manager.compressed_bytes.fetch_sub(length, Ordering::AcqRel);
-                manager.compressed_pages.fetch_sub(1, Ordering::AcqRel);
+                manager
+                    .compressed_bytes
+                    .fetch_sub(length, Ordering::Relaxed);
+                manager.compressed_pages.fetch_sub(1, Ordering::Relaxed);
                 // Capacity was reserved when the slot was created, so this
                 // cannot allocate and the slot can never be stranded.
                 debug_assert!(state.free_slots.len() < state.free_slots.capacity());
                 state.free_slots.push(slot as u32);
+                drop(state);
+                drop(data);
             }
         }
         SwapHandle::External(slot) => {
@@ -321,9 +379,14 @@ pub(super) fn free(handle: SwapHandle) {
             backend.free(slot);
             let mut state = manager.state.lock();
             state.external_ops -= 1;
-            manager.external_pages.fetch_sub(1, Ordering::AcqRel);
+            manager.external_pages.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Returns the generation of the currently configured swap tiers.
+pub(super) fn configuration_generation() -> u64 {
+    manager().configuration_generation.load(Ordering::Relaxed)
 }
 
 /// Returns current swap capacity and traffic counters.
@@ -331,10 +394,10 @@ pub fn stats() -> SwapStats {
     let manager = manager();
     SwapStats {
         maximum_compressed_bytes: manager.maximum_compressed_bytes,
-        compressed_bytes: manager.compressed_bytes.load(Ordering::Acquire),
-        compressed_pages: manager.compressed_pages.load(Ordering::Acquire),
-        same_fill_pages: manager.same_fill_pages.load(Ordering::Acquire),
-        external_pages: manager.external_pages.load(Ordering::Acquire),
+        compressed_bytes: manager.compressed_bytes.load(Ordering::Relaxed),
+        compressed_pages: manager.compressed_pages.load(Ordering::Relaxed),
+        same_fill_pages: manager.same_fill_pages.load(Ordering::Relaxed),
+        external_pages: manager.external_pages.load(Ordering::Relaxed),
         pageins: manager.pageins.load(Ordering::Relaxed),
         pageouts: manager.pageouts.load(Ordering::Relaxed),
         rejected_pages: manager.rejected_pages.load(Ordering::Relaxed),
@@ -343,6 +406,46 @@ pub fn stats() -> SwapStats {
 
 fn manager() -> &'static SwapManager {
     SWAP.get().expect("mem/swap: initialized before use")
+}
+
+fn trace_page_out(manager: &SwapManager, handle: SwapHandle, stored_bytes: usize) {
+    let sequence = manager.pageouts.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace_sample(sequence) {
+        trace!(
+            target: "mem::swap",
+            "page-out #{} handle={:?} stored={}B active={} payload={}B rejected={}",
+            sequence,
+            handle,
+            stored_bytes,
+            active_pages(manager),
+            manager.compressed_bytes.load(Ordering::Relaxed),
+            manager.rejected_pages.load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn trace_page_in(manager: &SwapManager, handle: SwapHandle) {
+    let sequence = manager.pageins.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace_sample(sequence) {
+        trace!(
+            target: "mem::swap",
+            "page-in #{} handle={:?} active={} payload={}B",
+            sequence,
+            handle,
+            active_pages(manager),
+            manager.compressed_bytes.load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn active_pages(manager: &SwapManager) -> u64 {
+    manager.compressed_pages.load(Ordering::Relaxed)
+        + manager.same_fill_pages.load(Ordering::Relaxed)
+        + manager.external_pages.load(Ordering::Relaxed)
+}
+
+fn trace_sample(sequence: u64) -> bool {
+    sequence <= 16 || sequence.is_multiple_of(TRACE_SAMPLE_INTERVAL)
 }
 
 /// Returns an integrity digest over one page.

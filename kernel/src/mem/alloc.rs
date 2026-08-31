@@ -288,7 +288,13 @@ impl HeapState {
         let page_idx = self.reserve_run(1, 1)?;
         let page_va = heap_page_virt(page_idx);
         let root = arch::paging::active_root();
-        let phys_page = phys::alloc_zeroed_page(phys::PageUse::KernelHeap)?;
+        let Some(phys_page) = phys::alloc_zeroed_page(phys::PageUse::KernelHeap) else {
+            // `reserve_run` changes side metadata before physical allocation.
+            // Roll it back on pressure or this virtual page remains Busy
+            // forever and slowly shrinks the heap window after each failure.
+            self.clear_run(page_idx, 1);
+            return None;
+        };
 
         // SAFETY: the reserved heap virtual page is currently unmapped and the
         // new physical page is exclusively owned by the allocator.

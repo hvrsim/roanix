@@ -3,8 +3,8 @@
 use crate::{
     fs::OpenFlags,
     mem::{
-        self, PAGE_SIZE, USER_ADDRESS_MIN, VirtAddr, VmAdvice, VmInheritance, VmPlacement,
-        VmProtection,
+        self, PAGE_SIZE, USER_ADDRESS_MIN, VirtAddr, VmAdvice, VmBacking, VmInheritance, VmMapping,
+        VmPlacement, VmProtection,
     },
     proc::Descriptor,
     syscall::{Errno, current_process, map_fs_error, map_memory_error},
@@ -63,15 +63,69 @@ crate::syscall_handler! {
 
         let process = current_process()?;
         let space = process.address_space();
+        let protection = vm_protection(protection);
+        let inheritance = if flags & MAP_SHARED != 0 {
+            VmInheritance::Share
+        } else {
+            VmInheritance::Copy
+        };
+        // Validate and retain file-backed state before MAP_FIXED tears down an
+        // existing mapping. A bad descriptor or unsupported vnode must leave
+        // the old range intact when mmap fails.
+        let (backing, maximum_protection) = if flags & MAP_ANONYMOUS != 0 {
+            if offset != 0 {
+                return Err(Errno::Invalid);
+            }
+            (VmBacking::Anonymous, all_user_protections())
+        } else {
+            let offset = i64::try_from(offset).map_err(|_| Errno::Invalid)?;
+            if offset % PAGE_SIZE as i64 != 0 {
+                return Err(Errno::Invalid);
+            }
+            let fd = i32::try_from(fd).map_err(|_| Errno::BadFileDescriptor)?;
+            let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+            let Descriptor::File(file) = descriptor else {
+                return Err(Errno::BadFileDescriptor);
+            };
+            if !file.flags().contains(OpenFlags::READ) {
+                return Err(Errno::Access);
+            }
+            if protection.contains(VmProtection::WRITE)
+                && flags & MAP_SHARED != 0
+                && !file.flags().contains(OpenFlags::WRITE)
+            {
+                return Err(Errno::Access);
+            }
+            let vnode = file.vnode();
+            let file_size = vnode.getattr().map_err(map_fs_error)?.size;
+            let mapped_size = file_size
+                .checked_add(PAGE_SIZE - 1)
+                .map(|size| size & !(PAGE_SIZE - 1))
+                .ok_or(Errno::Overflow)?;
+            if (offset as u64)
+                .checked_add(size)
+                .is_none_or(|end| end > mapped_size)
+            {
+                // SIGBUS-on-access is not implemented yet, so reject ranges
+                // that could otherwise fabricate zero pages past EOF.
+                return Err(Errno::Invalid);
+            }
+            let mut maximum = VmProtection::READ | VmProtection::EXECUTE;
+            if flags & MAP_PRIVATE != 0 || file.flags().contains(OpenFlags::WRITE) {
+                maximum |= VmProtection::WRITE;
+            }
+            (
+                VmBacking::Object {
+                    object: vnode.memory_object().map_err(map_fs_error)?,
+                    offset: offset as u64,
+                    private: flags & MAP_PRIVATE != 0,
+                },
+                maximum,
+            )
+        };
         let placement = if flags & MAP_FIXED != 0 {
             if hint < USER_ADDRESS_MIN || !hint.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::Invalid);
-            }
-            // A fixed mapping replaces whatever occupies the range, so the
-            // range is cleared before it is reserved again.
-            match space.unmap(VirtAddr::new(hint), size) {
-                Ok(()) | Err(mem::Error::NotMapped) => {}
-                Err(error) => return Err(map_memory_error(error)),
             }
             VmPlacement::Fixed(VirtAddr::new(hint))
         } else if hint == 0 {
@@ -79,48 +133,21 @@ crate::syscall_handler! {
         } else {
             VmPlacement::Hint(VirtAddr::new(hint))
         };
-        let protection = vm_protection(protection);
-        let inheritance = if flags & MAP_SHARED != 0 {
-            VmInheritance::Share
-        } else {
-            VmInheritance::Copy
+        let replace = matches!(placement, VmPlacement::Fixed(_));
+        let mapping = VmMapping {
+            placement,
+            length: size,
+            protection,
+            maximum_protection,
+            inheritance,
+            backing,
         };
-
-        let start = if flags & MAP_ANONYMOUS != 0 {
-            space
-                .map_anonymous(placement, size, protection, protection, inheritance)
-                .map_err(map_memory_error)?
+        let start = if replace {
+            space.replace(mapping)
         } else {
-            let offset = offset as i64;
-            if offset < 0 || !(offset as u64).is_multiple_of(PAGE_SIZE) {
-                return Err(Errno::Invalid);
-            }
-            let fd = fd as i32;
-            let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
-            let Descriptor::File(file) = descriptor else {
-                return Err(Errno::BadFileDescriptor);
-            };
-            if protection.contains(VmProtection::WRITE)
-                && flags & MAP_SHARED != 0
-                && !file.flags().contains(OpenFlags::WRITE)
-            {
-                return Err(Errno::Access);
-            }
-            let object = file.vnode().memory_object().map_err(map_fs_error)?;
-            space
-                .map_object(
-                    placement,
-                    size,
-                    object,
-                    offset as u64,
-                    protection,
-                    protection,
-                    inheritance,
-                    flags & MAP_PRIVATE != 0,
-                )
-                .map_err(map_memory_error)?
+            space.map(mapping)
         };
-        Ok(start.as_u64())
+        Ok(start.map_err(map_memory_error)?.as_u64())
     }
 }
 
@@ -170,8 +197,9 @@ crate::syscall_handler! {
             MADV_NORMAL => VmAdvice::Normal,
             MADV_RANDOM => VmAdvice::Random,
             MADV_SEQUENTIAL => VmAdvice::Sequential,
-            MADV_WILLNEED => VmAdvice::WillNeed,
-            MADV_DONTNEED => VmAdvice::DontNeed,
+            // These commands require prefault/discard semantics; accepting
+            // them as inert hints would mislead callers about data lifetime.
+            MADV_WILLNEED | MADV_DONTNEED => return Err(Errno::NotSupported),
             _ => return Err(Errno::Invalid),
         };
         current_process()?
@@ -194,4 +222,8 @@ fn vm_protection(bits: u64) -> VmProtection {
         protection |= VmProtection::EXECUTE;
     }
     protection
+}
+
+fn all_user_protections() -> VmProtection {
+    VmProtection::READ | VmProtection::WRITE | VmProtection::EXECUTE
 }

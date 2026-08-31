@@ -5,7 +5,7 @@
 //! compressed swap, reclamation, address spaces, and TLB coordination.
 //!
 
-use ::alloc::{sync::Arc, vec::Vec};
+use ::alloc::sync::Arc;
 use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
@@ -43,8 +43,8 @@ pub(crate) use alloc::HEAP_BASE;
 pub use error::{Error, Result};
 pub use io::{IoSink, IoSource, SinkWindow, SourceWindow};
 pub use map::{
-    FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmInheritance, VmMap,
-    VmMapEntry, VmPlacement, VmProtection,
+    FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmBacking,
+    VmInheritance, VmMap, VmMapEntry, VmMapping, VmPlacement, VmProtection,
 };
 pub use object::{ObjectKind, PageAccount, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};
@@ -85,12 +85,21 @@ struct MemoryState {
     reclaimed_pages: AtomicU64,
     faults: AtomicU64,
     promotions: AtomicU64,
+    reclaiming: AtomicBool,
     daemon_started: AtomicBool,
     zero_page: Once<Arc<VmPage>>,
 }
 
 struct MigrationPin {
     thread: Option<*mut crate::sys::thread::Thread>,
+}
+
+struct ReclaimGuard(&'static AtomicBool);
+
+impl Drop for ReclaimGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl MigrationPin {
@@ -150,7 +159,6 @@ pub fn init() {
     phys::init();
     alloc::init();
     init_state();
-    kstack::init();
 }
 
 fn init_state() {
@@ -175,6 +183,7 @@ fn init_state() {
         reclaimed_pages: AtomicU64::new(0),
         faults: AtomicU64::new(0),
         promotions: AtomicU64::new(0),
+        reclaiming: AtomicBool::new(false),
         daemon_started: AtomicBool::new(false),
         zero_page: Once::new(),
     });
@@ -226,9 +235,22 @@ pub fn stats() -> VmStats {
 
 /// Reclaims up to `target` resident pages synchronously.
 pub fn reclaim_now(target: usize) -> usize {
+    let reclaiming = &state().reclaiming;
+    if reclaiming
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return 0;
+    }
+    let _guard = ReclaimGuard(reclaiming);
     let mut reclaimed = 0usize;
     let mut attempts = 0usize;
     while reclaimed < target && attempts < target.saturating_mul(4).max(PAGE_SCAN_BATCH) {
+        if phys::managed_queues_empty() {
+            // A backend change or hardware write may have made parked pages
+            // eligible again. Keep this bounded like the normal scan.
+            reconsider_unswappable(PAGE_SCAN_BATCH);
+        }
         phys::age_active(PAGE_SCAN_BATCH);
         let progress = scan_inactive(PAGE_SCAN_BATCH, target - reclaimed);
         reclaimed += progress;
@@ -236,6 +258,20 @@ pub fn reclaim_now(target: usize) -> usize {
         if progress == 0 && phys::managed_queues_empty() {
             break;
         }
+    }
+    if reclaimed >= PAGE_SCAN_BATCH {
+        let swap = swap::stats();
+        debug!(
+            target: "mem::swap",
+            "reclaimed {} pages (resident={}, swapped={}, payload={} KiB, in={}, out={}, rejected={})",
+            reclaimed,
+            phys::stats().map_or(0, |stats| stats.managed_pages),
+            swap.compressed_pages + swap.same_fill_pages + swap.external_pages,
+            swap.compressed_bytes / 1024,
+            swap.pageins,
+            swap.pageouts,
+            swap.rejected_pages,
+        );
     }
     reclaimed
 }
@@ -358,6 +394,13 @@ pub(super) fn shared_zero_page() -> Arc<VmPage> {
         .expect("mem: shared zero page is not initialized")
 }
 
+pub(super) fn is_shared_zero_page(page: &Arc<VmPage>) -> bool {
+    state()
+        .zero_page
+        .get()
+        .is_some_and(|zero| Arc::ptr_eq(page, zero))
+}
+
 pub(super) fn allocate_physical_page() -> Result<&'static phys::Page> {
     if let Some(stats) = phys::stats()
         && stats.free_pages as u64 <= state().low_watermark
@@ -371,6 +414,20 @@ pub(super) fn allocate_physical_page() -> Result<&'static phys::Page> {
         return Ok(page);
     }
     let _ = reclaim_now(PAGE_SCAN_BATCH);
+    phys::alloc_zeroed_page(phys::PageUse::Managed).ok_or(Error::OutOfMemory)
+}
+
+/// Allocates the destination of a swap-in without first creating more swap.
+///
+/// Normal faults refill the free-page high watermark before allocating. A
+/// page-in must instead consume the existing reserve first: reclaiming while
+/// the compressed tier is full can only make progress after this load releases
+/// its old slot.
+pub(super) fn allocate_pagein_physical_page() -> Result<&'static phys::Page> {
+    if let Some(page) = phys::alloc_zeroed_page(phys::PageUse::Managed) {
+        return Ok(page);
+    }
+    let _ = reclaim_now(1);
     phys::alloc_zeroed_page(phys::PageUse::Managed).ok_or(Error::OutOfMemory)
 }
 
@@ -415,17 +472,6 @@ pub fn is_direct_mapped(pa: PhysAddr) -> bool {
         let end = entry.base.saturating_add(entry.length);
         (entry.base..end).contains(&address)
     })
-}
-
-/// Publishes `shootdown` and then drops the retired mapping references.
-///
-/// The references outlive the invalidation so a frame cannot be recycled while
-/// another CPU still holds a translation for it.
-fn retire_mappings(shootdown: tlb::Shootdown, pages: Vec<Arc<VmPage>>) {
-    shootdown.commit();
-    for page in pages {
-        page.release_mapping();
-    }
 }
 
 /// Publishes kernel mapping or permission changes to every online CPU.
@@ -474,6 +520,7 @@ pub fn virt_to_phys_hhdm(va: VirtAddr) -> Option<PhysAddr> {
 fn page_daemon() -> ! {
     loop {
         clock::sleep(PAGE_DAEMON_INTERVAL);
+        reconsider_unswappable(32);
         let free = phys::stats().map_or(0, |stats| stats.free_pages as u64);
         if free < state().high_watermark {
             let target = state().high_watermark.saturating_sub(free) as usize;
@@ -482,6 +529,23 @@ fn page_daemon() -> ! {
             phys::age_active(32);
             let _ = phys::zero_free_pages(8);
         }
+    }
+}
+
+/// Samples parked pages for hardware writes and swap-tier changes.
+fn reconsider_unswappable(maximum: usize) {
+    let mut candidates: [Option<Arc<VmPage>>; PAGE_SCAN_BATCH] = core::array::from_fn(|_| None);
+    let mut count = 0usize;
+    while count < maximum.min(PAGE_SCAN_BATCH) {
+        let Some(page) = phys::next_unswappable_owner() else {
+            break;
+        };
+        candidates[count] = Some(page);
+        count += 1;
+    }
+    pmap::harvest_page_states(&candidates[..count]);
+    for page in candidates[..count].iter().flatten() {
+        page.reconsider_unswappable();
     }
 }
 
@@ -502,8 +566,10 @@ fn scan_inactive(maximum: usize, target: usize) -> usize {
     for page in candidates[..count].iter().flatten() {
         if page.take_referenced() {
             page.reactivate();
-        } else if reclaimed < target && page.try_reclaim() {
-            reclaimed += 1;
+        } else if reclaimed < target {
+            if page.try_reclaim() {
+                reclaimed += 1;
+            }
         } else {
             page.reactivate();
         }

@@ -12,8 +12,8 @@ use xmas_elf::{
 use crate::{
     fs::{self, OpenFlags},
     mem::{
-        ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmInheritance, VmObject, VmPlacement,
-        VmProtection, VmSpace, align_down,
+        ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmBacking, VmInheritance, VmMapping,
+        VmObject, VmPlacement, VmProtection, VmSpace, align_down,
     },
 };
 
@@ -303,16 +303,18 @@ fn map_elf(
         if object.write_at(page_offset, payload)? != payload.len() {
             return Err(Error::Memory(crate::mem::Error::OutOfMemory));
         }
-        let _ = space.map_object(
-            VmPlacement::Fixed(VirtAddr::new(start)),
+        let _ = space.map(VmMapping {
+            placement: VmPlacement::Fixed(VirtAddr::new(start)),
             length,
-            object,
-            0,
             protection,
-            protection,
-            VmInheritance::Copy,
-            true,
-        )?;
+            maximum_protection: protection,
+            inheritance: VmInheritance::Copy,
+            backing: VmBacking::Object {
+                object,
+                offset: 0,
+                private: true,
+            },
+        })?;
     }
 
     let program_headers = if let Some(address) = spec.program_header_address {
@@ -441,16 +443,18 @@ fn build_stack(
         return Err(Error::Memory(crate::mem::Error::OutOfMemory));
     }
     let protection = VmProtection::READ | VmProtection::WRITE;
-    let _ = space.map_object(
-        VmPlacement::Fixed(VirtAddr::new(stack_base)),
-        STACK_SIZE,
-        object,
-        0,
+    let _ = space.map(VmMapping {
+        placement: VmPlacement::Fixed(VirtAddr::new(stack_base)),
+        length: STACK_SIZE,
         protection,
-        protection,
-        VmInheritance::Copy,
-        true,
-    )?;
+        maximum_protection: protection,
+        inheritance: VmInheritance::Copy,
+        backing: VmBacking::Object {
+            object,
+            offset: 0,
+            private: true,
+        },
+    })?;
     Ok(stack_base + cursor as u64)
 }
 

@@ -135,28 +135,20 @@ impl VmObject {
 
     /// Returns an existing page or instantiates a zero-filled page.
     pub fn get_or_create_page(&self, index: u64) -> Result<Arc<VmPage>> {
-        self.get_or_create_page_inner(index).map(|(page, _)| page)
-    }
-
-    fn get_or_create_page_inner(&self, index: u64) -> Result<(Arc<VmPage>, bool)> {
         let mut pages = self.pages.lock();
         if let Some(page) = pages.get(&index) {
-            return Ok((page.clone(), false));
+            return Ok(page.clone());
         }
         if let Some(account) = &self.account {
             account.reserve()?;
         }
         let page = VmPage::new_zero(index, super::page::owner_kind_for_object(self.kind));
         pages.insert(index, page.clone());
-        Ok((page, true))
+        Ok(page)
     }
 
     /// Returns the page used for a read or write fault.
-    pub fn fault_page(&self, index: u64, write: bool) -> Result<Arc<VmPage>> {
-        if let Some(page) = self.page(index) {
-            return Ok(page);
-        }
-        let _ = write;
+    pub fn fault_page(&self, index: u64, _write: bool) -> Result<Arc<VmPage>> {
         self.get_or_create_page(index)
     }
 
@@ -266,7 +258,12 @@ impl VmObject {
                     if let Some(account) = &self.account {
                         account.release(1);
                     }
-                    existing.write(page_offset, &window)?;
+                    if let Err(error) = existing.write(page_offset, &window) {
+                        if written != 0 {
+                            return Ok(written);
+                        }
+                        return Err(error);
+                    }
                 } else {
                     pages.insert(page_index, page);
                 }
@@ -311,7 +308,7 @@ impl VmObject {
     pub fn remove_page(&self, index: u64) -> Option<Arc<VmPage>> {
         let page = self.pages.lock().remove(&index);
         if let Some(page) = &page {
-            super::pmap::remove_all_mappings(page);
+            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
         }
         if page.is_some()
             && let Some(account) = &self.account

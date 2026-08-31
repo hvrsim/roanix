@@ -160,22 +160,45 @@ impl Vmem {
     ///
     /// Spans must not overlap resource already present in the arena.
     pub fn add_span(&mut self, base: u64, size: u64) -> Result<()> {
-        if size == 0
-            || !base.is_multiple_of(self.quantum)
-            || !size.is_multiple_of(self.quantum)
-            || base.checked_add(size).is_none()
-        {
+        let Some(end) = base.checked_add(size) else {
+            return Err(VmemError::Invalid);
+        };
+        let Some(total) = self.total.checked_add(size) else {
+            return Err(VmemError::Invalid);
+        };
+        if size == 0 || !base.is_multiple_of(self.quantum) || !size.is_multiple_of(self.quantum) {
             return Err(VmemError::Invalid);
         }
 
-        let after = self.tail;
+        // Span markers also keep adjacent imports from coalescing. Locate the
+        // insertion point in address order and reject any intersecting span.
+        let mut before = NIL;
+        let mut index = self.head;
+        while index != NIL {
+            let segment = self.segments[index as usize];
+            if segment.kind == SegmentKind::Span {
+                if base < segment.end() && segment.base < end {
+                    return Err(VmemError::Invalid);
+                }
+                if base < segment.base {
+                    before = index;
+                    break;
+                }
+            }
+            index = segment.next;
+        }
+
         let span = self.new_segment(base, size, SegmentKind::Span);
-        self.link_after(after, span);
+        if before == NIL {
+            self.link_after(self.tail, span);
+        } else {
+            self.link_before(before, span);
+        }
         let free = self.new_segment(base, size, SegmentKind::Free);
         self.link_after(span, free);
         self.push_free(free);
         self.by_base.insert(base, free);
-        self.total += size;
+        self.total = total;
         Ok(())
     }
 

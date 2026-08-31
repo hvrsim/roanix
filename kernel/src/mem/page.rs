@@ -1,7 +1,10 @@
 //! Logical memory pages backed by authoritative PFN database entries.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::ptr;
+use core::{
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     mem::{self, PAGE_SIZE, PhysAddr, phys, phys::PageOwnerKind},
@@ -11,7 +14,7 @@ use crate::{
 use super::{
     Error, Result,
     pmap::{PmapInner, ReverseMapping},
-    swap::{self, SwapHandle},
+    swap::{self, SwapError, SwapHandle},
 };
 
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
@@ -64,6 +67,8 @@ pub struct VmPage {
     /// survives eviction and so that per-frame metadata stays free of owning
     /// collections.
     mappings: Mutex<Vec<ReverseMapping>>,
+    /// Swap configuration generation that rejected these unchanged contents.
+    swap_reject_generation: AtomicU64,
     permanent: bool,
 }
 
@@ -75,6 +80,7 @@ impl VmPage {
             owner_kind,
             backing: Mutex::new(PageBacking::Zero),
             mappings: Mutex::new(Vec::new()),
+            swap_reject_generation: AtomicU64::new(0),
             permanent: false,
         })
     }
@@ -87,6 +93,7 @@ impl VmPage {
             owner_kind: PageOwnerKind::Kernel,
             backing: Mutex::new(PageBacking::Resident(frame)),
             mappings: Mutex::new(Vec::new()),
+            swap_reject_generation: AtomicU64::new(0),
             permanent: true,
         });
         frame.bind_owner(&page, PageOwnerKind::Kernel);
@@ -181,9 +188,9 @@ impl VmPage {
             return Ok(());
         }
 
-        let (frame, became_resident) = {
+        let frame = {
             let mut backing = self.backing.lock();
-            let became_resident = self.ensure_resident_locked(&mut backing)?;
+            self.ensure_resident_locked(&mut backing)?;
             let PageBacking::Resident(frame) = &*backing else {
                 unreachable!("mem/page: resident page lost backing");
             };
@@ -200,11 +207,9 @@ impl VmPage {
                     input.len(),
                 );
             }
-            (*frame, became_resident)
+            *frame
         };
-        if became_resident {
-            phys::activate_managed(frame, self);
-        }
+        self.mark_modified(frame);
         Ok(())
     }
 
@@ -215,9 +220,9 @@ impl VmPage {
             return Ok(());
         }
 
-        let (frame, became_resident) = {
+        let frame = {
             let mut backing = self.backing.lock();
-            let became_resident = self.ensure_resident_locked(&mut backing)?;
+            self.ensure_resident_locked(&mut backing)?;
             let PageBacking::Resident(frame) = &*backing else {
                 unreachable!("mem/page: resident page lost backing");
             };
@@ -234,11 +239,9 @@ impl VmPage {
                     length,
                 );
             }
-            (*frame, became_resident)
+            *frame
         };
-        if became_resident {
-            phys::activate_managed(frame, self);
-        }
+        self.mark_modified(frame);
         Ok(())
     }
 
@@ -405,12 +408,20 @@ impl VmPage {
             return false;
         }
 
+        if self.swap_rejected_for_current_configuration() {
+            let backing = self.backing.lock();
+            if let PageBacking::Resident(frame) = &*backing {
+                phys::park_unswappable(frame, self);
+            }
+            return false;
+        }
+
         let mapped = {
             let backing = self.backing.lock();
             matches!(&*backing, PageBacking::Resident(frame) if frame.map_count() != 0)
         };
         if mapped {
-            super::pmap::remove_all_mappings(self);
+            super::pmap::try_remove_all_mappings(self);
         }
 
         let mut backing = self.backing.lock();
@@ -429,14 +440,23 @@ impl VmPage {
         let bytes = unsafe { &*mem::phys_to_virt(frame.paddr()).as_ptr::<[u8; PAGE_BYTES]>() };
         let handle = match swap::store(bytes) {
             Ok(handle) => handle,
-            Err(_) => {
+            Err(error) => {
                 let _ = frame.unbusy();
+                if error == SwapError::Incompressible {
+                    self.swap_reject_generation
+                        .store(swap::configuration_generation(), Ordering::Relaxed);
+                }
                 drop(backing);
-                phys::activate_managed(frame, self);
+                if error == SwapError::Incompressible {
+                    phys::park_unswappable(frame, self);
+                } else {
+                    phys::activate_managed(frame, self);
+                }
                 return false;
             }
         };
 
+        self.swap_reject_generation.store(0, Ordering::Relaxed);
         *backing = PageBacking::Swapped(handle);
         let _ = frame.unbusy();
         frame.mark_clean();
@@ -455,15 +475,35 @@ impl VmPage {
         }
     }
 
-    pub(super) fn record_hardware_state(&self, referenced: bool, dirty: bool) {
-        let backing = self.backing.lock();
-        if let PageBacking::Resident(frame) = &*backing {
+    pub(super) fn record_hardware_state(self: &Arc<Self>, referenced: bool, dirty: bool) {
+        let frame = {
+            let backing = self.backing.lock();
+            let PageBacking::Resident(frame) = &*backing else {
+                return;
+            };
             if referenced {
                 frame.mark_referenced();
             }
             if dirty {
                 frame.mark_dirty();
             }
+            *frame
+        };
+        if dirty {
+            self.mark_modified(frame);
+        }
+    }
+
+    /// Requeues a parked page when it changed or the available swap tiers did.
+    pub(super) fn reconsider_unswappable(self: &Arc<Self>) {
+        let backing = self.backing.lock();
+        let PageBacking::Resident(frame) = &*backing else {
+            return;
+        };
+        if self.swap_rejected_for_current_configuration() {
+            phys::park_unswappable(frame, self);
+        } else {
+            phys::activate_managed(frame, self);
         }
     }
 
@@ -498,24 +538,39 @@ impl VmPage {
                 Ok(true)
             }
             PageBacking::Swapped(handle) => {
-                let frame = super::allocate_physical_page()?;
+                let frame = super::allocate_pagein_physical_page()?;
                 // SAFETY: the new managed frame is exclusively owned and
                 // writable through its HHDM mapping.
                 let output = unsafe {
                     &mut *mem::phys_to_virt(frame.paddr()).as_mut_ptr::<[u8; PAGE_BYTES]>()
                 };
-                if swap::load(handle, output).is_err() {
+                if let Err(error) = swap::load_and_free(handle, output) {
                     // SAFETY: the frame was never published or bound.
                     unsafe { phys::free_page(frame) };
-                    return Err(Error::CorruptSwap);
+                    return Err(match error {
+                        SwapError::Corrupt => Error::CorruptSwap,
+                        SwapError::Full | SwapError::Incompressible | SwapError::Io => {
+                            Error::SwapUnavailable
+                        }
+                    });
                 }
-                swap::free(handle);
+                self.swap_reject_generation.store(0, Ordering::Relaxed);
                 frame.bind_owner(self, self.owner_kind);
                 frame.mark_referenced();
                 *backing = PageBacking::Resident(frame);
                 Ok(true)
             }
         }
+    }
+
+    fn mark_modified(self: &Arc<Self>, frame: &'static phys::Page) {
+        self.swap_reject_generation.store(0, Ordering::Relaxed);
+        phys::activate_managed(frame, self);
+    }
+
+    fn swap_rejected_for_current_configuration(&self) -> bool {
+        let generation = self.swap_reject_generation.load(Ordering::Relaxed);
+        generation != 0 && generation == swap::configuration_generation()
     }
 }
 

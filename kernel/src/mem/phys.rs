@@ -123,6 +123,8 @@ pub enum PageQueue {
     Active = 1,
     /// Reclamation candidate.
     Inactive = 2,
+    /// Unchanged page that no configured swap tier can represent.
+    Unswappable = 3,
 }
 
 /// Authoritative metadata for one physical page frame.
@@ -450,6 +452,7 @@ struct PmmState {
     zero: LinkedList<FreePageAdapter>,
     active: LinkedList<ManagedPageAdapter>,
     inactive: LinkedList<ManagedPageAdapter>,
+    unswappable: LinkedList<ManagedPageAdapter>,
 }
 
 struct PageCache {
@@ -613,6 +616,7 @@ pub fn init() {
         zero: LinkedList::new(FreePageAdapter::NEW),
         active: LinkedList::new(ManagedPageAdapter::NEW),
         inactive: LinkedList::new(ManagedPageAdapter::NEW),
+        unswappable: LinkedList::new(ManagedPageAdapter::NEW),
     };
     let mut used_pages = 0usize;
     let mut free_pages = 0usize;
@@ -972,22 +976,60 @@ pub fn stats() -> Option<PhysStats> {
 }
 
 pub(crate) fn activate_managed(page: &'static Page, owner: &Arc<VmPage>) {
-    if page.queue() != PageQueue::None {
+    if page.queue() == PageQueue::Active {
         return;
     }
     let mut guard = PMM.lock();
     let state = guard.as_mut().expect("mem/phys: not initialized");
-    if page.queue() == PageQueue::None {
-        debug_assert!(
-            page.owner
-                .lock()
-                .as_ref()
-                .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
-            "mem/phys: queueing a frame for a page that does not own it"
-        );
-        page.set_status_field(QUEUE_SHIFT, PageQueue::Active as u8);
-        state.active.push_back(page);
+    debug_assert!(
+        page.owner
+            .lock()
+            .as_ref()
+            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
+        "mem/phys: queueing a frame for a page that does not own it"
+    );
+    match page.queue() {
+        PageQueue::None => {}
+        PageQueue::Active => return,
+        PageQueue::Inactive => {
+            // SAFETY: queue state and the PMM lock prove list membership.
+            unsafe {
+                state
+                    .inactive
+                    .cursor_mut_from_ptr(page as *const Page)
+                    .remove();
+            }
+        }
+        PageQueue::Unswappable => {
+            // SAFETY: queue state and the PMM lock prove list membership.
+            unsafe {
+                state
+                    .unswappable
+                    .cursor_mut_from_ptr(page as *const Page)
+                    .remove();
+            }
+        }
     }
+    page.set_status_field(QUEUE_SHIFT, PageQueue::Active as u8);
+    state.active.push_back(page);
+}
+
+/// Parks an unchanged page that the configured swap tiers rejected.
+pub(crate) fn park_unswappable(page: &'static Page, owner: &Arc<VmPage>) {
+    let mut guard = PMM.lock();
+    let state = guard.as_mut().expect("mem/phys: not initialized");
+    if page.queue() != PageQueue::None {
+        return;
+    }
+    debug_assert!(
+        page.owner
+            .lock()
+            .as_ref()
+            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
+        "mem/phys: parking a frame for a page that does not own it"
+    );
+    page.set_status_field(QUEUE_SHIFT, PageQueue::Unswappable as u8);
+    state.unswappable.push_back(page);
 }
 
 pub(crate) fn remove_managed(page: &'static Page) {
@@ -1009,6 +1051,15 @@ pub(crate) fn remove_managed(page: &'static Page) {
             unsafe {
                 state
                     .inactive
+                    .cursor_mut_from_ptr(page as *const Page)
+                    .remove();
+            }
+        }
+        PageQueue::Unswappable => {
+            // SAFETY: queue state and the PMM lock prove list membership.
+            unsafe {
+                state
+                    .unswappable
                     .cursor_mut_from_ptr(page as *const Page)
                     .remove();
             }
@@ -1048,6 +1099,23 @@ pub(crate) fn next_inactive_owner() -> Option<Arc<VmPage>> {
             continue;
         }
         return Some(owner);
+    }
+}
+
+/// Detaches one parked page so its dirty bits or swap configuration can be
+/// reconsidered without putting it back into the normal reclaim rotation.
+pub(crate) fn next_unswappable_owner() -> Option<Arc<VmPage>> {
+    loop {
+        let owner = {
+            let mut guard = PMM.lock();
+            let state = guard.as_mut().expect("mem/phys: not initialized");
+            let page = state.unswappable.pop_front()?;
+            page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
+            page.owner()
+        };
+        if let Some(owner) = owner {
+            return Some(owner);
+        }
     }
 }
 
@@ -1261,6 +1329,7 @@ fn decode_page_queue(value: u8) -> PageQueue {
         0 => PageQueue::None,
         1 => PageQueue::Active,
         2 => PageQueue::Inactive,
+        3 => PageQueue::Unswappable,
         _ => panic!("mem/phys: invalid page queue {value}"),
     }
 }

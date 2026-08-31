@@ -1430,7 +1430,12 @@ impl Scheduler {
             let kick_local = {
                 let mut cpu = self.cpu(target_cpu).lock();
                 let thread = thread_mut(thread_ptr);
-                let waking_current = cpu.current_thread() == Some(thread_ptr);
+                // `current` still names the outgoing thread while trap return
+                // drops this lock to steal work. Once `unwinding` is set, a
+                // wake must enqueue that thread; treating it as still running
+                // would let the switch complete to idle and lose the wakeup.
+                let waking_current =
+                    cpu.current_thread() == Some(thread_ptr) && cpu.unwinding != Some(thread_ptr);
                 let had_runnable = cpu.runq.has_runnable();
                 assert_eq!(
                     thread.state,
@@ -1504,7 +1509,7 @@ impl Scheduler {
             // A blocked thread can still be the owner's current thread in the
             // small `park_current -> int` handoff window. Keep that wake local
             // so we never run the same kernel stack on two CPUs at once.
-            if owner.current_thread() == Some(thread_ptr) {
+            if owner.current_thread() == Some(thread_ptr) && owner.unwinding != Some(thread_ptr) {
                 let _ = self.finish_wakeup(thread, now_ns);
                 thread.mark_running(owner_cpu, now_ns);
                 owner.need_resched = false;

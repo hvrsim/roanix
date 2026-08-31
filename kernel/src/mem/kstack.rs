@@ -12,10 +12,10 @@
 //! | guard page (unmapped) | stack pages ... | <- stack top
 //! ```
 //!
-//! The arena occupies a single top-level page-table entry, and a permanently
-//! mapped sentinel forces that entry to exist before the first user address
-//! space is created. User roots copy the kernel half at creation time, so
-//! every later slot mapping is shared automatically.
+//! The arena occupies a single top-level page-table entry. Memory
+//! initialization pre-populates every kernel-half top-level entry before the
+//! first user address space is created, so later slot mappings are shared
+//! automatically without a permanent sentinel stack.
 //!
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -48,10 +48,6 @@ const BITMAP_WORDS: usize = SLOT_COUNT.div_ceil(64);
 
 const _: () = assert!(ARENA_SIZE.is_power_of_two());
 const _: () = assert!(SLOT_COUNT * SLOT_PAGES * (PAGE_SIZE as usize) == ARENA_SIZE as usize);
-
-/// Slot 0 is permanently reserved for the sentinel mapping that pins the
-/// arena's top-level page-table entry.
-const SENTINEL_SLOT: usize = 0;
 
 struct Arena {
     words: [u64; BITMAP_WORDS],
@@ -103,16 +99,6 @@ impl Arena {
         None
     }
 
-    fn reserve(&mut self, slot: usize) {
-        assert!(slot < SLOT_COUNT, "mem/kstack: slot {slot} out of range");
-        let mask = 1u64 << (slot % 64);
-        assert!(
-            self.words[slot / 64] & mask == 0,
-            "mem/kstack: slot {slot} reserved twice"
-        );
-        self.words[slot / 64] |= mask;
-    }
-
     fn release(&mut self, slot: usize) {
         assert!(slot < SLOT_COUNT, "mem/kstack: slot {slot} out of range");
         let mask = 1u64 << (slot % 64);
@@ -159,9 +145,10 @@ impl Drop for KernelStack {
             }
         }
 
-        // Remote CPUs must drop their translations before these pages are
-        // reused or the slot is handed out again.
-        crate::mem::synchronize_kernel_mappings();
+        // Remote CPUs must drop these translations before the frames or slot
+        // are reused. The range fits in one shootdown batch, avoiding a full
+        // global TLB flush on every thread exit.
+        crate::mem::flush_tlb_range(self.base(), STACK_SIZE as u64);
 
         for page in pages.into_iter().flatten() {
             // SAFETY: the only mapping of this page was removed above and every
@@ -197,16 +184,16 @@ fn map_slot(slot: usize) -> Option<()> {
     for index in 0..STACK_PAGES {
         let page = pages[index].expect("mem/kstack: missing preallocated stack page");
         let virt = VirtAddr::new(base + index as u64 * PAGE_SIZE);
-        // Deliberately not GLOBAL: freeing a slot relies on
-        // `synchronize_kernel_mappings`, whose x86 shootdown is a CR3 reload
-        // that does not evict global TLB entries. A stale global mapping would
-        // survive into the next user of the recycled physical page.
-        //
         // SAFETY: the slot is exclusively owned by this allocation, the target
         // range is reserved for kernel stacks, and the arena's page tables are
         // serialized by `MAPPING`.
         let mapped = unsafe {
-            arch::paging::map_page(root, virt, page.paddr(), VmFlags::READ | VmFlags::WRITE)
+            arch::paging::map_page(
+                root,
+                virt,
+                page.paddr(),
+                VmFlags::READ | VmFlags::WRITE | VmFlags::GLOBAL,
+            )
         };
         if mapped.is_err() {
             unmap_partial(root, base, index);
@@ -238,18 +225,6 @@ fn unmap_partial(root: PhysAddr, base: u64, mapped: usize) {
             unsafe { phys::free_page(page) };
         }
     }
-}
-
-/// Reserves the arena's top-level page-table entry.
-///
-/// This must run before the first user address space is created so that every
-/// user root inherits the arena mapping.
-pub(crate) fn init() {
-    let mut arena = ARENA.lock();
-    arena.reserve(SENTINEL_SLOT);
-    drop(arena);
-
-    map_slot(SENTINEL_SLOT).expect("mem/kstack: failed to reserve the kernel stack arena");
 }
 
 /// Allocates a zeroed kernel stack preceded by an unmapped guard page.

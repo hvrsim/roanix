@@ -89,7 +89,7 @@ pub(super) struct Shootdown {
 
 impl Shootdown {
     /// Addresses recorded before escalating to a full flush.
-    const INLINE: usize = 64;
+    pub(super) const INLINE: usize = 64;
 
     /// Creates a batch targeting one address-space root.
     pub(super) fn for_root(root: PhysAddr) -> Self {
