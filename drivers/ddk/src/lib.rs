@@ -30,7 +30,7 @@ use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
 /// Configures Cargo's final link for a loadable Roanix driver module.
@@ -862,6 +862,56 @@ impl Error {
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// Borrows a nullable ABI input range.
+///
+/// # Safety
+/// A nonempty `pointer` range must remain readable and unaliased from mutable
+/// access for the returned lifetime.
+pub unsafe fn input_bytes<'a>(pointer: *const u8, length: usize) -> Result<&'a [u8]> {
+    if length == 0 {
+        return Ok(&[]);
+    }
+    if pointer.is_null() {
+        return Err(Error::from_status(EINVAL));
+    }
+    // SAFETY: forwarded from this function's contract.
+    Ok(unsafe { core::slice::from_raw_parts(pointer, length) })
+}
+
+/// Borrows a nullable ABI output range.
+///
+/// # Safety
+/// A nonempty `pointer` range must remain writable and exclusively borrowed
+/// for the returned lifetime.
+pub unsafe fn output_bytes<'a>(pointer: *mut u8, length: usize) -> Result<&'a mut [u8]> {
+    if length == 0 {
+        return Ok(&mut []);
+    }
+    if pointer.is_null() {
+        return Err(Error::from_status(EINVAL));
+    }
+    // SAFETY: forwarded from this function's contract.
+    Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
+}
+
+/// Allocates a nonzero, monotonically increasing identifier.
+///
+/// `u64::MAX` is reserved so callers can safely use `id + 1` as an iteration
+/// cursor. Once exhausted, the counter remains exhausted and IDs never wrap.
+pub fn allocate_monotonic_id(next: &AtomicU64) -> Result<u64> {
+    let mut id = next.load(Ordering::Relaxed);
+    loop {
+        let successor = id
+            .checked_add(1)
+            .filter(|_| id != 0)
+            .ok_or(Error::from_status(ENOSPC))?;
+        match next.compare_exchange_weak(id, successor, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(id),
+            Err(observed) => id = observed,
+        }
+    }
+}
 
 fn result(status: i32) -> Result<()> {
     if status == OK {

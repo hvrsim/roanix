@@ -253,6 +253,13 @@ pub struct ResolvedPage {
     pub protection: VmProtection,
     /// Whether this resolution completed a copy-on-write promotion.
     pub promoted: bool,
+    /// Object identity to revalidate after the PTE becomes visible.
+    pub(super) object_fault: Option<ObjectFault>,
+}
+
+pub(super) struct ObjectFault {
+    pub(super) object: Arc<VmObject>,
+    pub(super) index: u64,
 }
 
 /// Ordered set of virtual mappings for one address space.
@@ -525,6 +532,7 @@ impl VmMap {
                 page,
                 protection: entry.protection,
                 promoted: true,
+                object_fault: None,
             });
         }
 
@@ -539,13 +547,20 @@ impl VmMap {
                 page,
                 protection,
                 promoted: false,
+                object_fault: None,
             });
         }
 
-        let page = if let Some(object) = &entry.object {
-            object.fault_page(object_index, write && !entry.private)?
+        let (page, object_fault) = if let Some(object) = &entry.object {
+            (
+                object.fault_page(object_index, write && !entry.private)?,
+                Some(ObjectFault {
+                    object: object.clone(),
+                    index: object_index,
+                }),
+            )
         } else {
-            super::shared_zero_page()
+            (super::shared_zero_page(), None)
         };
         let mut protection = entry.protection;
         if entry.private || super::is_shared_zero_page(&page) {
@@ -555,6 +570,7 @@ impl VmMap {
             page,
             protection,
             promoted: false,
+            object_fault,
         })
     }
 

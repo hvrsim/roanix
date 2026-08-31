@@ -1,6 +1,6 @@
 //! Filesystem syscall implementations.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::{mem::size_of, time::Duration};
 
 use crate::{
@@ -201,7 +201,7 @@ crate::syscall_handler! {
         if spec.size > MAX_IOCTL_SIZE {
             return Err(Errno::Invalid);
         }
-        let mut bytes = vec![0u8; spec.size];
+        let mut bytes = zeroed_bytes(spec.size)?;
         if spec.input && spec.size != 0 {
             process
                 .address_space()
@@ -513,7 +513,11 @@ crate::syscall_handler! {
             return Err(Errno::NotDirectory);
         };
         let entries = file.readdir(maximum).map_err(map_fs_error)?;
-        let mut output = vec![0u8; entries.len() * USER_DIRENT_SIZE];
+        let output_size = entries
+            .len()
+            .checked_mul(USER_DIRENT_SIZE)
+            .ok_or(Errno::Overflow)?;
+        let mut output = zeroed_bytes(output_size)?;
         for (index, entry) in entries.iter().enumerate() {
             let record = &mut output[index * USER_DIRENT_SIZE..][..USER_DIRENT_SIZE];
             record[..8].copy_from_slice(&entry.key.node.get().to_ne_bytes());
@@ -673,7 +677,7 @@ crate::syscall_handler! {
             .checked_mul(POLL_FD_SIZE)
             .ok_or(Errno::Invalid)?;
         let process = current_process()?;
-        let mut bytes = vec![0u8; byte_len];
+        let mut bytes = zeroed_bytes(byte_len)?;
         if byte_len != 0 {
             process
                 .address_space()
@@ -682,21 +686,25 @@ crate::syscall_handler! {
         }
         let (records, remainder) = bytes.as_chunks::<POLL_FD_SIZE>();
         debug_assert!(remainder.is_empty());
-        let mut entries = records
-            .iter()
-            .map(|record| UserPollFd {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(records.len())
+            .map_err(|_| Errno::OutOfMemory)?;
+        entries.extend(records.iter().map(|record| UserPollFd {
                 fd: i32::from_ne_bytes(record[..4].try_into().expect("poll fd width")),
                 events: i16::from_ne_bytes(
                     record[4..6].try_into().expect("poll events width"),
                 ),
                 revents: 0,
-            })
-            .collect::<Vec<_>>();
+            }));
         let deadline = (timeout_ms >= 0).then(|| {
             clock::monotonic_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
         });
 
-        let fds: Vec<i32> = entries.iter().map(|entry| entry.fd).collect();
+        let mut fds = Vec::new();
+        fds.try_reserve_exact(entries.len())
+            .map_err(|_| Errno::OutOfMemory)?;
+        fds.extend(entries.iter().map(|entry| entry.fd));
         loop {
             let mut ready = 0usize;
             let descriptors = process.descriptors(&fds);
@@ -739,7 +747,11 @@ crate::syscall_handler! {
             if process.prepare_interrupt_wait() {
                 return Err(Errno::Interrupted);
             }
-            let mut wait_events = alloc::vec![process.interrupt_event()];
+            let mut wait_events = Vec::new();
+            wait_events
+                .try_reserve(entries.len().saturating_add(1))
+                .map_err(|_| Errno::OutOfMemory)?;
+            wait_events.push(process.interrupt_event());
             let mut event_driven = true;
             for (entry, descriptor) in entries.iter().zip(&descriptors) {
                 if entry.fd < 0 {
@@ -1262,6 +1274,15 @@ fn checked_io_size(size: u64) -> Result<usize> {
         return Err(Errno::Invalid);
     }
     Ok(size)
+}
+
+fn zeroed_bytes(length: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| Errno::OutOfMemory)?;
+    bytes.resize(length, 0);
+    Ok(bytes)
 }
 
 fn map_pipe_error(error: PipeError) -> Errno {

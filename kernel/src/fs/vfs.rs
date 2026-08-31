@@ -1,7 +1,6 @@
 //! Global mount namespace, path traversal, and convenience VFS operations.
 
 use alloc::{
-    boxed::Box,
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
     vec::Vec,
@@ -283,11 +282,9 @@ pub(crate) fn symlink_at(target: &[u8], base: &PathAnchor, path: &[u8]) -> Resul
         return Err(Error::NotDirectory);
     }
     path::validate_symlink_target(target)?;
-    directory.vnode.create(
-        parent.name,
-        CreateKind::Symlink(Box::<[u8]>::from(target)),
-        0o777,
-    )
+    directory
+        .vnode
+        .create(parent.name, CreateKind::Symlink(copy_bytes(target)?), 0o777)
 }
 
 /// Adds a hard link to an existing non-directory vnode.
@@ -474,7 +471,11 @@ pub fn sync_all() -> Result<()> {
     let namespace = namespace()?;
     let filesystems = {
         let state = namespace.state.lock();
-        let mut filesystems = alloc::vec![state.root.filesystem.clone()];
+        let mut filesystems = Vec::new();
+        filesystems
+            .try_reserve(state.mounted_at.len().saturating_add(1))
+            .map_err(|_| Error::OutOfMemory)?;
+        filesystems.push(state.root.filesystem.clone());
         filesystems.extend(
             state
                 .mounted_at
@@ -542,7 +543,7 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
     let follow_final = follow_final || parsed.trailing_slash;
     // Only symbolic-link expansion needs owned components; an ordinary lookup
     // never allocates.
-    let mut pending: VecDeque<Box<[u8]>> = VecDeque::new();
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut symlink_depth = 0usize;
 
     loop {
@@ -584,9 +585,17 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
             } else {
                 current.vnode = parent;
             }
-            let expanded: Vec<Box<[u8]>> = target.components.map(Box::<[u8]>::from).collect();
+            let component_count = target.components.clone().count();
+            let mut expanded = Vec::new();
+            expanded
+                .try_reserve_exact(component_count)
+                .map_err(|_| Error::OutOfMemory)?;
+            expanded.extend(target.components);
+            pending
+                .try_reserve(component_count)
+                .map_err(|_| Error::OutOfMemory)?;
             for component in expanded.into_iter().rev() {
-                pending.push_front(component);
+                pending.push_front(copy_bytes(component)?);
             }
             continue;
         }
@@ -619,4 +628,12 @@ fn ascend(mut current: PathAnchor) -> Result<PathAnchor> {
 
     current.vnode = current.vnode.parent()?;
     Ok(current)
+}
+
+fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
 }

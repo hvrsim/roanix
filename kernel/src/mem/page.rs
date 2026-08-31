@@ -222,6 +222,11 @@ impl VmPage {
 
         let frame = {
             let mut backing = self.backing.lock();
+            // Zeroing an already logical-zero page is a metadata no-op. In
+            // particular, sparse-file truncation must not allocate a frame.
+            if matches!(*backing, PageBacking::Zero) {
+                return Ok(());
+            }
             self.ensure_resident_locked(&mut backing)?;
             let PageBacking::Resident(frame) = &*backing else {
                 unreachable!("mem/page: resident page lost backing");

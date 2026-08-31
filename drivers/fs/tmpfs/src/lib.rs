@@ -245,10 +245,7 @@ impl Mount {
         parent: Weak<Node>,
         target: &[u8],
     ) -> core::result::Result<Arc<Node>, i32> {
-        let id = self.next_node.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            return Err(ddk::ENOSPC);
-        }
+        let id = ddk::allocate_monotonic_id(&self.next_node).map_err(ddk::Error::status)?;
         let now = ddk::monotonic_ns();
         let (links, size, data) = match kind {
             ddk::FS_KIND_REGULAR => (
@@ -428,31 +425,6 @@ fn checked_node(
     Ok(node)
 }
 
-fn checked_bytes<'a>(pointer: *const u8, length: usize) -> core::result::Result<&'a [u8], i32> {
-    if length == 0 {
-        return Ok(&[]);
-    }
-    if pointer.is_null() {
-        return Err(ddk::EINVAL);
-    }
-    // SAFETY: the provider ABI guarantees a readable range for this callback.
-    Ok(unsafe { core::slice::from_raw_parts(pointer, length) })
-}
-
-fn checked_bytes_mut<'a>(
-    pointer: *mut u8,
-    length: usize,
-) -> core::result::Result<&'a mut [u8], i32> {
-    if length == 0 {
-        return Ok(&mut []);
-    }
-    if pointer.is_null() {
-        return Err(ddk::EINVAL);
-    }
-    // SAFETY: the provider ABI guarantees a writable range for this callback.
-    Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
-}
-
 unsafe extern "C" fn mount(
     _context: *mut c_void,
     options: *const raw::FsMountOptions,
@@ -616,10 +588,7 @@ unsafe extern "C" fn setattr(
             Err(error) => return error,
         };
         let object = file.lock();
-        let old_size = node.size.load(Ordering::Acquire);
-        if attributes.size < old_size
-            && let Err(error) = object.truncate(attributes.size)
-        {
+        if let Err(error) = object.truncate(attributes.size) {
             return error;
         }
         node.size.store(attributes.size, Ordering::Release);
@@ -643,7 +612,8 @@ unsafe extern "C" fn lookup(
     if output.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(name) = checked_bytes(name, name_length) else {
+    // SAFETY: the provider ABI keeps the name readable for this callback.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     // SAFETY: VFS retains the mount receipt.
@@ -722,10 +692,12 @@ unsafe extern "C" fn create(
     if output.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(name) = checked_bytes(name, name_length) else {
+    // SAFETY: the provider ABI keeps both inputs readable for this callback.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
-    let Ok(target) = checked_bytes(target, target_length) else {
+    // SAFETY: as above; the immutable ranges may overlap.
+    let Ok(target) = (unsafe { ddk::input_bytes(target, target_length) }) else {
         return ddk::EINVAL;
     };
     if validate_name(name).is_err() {
@@ -788,7 +760,8 @@ unsafe extern "C" fn link(
     name_length: usize,
     target_receipt: *mut c_void,
 ) -> i32 {
-    let Ok(name) = checked_bytes(name, name_length) else {
+    // SAFETY: the provider ABI keeps the name readable for this callback.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     if validate_name(name).is_err() {
@@ -862,7 +835,8 @@ unsafe extern "C" fn unlink(
     name_length: usize,
     remove_directory: u8,
 ) -> i32 {
-    let Ok(name) = checked_bytes(name, name_length) else {
+    // SAFETY: the provider ABI keeps the name readable for this callback.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     if validate_name(name).is_err() {
@@ -973,10 +947,12 @@ unsafe extern "C" fn rename(
     target_name: *const u8,
     target_name_length: usize,
 ) -> i32 {
-    let Ok(source_name) = checked_bytes(source_name, source_name_length) else {
+    // SAFETY: the provider ABI keeps both names readable for this callback.
+    let Ok(source_name) = (unsafe { ddk::input_bytes(source_name, source_name_length) }) else {
         return ddk::EINVAL;
     };
-    let Ok(target_name) = checked_bytes(target_name, target_name_length) else {
+    // SAFETY: as above; the immutable name ranges may overlap.
+    let Ok(target_name) = (unsafe { ddk::input_bytes(target_name, target_name_length) }) else {
         return ddk::EINVAL;
     };
     if validate_name(source_name).is_err() || validate_name(target_name).is_err() {
@@ -1222,7 +1198,8 @@ unsafe extern "C" fn read(
         Ok(file) => file,
         Err(error) => return i64::from(error),
     };
-    let Ok(output) = checked_bytes_mut(output, length) else {
+    // SAFETY: VFS exclusively lends this output window for the callback.
+    let Ok(output) = (unsafe { ddk::output_bytes(output, length) }) else {
         return i64::from(ddk::EINVAL);
     };
     let size = node.size.load(Ordering::Acquire);
@@ -1249,18 +1226,40 @@ fn write_file(
     offset: u64,
     input: &[u8],
 ) -> core::result::Result<usize, i32> {
-    let end = offset
+    let requested_end = offset
         .checked_add(u64::try_from(input.len()).map_err(|_| ddk::EINVAL)?)
         .ok_or(ddk::EFBIG)?;
-    let written = object.write(offset, input)?;
-    node.size.fetch_max(
-        offset.saturating_add(u64::try_from(written).map_err(|_| ddk::EINVAL)?),
-        Ordering::AcqRel,
-    );
+    let old_size = node.size.load(Ordering::Acquire);
+    let grew_hole = offset > old_size;
+    if grew_hole {
+        // MAP_SHARED can modify the rounded tail beyond EOF. Growing through
+        // a sparse write must invalidate that PTE and zero the exposed hole.
+        object.truncate(offset)?;
+    }
+    let written = match object.write(offset, input) {
+        Ok(written) => written,
+        Err(error) => {
+            if grew_hole {
+                let _ = object.truncate(old_size);
+            }
+            return Err(error);
+        }
+    };
+    if written == 0 && grew_hole {
+        object.truncate(old_size)?;
+        return Ok(0);
+    }
+    let end = if written == input.len() {
+        requested_end
+    } else {
+        offset
+            .checked_add(u64::try_from(written).map_err(|_| ddk::EINVAL)?)
+            .ok_or(ddk::EFBIG)?
+    };
+    node.size.fetch_max(end, Ordering::AcqRel);
     if written != 0 {
         node.touch_modified();
     }
-    let _ = end;
     Ok(written)
 }
 
@@ -1281,7 +1280,8 @@ unsafe extern "C" fn write(
     let Ok(node) = checked_node(&mount, vnode_receipt) else {
         return i64::from(ddk::EINVAL);
     };
-    let Ok(input) = checked_bytes(input, length) else {
+    // SAFETY: VFS keeps this input window readable for the callback.
+    let Ok(input) = (unsafe { ddk::input_bytes(input, length) }) else {
         return i64::from(ddk::EINVAL);
     };
     if input.is_empty() {
@@ -1341,22 +1341,30 @@ unsafe extern "C" fn append(
     let mut offset = node.size.load(Ordering::Acquire);
     let start = offset;
     for vector in vectors {
-        let Ok(bytes) = checked_bytes(vector.data, vector.length) else {
+        // SAFETY: VFS pins every vector range until append returns.
+        let Ok(bytes) = (unsafe { ddk::input_bytes(vector.data, vector.length) }) else {
             return i64::from(ddk::EINVAL);
         };
         let written = match write_file(&node, &object, offset, bytes) {
             Ok(written) => written,
-            Err(error) => return i64::from(error),
+            Err(error) if offset == start => return i64::from(error),
+            Err(_) => break,
         };
-        offset = match offset.checked_add(u64::try_from(written).unwrap_or(u64::MAX)) {
+        let written = match u64::try_from(written) {
+            Ok(written) => written,
+            Err(_) if offset == start => return i64::from(ddk::EFBIG),
+            Err(_) => break,
+        };
+        offset = match offset.checked_add(written) {
             Some(offset) => offset,
-            None => return i64::from(ddk::EINVAL),
+            None if offset == start => return i64::from(ddk::EFBIG),
+            None => break,
         };
-        if written != bytes.len() {
+        if written != bytes.len() as u64 {
             break;
         }
     }
-    let written = usize::try_from(offset.saturating_sub(start)).unwrap_or(usize::MAX);
+    let written = usize::try_from(offset - start).unwrap_or(usize::MAX);
     // SAFETY: caller supplied writable next-offset storage.
     unsafe { *next_offset = offset };
     i64::try_from(written.min(total)).unwrap_or(i64::MAX)
@@ -1380,10 +1388,7 @@ unsafe extern "C" fn truncate(
         Err(error) => return error,
     };
     let object = file.lock();
-    let old = node.size.load(Ordering::Acquire);
-    if size < old
-        && let Err(error) = object.truncate(size)
-    {
+    if let Err(error) = object.truncate(size) {
         return error;
     }
     node.size.store(size, Ordering::Release);
@@ -1449,7 +1454,8 @@ unsafe extern "C" fn readlink(
     if capacity < size {
         return ddk::EINVAL;
     }
-    let Ok(output) = checked_bytes_mut(output, size) else {
+    // SAFETY: VFS exclusively lends `size` output bytes for the callback.
+    let Ok(output) = (unsafe { ddk::output_bytes(output, size) }) else {
         return ddk::EINVAL;
     };
     match object.read(0, output) {

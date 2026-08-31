@@ -227,10 +227,7 @@ impl Namespace {
         if parent_record.children.contains_key(name) {
             return Err(ddk::EEXIST);
         }
-        let id = self.next_node.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            return Err(ddk::ENOSPC);
-        }
+        let id = ddk::allocate_monotonic_id(&self.next_node).map_err(ddk::Error::status)?;
         // Ownership crosses the broker boundary only after all validations
         // above succeed. A failed broker call therefore leaves the endpoint
         // receipt with the kernel caller.
@@ -271,10 +268,7 @@ impl Namespace {
         if parent_record.children.contains_key(name) {
             return Err(ddk::EEXIST);
         }
-        let id = self.next_node.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            return Err(ddk::ENOSPC);
-        }
+        let id = ddk::allocate_monotonic_id(&self.next_node).map_err(ddk::Error::status)?;
         let node = self.make_node(id, kind, mode, data);
         let name = Arc::<[u8]>::from(name);
         let parent_record = records.get_mut(&parent).ok_or(ddk::ENOENT)?;
@@ -316,10 +310,13 @@ impl Namespace {
     fn remove_owner(&self, owner: u64, force: bool) -> core::result::Result<(), i32> {
         let mut records = self.records.lock();
         validate_no_foreign_children(&records, owner)?;
-        let ids: Vec<u64> = records
-            .iter()
-            .filter_map(|(id, record)| (record.owner == owner).then_some(*id))
-            .collect();
+        let mut ids = Vec::new();
+        ids.try_reserve(records.len()).map_err(|_| ddk::ENOMEM)?;
+        ids.extend(
+            records
+                .iter()
+                .filter_map(|(id, record)| (record.owner == owner).then_some(*id)),
+        );
         if !force {
             for id in &ids {
                 let record = records.get(id).ok_or(ddk::ENOENT)?;
@@ -344,7 +341,6 @@ impl Namespace {
                 return Err(error);
             }
         }
-        let mut ids = ids;
         ids.sort_unstable_by(|left, right| right.cmp(left));
         for id in ids {
             self.remove_record(&mut records, id)?;
@@ -573,28 +569,6 @@ fn checked_node(
     Ok(node)
 }
 
-fn input<'a>(pointer: *const u8, length: usize) -> core::result::Result<&'a [u8], i32> {
-    if length == 0 {
-        return Ok(&[]);
-    }
-    if pointer.is_null() {
-        return Err(ddk::EINVAL);
-    }
-    // SAFETY: the ABI gives this provider a readable buffer for the callback.
-    Ok(unsafe { core::slice::from_raw_parts(pointer, length) })
-}
-
-fn output<'a>(pointer: *mut u8, length: usize) -> core::result::Result<&'a mut [u8], i32> {
-    if length == 0 {
-        return Ok(&mut []);
-    }
-    if pointer.is_null() {
-        return Err(ddk::EINVAL);
-    }
-    // SAFETY: the ABI gives this provider a writable buffer for the callback.
-    Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
-}
-
 unsafe extern "C" fn provider_mount(
     _context: *mut c_void,
     options: *const raw::FsMountOptions,
@@ -784,7 +758,8 @@ unsafe extern "C" fn lookup(
     if output_vnode.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(name) = input(name, name_length) else {
+    // SAFETY: VFS keeps the name readable for this callback.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     // SAFETY: VFS retains the mount receipt.
@@ -1071,7 +1046,8 @@ unsafe extern "C" fn read(
     let Ok(node) = checked_node(&mount, vnode_receipt) else {
         return i64::from(ddk::EINVAL);
     };
-    let Ok(buffer) = output(buffer, length) else {
+    // SAFETY: VFS exclusively lends this output window for the callback.
+    let Ok(buffer) = (unsafe { ddk::output_bytes(buffer, length) }) else {
         return i64::from(ddk::EINVAL);
     };
     let Ok(activity) = node.begin_activity() else {
@@ -1110,7 +1086,8 @@ unsafe extern "C" fn write(
     let Ok(node) = checked_node(&mount, vnode_receipt) else {
         return i64::from(ddk::EINVAL);
     };
-    let Ok(buffer) = input(buffer, length) else {
+    // SAFETY: VFS keeps this input window readable for the callback.
+    let Ok(buffer) = (unsafe { ddk::input_bytes(buffer, length) }) else {
         return i64::from(ddk::EINVAL);
     };
     let Ok(activity) = node.begin_activity() else {
@@ -1405,7 +1382,8 @@ unsafe extern "C" fn ioctl(
     if output_result.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(argument) = output(argument, length) else {
+    // SAFETY: VFS exclusively lends this ioctl buffer for the callback.
+    let Ok(argument) = (unsafe { ddk::output_bytes(argument, length) }) else {
         return ddk::EINVAL;
     };
     // SAFETY: VFS retains the mount receipt.
@@ -1467,7 +1445,8 @@ unsafe extern "C" fn broker_mkdir(
     if output.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(name) = input(name, name_length) else {
+    // SAFETY: the registration ABI keeps the name readable for this call.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     let Ok(namespace) = namespace() else {
@@ -1497,7 +1476,8 @@ unsafe extern "C" fn broker_create(
     if output.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(name) = input(name, name_length) else {
+    // SAFETY: the registration ABI keeps the name readable for this call.
+    let Ok(name) = (unsafe { ddk::input_bytes(name, name_length) }) else {
         return ddk::EINVAL;
     };
     let Ok(namespace) = namespace() else {
@@ -1537,7 +1517,8 @@ unsafe extern "C" fn broker_lookup(
     if output.is_null() {
         return ddk::EINVAL;
     }
-    let Ok(path) = input(path, path_length) else {
+    // SAFETY: the registration ABI keeps the path readable for this call.
+    let Ok(path) = (unsafe { ddk::input_bytes(path, path_length) }) else {
         return ddk::EINVAL;
     };
     let Ok(namespace) = namespace() else {

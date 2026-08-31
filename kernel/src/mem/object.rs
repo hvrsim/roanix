@@ -1,4 +1,19 @@
-//! Memory objects and unified page-cache implementation.
+//! Memory objects and the unified filesystem page cache.
+//!
+//! A vnode has one `VmObject`, shared by descriptor I/O and every mapping, so
+//! coherence does not require a second buffer or copy. Missing indexes are
+//! sparse zeros; instantiated pages use the ordinary VM resident/swap state
+//! and therefore participate in the same reclaim policy as anonymous memory.
+//!
+//! # Synchronization invariants
+//!
+//! * Filesystems serialize writes that change logical length with truncation.
+//! * The page-index lock is released before resolving user windows or taking a
+//!   page backing lock on normal transfers.
+//! * Truncation deliberately holds the index lock as a fault gate until old
+//!   PTEs are removed and bytes newly outside/inside EOF are sanitized.
+//! * Object accounting is charged once when an index is inserted and released
+//!   once when that index is removed or the object is destroyed.
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::{
@@ -12,6 +27,23 @@ use super::{Error, IoSink, IoSource, Result, VmPage};
 
 /// Pages resolved per index acquisition during bulk transfers.
 const LOOKUP_BATCH: usize = 16;
+
+/// Snapshot of one unified page cache.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PageCacheStats {
+    /// Logical file length tracked by the object.
+    pub length: u64,
+    /// Instantiated logical pages, including zero and swapped pages.
+    pub pages: u64,
+    /// Pages with resident physical frames.
+    pub resident: u64,
+    /// Pages represented by compressed or external swap.
+    pub swapped: u64,
+    /// Instantiated pages that have not materialized a frame.
+    pub zero: u64,
+    /// Resident pages modified since materialization.
+    pub dirty: u64,
+}
 
 /// Memory object's semantic owner.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -89,8 +121,13 @@ impl PageAccount {
 pub struct VmObject {
     id: u64,
     kind: ObjectKind,
+    /// Protects index membership. Ordinary transfers never hold it while
+    /// faulting user memory or acquiring a page backing lock. Truncate is the
+    /// deliberate exception: it holds the index as a fault gate while it
+    /// invalidates mappings and sanitizes the retained tail page.
     pages: Mutex<BTreeMap<u64, Arc<VmPage>>>,
     account: Option<Arc<PageAccount>>,
+    length: AtomicU64,
 }
 
 impl VmObject {
@@ -110,6 +147,7 @@ impl VmObject {
             kind,
             pages: Mutex::new(BTreeMap::new()),
             account,
+            length: AtomicU64::new(0),
         })
     }
 
@@ -128,6 +166,31 @@ impl VmObject {
         self.pages.lock().len() as u64
     }
 
+    /// Returns the logical byte length maintained by writes and truncation.
+    pub fn length(&self) -> u64 {
+        self.length.load(Ordering::Acquire)
+    }
+
+    /// Returns cache length and residency statistics.
+    pub fn cache_stats(&self) -> PageCacheStats {
+        let mut stats = PageCacheStats {
+            length: self.length(),
+            ..PageCacheStats::default()
+        };
+        let pages = self.pages.lock();
+        stats.pages = pages.len() as u64;
+        for page in pages.values() {
+            let info = page.info();
+            match info.location {
+                super::PageLocation::Zero => stats.zero += 1,
+                super::PageLocation::Resident => stats.resident += 1,
+                super::PageLocation::Swapped => stats.swapped += 1,
+            }
+            stats.dirty += u64::from(info.dirty);
+        }
+        stats
+    }
+
     /// Looks up an instantiated page.
     pub fn page(&self, index: u64) -> Option<Arc<VmPage>> {
         self.pages.lock().get(&index).cloned()
@@ -139,17 +202,41 @@ impl VmObject {
         if let Some(page) = pages.get(&index) {
             return Ok(page.clone());
         }
-        if let Some(account) = &self.account {
-            account.reserve()?;
-        }
-        let page = VmPage::new_zero(index, super::page::owner_kind_for_object(self.kind));
-        pages.insert(index, page.clone());
-        Ok(page)
+        self.create_page_locked(&mut pages, index)
     }
 
     /// Returns the page used for a read or write fault.
     pub fn fault_page(&self, index: u64, _write: bool) -> Result<Arc<VmPage>> {
-        self.get_or_create_page(index)
+        let mut pages = self.pages.lock();
+        // The index check and insertion share the same lock as truncate's
+        // split, preventing a stale pre-truncate fault from recreating a page
+        // beyond the new EOF after truncation has removed it.
+        if self.kind == ObjectKind::Vnode
+            && index >= self.length.load(Ordering::Acquire).div_ceil(PAGE_SIZE)
+        {
+            return Err(Error::InvalidAddress);
+        }
+        if let Some(page) = pages.get(&index) {
+            return Ok(page.clone());
+        }
+        self.create_page_locked(&mut pages, index)
+    }
+
+    /// Confirms that a just-installed translation still names a live index.
+    ///
+    /// Truncate holds the same index lock while removing PTEs. Validation
+    /// after `Pmap::enter` closes the remaining race where a fault acquired an
+    /// `Arc<VmPage>` immediately before truncate acquired the lock.
+    pub(super) fn validates_fault(&self, index: u64, page: &Arc<VmPage>) -> bool {
+        let pages = self.pages.lock();
+        if self.kind == ObjectKind::Vnode
+            && index >= self.length.load(Ordering::Acquire).div_ceil(PAGE_SIZE)
+        {
+            return false;
+        }
+        pages
+            .get(&index)
+            .is_some_and(|current| Arc::ptr_eq(current, page))
     }
 
     /// Reads bytes into a sink, returning zeros for holes.
@@ -218,59 +305,34 @@ impl VmObject {
             // taken so that a user page fault never nests inside one.
             let window = match source.window(written, limit) {
                 Ok(window) => window,
-                Err(_) if written != 0 => return Ok(written),
+                Err(_) if written != 0 => return self.finish_write(offset, written),
                 Err(error) => return Err(error),
             };
             if window.is_empty() {
                 return Err(Error::InvalidAddress);
             }
             let count = window.len();
-            let existing = self.pages.lock().get(&page_index).cloned();
-            if let Some(page) = existing {
-                if let Err(error) = page.write(page_offset, &window) {
+            position
+                .checked_add(count as u64)
+                .ok_or(Error::InvalidAddress)?;
+            let page = match self.get_or_create_page(page_index) {
+                Ok(page) => page,
+                Err(error) => {
                     if written != 0 {
-                        return Ok(written);
+                        return self.finish_write(offset, written);
                     }
                     return Err(error);
                 }
-            } else {
-                if let Some(account) = &self.account
-                    && let Err(error) = account.reserve()
-                {
-                    if written != 0 {
-                        return Ok(written);
-                    }
-                    return Err(error);
+            };
+            if let Err(error) = page.write(page_offset, &window) {
+                if written != 0 {
+                    return self.finish_write(offset, written);
                 }
-                let page =
-                    VmPage::new_zero(page_index, super::page::owner_kind_for_object(self.kind));
-                if let Err(error) = page.write(page_offset, &window) {
-                    if let Some(account) = &self.account {
-                        account.release(1);
-                    }
-                    if written != 0 {
-                        return Ok(written);
-                    }
-                    return Err(error);
-                }
-                let mut pages = self.pages.lock();
-                if let Some(existing) = pages.get(&page_index) {
-                    if let Some(account) = &self.account {
-                        account.release(1);
-                    }
-                    if let Err(error) = existing.write(page_offset, &window) {
-                        if written != 0 {
-                            return Ok(written);
-                        }
-                        return Err(error);
-                    }
-                } else {
-                    pages.insert(page_index, page);
-                }
+                return Err(error);
             }
             written += count;
         }
-        Ok(written)
+        self.finish_write(offset, written)
     }
 
     /// Writes bytes from a kernel buffer and returns the number accepted.
@@ -280,23 +342,55 @@ impl VmObject {
 
     /// Removes pages beyond `size` and zeroes a retained partial tail.
     pub fn truncate(&self, size: u64) -> Result<u64> {
+        let mut pages = self.pages.lock();
+        let old_size = self.length.load(Ordering::Acquire);
+        if size == old_size {
+            return Ok(0);
+        }
+
+        if size > old_size {
+            let old_tail = (old_size % PAGE_SIZE) as usize;
+            if old_tail != 0
+                && let Some(page) = pages.get(&(old_size / PAGE_SIZE))
+            {
+                // A shared mapping may have written into the rounded portion
+                // beyond EOF. Retire its PTE before exposing that range, then
+                // restore the filesystem guarantee that a grown hole is zero.
+                super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+                let exposed = cmp::min(size - old_size, PAGE_SIZE - old_tail as u64) as usize;
+                page.zero(old_tail, exposed)?;
+            }
+            self.length.store(size, Ordering::Release);
+            return Ok(0);
+        }
+
         let first_removed = size.div_ceil(PAGE_SIZE);
         let tail = (size % PAGE_SIZE) as usize;
         let tail_page = if tail == 0 {
             None
         } else {
-            self.pages.lock().get(&(size / PAGE_SIZE)).cloned()
+            pages.get(&(size / PAGE_SIZE)).cloned()
         };
+
+        // Faults cannot pass the index lock while resident translations are
+        // retired. Once the shootdown completes, no userspace CPU can race the
+        // tail zeroing through an old writable PTE.
+        for page in pages.range(first_removed..).map(|(_, page)| page) {
+            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+        }
+        if let Some(page) = tail_page.as_ref() {
+            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+        }
         if let Some(page) = tail_page {
             page.zero(tail, PAGE_SIZE as usize - tail)?;
         }
 
-        let mut pages = self.pages.lock();
+        // Publish EOF under the same lock checked by `fault_page`, then remove
+        // the now-unreachable indexes before allowing another fault through.
+        self.length.store(size, Ordering::Release);
         let removed = pages.split_off(&first_removed);
         let removed_count = removed.len() as u64;
         drop(pages);
-        let removed_pages: alloc::vec::Vec<_> = removed.values().cloned().collect();
-        super::pmap::remove_mappings_for_pages(&removed_pages);
         drop(removed);
         if let Some(account) = &self.account {
             account.release(removed_count);
@@ -304,25 +398,37 @@ impl VmObject {
         Ok(removed_count)
     }
 
-    /// Removes one page from the object.
-    pub fn remove_page(&self, index: u64) -> Option<Arc<VmPage>> {
-        let page = self.pages.lock().remove(&index);
-        if let Some(page) = &page {
-            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+    fn create_page_locked(
+        &self,
+        pages: &mut BTreeMap<u64, Arc<VmPage>>,
+        index: u64,
+    ) -> Result<Arc<VmPage>> {
+        if let Some(account) = &self.account {
+            account.reserve()?;
         }
-        if page.is_some()
-            && let Some(account) = &self.account
-        {
-            account.release(1);
+        let page = VmPage::new_zero(index, super::page::owner_kind_for_object(self.kind));
+        pages.insert(index, page.clone());
+        Ok(page)
+    }
+
+    /// Publishes one transfer's final length once, keeping the per-page write
+    /// path free of contended atomic read-modify-write operations.
+    fn finish_write(&self, offset: u64, written: usize) -> Result<usize> {
+        if written != 0 {
+            let end = offset
+                .checked_add(written as u64)
+                .ok_or(Error::InvalidAddress)?;
+            self.length.fetch_max(end, Ordering::AcqRel);
         }
-        page
+        Ok(written)
     }
 }
 
 impl Drop for VmObject {
     fn drop(&mut self) {
-        let pages: alloc::vec::Vec<_> = self.pages.get_mut().values().cloned().collect();
-        super::pmap::remove_mappings_for_pages(&pages);
+        for page in self.pages.get_mut().values() {
+            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+        }
         if let Some(account) = &self.account {
             account.release(self.pages.get_mut().len() as u64);
         }

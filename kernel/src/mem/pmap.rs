@@ -494,8 +494,18 @@ impl VmSpace {
     pub fn fault(&self, address: VirtAddr, access: FaultAccess) -> Result<()> {
         let mut map = self.map.lock();
         let resolved = map.resolve_fault(address, access)?;
+        let page = resolved.page.clone();
         self.pmap
             .enter(address.align_down(), resolved.page, resolved.protection)?;
+        if let Some(fault) = resolved.object_fault
+            && !fault.object.validates_fault(fault.index, &page)
+        {
+            // The map lock prevents another fault from replacing this leaf
+            // before cleanup. Truncate either already won (this branch) or
+            // will observe the reverse mapping and remove it itself.
+            self.pmap.remove(address.align_down(), PAGE_SIZE)?;
+            return Err(Error::InvalidAddress);
+        }
         super::record_fault(resolved.promoted);
         Ok(())
     }

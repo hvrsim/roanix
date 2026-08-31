@@ -14,8 +14,8 @@ use core::{
 use bitflags::bitflags;
 
 use crate::{
-    mem::{IoSink, IoSource, VmObject},
-    sys::event::Event,
+    mem::{IoSink, IoSource, ObjectKind, VmObject},
+    sys::{event::Event, sync::Mutex},
 };
 
 use super::error::{Error, Result};
@@ -171,7 +171,7 @@ pub enum CreateKind {
     /// Create an empty directory.
     Directory,
     /// Create a symbolic link containing the supplied target.
-    Symlink(Box<[u8]>),
+    Symlink(Vec<u8>),
 }
 
 /// One directory entry returned by `readdir`.
@@ -376,7 +376,11 @@ pub trait VnodeOps: Any + Send + Sync {
         Err(Error::IsDirectory)
     }
 
-    /// Returns the unified page-cache object used for memory mappings.
+    /// Returns the unified page-cache object used by both I/O and mappings.
+    ///
+    /// Implementations must return an [`ObjectKind::Vnode`] object containing
+    /// the same bytes exposed through `read_at` and `write_at`. VFS retains the
+    /// first successful result for the active vnode.
     fn memory_object(&self, _vnode: &Vnode) -> Result<Arc<VmObject>> {
         Err(Error::Unsupported)
     }
@@ -419,6 +423,9 @@ struct VnodeInner {
     key: VnodeKey,
     kind: VnodeKind,
     operations: Box<dyn VnodeOps>,
+    /// One VFS-owned cache identity for the active vnode. Provider callbacks
+    /// run outside this lock so they may safely enter kernel memory services.
+    memory_object: Mutex<Option<Arc<VmObject>>>,
 }
 
 /// Filesystem-independent handle to one active node.
@@ -438,6 +445,7 @@ impl Vnode {
                 key,
                 kind,
                 operations,
+                memory_object: Mutex::new(None),
             }),
         }
     }
@@ -743,7 +751,23 @@ impl Vnode {
 
     /// Returns this vnode's unified page-cache object.
     pub fn memory_object(&self) -> Result<Arc<VmObject>> {
-        self.inner.operations.memory_object(self)
+        if let Some(object) = self.inner.memory_object.lock().as_ref() {
+            return Ok(object.clone());
+        }
+
+        let object = self.inner.operations.memory_object(self)?;
+        if object.kind() != ObjectKind::Vnode {
+            return Err(Error::Io);
+        }
+
+        // Concurrent first lookups may both enter the provider. Only one
+        // object becomes authoritative; the loser is dropped before return.
+        let mut cached = self.inner.memory_object.lock();
+        if let Some(object) = cached.as_ref() {
+            return Ok(object.clone());
+        }
+        *cached = Some(object.clone());
+        Ok(object)
     }
 
     /// Reads a symbolic-link target.

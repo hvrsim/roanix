@@ -186,7 +186,7 @@ impl OpenFile {
         let read = self
             .vnode
             .read_at_with_flags(self.file_context, *offset, sink, flags.bits())?;
-        *offset = offset.saturating_add(read as u64);
+        *offset = offset.checked_add(read as u64).ok_or(Error::FileTooLarge)?;
         self.offset.publish_read(*offset);
         Ok(read)
     }
@@ -207,7 +207,9 @@ impl OpenFile {
         let written =
             self.vnode
                 .write_at_with_flags(self.file_context, *offset, source, flags.bits())?;
-        *offset = offset.saturating_add(written as u64);
+        *offset = offset
+            .checked_add(written as u64)
+            .ok_or(Error::FileTooLarge)?;
         Ok(written)
     }
 

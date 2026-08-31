@@ -46,7 +46,7 @@ pub use map::{
     FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmBacking,
     VmInheritance, VmMap, VmMapEntry, VmMapping, VmPlacement, VmProtection,
 };
-pub use object::{ObjectKind, PageAccount, VmObject};
+pub use object::{ObjectKind, PageAccount, PageCacheStats, VmObject};
 pub use page::{PageInfo, PageLocation, VmPage};
 pub use pmap::{Pmap, VmSpace};
 pub use swap::{SwapBackend, SwapError, SwapStats};

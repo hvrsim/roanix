@@ -6,7 +6,7 @@
 //! lease and every live vnode retains that adapter, so callbacks never need to
 //! pin a module on the hot path.
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     ffi::c_void,
@@ -21,7 +21,7 @@ use crate::{
         error as driver_error,
         obj::{ObjHeader, ObjKind, ObjState},
     },
-    mem::{IoSink, IoSource, ObjectKind, PageAccount, VmObject},
+    mem::{IoSink, IoSource, ObjectKind, PAGE_SIZE, PageAccount, VmObject},
     sys::{
         event::Event,
         sync::{Mutex, Once},
@@ -50,19 +50,19 @@ pub const DEVFS_BROKER_OPS_SIZE: u32 = size_of::<DevfsBrokerOps>() as u32;
 /// Required prefix size for a device-filesystem broker operation table.
 pub const DEVFS_BROKER_REQUIRED_OPS_SIZE: u32 = 64;
 
-/// Regular-file kind in [`FsVnode`] and [`FsCreate`].
+/// Regular-file kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_REGULAR: u32 = 1;
-/// Directory kind in [`FsVnode`] and [`FsCreate`].
+/// Directory kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_DIRECTORY: u32 = 2;
-/// Symbolic-link kind in [`FsVnode`] and [`FsCreate`].
+/// Symbolic-link kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_SYMLINK: u32 = 3;
-/// Character-device kind in [`FsVnode`] and [`FsCreate`].
+/// Character-device kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_CHARACTER_DEVICE: u32 = 4;
-/// Block-device kind in [`FsVnode`] and [`FsCreate`].
+/// Block-device kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_BLOCK_DEVICE: u32 = 5;
-/// FIFO kind in [`FsVnode`] and [`FsCreate`].
+/// FIFO kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_FIFO: u32 = 6;
-/// Socket kind in [`FsVnode`] and [`FsCreate`].
+/// Socket kind in [`FsVnode`] and [`FsAttr`].
 pub const FS_KIND_SOCKET: u32 = 7;
 
 /// [`FsSetAttr::valid`] bit for `size`.
@@ -654,7 +654,8 @@ pub(crate) fn mount_named(name: &str, options: FsMountOptions) -> Result<FileSys
         return Err(Error::Io);
     }
     let id = FilesystemId::allocate();
-    Ok(Arc::new(ProviderFilesystem { id, mount }))
+    let root = mount.root(id)?;
+    Ok(Arc::new(ProviderFilesystem { id, mount, root }))
 }
 
 struct ProviderMount {
@@ -777,6 +778,7 @@ impl Drop for ProviderMount {
 struct ProviderFilesystem {
     id: FilesystemId,
     mount: Arc<ProviderMount>,
+    root: Vnode,
 }
 
 impl FileSystem for ProviderFilesystem {
@@ -789,9 +791,7 @@ impl FileSystem for ProviderFilesystem {
     }
 
     fn root(&self) -> Vnode {
-        self.mount
-            .root(self.id)
-            .expect("filesystem provider returned no root vnode")
+        self.root.clone()
     }
 
     fn statfs(&self) -> StatFs {
@@ -836,6 +836,29 @@ struct ProviderVnode {
     node: NodeId,
 }
 
+/// Owns every vnode receipt returned in a provider output batch until VFS
+/// individually accepts it. This closes partial-error and malformed-count
+/// paths without requiring each caller to duplicate cleanup loops.
+struct VnodeReceipts<'a> {
+    mount: &'a ProviderMount,
+    entries: &'a mut [FsDirEntry],
+}
+
+impl VnodeReceipts<'_> {
+    fn take(&mut self, index: usize) -> FsDirEntry {
+        core::mem::replace(&mut self.entries[index], FsDirEntry::EMPTY)
+    }
+}
+
+impl Drop for VnodeReceipts<'_> {
+    fn drop(&mut self) {
+        for entry in self.entries.iter_mut() {
+            self.mount.release_vnode(entry.vnode.receipt);
+            entry.vnode = FsVnode::EMPTY;
+        }
+    }
+}
+
 // SAFETY: the provider defines vnode callback concurrency.  The receipt is
 // immutable from the adapter's perspective and survives until `Drop`.
 unsafe impl Send for ProviderVnode {}
@@ -874,12 +897,13 @@ impl ProviderVnode {
             .map_or_else(|| source.map_or(0, IoSource::len), |sink| sink.len());
         let mut done = 0usize;
         while done < total {
+            let position = offset.checked_add(done as u64).ok_or(Error::FileTooLarge)?;
             let window_flags = if done == 0 {
                 flags
             } else {
                 flags | OpenFlags::NONBLOCK.bits()
             };
-            let value = if let Some(sink) = sink.as_deref_mut() {
+            let (value, capacity) = if let Some(sink) = sink.as_deref_mut() {
                 let mut window = sink
                     .window(done, total - done)
                     .map_err(|_| Error::InvalidArgument)?;
@@ -896,7 +920,7 @@ impl ProviderVnode {
                         self.mount.receipt,
                         self.receipt,
                         file_context,
-                        offset.saturating_add(done as u64),
+                        position,
                         window.as_mut_ptr(),
                         capacity,
                         window_flags,
@@ -909,7 +933,7 @@ impl ProviderVnode {
                 {
                     return Err(Error::Io);
                 }
-                value
+                (value, capacity)
             } else {
                 let source = source.expect("one transfer source is present");
                 let window = source
@@ -928,7 +952,7 @@ impl ProviderVnode {
                         self.mount.receipt,
                         self.receipt,
                         file_context,
-                        offset.saturating_add(done as u64),
+                        position,
                         window.as_ptr(),
                         capacity,
                         window_flags,
@@ -941,17 +965,17 @@ impl ProviderVnode {
                 {
                     return Err(Error::Io);
                 }
-                value
+                (value, capacity)
             };
             if value < 0 {
                 if done != 0 {
                     break;
                 }
-                return Err(fs_status(value as i32));
+                let status = i32::try_from(value).map_err(|_| Error::Io)?;
+                return Err(fs_status(status));
             }
             let count = usize::try_from(value).map_err(|_| Error::Io)?;
-            done = done.saturating_add(count);
-            let capacity = total - done.saturating_sub(count);
+            done = done.checked_add(count).ok_or(Error::FileTooLarge)?;
             if count < capacity {
                 break;
             }
@@ -1235,6 +1259,9 @@ impl VnodeOps for ProviderVnode {
         // The window guards are kept alive until the callback returns so the
         // frames behind every vector stay wired for the whole call.
         let mut windows = Vec::new();
+        windows
+            .try_reserve(source.len().div_ceil(PAGE_SIZE as usize).saturating_add(1))
+            .map_err(|_| Error::OutOfMemory)?;
         let mut offset = 0usize;
         while offset < source.len() {
             let window = source
@@ -1243,16 +1270,19 @@ impl VnodeOps for ProviderVnode {
             if window.is_empty() {
                 return Err(Error::InvalidArgument);
             }
-            offset = offset.saturating_add(window.len());
+            offset = offset
+                .checked_add(window.len())
+                .ok_or(Error::FileTooLarge)?;
             windows.push(window);
         }
-        let vectors: Vec<FsIoVec> = windows
-            .iter()
-            .map(|window| FsIoVec {
-                data: window.as_ptr(),
-                length: window.len(),
-            })
-            .collect();
+        let mut vectors = Vec::new();
+        vectors
+            .try_reserve(windows.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        vectors.extend(windows.iter().map(|window| FsIoVec {
+            data: window.as_ptr(),
+            length: window.len(),
+        }));
         let mut next = 0;
         // SAFETY: vector metadata points directly at pinned source windows; no
         // whole-request bounce buffer is made.
@@ -1267,7 +1297,7 @@ impl VnodeOps for ProviderVnode {
             )
         };
         if result < 0 {
-            return Err(fs_status(result as i32));
+            return Err(fs_status(i32::try_from(result).map_err(|_| Error::Io)?));
         }
         let written = usize::try_from(result).map_err(|_| Error::Io)?;
         if written > source.len() {
@@ -1310,7 +1340,14 @@ impl VnodeOps for ProviderVnode {
     fn readlink(&self, vnode: &Vnode) -> Result<Box<[u8]>> {
         let callback = self.callback(self.mount.provider.operations.readlink)?;
         let size = usize::try_from(self.getattr(vnode)?.size).map_err(|_| Error::FileTooLarge)?;
-        let mut target = vec![0; size];
+        if size > super::path::MAX_PATH_LEN {
+            return Err(Error::NameTooLong);
+        }
+        let mut target = Vec::new();
+        target
+            .try_reserve_exact(size)
+            .map_err(|_| Error::OutOfMemory)?;
+        target.resize(size, 0);
         let mut written = 0;
         // SAFETY: the vector is writable for exactly its capacity.
         status(unsafe {
@@ -1339,12 +1376,16 @@ impl VnodeOps for ProviderVnode {
         if maximum == 0 {
             return Ok((Vec::new(), cursor));
         }
-        let mut raw_entries = vec![FsDirEntry::EMPTY; maximum];
+        let mut raw_entries = Vec::new();
+        raw_entries
+            .try_reserve_exact(maximum)
+            .map_err(|_| Error::OutOfMemory)?;
+        raw_entries.resize(maximum, FsDirEntry::EMPTY);
         let mut count = 0usize;
         let mut next = cursor;
         // SAFETY: output storage is initialized and writable for `maximum`
         // entries; names returned by the provider are copied before return.
-        status(unsafe {
+        let result = unsafe {
             callback(
                 self.mount.provider.operations.context,
                 self.mount.receipt,
@@ -1355,12 +1396,20 @@ impl VnodeOps for ProviderVnode {
                 &raw mut count,
                 &raw mut next,
             )
-        })?;
-        if count > raw_entries.len() {
+        };
+        let capacity = raw_entries.len();
+        let mut receipts = VnodeReceipts {
+            mount: &self.mount,
+            entries: &mut raw_entries,
+        };
+        status(result)?;
+        if count > capacity {
             return Err(Error::Io);
         }
-        let mut entries = Vec::with_capacity(count);
-        for entry in raw_entries.into_iter().take(count) {
+        let mut entries = Vec::new();
+        entries.try_reserve(count).map_err(|_| Error::OutOfMemory)?;
+        for index in 0..count {
+            let entry = receipts.take(index);
             let name_length = usize::from(entry.name_length);
             if name_length > entry.name.len() {
                 self.mount.release_vnode(entry.vnode.receipt);
@@ -1663,7 +1712,8 @@ pub unsafe fn memory_object_read(
 ) -> Result<usize> {
     // SAFETY: forwarded from this function's safety contract.
     let object = unsafe { borrow_arc::<VmObject>(receipt) }?;
-    let bytes = mutable_bytes(buffer, length)?;
+    // SAFETY: forwarded from this function's buffer contract.
+    let bytes = unsafe { mutable_bytes(buffer, length) }?;
     object.read_at(offset, bytes).map_err(mem_error)
 }
 
@@ -1679,7 +1729,8 @@ pub unsafe fn memory_object_write(
 ) -> Result<usize> {
     // SAFETY: forwarded from this function's safety contract.
     let object = unsafe { borrow_arc::<VmObject>(receipt) }?;
-    let bytes = immutable_bytes(buffer, length)?;
+    // SAFETY: forwarded from this function's buffer contract.
+    let bytes = unsafe { immutable_bytes(buffer, length) }?;
     object.write_at(offset, bytes).map_err(mem_error)
 }
 
@@ -1736,7 +1787,12 @@ unsafe fn borrow_arc<T>(receipt: *mut c_void) -> Result<core::mem::ManuallyDrop<
     }))
 }
 
-fn mutable_bytes<'a>(pointer: *mut u8, length: usize) -> Result<&'a mut [u8]> {
+/// Builds a writable view over a foreign ABI buffer.
+///
+/// # Safety
+/// `pointer` must be uniquely writable for `length` bytes and remain live for
+/// the returned borrow. The caller chooses and therefore owns that lifetime.
+unsafe fn mutable_bytes<'a>(pointer: *mut u8, length: usize) -> Result<&'a mut [u8]> {
     if length == 0 {
         return Ok(&mut []);
     }
@@ -1747,7 +1803,12 @@ fn mutable_bytes<'a>(pointer: *mut u8, length: usize) -> Result<&'a mut [u8]> {
     Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
 }
 
-fn immutable_bytes<'a>(pointer: *const u8, length: usize) -> Result<&'a [u8]> {
+/// Builds a readable view over a foreign ABI buffer.
+///
+/// # Safety
+/// `pointer` must be readable for `length` bytes and remain live for the
+/// returned borrow. The caller chooses and therefore owns that lifetime.
+unsafe fn immutable_bytes<'a>(pointer: *const u8, length: usize) -> Result<&'a [u8]> {
     if length == 0 {
         return Ok(&[]);
     }
@@ -2010,7 +2071,11 @@ pub(crate) fn devfs_children(parent: u64) -> crate::driver::Result<Vec<DevfsBrok
                 &raw mut needed,
             )
         })?;
-        let mut entries = vec![DevfsBrokerEntry::EMPTY; needed];
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(needed)
+            .map_err(|_| crate::driver::Error::OutOfMemory)?;
+        entries.resize(needed, DevfsBrokerEntry::EMPTY);
         let mut written = needed;
         // SAFETY: `entries` is writable for its advertised capacity and the
         // broker callback remains resident while the mounted provider holds
