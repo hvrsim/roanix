@@ -702,6 +702,12 @@ static inline int32_t rdf_irq_map(const struct rdf_irq_domain *domain, uint64_t 
     return rdf_api_v1_irq_map(domain, hwirq, flags, out_virq);
 }
 
+/* Removes an unused hardware interrupt mapping. */
+static inline int32_t rdf_irq_unmap(const struct rdf_irq_domain *domain, uint64_t hwirq)
+{
+    return rdf_api_v1_irq_unmap(domain, hwirq);
+}
+
 /* Resolves a device's index-th firmware interrupt. */
 static inline int32_t rdf_irq_of_device(const struct rdf_device *device, size_t index,
                                         uint32_t *out_virq)

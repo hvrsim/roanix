@@ -306,6 +306,7 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         irq_domain_register => shim_irq_domain_register,
         irq_domain_unregister => shim_irq_domain_unregister,
         irq_map => shim_irq_map,
+        irq_unmap => shim_irq_unmap,
         irq_of_device => shim_irq_of_device,
         irq_request => shim_irq_request,
         irq_release => shim_irq_release,

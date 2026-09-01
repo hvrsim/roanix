@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "ddk",
+    "bus/pci",
     "platform/acpi",
     "platform/fdt",
     "irqchip/ioapic",
@@ -11,6 +12,7 @@ members = [
     "tty/special",
     "fs/tmpfs",
     "fs/devfs",
+    "storage/nvme",
 ]
 resolver = "3"
 

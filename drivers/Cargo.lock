@@ -42,6 +42,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvme"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+]
+
+[[package]]
+name = "pci"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+]
+
+[[package]]
 name = "plic"
 version = "0.1.0"
 dependencies = [

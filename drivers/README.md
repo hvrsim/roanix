@@ -15,6 +15,8 @@ operation records made of plain function pointers.
 | `platform/acpi/`   | `acpi.ko`   | x86_64 ACPI (MADT) platform enumerator      |
 | `platform/fdt/`    | `fdt.ko`    | riscv64 flattened device-tree enumerator    |
 | `irqchip/ioapic/`  | `ioapic.ko` | I/O APIC interrupt controller and domain    |
+| `bus/pci/`         | `pci.ko`    | PCI/PCIe enumeration and configuration       |
+| `storage/nvme/`    | `storage-nvme.ko` | Per-CPU-queue NVMe block driver       |
 | `tty/uart8250/`    | `uart8250.ko` | 8250/16550 serial port driver             |
 | `tty/console/`     | `console.ko`  | Terminal line discipline and tty provider |
 | `tty/pty/`         | `pty.ko`    | ptmx/pts pseudo-terminal driver             |

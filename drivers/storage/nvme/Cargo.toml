@@ -1,0 +1,25 @@
+[package]
+name = "nvme"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+build = "build.rs"
+autolib = false
+
+[[bin]]
+name = "nvme"
+path = "src/lib.rs"
+
+[dependencies]
+ddk = { path = "../../ddk" }
+
+[build-dependencies]
+ddk = { path = "../../ddk", features = ["module-build"] }
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

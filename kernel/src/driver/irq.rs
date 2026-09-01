@@ -526,6 +526,7 @@ pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result
     if index >= domain.hwirq_count as usize {
         return Err(Error::InvalidArgument);
     }
+    let _registration = registry()?.registration.lock();
     if let Some(existing) = domain.lookup(hwirq) {
         return Ok(existing);
     }
@@ -557,6 +558,47 @@ pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result
         }
     }
     Ok(record.virq)
+}
+
+/// Removes a hardware interrupt mapping after every handler has been released.
+pub fn destroy_mapping(domain: &Arc<IrqDomain>, hwirq: u64) -> Result<()> {
+    let index = usize::try_from(hwirq).map_err(|_| Error::InvalidArgument)?;
+    if index >= domain.hwirq_count as usize {
+        return Err(Error::InvalidArgument);
+    }
+    let virq = domain.map[index].load(Ordering::Acquire);
+    if virq == 0 {
+        return Err(Error::NotFound);
+    }
+    let record = desc(virq).ok_or(Error::NotFound)?;
+    // Serializes against both a new mapping and a handler attachment.
+    let _registration = registry()?.registration.lock();
+    {
+        let inner = record.inner.lock();
+        if !inner.actions.is_empty()
+            || inner
+                .domain
+                .as_ref()
+                .is_none_or(|mapped| !Arc::ptr_eq(mapped, domain))
+            || inner.hwirq != hwirq
+        {
+            return Err(Error::Busy);
+        }
+    }
+    domain.mask(hwirq);
+    while record.in_flight.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+    if let Some(teardown) = domain.ops.teardown {
+        // SAFETY: registration keeps the callback executable until every
+        // mapping is removed and no dispatch remains in flight here.
+        unsafe { teardown(domain.ops.context, hwirq, virq) };
+    }
+    domain.map[index]
+        .compare_exchange(virq, 0, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| Error::Busy)?;
+    unbind_desc(virq);
+    Ok(())
 }
 
 /// Resolves the `index`-th firmware interrupt of `device` to a virtual

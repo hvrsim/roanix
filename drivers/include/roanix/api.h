@@ -505,6 +505,7 @@ extern int32_t rdf_api_v1_irq_domain_register(const struct rdf_module *module, c
 extern int32_t rdf_api_v1_irq_domain_unregister(const struct rdf_irq_domain *domain);
 extern int32_t rdf_api_v1_irq_map(const struct rdf_irq_domain *domain, uint64_t hwirq, uint32_t flags,
                    uint32_t *out_virq);
+extern int32_t rdf_api_v1_irq_unmap(const struct rdf_irq_domain *domain, uint64_t hwirq);
 extern int32_t rdf_api_v1_irq_of_device(const struct rdf_device *device, size_t index, uint32_t *out_virq);
 extern int32_t rdf_api_v1_irq_request(const struct rdf_module *module, const struct rdf_device *device,
                        uint32_t virq, const char *name, uint32_t flags,

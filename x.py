@@ -39,6 +39,8 @@ RUST_DRIVER_MODULES = {
     "x86_64": (
         ("acpi", "acpi.ko"),
         ("ioapic", "ioapic.ko"),
+        ("pci", "pci.ko"),
+        ("nvme", "storage-nvme.ko"),
         ("tmpfs", "tmpfs.ko"),
         ("devfs", "devfs.ko"),
         ("console", "console.ko"),
@@ -49,6 +51,8 @@ RUST_DRIVER_MODULES = {
     "riscv64": (
         ("fdt", "fdt.ko"),
         ("plic", "plic.ko"),
+        ("pci", "pci.ko"),
+        ("nvme", "storage-nvme.ko"),
         ("tmpfs", "tmpfs.ko"),
         ("devfs", "devfs.ko"),
         ("console", "console.ko"),

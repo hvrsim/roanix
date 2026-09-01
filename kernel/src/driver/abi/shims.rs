@@ -1043,6 +1043,13 @@ unsafe extern "C" fn shim_irq_map(
     })())
 }
 
+unsafe extern "C" fn shim_irq_unmap(domain: *const c_void, hwirq: u64) -> i32 {
+    status((|| -> Result<()> {
+        let domain = object::<IrqDomain>(domain)?;
+        irq::destroy_mapping(&domain, hwirq)
+    })())
+}
+
 unsafe extern "C" fn shim_irq_of_device(
     device: *const c_void,
     index: usize,
