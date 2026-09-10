@@ -31,9 +31,12 @@ const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_DEPTH: usize = 32;
 const MAX_DEVICES: usize = 256;
-const MAX_CONTROLLERS: usize = 32;
+// Match the kernel/PLIC limit. QEMU describes a CPU interrupt controller per
+// hart and two PLIC contexts (machine and supervisor), each with two cells.
+const MAX_HARTS: usize = 256;
+const MAX_CONTROLLERS: usize = MAX_HARTS + 32;
 const MAX_STRINGS: usize = 16;
-const MAX_CELLS: usize = 32;
+const MAX_CELLS: usize = MAX_HARTS * 4;
 const MAX_BLOB: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy)]

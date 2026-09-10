@@ -33,14 +33,18 @@ the hardware backend to the native terminal layer.
 ```
 ./x.py --arch x86_64        # build, install, and boot x86_64
 ./x.py --arch riscv64       # build, install, and boot RISC-V
+./x.py build drivers       # build only the hardware modules
 ```
 
 The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`
 with the pinned nightly toolchain in `rust-toolchain.toml`. RISC-V builds
 rebuild `core` and `alloc` with `-Z build-std` so every image stays position
-independent. xtool keeps Cargo intermediates under `build/cargo/drivers`,
-copies finished modules to `build/<arch>/drivers-rust`, and installs them
-directly into the staged sysroot alongside the public headers.
+independent. `x.py` lets Cargo detect changes and keeps intermediates under
+`build/cargo/drivers`. It copies finished modules to `build/<arch>/drivers-rust`
+and installs them directly into the staged sysroot alongside the public headers.
+
+Drivers always use the release profile. Add new module packages to the
+architecture's `DRIVERS` tuple in `x.py`.
 
 ## Writing a driver
 

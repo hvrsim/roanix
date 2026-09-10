@@ -9,6 +9,7 @@ kernel/target/
 userland/.jinx-cache/
 userland/host-sources/
 userland/sources/
+userland/util-roanix/roanix-root
 __pycache__/
 
 # editor artifacts

@@ -27,14 +27,16 @@
 Roanix is built with `x.py`, a single-file build tool in the project root:
 
 ```bash
-./x.py doctor     # check the host has everything that is needed
-./x.py            # build whatever changed and boot it in QEMU
+./x.py                  # build changed parts and boot in QEMU
+./x.py build iso        # build an ISO and its ext4 root disk
+./x.py rebuild bash -f  # save source edits as a patch, refetch, and rebuild Bash
 ```
 
 For detailed build instructions, see the *Roanix Internals* book under
 [Building Roanix](book/src/guide/BUILDING.md).
 
-**NOTE: Builds are not supported on non-linux platforms.**
+Builds require Linux. Image builds use cached binary packages where available;
+Cargo detects kernel and driver changes, and `rebuild` handles userland edits.
 
 ## Contributing
 
