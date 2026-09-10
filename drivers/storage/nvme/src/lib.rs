@@ -13,10 +13,13 @@
 //! NVM Express 1.x block driver with one interrupt-driven I/O queue per CPU.
 //!
 //! Queue memory, transfer buffers, and PRP lists are allocated once during
-//! probe. The I/O path selects a queue from the current CPU, takes only that
-//! queue's lock, and performs no allocation or controller-global locking.
+//! probe. Callers prefer their CPU's queue, borrow idle queues under load, and
+//! sleep for admission when all queues are busy. No spin lock spans an I/O wait.
 
 extern crate alloc;
+
+mod lease;
+use lease::{Guard as QueueGuard, Lease};
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{
@@ -29,8 +32,8 @@ use core::{
 #[cfg(target_arch = "x86_64")]
 use ddk::InterfaceBinding;
 use ddk::{
-    Bus, Devfs, Device, Dma, DriverRegistration, Error, Event, Irq, Mmio, Module, RESOURCE_MEMORY,
-    Result, TicketLock, raw,
+    BlockRegistration, Bus, Device, Dma, DriverRegistration, Error, Event, Irq, Mmio, Module,
+    RESOURCE_MEMORY, Result, TicketLock, raw,
 };
 
 const CAP: usize = 0x00;
@@ -113,6 +116,7 @@ struct QueuePair {
     phase: bool,
     next_cid: u16,
     event: Event,
+    failed: bool,
 }
 
 impl QueuePair {
@@ -141,10 +145,17 @@ impl QueuePair {
             phase: true,
             next_cid: 1,
             event,
+            failed: false,
         })
     }
 
     fn submit(&mut self, registers: &Mmio, stride: usize, mut command: Command) -> Result<u32> {
+        if self.failed {
+            return Err(Error::from_status(ddk::EIO));
+        }
+        // Until a matching completion is consumed, neither the queue nor its
+        // DMA buffers may be reused, including after a timeout/wait error.
+        self.failed = true;
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
         command.cdw0 = (command.cdw0 & 0xffff) | (u32::from(cid) << 16);
@@ -199,6 +210,7 @@ impl QueuePair {
         if completion.cid != cid {
             return Err(Error::from_status(ddk::EIO));
         }
+        self.failed = false;
         self.cq_head += 1;
         if self.cq_head == self.depth {
             self.cq_head = 0;
@@ -242,6 +254,9 @@ impl IoQueue {
     }
 
     fn set_prps(&mut self, command: &mut Command, length: usize) -> Result<()> {
+        if self.pair.failed {
+            return Err(Error::from_status(ddk::EIO));
+        }
         if length == 0 || length > self.data.len() {
             return Err(Error::from_status(ddk::EINVAL));
         }
@@ -339,6 +354,9 @@ impl IoQueue {
         blocks: u16,
         input: &[u8],
     ) -> Result<()> {
+        if self.pair.failed || input.len() > self.data.len() {
+            return Err(Error::from_status(ddk::EIO));
+        }
         // SAFETY: the exclusively borrowed coherent allocation is valid for
         // the checked transfer length and is disjoint from caller input.
         unsafe { ptr::copy_nonoverlapping(input.as_ptr(), self.data.as_ptr(), input.len()) };
@@ -362,9 +380,8 @@ impl IoQueue {
 struct Namespace {
     controller: usize,
     nsid: u32,
-    blocks: u64,
     block_size: usize,
-    node: u64,
+    block: Option<BlockRegistration>,
 }
 
 struct Controller {
@@ -374,10 +391,10 @@ struct Controller {
     timeout_ns: u64,
     maximum_entries: u16,
     maximum_io_queues: u16,
-    admin: TicketLock<QueuePair>,
-    io: Vec<TicketLock<IoQueue>>,
-    // Boxing is intentional: devfs stores stable namespace context pointers
-    // while this vector is allowed to grow during discovery.
+    admin: Lease<QueuePair>,
+    io: Vec<Lease<IoQueue>>,
+    // Boxing is intentional: the block ABI stores stable namespace context
+    // pointers while this vector is allowed to grow during discovery.
     #[allow(clippy::vec_box)]
     namespaces: Vec<Box<Namespace>>,
     max_transfer: usize,
@@ -449,7 +466,7 @@ impl Controller {
             timeout_ns,
             maximum_entries,
             maximum_io_queues,
-            admin: TicketLock::new(admin),
+            admin: Lease::new(admin)?,
             io: Vec::new(),
             namespaces: Vec::new(),
             max_transfer: DATA_BYTES,
@@ -471,7 +488,7 @@ impl Controller {
             return Err(Error::from_status(ddk::ENOTSUP));
         }
         self.vector_count = virqs.len().min(usize::from(u16::MAX)) as u16;
-        self.event_ids[0].store(self.admin.lock().event.id(), Ordering::Release);
+        self.event_ids[0].store(self.admin.take()?.event.id(), Ordering::Release);
         self.event_count.store(1, Ordering::Release);
         #[cfg(target_arch = "riscv64")]
         {
@@ -499,7 +516,7 @@ impl Controller {
 
     fn admin_command(&self, command: Command) -> Result<u32> {
         self.admin
-            .lock()
+            .take()?
             .submit(&self.registers, self.doorbell_stride, command)
     }
 
@@ -514,7 +531,7 @@ impl Controller {
         Ok(())
     }
 
-    fn configure(&mut self, devfs: &Devfs, parent: u64, controller_id: u32) -> Result<()> {
+    fn configure(&mut self, controller_id: u32) -> Result<()> {
         let identify = Dma::allocate(Some(self.device), PAGE_SIZE, PAGE_SIZE, ddk::DMA_ZERO)?;
         self.identify(0, 1, &identify)?;
         // SAFETY: Identify Controller completed successfully into all 4096
@@ -553,42 +570,34 @@ impl Controller {
             self.namespaces.push(Box::new(Namespace {
                 controller: controller_pointer,
                 nsid,
-                blocks,
                 block_size,
-                node: 0,
+                block: None,
             }));
             let namespace = self
                 .namespaces
                 .last_mut()
                 .expect("namespace was just pushed");
             let mut name_storage = [0u8; 32];
-            let operations = raw::NodeOps {
-                size: raw::NODE_OPS_SIZE,
+            let operations = raw::BlockOps {
+                size: raw::BLOCK_OPS_SIZE,
+                flags: 0,
                 context: (&raw mut **namespace).cast(),
-                open: None,
-                close: None,
-                initial_offset: None,
-                read: Some(node_read),
-                write: Some(node_write),
-                size_bytes: Some(node_size),
-                sync: Some(node_sync),
-                poll: Some(node_poll),
-                ioctl: None,
-                readable_event: None,
-                writable_event: None,
-                hangup_event: None,
-                terminal_state: None,
+                logical_block_size: block_size as u32,
+                max_transfer_blocks: (self.max_transfer / block_size) as u32,
+                block_count: blocks,
+                read: Some(block_read),
+                write: Some(block_write),
+                flush: Some(block_flush),
+                discard: None,
             };
             // SAFETY: callbacks are static and the boxed namespace plus its
-            // controller outlive the node. The table itself is copied.
-            namespace.node = unsafe {
-                devfs.create_block(
-                    parent,
+            // controller outlive the registration. The table itself is copied.
+            namespace.block = Some(unsafe {
+                BlockRegistration::register(
                     namespace_name(controller_id, nsid, &mut name_storage),
-                    0o660,
                     &operations,
                 )?
-            };
+            });
         }
         if self.namespaces.is_empty() {
             return Err(Error::from_status(ddk::ENODEV));
@@ -642,127 +651,90 @@ impl Controller {
                 self.event_count.store(u32::from(id), Ordering::Release);
                 return Err(error);
             }
-            self.io.push(TicketLock::new(queue));
+            self.io.push(Lease::new(queue)?);
         }
         Ok(())
     }
 
-    fn queue(&self) -> &TicketLock<IoQueue> {
-        &self.io[ddk::cpu_current() as usize % self.io.len()]
-    }
-
-    fn read_at(&self, namespace: &Namespace, offset: u64, output: &mut [u8]) -> Result<usize> {
-        let length = bounded_length(namespace, offset, output.len());
-        let mut done = 0;
-        let block_size = namespace.block_size;
-        let max_transfer = self.max_transfer / block_size * block_size;
-        let mut queue = self.queue().lock();
-        while done < length {
-            let absolute = offset + done as u64;
-            let within = absolute as usize % block_size;
-            if within == 0 {
-                let full = (length - done) / block_size * block_size;
-                if full != 0 {
-                    let bytes = full.min(max_transfer);
-                    queue.read(
-                        &self.registers,
-                        self.doorbell_stride,
-                        namespace.nsid,
-                        absolute / block_size as u64,
-                        (bytes / block_size) as u16,
-                        &mut output[done..done + bytes],
-                    )?;
-                    done += bytes;
-                    continue;
+    fn queue(&self) -> Result<QueueGuard<'_, IoQueue>> {
+        let first = ddk::cpu_current() as usize % self.io.len();
+        let mut events = [self.io[0].ready; MAX_CPUS as usize];
+        for (event, queue) in events.iter_mut().zip(&self.io) {
+            *event = queue.ready;
+        }
+        loop {
+            for step in 0..self.io.len() {
+                if let Some(queue) = self.io[(first + step) % self.io.len()].try_take()? {
+                    return Ok(queue);
                 }
             }
-            let count = (block_size - within).min(length - done);
-            queue.read_dma(
-                &self.registers,
-                self.doorbell_stride,
-                namespace.nsid,
-                absolute / block_size as u64,
-                1,
-                block_size,
-            )?;
-            // SAFETY: the DMA buffer contains the completed block and the
-            // output subrange is writable and non-overlapping.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    queue.data.as_ptr().add(within),
-                    output.as_mut_ptr().add(done),
-                    count,
-                );
-            }
-            done += count;
+            Event::wait_any(&events[..self.io.len()])?;
         }
-        Ok(done)
     }
 
-    fn write_at(&self, namespace: &Namespace, offset: u64, input: &[u8]) -> Result<usize> {
-        let length = bounded_length(namespace, offset, input.len());
-        let mut done = 0;
-        let block_size = namespace.block_size;
-        let max_transfer = self.max_transfer / block_size * block_size;
-        let mut queue = self.queue().lock();
-        while done < length {
-            let absolute = offset + done as u64;
-            let within = absolute as usize % block_size;
-            if within == 0 {
-                let full = (length - done) / block_size * block_size;
-                if full != 0 {
-                    let bytes = full.min(max_transfer);
-                    queue.write(
-                        &self.registers,
-                        self.doorbell_stride,
-                        namespace.nsid,
-                        absolute / block_size as u64,
-                        (bytes / block_size) as u16,
-                        &input[done..done + bytes],
-                    )?;
-                    done += bytes;
-                    continue;
-                }
-            }
-            let count = (block_size - within).min(length - done);
-            let lba = absolute / block_size as u64;
-            let data_pointer = queue.data.as_ptr();
-            // Read-modify-write preserves bytes outside an unaligned request.
-            // Use caller-sized temporary storage only through the existing DMA
-            // buffer, avoiding allocation on this slow path.
-            queue.read_dma(
-                &self.registers,
-                self.doorbell_stride,
-                namespace.nsid,
-                lba,
-                1,
-                block_size,
-            )?;
-            // SAFETY: the completed read initialized the coherent block and
-            // the requested subsection lies within it.
-            unsafe {
-                ptr::copy_nonoverlapping(input.as_ptr().add(done), data_pointer.add(within), count);
-            }
-            queue.write_dma(
-                &self.registers,
-                self.doorbell_stride,
-                namespace.nsid,
-                lba,
-                1,
-                block_size,
-            )?;
-            done += count;
+    fn read_blocks(
+        &self,
+        namespace: &Namespace,
+        lba: u64,
+        blocks: u32,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let bytes = blocks as usize * namespace.block_size;
+        if blocks == 0 || output.len() != bytes || blocks > u16::MAX.into() {
+            return Err(Error::from_status(ddk::EINVAL));
         }
-        Ok(done)
+        let mut queue = self.queue()?;
+        queue.read(
+            &self.registers,
+            self.doorbell_stride,
+            namespace.nsid,
+            lba,
+            blocks as u16,
+            output,
+        )
     }
 
-    fn remove_nodes(&mut self) -> Result<()> {
-        let devfs = Devfs::current()?;
+    fn write_blocks(
+        &self,
+        namespace: &Namespace,
+        lba: u64,
+        blocks: u32,
+        input: &[u8],
+    ) -> Result<()> {
+        let bytes = blocks as usize * namespace.block_size;
+        if blocks == 0 || input.len() != bytes || blocks > u16::MAX.into() {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let mut queue = self.queue()?;
+        queue.write(
+            &self.registers,
+            self.doorbell_stride,
+            namespace.nsid,
+            lba,
+            blocks as u16,
+            input,
+        )
+    }
+
+    fn remove_blocks(&mut self) -> Result<()> {
         for namespace in self.namespaces.iter_mut().rev() {
-            if namespace.node != 0 {
-                devfs.remove(namespace.node)?;
-                namespace.node = 0;
+            if let Some(mut registration) = namespace.block.take() {
+                if let Err(error) = registration.unregister() {
+                    namespace.block = Some(registration);
+                    return Err(error);
+                }
             }
+        }
+        Ok(())
+    }
+
+    fn scan_blocks(&self) -> Result<()> {
+        for namespace in &self.namespaces {
+            namespace
+                .block
+                .as_ref()
+                .ok_or(Error::from_status(ddk::ENODEV))?
+                .rescan()?;
         }
         Ok(())
     }
@@ -846,101 +818,79 @@ fn le64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
 }
 
-fn bounded_length(namespace: &Namespace, offset: u64, requested: usize) -> usize {
-    let size = namespace.blocks.saturating_mul(namespace.block_size as u64);
-    if offset >= size {
-        return 0;
-    }
-    requested.min((size - offset).min(usize::MAX as u64) as usize)
-}
-
 fn namespace(pointer: *mut c_void) -> Option<&'static Namespace> {
     if pointer.is_null() {
         None
     } else {
-        // SAFETY: node creation stores a pointer to a boxed namespace that is
-        // removed from devfs before the box is released.
+        // SAFETY: block registration stores a pointer to a boxed namespace and
+        // is withdrawn before the box is released.
         Some(unsafe { &*pointer.cast::<Namespace>() })
     }
 }
 
 fn controller(namespace: &Namespace) -> &'static Controller {
     // SAFETY: the namespace is owned by this controller and every namespace
-    // node is withdrawn before the controller is destroyed.
+    // registration is withdrawn before the controller is destroyed.
     unsafe { &*(namespace.controller as *const Controller) }
 }
 
-unsafe extern "C" fn node_read(
+unsafe extern "C" fn block_read(
     context: *mut c_void,
-    _file: usize,
-    offset: u64,
+    lba: u64,
+    blocks: u32,
     output: *mut u8,
-    length: usize,
-    _flags: u32,
-) -> i64 {
+) -> i32 {
     let Some(namespace) = namespace(context) else {
-        return ddk::EINVAL.into();
+        return ddk::EINVAL;
     };
-    // SAFETY: the node ABI supplies exactly `length` writable bytes, and the
-    // DDK helper checks the null/length combination.
+    let Some(length) = (blocks as usize).checked_mul(namespace.block_size) else {
+        return ddk::EINVAL;
+    };
+    // SAFETY: the block ABI supplies exactly the geometry-derived writable range.
     let output = match unsafe { ddk::output_bytes(output, length) } {
         Ok(value) => value,
-        Err(error) => return error.status().into(),
+        Err(error) => return error.status(),
     };
     controller(namespace)
-        .read_at(namespace, offset, output)
-        .map_or_else(|error| error.status().into(), |count| count as i64)
+        .read_blocks(namespace, lba, blocks, output)
+        .map_or_else(Error::status, |()| ddk::OK)
 }
 
-unsafe extern "C" fn node_write(
+unsafe extern "C" fn block_write(
     context: *mut c_void,
-    _file: usize,
-    offset: u64,
+    lba: u64,
+    blocks: u32,
     input: *const u8,
-    length: usize,
-    _flags: u32,
-) -> i64 {
+) -> i32 {
     let Some(namespace) = namespace(context) else {
-        return ddk::EINVAL.into();
+        return ddk::EINVAL;
     };
-    // SAFETY: the node ABI supplies exactly `length` readable bytes, and the
-    // DDK helper checks the null/length combination.
+    let Some(length) = (blocks as usize).checked_mul(namespace.block_size) else {
+        return ddk::EINVAL;
+    };
+    // SAFETY: the block ABI supplies exactly the geometry-derived readable range.
     let input = match unsafe { ddk::input_bytes(input, length) } {
         Ok(value) => value,
-        Err(error) => return error.status().into(),
+        Err(error) => return error.status(),
     };
     controller(namespace)
-        .write_at(namespace, offset, input)
-        .map_or_else(|error| error.status().into(), |count| count as i64)
+        .write_blocks(namespace, lba, blocks, input)
+        .map_or_else(Error::status, |()| ddk::OK)
 }
 
-unsafe extern "C" fn node_size(context: *mut c_void) -> u64 {
-    namespace(context).map_or(0, |namespace| {
-        namespace.blocks.saturating_mul(namespace.block_size as u64)
-    })
-}
-
-unsafe extern "C" fn node_sync(context: *mut c_void) -> i32 {
+unsafe extern "C" fn block_flush(context: *mut c_void) -> i32 {
     let Some(namespace) = namespace(context) else {
         return ddk::EINVAL;
     };
     let controller = controller(namespace);
-    let result = controller.queue().lock().flush(
-        &controller.registers,
-        controller.doorbell_stride,
-        namespace.nsid,
-    );
+    let result = controller.queue().and_then(|mut queue| {
+        queue.flush(
+            &controller.registers,
+            controller.doorbell_stride,
+            namespace.nsid,
+        )
+    });
     result.map_or_else(Error::status, |()| ddk::OK)
-}
-
-unsafe extern "C" fn node_poll(
-    _context: *mut c_void,
-    _file: usize,
-    _offset: u64,
-    events: u16,
-    _flags: u32,
-) -> i64 {
-    i64::from(events & (ddk::POLL_IN | ddk::POLL_RDNORM | ddk::POLL_OUT | ddk::POLL_WRNORM))
 }
 
 fn decimal(mut value: u32, output: &mut [u8]) -> usize {
@@ -1101,12 +1051,10 @@ unsafe extern "C" fn probe(
         controller.request_interrupts(&virqs)?;
         #[cfg(target_arch = "x86_64")]
         pci_msi_unmask(device)?;
-        let devfs = Devfs::current()?;
-        let root = devfs.root()?;
         let controller_id = NEXT_CONTROLLER.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = controller.configure(&devfs, root, controller_id) {
-            if controller.remove_nodes().is_err() {
-                // A concurrently opened node still owns this context. Leaking
+        if let Err(error) = controller.configure(controller_id) {
+            if controller.remove_blocks().is_err() {
+                // A concurrently mounted device still owns this context. Leaking
                 // is safer than invalidating its callbacks; the module lease
                 // held by that endpoint also prevents code unload.
                 let _ = Box::leak(controller);
@@ -1119,11 +1067,14 @@ unsafe extern "C" fn probe(
         if let Err(error) = unsafe { device.set_data(pointer.cast()) } {
             // SAFETY: set_data failed, so ownership was not transferred.
             let mut controller = unsafe { Box::from_raw(pointer) };
-            if controller.remove_nodes().is_err() {
+            if controller.remove_blocks().is_err() {
                 let _ = Box::leak(controller);
             }
             return Err(error);
         }
+        // SAFETY: device data now owns the controller at its final address, so
+        // partition scanning may re-enter the immutable block callbacks.
+        unsafe { &*pointer }.scan_blocks()?;
         #[cfg(target_arch = "x86_64")]
         ATTACHED_CONTROLLERS.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -1145,7 +1096,7 @@ unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) 
     // callback against another remove. Keep ownership in device data until all
     // externally reachable namespace contexts have been revoked.
     let controller_ref = unsafe { &mut *controller };
-    if controller_ref.remove_nodes().is_err() {
+    if controller_ref.remove_blocks().is_err() {
         return;
     }
     // SAFETY: clearing prevents any later callback from claiming this box.

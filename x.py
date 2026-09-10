@@ -41,26 +41,17 @@ RUST_DRIVER_MODULES = {
         ("ioapic", "ioapic.ko"),
         ("pci", "pci.ko"),
         ("nvme", "storage-nvme.ko"),
-        ("tmpfs", "tmpfs.ko"),
-        ("devfs", "devfs.ko"),
-        ("console", "console.ko"),
-        ("pty", "pty.ko"),
         ("uart8250", "uart8250.ko"),
-        ("special", "special.ko"),
     ),
     "riscv64": (
         ("fdt", "fdt.ko"),
         ("plic", "plic.ko"),
         ("pci", "pci.ko"),
         ("nvme", "storage-nvme.ko"),
-        ("tmpfs", "tmpfs.ko"),
-        ("devfs", "devfs.ko"),
-        ("console", "console.ko"),
-        ("pty", "pty.ko"),
         ("uart8250", "uart8250.ko"),
-        ("special", "special.ko"),
     ),
 }
+BOOTSTRAP_PACKAGES = ("coreutils", "bash", "mlibc", "util-roanix")
 BOOK_DIR = ROOT / "book"
 USERLAND_DIR = ROOT / "userland"
 RECIPES_DIR = USERLAND_DIR / "recipes"
@@ -97,6 +88,7 @@ TOOL_PACKAGES = {
     "make": {"apt": "make", "pacman": "make", "apk": "make", "dnf": "make"},
     "xorriso": {"apt": "xorriso", "pacman": "xorriso", "apk": "xorriso", "dnf": "xorriso"},
     "sgdisk": {"apt": "gdisk", "pacman": "gptfdisk", "apk": "sgdisk", "dnf": "gdisk"},
+    "mke2fs": {"apt": "e2fsprogs", "pacman": "e2fsprogs", "apk": "e2fsprogs", "dnf": "e2fsprogs"},
     "mformat": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
     "mmd": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
     "mcopy": {"apt": "mtools", "pacman": "mtools", "apk": "mtools", "dnf": "mtools"},
@@ -492,7 +484,7 @@ class Context:
 
     # -- paths -------------------------------------------------------------
     #
-    #   build/<arch>/out/<profile>/   kernel, initramfs, bootable images
+    #   build/<arch>/out/<profile>/   kernel, initramfs, root and boot images
     #   build/<arch>/jinx/            Jinx build directory and packages
     #   build/<arch>/sysroot/         installed userland
     #   build/<arch>/firmware/        per-machine UEFI variables
@@ -532,6 +524,10 @@ class Context:
     @property
     def initramfs(self) -> Path:
         return self.artifacts / f"roanix-{self.arch.name}.initramfs.tar.gz"
+
+    @property
+    def root_disk(self) -> Path:
+        return self.artifacts / f"roanix-{self.arch.name}.root.img"
 
     @property
     def sysroot(self) -> Path:
@@ -1617,13 +1613,16 @@ def announce_plan(ctx: Context, jinx: Jinx, targets: Sequence[str]) -> None:
         ctx.log.msg2("Jinx has nothing to build")
 
 
-def install_rust_drivers(root: Path, modules: Sequence[Path]) -> None:
+def install_rust_drivers(
+    root: Path, modules: Sequence[Path], *, headers: bool = True
+) -> None:
     module_dir = root / "usr/lib/roanix/drivers"
-    include_dir = root / "usr/include/roanix"
     for module in modules:
         copy(module, module_dir / module.name)
-    for header in sorted((DRIVERS_DIR / "include/roanix").glob("*.h")):
-        copy(header, include_dir / header.name)
+    if headers:
+        include_dir = root / "usr/include/roanix"
+        for header in sorted((DRIVERS_DIR / "include/roanix").glob("*.h")):
+            copy(header, include_dir / header.name)
 
 
 def install_sysroot(
@@ -1728,11 +1727,28 @@ def sysroot_token(ctx: Context) -> str:
     return f"{stamp(ctx.sysroot)}|{recorded}"
 
 
+def rust_driver_outputs(ctx: Context) -> tuple[Path, ...]:
+    return tuple(
+        ctx.arch_root / "drivers-rust" / output_name
+        for _, output_name in RUST_DRIVER_MODULES[ctx.arch.name]
+    )
+
+
 def initramfs_digest(ctx: Context) -> str:
-    return fingerprint("initramfs", values=(ctx.arch.name, ctx.profile, sysroot_token(ctx)))
+    modules = rust_driver_outputs(ctx)
+    return fingerprint(
+        "bootstrap-initramfs-v2",
+        values=(
+            ctx.arch.name,
+            ctx.profile,
+            sysroot_token(ctx),
+            *BOOTSTRAP_PACKAGES,
+            *(f"{module.name}:{stamp(module)}" for module in modules),
+        ),
+    )
 
 
-def build_initramfs(ctx: Context, cache: Cache) -> Path:
+def build_initramfs(ctx: Context, jinx: Jinx, cache: Cache) -> Path:
     if not ctx.sysroot.is_dir():
         if ctx.dry_run:
             # The sysroot would have been produced by the preceding step; a dry
@@ -1754,10 +1770,15 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
     if ctx.dry_run:
         return ctx.initramfs
     level = 1 if ctx.profile == "dev" else 9
-    ctx.log.msg3(f"gzip level {level} from {rel(ctx.sysroot)}")
+    ctx.log.msg3(
+        f"bootstrap packages: {', '.join(BOOTSTRAP_PACKAGES)} plus hardware modules"
+    )
     ensure_dir(ctx.initramfs.parent)
     temporary = ctx.initramfs.with_suffix(".tmp")
+    staging = ctx.work / "initramfs-root"
     remove(temporary)
+    remove(staging)
+    ensure_dir(staging)
 
     def as_root(info: tarfile.TarInfo) -> tarfile.TarInfo:
         info.uid = info.gid = 0
@@ -1765,6 +1786,17 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
         return info
 
     try:
+        jinx.install(staging, BOOTSTRAP_PACKAGES, force=ctx.force)
+        install_rust_drivers(staging, rust_driver_outputs(ctx), headers=False)
+        # util-roanix carries these sentinels so package installation retains
+        # empty directories in the real root. They are not bootstrap payload
+        # and `/dev` is already a mounted devfs when the archive is imported.
+        for root_only in (
+            "dev/.roanix-keep",
+            "tmp/.roanix-keep",
+            "etc/roanix-root",
+        ):
+            remove(staging / root_only)
         with tarfile.open(
             temporary,
             mode="w:gz",
@@ -1773,13 +1805,13 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
             compresslevel=level,
         ) as archive:
             entries = sorted(
-                ctx.sysroot.rglob("*"),
-                key=lambda item: item.relative_to(ctx.sysroot).as_posix(),
+                staging.rglob("*"),
+                key=lambda item: item.relative_to(staging).as_posix(),
             )
             for entry in entries:
                 archive.add(
                     entry,
-                    arcname=entry.relative_to(ctx.sysroot).as_posix(),
+                    arcname=entry.relative_to(staging).as_posix(),
                     recursive=False,
                     filter=as_root,
                 )
@@ -1787,11 +1819,129 @@ def build_initramfs(ctx: Context, cache: Cache) -> Path:
         ctx.initramfs.chmod(0o644)
     finally:
         remove(temporary)
+        remove(staging)
     cache.record(key, digest, (ctx.initramfs,))
     ctx.log.msg2(
         f"{rel(ctx.initramfs)} ({human_size(ctx.initramfs.stat().st_size)})"
     )
     return ctx.initramfs
+
+
+# --------------------------------------------------------------------------
+# System root disk
+# --------------------------------------------------------------------------
+
+
+def root_disk_digest(ctx: Context) -> str:
+    return fingerprint(
+        "ext4-root-disk-v1",
+        values=(ctx.arch.name, ctx.profile, sysroot_token(ctx)),
+    )
+
+
+def build_root_disk(ctx: Context, run: Runner, cache: Cache) -> Path:
+    """Materialize the full sysroot as a GPT-partitioned ext4 disk."""
+    target = ctx.root_disk
+    key = f"root-disk-{ctx.profile}"
+    digest = root_disk_digest(ctx)
+    if cache.is_current(key, digest, (target,)):
+        ctx.log.msg2(f"root disk is up to date ({rel(target)})")
+        return target
+
+    if not ctx.sysroot.is_dir():
+        if ctx.dry_run:
+            ctx.log.msg(f"Creating the ext4 root disk ({ctx.arch.name})")
+            return target
+        raise Failure(
+            f"the {ctx.arch.name} sysroot does not exist yet",
+            hint=f"run './x.py build sysroot --arch {ctx.arch.name}' first",
+        )
+
+    started = time.monotonic()
+    ctx.log.msg(f"Creating the ext4 root disk ({ctx.arch.name})")
+    if ctx.dry_run:
+        return target
+
+    mebibyte = 1024 * 1024
+    partition_start = mebibyte
+
+    ensure_dir(ctx.work)
+    ensure_dir(target.parent)
+    temporary = target.with_suffix(".tmp")
+    remove(temporary)
+
+    try:
+        required = tuple(ctx.sysroot / path for path in ("dev", "etc", "sbin", "tmp", "usr"))
+        marker = ctx.sysroot / "etc/roanix-root"
+        if any(not path.is_dir() for path in required) or not marker.is_file():
+            raise Failure(
+                "the sysroot is missing its root-filesystem layout",
+                hint="rebuild util-roanix and reinstall the sysroot",
+            )
+
+        # Account for ext4 metadata, per-file block rounding, and useful spare
+        # space without expanding symlinks or reserving a second payload-sized
+        # staging area.
+        payload = tree_size(ctx.sysroot)
+        partition_size = max(128 * mebibyte, int(payload * 1.10) + 64 * mebibyte)
+        partition_size = (partition_size + mebibyte - 1) // mebibyte * mebibyte
+        disk_size = partition_size + 2 * mebibyte
+        partition_end_sector = partition_start // 512 + partition_size // 512 - 1
+        filesystem_blocks = partition_size // 4096
+
+        with temporary.open("wb") as disk:
+            disk.truncate(disk_size)
+        path = os.environ.get("PATH", "")
+        sbin_path = f"{path}:/usr/sbin:/sbin" if path else "/usr/sbin:/sbin"
+        run(
+            [
+                "sgdisk",
+                str(temporary),
+                "-n",
+                f"1:2048:{partition_end_sector}",
+                "-t",
+                "1:8300",
+                "-c",
+                "1:ROANIX_ROOT",
+            ],
+            env={"PATH": sbin_path},
+        )
+        run(
+            [
+                "mke2fs",
+                "-q",
+                "-t",
+                "ext4",
+                "-F",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-i",
+                "8192",
+                "-m",
+                "0",
+                "-L",
+                "ROANIX_ROOT",
+                "-O",
+                "none,filetype,extent,sparse_super,large_file",
+                "-E",
+                f"offset={partition_start}",
+                "-d",
+                str(ctx.sysroot),
+                str(temporary),
+                str(filesystem_blocks),
+            ],
+            env={"PATH": sbin_path},
+        )
+        temporary.replace(target)
+    finally:
+        remove(temporary)
+
+    cache.record(key, digest, (target,))
+    ctx.log.msg2(f"{rel(target)} ({human_size(target.stat().st_size)})")
+    ctx.log.finished("the ext4 root disk", time.monotonic() - started)
+    return target
 
 
 # --------------------------------------------------------------------------
@@ -1988,6 +2138,12 @@ def qemu_command(ctx: Context, run: Runner, image: Path, options: QemuOptions) -
         argv += ["-cdrom", str(image)]
     else:
         argv += ["-drive", f"file={image},format=raw"]
+    argv += [
+        "-drive",
+        f"file={ctx.root_disk},if=none,format=raw,snapshot=on,id=roanix-root",
+        "-device",
+        "nvme,drive=roanix-root,serial=roanix-root",
+    ]
 
     use_kvm = (
         options.accel != "tcg"
@@ -2087,7 +2243,7 @@ def run_qemu(ctx: Context, run: Runner, image: Path, options: QemuOptions) -> No
 # Build planning
 # --------------------------------------------------------------------------
 
-TARGETS = ("kernel", "sysroot", "initramfs", "iso", "hdd", "all")
+TARGETS = ("kernel", "sysroot", "initramfs", "rootfs", "iso", "hdd", "all")
 
 
 @dataclass
@@ -2151,6 +2307,17 @@ def survey(
             Component("initramfs", "ready", human_size(ctx.initramfs.stat().st_size))
         )
 
+    if not ctx.root_disk.exists():
+        components.append(Component("root disk", "missing", "never built"))
+    elif not ctx.sysroot.is_dir() or not cache.is_current(
+        f"root-disk-{ctx.profile}", root_disk_digest(ctx), (ctx.root_disk,)
+    ):
+        components.append(Component("root disk", "stale", "sysroot changed"))
+    else:
+        components.append(
+            Component("root disk", "ready", human_size(ctx.root_disk.stat().st_size))
+        )
+
     for kind in ("hdd", "iso"):
         image = ctx.image(kind)
         if not image.exists():
@@ -2184,16 +2351,20 @@ def build_chain(
         return [build_userland(ctx, jinx, manifest)]
     if target == "initramfs":
         build_userland(ctx, jinx, manifest)
-        return [build_initramfs(ctx, cache)]
+        return [build_initramfs(ctx, jinx, cache)]
+    if target == "rootfs":
+        build_userland(ctx, jinx, manifest)
+        return [build_root_disk(ctx, run, cache)]
     if target in ("iso", "hdd", "all"):
         build_kernel(ctx, run, cache)
         build_userland(ctx, jinx, manifest)
-        build_initramfs(ctx, cache)
+        build_initramfs(ctx, jinx, cache)
+        root_disk = build_root_disk(ctx, run, cache)
         if target == "iso":
-            return [build_iso(ctx, run, cache)]
+            return [build_iso(ctx, run, cache), root_disk]
         if target == "hdd":
-            return [build_hdd(ctx, run, cache)]
-        return [build_hdd(ctx, run, cache), build_iso(ctx, run, cache)]
+            return [build_hdd(ctx, run, cache), root_disk]
+        return [build_hdd(ctx, run, cache), build_iso(ctx, run, cache), root_disk]
     raise Failure(f"unknown build target: {target}", hint=f"valid targets: {', '.join(TARGETS)}")
 
 
@@ -2251,6 +2422,11 @@ def cmd_run(world: World, args: argparse.Namespace, settings: Mapping[str, str])
                 f"no {options.image} image to boot: {rel(image)}",
                 hint="drop --no-build so xtool can create it",
             )
+        if not ctx.root_disk.exists():
+            raise Failure(
+                f"no root disk to attach: {rel(ctx.root_disk)}",
+                hint="drop --no-build so xtool can create it",
+            )
     else:
         header(ctx, world.manifest)
         build_chain(ctx, world.run, world.jinx, world.manifest, options.image)
@@ -2290,6 +2466,11 @@ def jinx_recipe_paths(name: str) -> tuple[Path, Path, bool]:
 def cmd_build(world: World, args: argparse.Namespace, settings: Mapping[str, str]) -> int:
     ctx = world.ctx
     name = args.package
+    if name in TARGETS:
+        header(ctx, world.manifest)
+        build_chain(ctx, world.run, world.jinx, world.manifest, name)
+        ctx.log.finished(f"target {name}", time.monotonic() - ctx.started)
+        return 0
     _, _, is_host = jinx_recipe_paths(name)
     header(ctx, world.manifest)
     prefetch_packages(ctx, world.jinx, ("host:*",))
@@ -2392,7 +2573,8 @@ def cmd_list(world: World, args: argparse.Namespace, settings: Mapping[str, str]
         for target, description in (
             ("kernel", "the Rust kernel binary"),
             ("sysroot", "every userland package, installed into a sysroot"),
-            ("initramfs", "the sysroot packed as a boot module"),
+            ("initramfs", "the minimal bootstrap packed as a boot module"),
+            ("rootfs", "the full sysroot on a GPT/ext4 disk"),
             ("hdd", "a bootable GPT disk image"),
             ("iso", "a bootable hybrid ISO"),
             ("all", "both images"),
@@ -2455,7 +2637,7 @@ def cmd_doctor(world: World, args: argparse.Namespace, settings: Mapping[str, st
     groups: dict[str, tuple[str, ...]] = {
         "kernel": ("cargo", "rustup"),
         "userland": ("bash", "git", "make", "tar", "gzip", "zstd", "sed", "awk", "grep", "find"),
-        "images": ("xorriso", "sgdisk", "mformat", "mmd", "mcopy"),
+        "images": ("xorriso", "sgdisk", "mke2fs", "mformat", "mmd", "mcopy"),
         "emulator": (ctx.arch.qemu,),
     }
     problems: list[tuple[str, str | None]] = []
@@ -2934,15 +3116,17 @@ def build_cli() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentPar
     build = add(
         "build", ["b"],
         description=(
-            "Build one Jinx package and install it into the target sysroot.\n"
-            "With -f, discard its build/install outputs and rebuild from the prepared source tree."
+            "Build an OS target, or build one Jinx package and install it into the sysroot.\n"
+            "With -f, discard affected outputs and rebuild them."
         ),
         epilog="examples:\n"
+               "  ./x.py build rootfs\n"
+               "  ./x.py build initramfs\n"
                "  ./x.py build bash\n"
                "  ./x.py build -f bash\n"
                "  ./x.py build host:cmake\n",
     )
-    build.add_argument("package", help="recipe name, optionally prefixed with host:")
+    build.add_argument("package", help="OS target, recipe name, or host: recipe")
 
     regen = add(
         "regen",

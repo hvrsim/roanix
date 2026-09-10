@@ -12,6 +12,7 @@ use limine::{
 use log::info;
 
 pub mod arch;
+pub mod dev;
 pub mod driver;
 pub mod fs;
 pub mod mem;
@@ -52,6 +53,7 @@ fn early_init() -> ! {
 
     mem::init();
     driver::init();
+    dev::init();
     driver::load_boot_modules().expect("boot: failed to load required boot modules");
     arch::init_platform();
     #[cfg(target_arch = "riscv64")]
@@ -69,6 +71,7 @@ fn init_thread() {
     mem::start_page_daemon();
     fs::init();
     sys::random::init();
+    dev::publish();
     sys::initramfs::populate().expect("boot: failed to import initramfs");
     driver::load_packaged_modules().expect("boot: failed to load packaged driver modules");
 

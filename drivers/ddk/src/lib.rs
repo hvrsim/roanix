@@ -62,15 +62,13 @@ pub fn configure_module_link() {
 mod imports {
     use core::ffi::{c_char, c_void};
 
-    use crate::raw::{
-        self, DevfsEndpoint, FsMemoryObject, FsPageAccount, Module, NodeOps, TtyProviderOps,
-    };
+    use crate::raw::{self, BlockOps, Module, NodeOps};
 
     macro_rules! kernel_imports {
         ($(fn $name:ident($($argument:ty),*) $(-> $result:ty)?;)*) => {
             unsafe extern "C" {
                 $(
-                    #[link_name = concat!("rdf_api_v1_", stringify!($name))]
+                    #[link_name = concat!("rdf_api_v2_", stringify!($name))]
                     pub fn $name($(_: $argument),*) $(-> $result)?;
                 )*
             }
@@ -83,28 +81,13 @@ mod imports {
         fn bus_find(*const c_char, *mut *const raw::Bus) -> i32;
         fn bus_register(*const raw::Module, *const c_char, *const raw::BusDef, *mut *const raw::Bus) -> i32;
         fn bus_unregister(*const raw::Bus) -> i32;
-        fn class_add(*const raw::Module, *const raw::Class, *const raw::Device, *const c_char, *const c_void, usize, *mut c_void, *mut *const raw::ClassDevice) -> i32;
-        fn class_register(*const raw::Module, *const c_char, *const raw::ClassDef, *mut *const raw::Class) -> i32;
-        fn class_remove(*const raw::ClassDevice);
-        fn class_unregister(*const raw::Class) -> i32;
+        fn block_register(*const Module, *const c_char, *const BlockOps, *mut *const raw::BlockDevice) -> i32;
+        fn block_unregister(*const raw::BlockDevice) -> i32;
+        fn block_rescan(*const raw::BlockDevice) -> i32;
         fn cpu_count() -> u32;
         fn cpu_current() -> u32;
         fn cpu_platform_id(u32, *mut u64) -> i32;
-        fn devfs_broker_register(*const raw::Module, *const raw::DevfsBrokerOps, *mut *mut raw::DevfsBroker) -> i32;
-        fn devfs_broker_unregister(*mut raw::DevfsBroker) -> i32;
-        fn devfs_create(*const Module, *const c_void, u64, *const c_char, u32, u16, *const NodeOps, *mut u64) -> i32;
-        fn devfs_endpoint_close(*mut DevfsEndpoint, usize, u32);
-        fn devfs_endpoint_event(*mut DevfsEndpoint, usize, u32) -> usize;
-        fn devfs_endpoint_initial_offset(*mut DevfsEndpoint, usize, u32, *mut u64) -> i32;
-        fn devfs_endpoint_ioctl(*mut DevfsEndpoint, usize, u64, i32, i32, u8, u64, u64, *mut u8, usize) -> i64;
-        fn devfs_endpoint_open(*mut DevfsEndpoint, u32, *mut usize) -> i32;
-        fn devfs_endpoint_poll(*mut DevfsEndpoint, usize, u64, u16, u32) -> i64;
-        fn devfs_endpoint_read(*mut DevfsEndpoint, usize, u64, *mut u8, usize, u32) -> i64;
-        fn devfs_endpoint_release(*mut DevfsEndpoint);
-        fn devfs_endpoint_size(*mut DevfsEndpoint) -> u64;
-        fn devfs_endpoint_sync(*mut DevfsEndpoint) -> i32;
-        fn devfs_endpoint_terminal_state(*mut DevfsEndpoint, *mut crate::raw::FsTerminalState) -> i32;
-        fn devfs_endpoint_write(*mut DevfsEndpoint, usize, u64, *const u8, usize, u32) -> i64;
+        fn devfs_create(*const Module, u64, *const c_char, u32, u16, *const NodeOps, *mut u64) -> i32;
         fn devfs_mkdir(*const raw::Module, u64, *const c_char, u16, *mut u64) -> i32;
         fn devfs_remove(*const Module, u64) -> i32;
         fn devfs_root(*mut u64) -> i32;
@@ -144,20 +127,6 @@ mod imports {
         fn iface_withdraw(*const raw::Interface) -> i32;
         fn iface_bind(*const raw::Module, *const raw::Device, u32, *const c_char, u32, *mut *mut raw::InterfaceBinding, *mut *mut c_void, *mut *mut c_void) -> i32;
         fn iface_unbind(*mut raw::InterfaceBinding);
-        fn fs_memory_object_create(*mut FsPageAccount, *mut *mut FsMemoryObject) -> i32;
-        fn fs_memory_object_page_count(*mut FsMemoryObject, *mut u64) -> i32;
-        fn fs_memory_object_read(*mut FsMemoryObject, u64, *mut u8, usize) -> i64;
-        fn fs_memory_object_release(*mut FsMemoryObject);
-        fn fs_memory_object_retain(*mut FsMemoryObject) -> i32;
-        fn fs_memory_object_truncate(*mut FsMemoryObject, u64, *mut u64) -> i32;
-        fn fs_memory_object_write(*mut FsMemoryObject, u64, *const u8, usize) -> i64;
-        fn fs_page_account_create(u64, *mut *mut FsPageAccount) -> i32;
-        fn fs_page_account_limit(*mut FsPageAccount, *mut u64) -> i32;
-        fn fs_page_account_release(*mut FsPageAccount);
-        fn fs_page_account_used(*mut FsPageAccount, *mut u64) -> i32;
-        fn fs_provider_register(*const raw::Module, *const c_char, *const raw::FsProviderOps, *mut *mut raw::FsProvider) -> i32;
-        fn fs_provider_unregister(*mut raw::FsProvider) -> i32;
-        fn fs_total_physical_pages() -> u64;
         fn irq_alloc_vector(u32, *mut u32) -> i32;
         fn irq_domain_register(*const raw::Module, *const c_char, u32, u32, *const raw::IrqDomainDef, *mut *const raw::IrqDomain) -> i32;
         fn irq_domain_unregister(*const raw::IrqDomain) -> i32;
@@ -174,16 +143,11 @@ mod imports {
         fn mmio_direct(u64, *mut *mut c_void) -> i32;
         fn mmio_map(*const raw::Module, u64, usize, u32, *mut raw::Mmio) -> i32;
         fn mmio_unmap(*mut raw::Mmio) -> i32;
-        fn port_read8(u16) -> u32;
-        fn port_write8(u16, u8);
-        fn process_group_signal(i32, u8) -> i32;
         fn random_fill(*mut u8, usize);
         fn random_mix(*const u8, usize);
         fn time_monotonic() -> u64;
         fn time_sleep(u64);
-        fn tty_provider_register(*const Module, *const TtyProviderOps, *mut *mut c_void) -> i32;
-        fn tty_provider_unregister(*mut c_void) -> i32;
-        fn tty_register(*const raw::Module, *const raw::Device, u64, *const c_char, u16, u32, *const raw::ConsoleOps, *mut *mut raw::Tty) -> i32;
+        fn tty_register(*const raw::Module, u64, *const c_char, u16, u32, *const raw::ConsoleOps, *mut *mut raw::Tty) -> i32;
         fn tty_unregister(*mut raw::Tty) -> i32;
         fn worker_join(*mut c_void) -> i32;
         fn worker_spawn(*const Module, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void, *mut *mut c_void) -> i32;
@@ -195,23 +159,16 @@ mod imports {
 pub mod raw {
     use core::ffi::{c_char, c_void};
 
-    pub const ABI_MAJOR: u16 = 1;
-    pub const ABI_MINOR: u16 = 3;
+    pub const ABI_MAJOR: u16 = 2;
     pub const MODULE_DEF_SIZE: u32 = 48;
     /// The original 112-byte prefix remains accepted by the kernel.
     pub const NODE_OPS_LEGACY_SIZE: u32 = 112;
     pub const NODE_OPS_SIZE: u32 = 120;
     pub const CONSOLE_OPS_SIZE: u32 = 160;
-    pub const TTY_PROVIDER_OPS_SIZE: u32 = 32;
-    pub const FS_PROVIDER_OPS_SIZE: u32 = 248;
-    pub const FS_PROVIDER_REQUIRED_OPS_SIZE: u32 = 144;
-    pub const DEVFS_BROKER_OPS_SIZE: u32 = 72;
-    pub const DEVFS_BROKER_REQUIRED_OPS_SIZE: u32 = 64;
-    pub const FS_DIRECTORY_NAME_MAX: usize = 255;
-    pub const CLASS_DEF_SIZE: u32 = 32;
     pub const BUS_DEF_SIZE: u32 = 48;
     pub const DRIVER_DEF_SIZE: u32 = 80;
     pub const IRQ_DOMAIN_DEF_SIZE: u32 = 96;
+    pub const BLOCK_OPS_SIZE: u32 = 64;
 
     macro_rules! opaque {
         ($($name:ident),+ $(,)?) => {$(
@@ -227,20 +184,13 @@ pub mod raw {
         DeviceBuilder,
         Bus,
         Driver,
-        Class,
-        ClassDevice,
         Interface,
         InterfaceBinding,
         IrqDomain,
         Irq,
         Tty,
-        TtyProvider,
+        BlockDevice,
         Worker,
-        FsProvider,
-        FsPageAccount,
-        FsMemoryObject,
-        DevfsBroker,
-        DevfsEndpoint,
     );
 
     pub type WorkerEntry = Option<unsafe extern "C" fn(*mut c_void)>;
@@ -370,6 +320,22 @@ pub mod raw {
         pub terminal_state: Option<unsafe extern "C" fn(*mut c_void, *mut TerminalState) -> i32>,
     }
 
+    /// Logical-block callbacks supplied by a hardware driver.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct BlockOps {
+        pub size: u32,
+        pub flags: u32,
+        pub context: *mut c_void,
+        pub logical_block_size: u32,
+        pub max_transfer_blocks: u32,
+        pub block_count: u64,
+        pub read: Option<unsafe extern "C" fn(*mut c_void, u64, u32, *mut u8) -> i32>,
+        pub write: Option<unsafe extern "C" fn(*mut c_void, u64, u32, *const u8) -> i32>,
+        pub flush: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+        pub discard: Option<unsafe extern "C" fn(*mut c_void, u64, u32) -> i32>,
+    }
+
     #[repr(C)]
     pub struct SerialFraming {
         pub baud: u32,
@@ -403,359 +369,11 @@ pub mod raw {
         pub hangup_event: usize,
     }
 
-    /// Provider callbacks registered by the modular terminal subsystem.
-    #[repr(C)]
-    pub struct TtyProviderOps {
-        pub size: u32,
-        pub context: *mut c_void,
-        pub register: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *const Module,
-                *const Device,
-                u64,
-                *const c_char,
-                u16,
-                u32,
-                *const ConsoleOps,
-                *mut *mut c_void,
-            ) -> i32,
-        >,
-        pub unregister: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsMountOptions {
-        pub size: u32,
-        pub flags: u32,
-        pub page_limit: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsVnode {
-        pub receipt: *mut c_void,
-        pub node_id: u64,
-        pub kind: u32,
-        pub reserved: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsAttr {
-        pub size: u64,
-        pub links: u64,
-        pub accessed_ns: u64,
-        pub modified_ns: u64,
-        pub changed_ns: u64,
-        pub mode: u16,
-        pub kind: u32,
-        pub reserved: u16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsSetAttr {
-        pub valid: u32,
-        pub reserved: u32,
-        pub size: u64,
-        pub mode: u16,
-        pub reserved2: [u8; 6],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsIoVec {
-        pub data: *const u8,
-        pub length: usize,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsDirEntry {
-        pub vnode: FsVnode,
-        pub name_length: u16,
-        pub reserved: [u8; 6],
-        pub offset: u64,
-        pub name: [u8; FS_DIRECTORY_NAME_MAX],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct DevfsBrokerEntry {
-        pub node: u64,
-        pub name_length: u16,
-        pub reserved: [u8; 6],
-        pub name: [u8; FS_DIRECTORY_NAME_MAX],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct FsStat {
-        pub total_bytes: u64,
-        pub used_bytes: u64,
-        pub total_nodes: u64,
-        pub used_nodes: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct FsTerminalState {
-        pub session: i32,
-        pub foreground_group: i32,
-        pub stop_background_output: u8,
-        pub reserved: [u8; 3],
-    }
-
-    /// The device-node ioctl entry of [`FsProviderOps`]. Factored out only to
-    /// keep the record readable; the C layout is unchanged.
-    pub type FsProviderIoctl = unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        usize,
-        u64,
-        i32,
-        i32,
-        u8,
-        u64,
-        u64,
-        *mut u8,
-        usize,
-        *mut u64,
-    ) -> i32;
-
-    #[repr(C)]
-    pub struct FsProviderOps {
-        pub size: u32,
-        pub context: *mut c_void,
-        pub mount: Option<
-            unsafe extern "C" fn(*mut c_void, *const FsMountOptions, *mut *mut c_void) -> i32,
-        >,
-        pub unmount: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-        pub root: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FsVnode) -> i32>,
-        pub statfs: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FsStat) -> i32>,
-        pub sync: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-        pub vnode_release: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
-        pub getattr:
-            Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut FsAttr) -> i32>,
-        pub setattr: Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const FsSetAttr) -> i32,
-        >,
-        pub lookup: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const u8,
-                usize,
-                *mut FsVnode,
-            ) -> i32,
-        >,
-        pub parent: Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut FsVnode) -> i32,
-        >,
-        pub create: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const u8,
-                usize,
-                u32,
-                *const u8,
-                usize,
-                u16,
-                *mut FsVnode,
-            ) -> i32,
-        >,
-        pub link: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const u8,
-                usize,
-                *mut c_void,
-            ) -> i32,
-        >,
-        pub unlink: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const u8,
-                usize,
-                u8,
-            ) -> i32,
-        >,
-        pub rename: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const u8,
-                usize,
-                *mut c_void,
-                *const u8,
-                usize,
-            ) -> i32,
-        >,
-        pub open: Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, *mut usize) -> i32,
-        >,
-        pub close: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, usize, u32)>,
-        pub initial_offset: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                u32,
-                *mut u64,
-            ) -> i32,
-        >,
-        pub read: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                u64,
-                *mut u8,
-                usize,
-                u32,
-            ) -> i64,
-        >,
-        pub write: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                u64,
-                *const u8,
-                usize,
-                u32,
-            ) -> i64,
-        >,
-        pub append: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const FsIoVec,
-                usize,
-                *mut u64,
-            ) -> i64,
-        >,
-        pub truncate:
-            Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64) -> i32>,
-        pub memory_object: Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut *mut c_void) -> i32,
-        >,
-        pub readlink: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut u8,
-                usize,
-                *mut usize,
-            ) -> i32,
-        >,
-        pub readdir: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                u64,
-                *mut FsDirEntry,
-                usize,
-                *mut usize,
-                *mut u64,
-            ) -> i32,
-        >,
-        pub fsync: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32>,
-        pub poll: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                u64,
-                u16,
-                u32,
-                *mut u16,
-            ) -> i32,
-        >,
-        pub poll_events: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                u16,
-                *mut usize,
-                usize,
-                *mut usize,
-            ) -> i32,
-        >,
-        pub terminal_state: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut FsTerminalState,
-            ) -> i32,
-        >,
-        pub ioctl: Option<FsProviderIoctl>,
-    }
-
-    #[repr(C)]
-    pub struct DevfsBrokerOps {
-        pub size: u32,
-        pub context: *mut c_void,
-        pub root: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> i32>,
-        pub mkdir: Option<
-            unsafe extern "C" fn(*mut c_void, u64, u64, *const u8, usize, u16, *mut u64) -> i32,
-        >,
-        pub create: Option<
-            unsafe extern "C" fn(
-                *mut c_void,
-                u64,
-                u64,
-                *const u8,
-                usize,
-                u32,
-                u16,
-                *mut DevfsEndpoint,
-                *mut u64,
-            ) -> i32,
-        >,
-        pub remove: Option<unsafe extern "C" fn(*mut c_void, u64, u64) -> i32>,
-        pub remove_owner: Option<unsafe extern "C" fn(*mut c_void, u64, u8) -> i32>,
-        pub lookup: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u64) -> i32>,
-        pub children: Option<
-            unsafe extern "C" fn(*mut c_void, u64, *mut DevfsBrokerEntry, usize, *mut usize) -> i32,
-        >,
-    }
-
-    /// Class callbacks supplied through the C ABI.
-    #[repr(C)]
-    pub struct ClassDef {
-        pub size: u32,
-        pub attach: Option<unsafe extern "C" fn(*mut c_void, *const ClassDevice) -> i32>,
-        pub detach: Option<unsafe extern "C" fn(*mut c_void, *const ClassDevice)>,
-        pub context: *mut c_void,
-    }
-
     #[repr(C)]
     pub struct ModuleDef {
         pub size: u32,
         pub abi_major: u16,
-        pub abi_minor: u16,
+        pub abi_reserved: u16,
         pub flags: u32,
         pub name: *const c_char,
         pub description: *const c_char,
@@ -766,21 +384,12 @@ pub mod raw {
     // SAFETY: all callback tables and module descriptors used by the DDK are
     // immutable statics. Their callback synchronization is explicit.
     unsafe impl Sync for NodeOps {}
+    // SAFETY: block operation tables are immutable after registration and the
+    // driver synchronizes their opaque context.
+    unsafe impl Sync for BlockOps {}
     // SAFETY: the immutable table delegates synchronization of its context to
     // the owning console backend.
     unsafe impl Sync for ConsoleOps {}
-    // SAFETY: provider operation tables are immutable after publication and
-    // their contexts are synchronized by the provider.
-    unsafe impl Sync for TtyProviderOps {}
-    // SAFETY: provider operation tables are immutable after publication and
-    // their contexts are synchronized by the provider.
-    unsafe impl Sync for FsProviderOps {}
-    // SAFETY: broker operation tables are immutable after publication and the
-    // broker synchronizes its context.
-    unsafe impl Sync for DevfsBrokerOps {}
-    // SAFETY: class definitions are immutable after registration and their
-    // callback context is synchronized by the class owner.
-    unsafe impl Sync for ClassDef {}
     // SAFETY: console tables are immutable after registration; their opaque
     // context is synchronized by the owning driver.
     unsafe impl Send for ConsoleOps {}
@@ -811,19 +420,8 @@ pub mod raw {
     const _: () = assert!(core::mem::size_of::<DriverDef>() == DRIVER_DEF_SIZE as usize);
     const _: () = assert!(core::mem::size_of::<IrqDomainDef>() == IRQ_DOMAIN_DEF_SIZE as usize);
     const _: () = assert!(core::mem::size_of::<NodeOps>() == NODE_OPS_SIZE as usize);
+    const _: () = assert!(core::mem::size_of::<BlockOps>() == BLOCK_OPS_SIZE as usize);
     const _: () = assert!(core::mem::size_of::<ConsoleOps>() == CONSOLE_OPS_SIZE as usize);
-    const _: () = assert!(core::mem::size_of::<TtyProviderOps>() == TTY_PROVIDER_OPS_SIZE as usize);
-    const _: () = assert!(core::mem::size_of::<FsMountOptions>() == 16);
-    const _: () = assert!(core::mem::size_of::<FsVnode>() == 24);
-    const _: () = assert!(core::mem::size_of::<FsAttr>() == 56);
-    const _: () = assert!(core::mem::size_of::<FsSetAttr>() == 24);
-    const _: () = assert!(core::mem::size_of::<FsIoVec>() == 16);
-    const _: () = assert!(core::mem::size_of::<FsDirEntry>() == 296);
-    const _: () = assert!(core::mem::size_of::<DevfsBrokerEntry>() == 272);
-    const _: () = assert!(core::mem::size_of::<FsTerminalState>() == 12);
-    const _: () = assert!(core::mem::size_of::<FsProviderOps>() == FS_PROVIDER_OPS_SIZE as usize);
-    const _: () = assert!(core::mem::size_of::<DevfsBrokerOps>() == DEVFS_BROKER_OPS_SIZE as usize);
-    const _: () = assert!(core::mem::size_of::<ClassDef>() == CLASS_DEF_SIZE as usize);
     const _: () = assert!(core::mem::size_of::<SerialFraming>() == 8);
     const _: () = assert!(core::mem::size_of::<IoctlIdentity>() == 24);
     const _: () = assert!(core::mem::size_of::<TerminalState>() == 12);
@@ -875,7 +473,6 @@ pub const IFACE_SINGLETON: u32 = 1 << 3;
 pub const MATCH_COMPATIBLE: u32 = 1;
 pub const MATCH_ID: u32 = 5;
 pub const NODE_CHARACTER: u32 = 1;
-pub const NODE_BLOCK: u32 = 2;
 pub const DMA_FROM_DEVICE: u32 = 1;
 pub const DMA_TO_DEVICE: u32 = 2;
 pub const DMA_BIDIRECTIONAL: u32 = 3;
@@ -1067,28 +664,6 @@ unsafe impl Send for Bus {}
 unsafe impl Sync for Bus {}
 
 impl Bus {
-    /// Registers a bus owned by the current module.
-    ///
-    /// # Safety
-    /// `definition` and all callback targets it contains must remain valid and
-    /// immutable until [`Bus::unregister`] completes.
-    pub unsafe fn register(name: &CStr, definition: &'static raw::BusDef) -> Result<Self> {
-        let mut bus = ptr::null();
-        // SAFETY: upheld by this method's contract; the output pointer is
-        // writable local storage and the current module is live.
-        unsafe {
-            result(imports::bus_register(
-                module()?.as_ptr(),
-                name.as_ptr(),
-                definition,
-                &raw mut bus,
-            ))?;
-        }
-        NonNull::new(bus.cast_mut())
-            .map(|value| Self(value.as_ptr().cast_const()))
-            .ok_or(Error::from_status(EINVAL))
-    }
-
     pub fn find(name: &CStr) -> Result<Self> {
         let mut bus = ptr::null();
         // SAFETY: `name` and `bus` remain valid for this immediate C ABI call.
@@ -1102,10 +677,52 @@ impl Bus {
     pub const fn as_raw(self) -> *const raw::Bus {
         self.0
     }
+}
 
-    pub fn unregister(self) -> Result<()> {
-        // SAFETY: this is a live bus handle returned by register.
-        unsafe { result(imports::bus_unregister(self.0)) }
+/// Unique receipt for a bus registered by this module.
+pub struct BusRegistration(Option<NonNull<raw::Bus>>);
+
+// SAFETY: the receipt is opaque and registration teardown is externally
+// serialized by the owning module.
+unsafe impl Send for BusRegistration {}
+
+impl BusRegistration {
+    /// Registers a bus owned by the current module.
+    ///
+    /// # Safety
+    /// `definition` and all callback targets it contains must remain valid and
+    /// immutable until [`BusRegistration::unregister`] completes.
+    pub unsafe fn register(name: &CStr, definition: &'static raw::BusDef) -> Result<Self> {
+        let mut bus = ptr::null();
+        // SAFETY: upheld by this method's contract; the output pointer is
+        // writable local storage and the current module is live.
+        unsafe {
+            result(imports::bus_register(
+                module()?.as_ptr(),
+                name.as_ptr(),
+                definition,
+                &raw mut bus,
+            ))?;
+        }
+        NonNull::new(bus.cast_mut())
+            .map(|value| Self(Some(value)))
+            .ok_or(Error::from_status(EINVAL))
+    }
+
+    pub fn bus(&self) -> Result<Bus> {
+        self.0
+            .map(|value| Bus(value.as_ptr().cast_const()))
+            .ok_or(Error::from_status(EINVAL))
+    }
+
+    pub fn unregister(&mut self) -> Result<()> {
+        let Some(bus) = self.0 else {
+            return Ok(());
+        };
+        // SAFETY: the receipt stays owned until unregistration succeeds.
+        unsafe { result(imports::bus_unregister(bus.as_ptr().cast_const()))? };
+        self.0 = None;
+        Ok(())
     }
 }
 
@@ -1356,102 +973,6 @@ impl Drop for DeviceBuilder {
     }
 }
 
-/// Receipt for a registered device class.
-pub struct Class(Option<NonNull<raw::Class>>);
-
-// SAFETY: class registration ownership is serialized by the provider that
-// stores this receipt; the opaque pointer is never dereferenced in Rust.
-unsafe impl Send for Class {}
-
-impl Class {
-    /// Registers a class owned by this module.
-    ///
-    /// # Safety
-    /// `definition` must remain immutable and valid until `unregister`
-    /// completes.
-    pub unsafe fn register(name: &CStr, definition: &'static raw::ClassDef) -> Result<Self> {
-        let mut class = ptr::null();
-        // SAFETY: module, name, immutable definition, and output storage are
-        // valid for this immediate ABI call.
-        unsafe {
-            result(imports::class_register(
-                module()?.as_ptr(),
-                name.as_ptr(),
-                definition,
-                &raw mut class,
-            ))?;
-        }
-        NonNull::new(class.cast_mut())
-            .map(|value| Self(Some(value)))
-            .ok_or(Error::from_status(EINVAL))
-    }
-
-    fn pointer(&self) -> Result<*const raw::Class> {
-        self.0
-            .map(|value| value.as_ptr().cast_const())
-            .ok_or(Error::from_status(EINVAL))
-    }
-
-    /// Adds a class membership for `device`.
-    ///
-    /// # Safety
-    /// `operations` and `context` must remain valid until the returned
-    /// membership is removed.
-    pub unsafe fn add(
-        &self,
-        device: Option<Device>,
-        name: &CStr,
-        operations: *const c_void,
-        operations_size: usize,
-        context: *mut c_void,
-    ) -> Result<ClassDevice> {
-        let mut member = ptr::null();
-        // SAFETY: all opaque handles and the membership table meet this
-        // method's contract, and `member` is writable local output storage.
-        unsafe {
-            result(imports::class_add(
-                module()?.as_ptr(),
-                self.pointer()?,
-                device.map_or(ptr::null(), Device::as_raw),
-                name.as_ptr(),
-                operations,
-                operations_size,
-                context,
-                &raw mut member,
-            ))?;
-        }
-        NonNull::new(member.cast_mut())
-            .map(|value| ClassDevice(Some(value)))
-            .ok_or(Error::from_status(EINVAL))
-    }
-
-    pub fn unregister(&mut self) -> Result<()> {
-        let Some(class) = self.0.take() else {
-            return Ok(());
-        };
-        // SAFETY: this uniquely consumes the class registration receipt.
-        unsafe { result(imports::class_unregister(class.as_ptr().cast_const())) }
-    }
-}
-
-/// Receipt for one module-owned class membership.
-pub struct ClassDevice(Option<NonNull<raw::ClassDevice>>);
-
-// SAFETY: membership removal is serialized by its terminal owner and the
-// opaque pointer is never dereferenced by Rust.
-unsafe impl Send for ClassDevice {}
-
-impl ClassDevice {
-    pub fn remove(&mut self) {
-        let Some(member) = self.0.take() else {
-            return;
-        };
-        // SAFETY: this uniquely consumes the membership receipt.
-        unsafe { imports::class_remove(member.as_ptr().cast_const()) };
-    }
-}
-
-/// Receipt for a globally published operation table.
 pub struct InterfacePublication(Option<NonNull<raw::Interface>>);
 
 // SAFETY: withdrawal is externally serialized and the opaque handle is never
@@ -1602,11 +1123,13 @@ impl DriverRegistration {
     }
 
     pub fn unregister(&mut self) -> Result<()> {
-        let Some(driver) = self.0.take() else {
+        let Some(driver) = self.0 else {
             return Ok(());
         };
-        // SAFETY: this uniquely consumes the registration receipt.
-        unsafe { result(imports::driver_unregister(driver.as_ptr().cast_const())) }
+        // SAFETY: the receipt stays owned until unregistration succeeds.
+        unsafe { result(imports::driver_unregister(driver.as_ptr().cast_const()))? };
+        self.0 = None;
+        Ok(())
     }
 }
 
@@ -1635,8 +1158,12 @@ impl Mmio {
                 &raw mut raw,
             ))?;
         };
-        if raw.base.is_null() || raw.length < length {
-            return Err(Error::from_status(EINVAL));
+        if raw.base.is_null() || raw.token.is_null() || raw.length < length {
+            if !raw.token.is_null() {
+                // SAFETY: this is the mapping receipt just returned above.
+                let _ = unsafe { imports::mmio_unmap(&raw mut raw) };
+            }
+            return Err(Error::from_status(EIO));
         }
         Ok(Self { raw })
     }
@@ -2134,11 +1661,13 @@ impl IrqDomain {
     }
 
     pub fn unregister(&mut self) -> Result<()> {
-        let Some(domain) = self.0.take() else {
+        let Some(domain) = self.0 else {
             return Ok(());
         };
-        // SAFETY: this consumes this unique kernel-issued domain receipt.
-        unsafe { result(imports::irq_domain_unregister(domain.as_ptr().cast_const())) }
+        // SAFETY: the receipt stays owned until unregistration succeeds.
+        unsafe { result(imports::irq_domain_unregister(domain.as_ptr().cast_const()))? };
+        self.0 = None;
+        Ok(())
     }
 
     pub fn map(&self, hwirq: u64, flags: u32) -> Result<u32> {
@@ -2289,6 +1818,62 @@ fn firmware(
 
 pub struct Devfs;
 
+/// Unique receipt for a hardware block device owned by this module.
+pub struct BlockRegistration(Option<NonNull<raw::BlockDevice>>);
+
+// SAFETY: the receipt is opaque. Drivers must serialize access to their own
+// callback context, while the kernel serializes registration lifetime.
+unsafe impl Send for BlockRegistration {}
+
+impl BlockRegistration {
+    /// Registers logical-block callbacks with the kernel block layer.
+    ///
+    /// # Safety
+    /// Callback targets and `operations.context` must remain valid until this
+    /// receipt has been unregistered.
+    pub unsafe fn register(name: &CStr, operations: &raw::BlockOps) -> Result<Self> {
+        let mut device = ptr::null();
+        // SAFETY: upheld by this method's contract; both input records remain
+        // readable and output storage is writable for the immediate call.
+        unsafe {
+            result(imports::block_register(
+                module()?.as_ptr(),
+                name.as_ptr(),
+                operations,
+                &raw mut device,
+            ))?;
+        }
+        NonNull::new(device.cast_mut())
+            .map(|device| Self(Some(device)))
+            .ok_or(Error::from_status(EINVAL))
+    }
+
+    /// Unregisters the disk after all mounts and open device nodes are gone.
+    pub fn unregister(&mut self) -> Result<()> {
+        let Some(device) = self.0 else {
+            return Ok(());
+        };
+        // SAFETY: this is the live receipt returned by `block_register`.
+        unsafe { result(imports::block_unregister(device.as_ptr()))? };
+        self.0 = None;
+        Ok(())
+    }
+
+    /// Runs partition discovery after the controller and callback context have
+    /// reached their final published locations.
+    pub fn rescan(&self) -> Result<()> {
+        let device = self.0.ok_or(Error::from_status(EINVAL))?;
+        // SAFETY: the receipt remains live for this shared borrow.
+        unsafe { result(imports::block_rescan(device.as_ptr())) }
+    }
+}
+
+impl Drop for BlockRegistration {
+    fn drop(&mut self) {
+        let _ = self.unregister();
+    }
+}
+
 impl Devfs {
     pub fn current() -> Result<Self> {
         let _ = module()?;
@@ -2334,41 +1919,9 @@ impl Devfs {
         let status = unsafe {
             imports::devfs_create(
                 module()?.as_ptr(),
-                ptr::null(),
                 parent,
                 name.as_ptr(),
                 NODE_CHARACTER,
-                mode,
-                operations,
-                &raw mut node,
-            )
-        };
-        result(status)?;
-        Ok(node)
-    }
-
-    /// Creates a seekable block-device endpoint.
-    ///
-    /// # Safety
-    /// `operations` must describe valid C ABI callbacks. The kernel copies the
-    /// table, while its context and callback targets must remain valid until
-    /// the node is removed.
-    pub unsafe fn create_block(
-        &self,
-        parent: u64,
-        name: &CStr,
-        mode: u16,
-        operations: &raw::NodeOps,
-    ) -> Result<u64> {
-        let mut node = 0;
-        // SAFETY: upheld by this method's contract and the closed kernel ABI.
-        let status = unsafe {
-            imports::devfs_create(
-                module()?.as_ptr(),
-                ptr::null(),
-                parent,
-                name.as_ptr(),
-                NODE_BLOCK,
                 mode,
                 operations,
                 &raw mut node,
@@ -2386,347 +1939,6 @@ impl Devfs {
     }
 }
 
-/// Registers a filesystem-provider table and returns its opaque registration
-/// receipt.  The table must remain immutable until it is unregistered.
-pub fn fs_provider_register(
-    name: &CStr,
-    operations: &'static raw::FsProviderOps,
-) -> Result<NonNull<raw::FsProvider>> {
-    let mut provider = ptr::null_mut();
-    // SAFETY: the static table, C string, and local output remain valid for
-    // this immediate C ABI registration call.
-    unsafe {
-        result(imports::fs_provider_register(
-            module()?.as_ptr(),
-            name.as_ptr(),
-            operations,
-            &raw mut provider,
-        ))?;
-    }
-    NonNull::new(provider).ok_or(Error::from_status(EINVAL))
-}
-
-/// Removes a filesystem-provider registration.
-///
-/// # Safety
-/// `provider` must be the live receipt returned by [`fs_provider_register`].
-pub unsafe fn fs_provider_unregister(provider: NonNull<raw::FsProvider>) -> Result<()> {
-    // SAFETY: upheld by this function's safety contract.
-    unsafe { result(imports::fs_provider_unregister(provider.as_ptr())) }
-}
-
-pub fn fs_page_account_create(limit: u64) -> Result<NonNull<raw::FsPageAccount>> {
-    let mut account = ptr::null_mut();
-    // SAFETY: account is writable local output storage.
-    let status = unsafe { imports::fs_page_account_create(limit, &raw mut account) };
-    result(status)?;
-    NonNull::new(account).ok_or(Error::from_status(EINVAL))
-}
-
-/// # Safety
-/// `account` must be an owned account receipt.
-pub unsafe fn fs_page_account_release(account: NonNull<raw::FsPageAccount>) {
-    // SAFETY: upheld by this function's safety contract.
-    unsafe { imports::fs_page_account_release(account.as_ptr()) };
-}
-
-pub fn fs_page_account_limit(account: NonNull<raw::FsPageAccount>) -> Result<u64> {
-    let mut value = 0;
-    // SAFETY: account is opaque and value is writable local output storage.
-    let status = unsafe { imports::fs_page_account_limit(account.as_ptr(), &raw mut value) };
-    result(status)?;
-    Ok(value)
-}
-
-pub fn fs_page_account_used(account: NonNull<raw::FsPageAccount>) -> Result<u64> {
-    let mut value = 0;
-    // SAFETY: account is opaque and value is writable local output storage.
-    let status = unsafe { imports::fs_page_account_used(account.as_ptr(), &raw mut value) };
-    result(status)?;
-    Ok(value)
-}
-
-pub fn fs_memory_object_create(
-    account: NonNull<raw::FsPageAccount>,
-) -> Result<NonNull<raw::FsMemoryObject>> {
-    let mut object = ptr::null_mut();
-    // SAFETY: account is opaque and object is writable local output storage.
-    let status = unsafe { imports::fs_memory_object_create(account.as_ptr(), &raw mut object) };
-    result(status)?;
-    NonNull::new(object).ok_or(Error::from_status(EINVAL))
-}
-
-/// # Safety
-/// `object` must be a live memory-object receipt.
-pub unsafe fn fs_memory_object_retain(object: NonNull<raw::FsMemoryObject>) -> Result<()> {
-    // SAFETY: upheld by this function's safety contract.
-    unsafe { result(imports::fs_memory_object_retain(object.as_ptr())) }
-}
-
-/// # Safety
-/// `object` must be an owned memory-object receipt.
-pub unsafe fn fs_memory_object_release(object: NonNull<raw::FsMemoryObject>) {
-    // SAFETY: upheld by this function's safety contract.
-    unsafe { imports::fs_memory_object_release(object.as_ptr()) };
-}
-
-pub fn fs_memory_object_read(
-    object: NonNull<raw::FsMemoryObject>,
-    offset: u64,
-    output: &mut [u8],
-) -> Result<usize> {
-    // SAFETY: output is writable for exactly its slice length.
-    let value = unsafe {
-        imports::fs_memory_object_read(object.as_ptr(), offset, output.as_mut_ptr(), output.len())
-    };
-    signed_count(value, output.len())
-}
-
-pub fn fs_memory_object_write(
-    object: NonNull<raw::FsMemoryObject>,
-    offset: u64,
-    input: &[u8],
-) -> Result<usize> {
-    // SAFETY: input is readable for exactly its slice length.
-    let value = unsafe {
-        imports::fs_memory_object_write(object.as_ptr(), offset, input.as_ptr(), input.len())
-    };
-    signed_count(value, input.len())
-}
-
-pub fn fs_memory_object_truncate(object: NonNull<raw::FsMemoryObject>, size: u64) -> Result<u64> {
-    let mut removed = 0;
-    // SAFETY: object is opaque and removed is writable local output storage.
-    let status =
-        unsafe { imports::fs_memory_object_truncate(object.as_ptr(), size, &raw mut removed) };
-    result(status)?;
-    Ok(removed)
-}
-
-pub fn fs_memory_object_page_count(object: NonNull<raw::FsMemoryObject>) -> Result<u64> {
-    let mut count = 0;
-    // SAFETY: object is opaque and count is writable local output storage.
-    let status = unsafe { imports::fs_memory_object_page_count(object.as_ptr(), &raw mut count) };
-    result(status)?;
-    Ok(count)
-}
-
-pub fn fs_total_physical_pages() -> u64 {
-    // SAFETY: this versioned import takes no arguments.
-    unsafe { imports::fs_total_physical_pages() }
-}
-
-fn signed_count(value: i64, capacity: usize) -> Result<usize> {
-    if value < 0 {
-        return Err(Error::from_status(value as i32));
-    }
-    let count = usize::try_from(value).map_err(|_| Error::from_status(EINVAL))?;
-    if count > capacity {
-        Err(Error::from_status(EINVAL))
-    } else {
-        Ok(count)
-    }
-}
-
-pub fn devfs_broker_register(
-    operations: &'static raw::DevfsBrokerOps,
-) -> Result<NonNull<raw::DevfsBroker>> {
-    let mut broker = ptr::null_mut();
-    // SAFETY: table is static and broker is local writable output storage.
-    unsafe {
-        result(imports::devfs_broker_register(
-            module()?.as_ptr(),
-            operations,
-            &raw mut broker,
-        ))?;
-    };
-    NonNull::new(broker).ok_or(Error::from_status(EINVAL))
-}
-
-/// # Safety
-/// `broker` must be an owned devfs broker registration receipt.
-pub unsafe fn devfs_broker_unregister(broker: NonNull<raw::DevfsBroker>) -> Result<()> {
-    // SAFETY: upheld by this function's safety contract.
-    unsafe { result(imports::devfs_broker_unregister(broker.as_ptr())) }
-}
-
-/// Endpoint operations used by the devfs provider.  Each method borrows an
-/// endpoint held in a devfs vnode receipt; `release` consumes that receipt.
-pub struct DevfsEndpoint;
-
-impl DevfsEndpoint {
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn open(endpoint: *mut raw::DevfsEndpoint, flags: u32) -> Result<usize> {
-        let mut file = 0;
-        // SAFETY: upheld by this function's safety contract.
-        let status = unsafe { imports::devfs_endpoint_open(endpoint, flags, &raw mut file) };
-        result(status)?;
-        Ok(file)
-    }
-
-    /// # Safety
-    /// `endpoint` and `file` must be the matching live endpoint/open receipt.
-    pub unsafe fn close(endpoint: *mut raw::DevfsEndpoint, file: usize, flags: u32) {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { imports::devfs_endpoint_close(endpoint, file, flags) };
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn initial_offset(
-        endpoint: *mut raw::DevfsEndpoint,
-        file: usize,
-        flags: u32,
-    ) -> Result<u64> {
-        let mut offset = 0;
-        // SAFETY: upheld by this function's safety contract.
-        let status = unsafe {
-            imports::devfs_endpoint_initial_offset(endpoint, file, flags, &raw mut offset)
-        };
-        result(status)?;
-        Ok(offset)
-    }
-
-    /// # Safety
-    /// `endpoint` must be live and `output` writable for its slice length.
-    pub unsafe fn read(
-        endpoint: *mut raw::DevfsEndpoint,
-        file: usize,
-        offset: u64,
-        output: &mut [u8],
-        flags: u32,
-    ) -> Result<usize> {
-        // SAFETY: upheld by contract and output is writable for its length.
-        let value = unsafe {
-            imports::devfs_endpoint_read(
-                endpoint,
-                file,
-                offset,
-                output.as_mut_ptr(),
-                output.len(),
-                flags,
-            )
-        };
-        signed_count(value, output.len())
-    }
-
-    /// # Safety
-    /// `endpoint` must be live and `input` readable for its slice length.
-    pub unsafe fn write(
-        endpoint: *mut raw::DevfsEndpoint,
-        file: usize,
-        offset: u64,
-        input: &[u8],
-        flags: u32,
-    ) -> Result<usize> {
-        // SAFETY: upheld by contract and input is readable for its length.
-        let value = unsafe {
-            imports::devfs_endpoint_write(
-                endpoint,
-                file,
-                offset,
-                input.as_ptr(),
-                input.len(),
-                flags,
-            )
-        };
-        signed_count(value, input.len())
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn size(endpoint: *mut raw::DevfsEndpoint) -> u64 {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { imports::devfs_endpoint_size(endpoint) }
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn sync(endpoint: *mut raw::DevfsEndpoint) -> Result<()> {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { result(imports::devfs_endpoint_sync(endpoint)) }
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn poll(
-        endpoint: *mut raw::DevfsEndpoint,
-        file: usize,
-        offset: u64,
-        events: u16,
-        flags: u32,
-    ) -> Result<u16> {
-        // SAFETY: upheld by this function's safety contract.
-        let value = unsafe { imports::devfs_endpoint_poll(endpoint, file, offset, events, flags) };
-        if value < 0 {
-            Err(Error::from_status(value as i32))
-        } else {
-            u16::try_from(value).map_err(|_| Error::from_status(EINVAL))
-        }
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn event(endpoint: *mut raw::DevfsEndpoint, file: usize, selector: u32) -> usize {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { imports::devfs_endpoint_event(endpoint, file, selector) }
-    }
-
-    /// # Safety
-    /// `endpoint` must be a live kernel endpoint receipt.
-    pub unsafe fn terminal_state(
-        endpoint: *mut raw::DevfsEndpoint,
-        state: &mut raw::FsTerminalState,
-    ) -> Result<()> {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { result(imports::devfs_endpoint_terminal_state(endpoint, state)) }
-    }
-
-    /// # Safety
-    /// `endpoint` must be live and `argument` writable for its slice length.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn ioctl(
-        endpoint: *mut raw::DevfsEndpoint,
-        file: usize,
-        process: u64,
-        group: i32,
-        session: i32,
-        session_leader: bool,
-        request: u64,
-        value: u64,
-        argument: &mut [u8],
-    ) -> Result<u64> {
-        // SAFETY: upheld by contract and argument is writable for its length.
-        let result = unsafe {
-            imports::devfs_endpoint_ioctl(
-                endpoint,
-                file,
-                process,
-                group,
-                session,
-                u8::from(session_leader),
-                request,
-                value,
-                argument.as_mut_ptr(),
-                argument.len(),
-            )
-        };
-        if result < 0 {
-            Err(Error::from_status(result as i32))
-        } else {
-            u64::try_from(result).map_err(|_| Error::from_status(EINVAL))
-        }
-    }
-
-    /// # Safety
-    /// `endpoint` must be the owned endpoint receipt passed to devfs create.
-    pub unsafe fn release(endpoint: *mut raw::DevfsEndpoint) {
-        // SAFETY: upheld by this function's safety contract.
-        unsafe { imports::devfs_endpoint_release(endpoint) };
-    }
-}
-
 pub struct Tty(Option<NonNull<raw::Tty>>);
 
 // SAFETY: terminal receipt use is serialized by its driver state lock.
@@ -2737,7 +1949,6 @@ impl Tty {
     /// `operations` must remain immutable and valid for the terminal's
     /// lifetime. Its context ownership stays with the caller.
     pub unsafe fn register(
-        device: Option<Device>,
         parent: u64,
         name: &CStr,
         mode: u16,
@@ -2749,7 +1960,6 @@ impl Tty {
         unsafe {
             result(imports::tty_register(
                 module()?.as_ptr(),
-                device.map_or(ptr::null(), Device::as_raw),
                 parent,
                 name.as_ptr(),
                 mode,
@@ -2772,51 +1982,6 @@ impl Tty {
         self.0 = None;
         Ok(())
     }
-}
-
-/// Receipt for the single registered terminal provider.
-pub struct TtyProvider(Option<NonNull<raw::TtyProvider>>);
-
-// SAFETY: provider lifecycle is serialized by the console module's global
-// state and the opaque receipt is never dereferenced by Rust.
-unsafe impl Send for TtyProvider {}
-
-impl TtyProvider {
-    /// Registers the terminal-semantics provider with the kernel broker.
-    ///
-    /// # Safety
-    /// `operations` must remain immutable until `unregister` returns.
-    pub unsafe fn register(operations: &'static raw::TtyProviderOps) -> Result<Self> {
-        let mut provider = ptr::null_mut::<c_void>();
-        // SAFETY: upheld by this method's contract and `provider` is writable
-        // local output storage.
-        let status = unsafe {
-            imports::tty_provider_register(module()?.as_ptr(), operations, &raw mut provider)
-        };
-        result(status)?;
-        NonNull::new(provider.cast())
-            .map(|value| Self(Some(value)))
-            .ok_or(Error::from_status(EINVAL))
-    }
-
-    /// Unregisters the provider after all backend terminal receipts are gone.
-    pub fn unregister(&mut self) -> Result<()> {
-        let Some(provider) = self.0 else {
-            return Ok(());
-        };
-        // SAFETY: the receipt remains valid until the kernel reports success.
-        let status = unsafe { imports::tty_provider_unregister(provider.as_ptr().cast()) };
-        result(status)?;
-        self.0 = None;
-        Ok(())
-    }
-}
-
-/// Delivers a POSIX signal to every process in `process_group`.
-pub fn signal_process_group(process_group: i32, signal: u8) -> Result<()> {
-    // SAFETY: both arguments are scalar process and signal identifiers.
-    let status = unsafe { imports::process_group_signal(process_group, signal) };
-    result(status)
 }
 
 pub fn sleep_ns(nanoseconds: u64) {
@@ -2871,14 +2036,123 @@ pub unsafe fn free(pointer: NonNull<u8>, size: usize, align: usize) {
 }
 
 pub fn port_read8(port: u16) -> u8 {
-    // SAFETY: the caller selected this I/O port from a firmware resource.
-    unsafe { imports::port_read8(port) as u8 }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u8;
+        // SAFETY: the caller selected this port from a device resource; the
+        // instruction is the complete x86 port-I/O operation.
+        unsafe {
+            core::arch::asm!(
+                "in al, dx",
+                out("al") value,
+                in("dx") port,
+                options(nostack, preserves_flags),
+            );
+        }
+        value
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        u8::MAX
+    }
 }
 
 pub fn port_write8(port: u16, value: u8) {
-    // SAFETY: the caller selected this I/O port from a firmware resource.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the caller selected this port from a device resource; the
+        // instruction is the complete x86 port-I/O operation.
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") port,
+                in("al") value,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
+    }
+}
+
+pub fn port_read16(port: u16) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u16;
+        // SAFETY: this is one complete x86 port-I/O instruction.
+        unsafe {
+            core::arch::asm!(
+                "in ax, dx",
+                out("ax") value,
+                in("dx") port,
+                options(nostack, preserves_flags),
+            );
+        }
+        value
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        u16::MAX
+    }
+}
+
+pub fn port_write16(port: u16, value: u16) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: this is one complete x86 port-I/O instruction.
     unsafe {
-        imports::port_write8(port, value);
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") value,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
+    }
+}
+
+pub fn port_read32(port: u16) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let value: u32;
+        // SAFETY: this is one complete x86 port-I/O instruction.
+        unsafe {
+            core::arch::asm!(
+                "in eax, dx",
+                out("eax") value,
+                in("dx") port,
+                options(nostack, preserves_flags),
+            );
+        }
+        value
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = port;
+        u32::MAX
+    }
+}
+
+pub fn port_write32(port: u16, value: u32) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: this is one complete x86 port-I/O instruction.
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (port, value);
     }
 }
 
@@ -2943,7 +2217,7 @@ macro_rules! module {
         static __RDF_MODULE_DEFINITION: $crate::raw::ModuleDef = $crate::raw::ModuleDef {
             size: $crate::raw::MODULE_DEF_SIZE,
             abi_major: $crate::raw::ABI_MAJOR,
-            abi_minor: $crate::raw::ABI_MINOR,
+            abi_reserved: 0,
             flags: 0,
             name: __RDF_MODULE_NAME.as_ptr().cast(),
             description: __RDF_MODULE_DESCRIPTION.as_ptr().cast(),

@@ -77,7 +77,7 @@ new file mode 100644
 index 0000000..3209d9b
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1360 @@
+@@ -0,0 +1,1374 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -1428,6 +1428,20 @@ index 0000000..3209d9b
 +    return error;
 +}
 +
++int Sysdeps<Mount>::operator()(const char *source, const char *target,
++        const char *filesystem, unsigned long flags, const void *data) {
++    if (data)
++        return EINVAL;
++    long result = roanix_syscall4(
++        ROANIX_SYS_FILE_MOUNT,
++        as_word(source),
++        as_word(target),
++        as_word(filesystem),
++        flags
++    );
++    return syscall_error(result);
++}
++
 +int Sysdeps<Umount2>::operator()(const char *target, int flags) {
 +    // The kernel unmount path takes a target only; there is nothing to map the
 +    // Linux MNT_* flags onto, so reject them rather than silently ignoring.
@@ -1527,7 +1541,7 @@ new file mode 100644
 index 0000000..44482f7
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,143 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1655,6 +1669,7 @@ index 0000000..44482f7
 +    PosixMadvise,
 +    GetPriority,
 +    SetPriority,
++    Mount,
 +    Umount2,
 +    Yield,
 +    Tgkill,
@@ -1675,7 +1690,7 @@ new file mode 100644
 index 0000000..fd97218
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,247 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1762,7 +1777,8 @@ index 0000000..fd97218
 +    ROANIX_SYS_THREAD_YIELD,
 +    ROANIX_SYS_THREAD_KILL,
 +    ROANIX_SYS_THREAD_SET_NAME,
-+    ROANIX_SYS_THREAD_GET_NAME
++    ROANIX_SYS_THREAD_GET_NAME,
++    ROANIX_SYS_FILE_MOUNT
 +};
 +
 +/// Longest thread name the kernel stores, excluding the NUL terminator.

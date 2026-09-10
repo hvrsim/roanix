@@ -90,7 +90,7 @@ pub fn with<F: FnOnce(&Event) -> Result<()>>(handle: usize, action: F) -> Result
     action(borrow(handle)?)
 }
 
-/// Returns the event behind a handle, for the kernel-side class adapters.
+/// Returns the event behind a handle for kernel-side device adapters.
 pub fn resolve(handle: usize) -> Option<&'static Event> {
     borrow(handle).ok()
 }

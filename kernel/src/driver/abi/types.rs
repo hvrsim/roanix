@@ -11,9 +11,7 @@ use super::super::error::{Error, Result};
 
 /// Incompatible ABI generation. A module built against a different major
 /// version is rejected.
-pub const ABI_MAJOR: u16 = 1;
-/// Append-only ABI revision. A module may request at most the kernel's value.
-pub const ABI_MINOR: u16 = 3;
+pub const ABI_MAJOR: u16 = 2;
 
 /// Longest string accepted across the boundary.
 pub const MAX_STRING: usize = 4096;
@@ -25,8 +23,8 @@ pub struct ModuleDef {
     pub size: u32,
     /// Incompatible ABI generation the module was built against.
     pub abi_major: u16,
-    /// Append-only ABI revision the module requires.
-    pub abi_minor: u16,
+    /// Reserved for future descriptor flags and required to be zero.
+    pub abi_reserved: u16,
     /// Reserved for future use and required to be zero.
     pub flags: u32,
     /// Module name, unique among loaded modules.

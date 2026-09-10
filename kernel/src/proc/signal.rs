@@ -27,6 +27,9 @@ const SIGNAL_MAX: usize = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
+pub(crate) const SIGHUP: u8 = 1;
+pub(crate) const SIGINT: u8 = 2;
+pub(crate) const SIGQUIT: u8 = 3;
 pub(crate) const SIGILL: u8 = 4;
 pub(crate) const SIGTRAP: u8 = 5;
 pub(crate) const SIGBUS: u8 = 7;

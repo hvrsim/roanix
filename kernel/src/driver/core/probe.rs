@@ -341,20 +341,11 @@ fn unbind(device: &Arc<Device>) {
 /// Releases framework state a driver may have left attached to `device`.
 ///
 /// Drivers are expected to clean up in their remove callback, but a failed
-/// probe or a misbehaving driver must not leak interrupts, class memberships,
-/// or published interfaces.
+/// probe or a misbehaving driver must not leak interrupts or interfaces.
 fn release_driver_state(device: &Arc<Device>, driver: &Arc<Driver>) {
     let Some(owner) = driver.owner() else {
         return;
     };
-    for member in device.class_devices() {
-        if member
-            .owner()
-            .is_some_and(|module| Arc::ptr_eq(module, owner))
-        {
-            super::class::remove_device(&member);
-        }
-    }
     for interface in device.interfaces() {
         if interface
             .owner()

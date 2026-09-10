@@ -197,7 +197,7 @@ crate::syscall_handler! {
         let Descriptor::File(file) = descriptor else {
             return Err(Errno::NotTty);
         };
-        let spec = crate::driver::class::console::ioctl_spec(request);
+        let spec = crate::dev::tty::ioctl_spec(request);
         if spec.size > MAX_IOCTL_SIZE {
             return Err(Errno::Invalid);
         }
@@ -208,14 +208,14 @@ crate::syscall_handler! {
                 .read_user(VirtAddr::new(argument), &mut bytes)
                 .map_err(map_memory_error)?;
         }
-        if request == crate::driver::class::console::TIOCSPGRP {
+        if request == crate::dev::tty::TIOCSPGRP {
             let group =
                 i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| Errno::Invalid)?);
             if group <= 0 || !proc::process_group_in_session(group as usize, process.session()) {
                 return Err(Errno::Permission);
             }
         }
-        if request == crate::driver::class::console::TIOCSCTTY
+        if request == crate::dev::tty::TIOCSCTTY
             && process
                 .controlling_tty_key()
                 .is_some_and(|key| key != file.vnode().key())
@@ -233,11 +233,11 @@ crate::syscall_handler! {
                 other => map_fs_error(other),
             })?;
         match request {
-            crate::driver::class::console::TIOCSCTTY => process.set_controlling_tty(file.clone()),
-            crate::driver::class::console::TIOCNOTTY if process.session() == process.pid() => {
+            crate::dev::tty::TIOCSCTTY => process.set_controlling_tty(file.clone()),
+            crate::dev::tty::TIOCNOTTY if process.session() == process.pid() => {
                 proc::clear_session_controlling_tty(process.session(), file.vnode().key());
             }
-            crate::driver::class::console::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
+            crate::dev::tty::TIOCNOTTY => process.clear_controlling_tty(file.vnode().key()),
             _ => {}
         }
         if spec.output && spec.size != 0 {
@@ -287,6 +287,36 @@ crate::syscall_handler! {
         let process = current_process()?;
         let path = read_user_path(&process, path)?;
         fs::unmount(&path).map_err(map_fs_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_mount(
+        _frame,
+        source: u64 = 0,
+        target: u64 = 1,
+        filesystem: u64 = 2,
+        flags: u64 = 3,
+    ) {
+        // Disk filesystems are currently mounted read-only. Accept Linux
+        // MS_RDONLY or no flags so libc can use its conventional interface.
+        if flags & !1 != 0 {
+            return Err(Errno::Invalid);
+        }
+        let process = current_process()?;
+        let source = read_user_path(&process, source)?;
+        let target = read_user_path(&process, target)?;
+        let filesystem = read_user_path(&process, filesystem)?;
+        let source = core::str::from_utf8(&source).map_err(|_| Errno::Invalid)?;
+        let filesystem = core::str::from_utf8(&filesystem).map_err(|_| Errno::Invalid)?;
+        if target == b"/" && process.pid() != 1 {
+            return Err(Errno::Permission);
+        }
+        fs::mount_block(source, &target, filesystem).map_err(map_fs_error)?;
+        if target == b"/" {
+            process.reset_cwd().map_err(map_process_error)?;
+        }
         Ok(0)
     }
 }
@@ -804,7 +834,7 @@ fn file_open_at(process: &Process, dirfd: i32, path: u64, flags: u64, mode: u64)
         && file
             .ioctl(
                 ioctl_context(process)?,
-                crate::driver::class::console::TIOCSCTTY,
+                crate::dev::tty::TIOCSCTTY,
                 0,
                 &mut [],
             )

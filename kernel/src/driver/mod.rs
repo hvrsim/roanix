@@ -1,9 +1,9 @@
 //!
 //! # Driver Framework
 //!
-//! Roanix drivers are modules that run in the kernel and may implement any
-//! kernel-visible functionality, not just device access. The framework is
-//! organized around five ideas:
+//! Roanix drivers are loadable hardware modules. Kernel policy facilities such
+//! as filesystems, terminals, and software devices deliberately live outside
+//! this framework. The framework is organized around four ideas:
 //!
 //! * A **device** is a uniform node in one tree. There is no separate bus node
 //!   type, so a bridge, a hub, or a controller is an ordinary device that
@@ -19,9 +19,6 @@
 //!   ancestry requirement, so any driver can consume any service. A driver that
 //!   needs a service which has not appeared yet defers, and the probe engine
 //!   retries it when the topology changes.
-//! * A **class** groups devices that share a software contract and notifies its
-//!   owner as members come and go, which is what allows an entire subsystem to
-//!   be implemented as a driver.
 //!
 //! Handles crossing the C boundary are pointers to reference-counted objects
 //! rather than identifiers resolved through a table, so no lock is taken and no
@@ -30,7 +27,6 @@
 //!
 
 pub mod abi;
-pub mod class;
 pub mod core;
 pub mod error;
 pub mod io;
@@ -40,7 +36,6 @@ pub mod platform;
 
 pub use core::{
     bus::Bus,
-    class::{Class, ClassDevice},
     device::{Device, DeviceBuilder},
     driver::Driver,
     iface::{Interface, InterfaceRef},
@@ -67,14 +62,6 @@ const BOOT_MODULES: &[BootModuleSpec] = &[
         name: "ioapic",
         path: b"usr/lib/roanix/drivers/ioapic.ko",
     },
-    BootModuleSpec {
-        name: "tmpfs",
-        path: b"usr/lib/roanix/drivers/tmpfs.ko",
-    },
-    BootModuleSpec {
-        name: "devfs",
-        path: b"usr/lib/roanix/drivers/devfs.ko",
-    },
 ];
 
 #[cfg(target_arch = "riscv64")]
@@ -86,14 +73,6 @@ const BOOT_MODULES: &[BootModuleSpec] = &[
     BootModuleSpec {
         name: "plic",
         path: b"usr/lib/roanix/drivers/plic.ko",
-    },
-    BootModuleSpec {
-        name: "tmpfs",
-        path: b"usr/lib/roanix/drivers/tmpfs.ko",
-    },
-    BootModuleSpec {
-        name: "devfs",
-        path: b"usr/lib/roanix/drivers/devfs.ko",
     },
 ];
 
@@ -108,12 +87,7 @@ pub fn init() {
     irq::init();
     io::init();
     work::init();
-    class::init();
     platform::init();
-    // Filesystem providers register through the driver ABI during the early
-    // boot-module phase, before VFS mounts its root.
-    crate::fs::provider::init();
-    crate::fs::provider::init_broker();
 }
 
 /// Loads the architecture-specific modules needed during early platform boot.

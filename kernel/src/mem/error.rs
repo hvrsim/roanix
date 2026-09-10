@@ -27,6 +27,8 @@ pub enum Error {
     CorruptSwap,
     /// An architecture page-table operation failed.
     Pmap,
+    /// The file backing a demand-loaded page could not be read.
+    Io,
 }
 
 impl fmt::Display for Error {
@@ -40,6 +42,7 @@ impl fmt::Display for Error {
             Self::LimitExceeded => "virtual memory account limit exceeded",
             Self::SwapUnavailable => "no swap tier accepted the page",
             Self::CorruptSwap => "corrupt swapped page",
+            Self::Io => "file page I/O failed",
             Self::Pmap => "architecture page-table operation failed",
         })
     }

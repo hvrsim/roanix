@@ -19,15 +19,15 @@ $ ./x.py            # build whatever changed and boot it in QEMU
 
 `./x.py` with no arguments is shorthand for `./x.py run`: it rebuilds the
 kernel if the sources changed, rebuilds any userland package whose recipe
-changed, reinstalls the sysroot, repacks the initramfs, refreshes the disk
-image, and boots the result. Anything already up to date is skipped, so a
-no-op run finishes in well under a second.
+changed, reinstalls the sysroot, repacks the bootstrap initramfs, refreshes the
+ext4 root disk and boot image, and boots the result. Anything already up to
+date is skipped, so a no-op run finishes in well under a second.
 
 ## Dependencies
 
 Because the kernel selects its toolchain through `rust-toolchain.toml`, an
 installation of [rustup] is required. Disk image creation needs `xorriso`,
-`mtools`, and `sgdisk`; Python 3.11 or newer is required to run xtool itself;
+`mtools`, `e2fsprogs`, and `sgdisk`; Python 3.11 or newer is required to run xtool itself;
 and QEMU is used for testing. Building the userland additionally needs the Jinx
 host dependencies: Bash, awk, findutils, Git, GNU Make, grep, gzip, sed, tar,
 zstd, coreutils, procps, and util-linux. Jinx normally uses `wget`; xtool also
@@ -38,19 +38,19 @@ accepts `curl` and provides a shim.
 **Ubuntu/Debian:**
 
 ```bash
-$ sudo apt-get install make python3 xorriso mtools gdisk zstd qemu-system-x86
+$ sudo apt-get install make python3 xorriso mtools e2fsprogs gdisk zstd qemu-system-x86
 ```
 
 **Alpine:**
 
 ```bash
-$ sudo apk add make python3 xorriso mtools sgdisk zstd qemu qemu-system-x86_64
+$ sudo apk add make python3 xorriso mtools e2fsprogs sgdisk zstd qemu qemu-system-x86_64
 ```
 
 **Arch:**
 
 ```bash
-$ sudo pacman -S make python xorriso mtools gptfdisk zstd qemu-system-x86
+$ sudo pacman -S make python xorriso mtools e2fsprogs gptfdisk zstd qemu-system-x86
 ```
 
 Rather than checking these by hand, run:
@@ -166,8 +166,12 @@ $ ./x.py build kernel
 # build/<arch>/sysroot
 $ ./x.py build sysroot
 
-# Pack that sysroot as build/<arch>/<profile>/roanix-<arch>.initramfs.tar.gz
+# Pack the bootstrap userland and hardware modules as
+# build/<arch>/out/<profile>/roanix-<arch>.initramfs.tar.gz
 $ ./x.py build initramfs
+
+# Put the complete sysroot in a GPT-partitioned ext4 disk image
+$ ./x.py build rootfs
 
 # Both images at once, for release
 $ ./x.py build all --release
@@ -394,7 +398,8 @@ build/
 │   └── host-tools/          the wget shim, when only curl is present
 ├── cargo/                   CARGO_TARGET_DIR; Cargo namespaces by triple
 └── x86_64/
-    ├── out/dev/             roanix, *.initramfs.tar.gz, *.hdd, *.iso
+    ├── out/dev/             roanix, *.initramfs.tar.gz, *.root.img,
+    │                        *.hdd, *.iso
     ├── out/release/
     ├── jinx/                Jinx build directory, pkgs/, builds/
     ├── sysroot/             installed userland
@@ -409,131 +414,122 @@ place by hand if you want to keep a populated Jinx tree.
 
 ## Driver modules
 
-Native drivers are freestanding shared objects built from `drivers/` and
-installed as `.ko` module images. Every in-tree driver is a Rust crate; the
-workspace is rooted at `drivers/Cargo.toml` and organized by hardware domain:
-
-```
-drivers/
-├── ddk/                 the no_std driver development kit
-├── platform/acpi/       x86_64 ACPI (MADT) enumerator
-├── platform/fdt/        riscv64 flattened device-tree enumerator
-├── irqchip/ioapic/      I/O APIC interrupt controller
-├── irqchip/plic/        RISC-V platform-level interrupt controller
-├── tty/uart8250/        8250/16550 serial port
-├── tty/console/         terminal line discipline and tty provider
-├── tty/pty/             ptmx/pts pseudo-terminals
-├── tty/special/         null, zero, random, urandom
-└── fs/{tmpfs,devfs}/    loadable filesystem providers
-```
-
-All modules use the same C ABI, including `rdf_module_entry`, the service
-table, and C-compatible operation records. The ABI itself is documented by the
-C headers in `drivers/include/roanix/` (`driver.h` and `RDF_MODULE` remain the
-contract for out-of-tree C drivers), while in-tree crates use the no_std `ddk`
-crate.
-
-The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`,
-uses `panic = "abort"`, and links self-contained ET_DYN images with
-`rdf_module_entry` as their ELF entry. Each module's build script asks the DDK
-to configure Cargo's final link, and xtool installs the resulting images
-directly under `/usr/lib/roanix/drivers/` in the staged sysroot. Kernel calls
-use versioned `rdf_api_v1_*` imports that the module loader resolves before
-entry; modules carry imports only for services they use.
-
-`console.ko` is also built for both targets. It registers the shared terminal
-provider before the lexically later `pty.ko` and `uart8250.ko` modules, and owns
-termios, line discipline, terminal nodes, and the `tty` class. UART and PTY
-backends continue to use the unchanged `rdf_tty_register` ABI.
-
-For RISC-V shared Rust modules that use `alloc`, xtool rebuilds
-`core`, `alloc`, and `compiler_builtins` with PIC via Cargo's `build-std`
-support; the distributed static runtime is not suitable for a loadable image.
-
-Modules reach kernel services through versioned C ABI imports such as
-`rdf_api_v1_random_fill`. The loader resolves only its closed export list; it
-never exposes internal Rust symbols or a general kernel symbol namespace.
-Images still have no runtime dependency or interpreter, and the loader accepts
-only relative relocations plus architecture-specific import relocations.
-
-### Modular filesystem providers
-
-`tmpfs.ko` and `devfs.ko` are required early Rust modules on x86_64 and
-riscv64. They register after memory and driver-core services come up, before
-VFS mounts `/`; the kernel scans their images directly from the initramfs, so
-VFS never loads an ELF image itself. `tmpfs` supplies the root mount and
-`devfs` supplies `/dev`, after which console, PTY, UART, and special-device
-modules load normally.
-
-The append-only C ABI in `<roanix/api.h>` uses opaque mount and vnode receipts.
-A mounted VFS adapter takes one module lease, caches live vnodes by provider
-node ID, and each vnode retains its mount. Device endpoint receipts likewise
-own their hardware module lease, while the devfs broker takes a scoped lease
-for namespace calls. Therefore normal filesystem and device I/O never pins a
-module per callback, but unload cannot unmap a live provider or endpoint.
-
-Tmpfs metadata remains in its module. Its sparse contents use only the
-versioned page-account and memory-object services in the provider table; the
-kernel owns physical pages and VM objects, and transfers use provider buffers
-directly without whole-request bounce copies. C filesystem drivers can use the
-same records and services documented in the headers.
-
-The framework is built from five ideas:
-
-* A **device** is a uniform node in one tree. There is no separate bus node
-  type, so a bridge, a hub, or a controller is an ordinary device that happens
-  to have children.
-* A **bus** describes how a family of devices is enumerated, matched, and
-  addressed. Buses are registered by modules, so PCI, USB, or I2C support is
-  added without touching the framework. The kernel registers only `platform`,
-  the namespace for firmware-described devices.
-* A **driver** binds to devices through a match table that understands
-  device-tree `compatible` strings, ACPI identifiers, and masked numeric
-  identifier tables of the kind PCI and USB use.
-* An **interface** is a versioned operation table published under a name, and
-  is the only mechanism for one driver to call another. It has no ancestry
-  requirement, so a driver can combine services from anywhere in the system. A
-  driver whose prerequisite has not appeared yet returns `RDF_EDEFER`, and the
-  probe engine retries it when the topology changes — which is why module load
-  order does not matter.
-* A **class** groups devices that share a software contract and notifies its
-  owner as members come and go. This is how a whole subsystem — a block layer,
-  an input stack, a display core — can be implemented as an ordinary driver.
-
-Handles crossing the C boundary are pointers to reference-counted kernel
-objects rather than identifiers resolved through a table, so a framework call
-takes no lock and performs no lookup. After a register window is mapped, device
-register access involves no framework call at all.
-
-The tree is organized by role:
+Only hardware-facing code is loadable. In-tree modules are freestanding Rust
+shared objects from the `drivers/` workspace:
 
 ```text
-drivers/include/roanix/   the API headers, installed to /usr/include/roanix
-drivers/platform/         firmware enumerators (ACPI, device tree)
-drivers/irqchip/          interrupt controllers
-drivers/tty/              serial ports and pseudo-terminals
-drivers/tty/special/      null, zero, random, and urandom devices
+drivers/
+├── ddk/                 no_std driver development kit
+├── platform/{acpi,fdt}/ firmware enumerators
+├── irqchip/{ioapic,plic}/ interrupt controllers
+├── bus/pci/             PCI/PCIe bus driver
+├── storage/nvme/        NVMe controller driver
+└── tty/uart8250/        8250/16550 serial hardware driver
 ```
 
-xtool fingerprints `drivers/`, builds changed modules with Cargo, and installs
-them directly into the staged sysroot, so editing a driver is enough to rebuild
-and reinstall it:
+Always-present software belongs in the kernel. `kernel/src/fs/{tmpfs,devfs}.rs`
+provides the root and device filesystems directly; `kernel/src/dev/` owns the
+TTY line discipline, console adapter, PTYs, and special devices. Consequently
+boot does not depend on loading filesystem or terminal-provider modules, and
+ordinary VFS/TTY operations avoid a module ABI callback layer.
+
+The remaining driver framework has four concepts: devices form one topology;
+buses define enumeration and matching; drivers bind to devices using match
+tables; and named, versioned interfaces support the few cross-driver protocols.
+The old generic class layer is gone. Kernel subsystems should use native Rust
+traits and explicit registries instead of turning software policy into a
+module.
+
+Storage follows the same boundary. `kernel/src/dev/block.rs` owns block-device
+geometry, byte-range adaptation, `/dev` publication, transfer splitting, and
+mount lifetime claims. A hardware module supplies only exact logical-block
+callbacks, then requests a scan after its controller state reaches its final
+address. `kernel/src/fs/partition.rs` validates GPT (including both CRCs) and
+MBR/EBR tables and publishes partitions as derived block devices.
+
+Disk filesystems are kernel-owned. `kernel/src/fs/ext4.rs` supplies the system
+root and currently mounts a deliberately constrained ext4 feature set
+read-only. It supports 1--4 KiB blocks, 32- and 64-bit group descriptors,
+extent trees, sparse and uninitialized extents, typed linear directories,
+Unix modes, fast and extent-backed symbolic links, statfs, and executable
+mappings. It rejects journals requiring replay, directory indexes, bigalloc,
+inline data, encryption, metadata checksums, and unknown incompatible features.
+The generated root image disables those features explicitly.
+
+`kernel/src/fs/fat32.rs` remains available for FAT32/VFAT data volumes. It
+validates cluster chains and BPB geometry, decodes checksum-protected UTF-16
+long names, and implements lookup, readdir, reads, mappings, statfs, and sync.
+Both implementations stay read-only until their metadata allocation and crash
+ordering rules are implemented. Regular reads and mappings now share one
+mount-owned `VmObject` per file. Immutable pagers load missing pages on demand,
+batch contiguous reads up to 128 KiB, and read ahead for sequential access.
+Clean file frames participate in VM reclamation and can be discarded and
+reloaded without occupying swap. Metadata uses the same VM infrastructure;
+there is no separate cache of regular file data in the block layer.
+
+`kernel/src/fs/io.rs` provides a validated extent pager for other immutable
+filesystems. FAT32 retains its cluster index across reads and combines adjacent
+clusters into device transfers. Pagers retain device claims independently of
+the mount, preserving existing mappings after unmount. File page fills release
+the address-space lock before I/O and revalidate mappings before installing
+PTEs. NVMe queues are leased outside spin locks; callers can borrow an idle
+queue or sleep for admission. DMA transport still uses bounded staging buffers,
+and writable disk pagers require a future writeback and crash-ordering design.
+
+Kernel callers use `fs::mount_block`; syscall
+clients use the `file_mount` entry with a source such as `/dev/nvme0n1p1` and
+filesystem name `ext4`, `vfat`, or `fat32`.
+
+All hardware modules use ABI generation 2. `rdf_module_entry` returns a module
+descriptor, operation records are size-prefixed, and a module imports only the
+`rdf_api_v2_*` services it actually calls. The loader resolves a closed export
+list and exposes no internal Rust symbols. The C contract remains in
+`drivers/include/roanix/`; in-tree Rust drivers use `drivers/ddk`.
+
+The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`,
+uses `panic = "abort"`, and links self-contained ET_DYN images. For RISC-V
+modules that use `alloc`, xtool rebuilds `core`, `alloc`, and
+`compiler_builtins` as position-independent code.
+
+Handles for framework objects are direct opaque pointers, so a call does not
+perform a global ID lookup. Registration APIs return unique receipts; borrowed
+bus/device handles cannot tear down registrations. Once MMIO is mapped, normal
+register access is inline and makes no framework call.
+
+xtool fingerprints `drivers/`, rebuilds changed modules, and installs them
+under `/usr/lib/roanix/drivers/` in the staged sysroot:
 
 ```bash
-$ vim drivers/tty/pty/src/lib.rs
+$ vim drivers/storage/nvme/src/lib.rs
 $ ./x.py                # rebuilds the module and boots the result
 ```
 
 Cargo intermediates live under `build/cargo/drivers`, and finished modules live
-under `build/<arch>/drivers-rust`; no generated driver tree belongs under the
-source directory.
+under `build/<arch>/drivers-rust`.
 
 ## Notes on the sysroot
 
 The userland sysroot is dynamically linked against `/usr/lib/ld.so`. Its mlibc
-port uses the Roanix syscall ABI; the kernel imports the initramfs and starts
-`/sbin/init` through that ABI. HDD and ISO builds automatically build or reuse
-the sysroot, repack it, and attach it as the Limine initramfs module.
+port uses the Roanix syscall ABI. The initramfs is deliberately only a bootstrap:
+it contains coreutils, Bash, mlibc, util-roanix, their required runtime
+dependencies, and the architecture's hardware modules. Drivers needed to reach
+the root NVMe device must remain there.
+
+The complete sysroot is instead materialized directly into a GPT-partitioned
+ext4 image at `build/<arch>/out/<profile>/roanix-<arch>.root.img`. `mke2fs`
+populates the partition at its final byte offset, preserving symlinks, modes,
+and case-sensitive names without an expanded staging tree or a second image
+copy. The image uses 4 KiB blocks, extents, typed directories, and no journal.
+QEMU attaches it as an NVMe disk using an ephemeral snapshot, keeping the build
+artifact immutable.
+
+The bootstrap `/sbin/init` waits for `/dev/nvme0n1p1`, asks the kernel to mount
+it read-only on `/`, and re-executes `/sbin/init` from the new root. The kernel
+accepts a root replacement only from PID 1 and only when the filesystem contains
+`/etc/roanix-root` plus the required system directories. Existing devfs is then
+reattached at `/dev`, a fresh tmpfs is mounted at `/tmp`, and the process working
+directory is reset. If discovery or validation fails, init retains the
+bootstrap root and provides an emergency shell.
 
 For faster iteration, `dev` builds compress the initramfs at gzip level 1 while
 `release` builds use level 9.

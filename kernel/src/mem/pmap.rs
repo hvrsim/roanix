@@ -493,6 +493,24 @@ impl VmSpace {
     /// Resolves and enters one page fault.
     pub fn fault(&self, address: VirtAddr, access: FaultAccess) -> Result<()> {
         let mut map = self.map.lock();
+        let _file_pin = loop {
+            let Some((object, index)) = map.file_fault(address, access)? else {
+                break None;
+            };
+            let timestamp = map.timestamp();
+            drop(map);
+            let loaded = object
+                .fault_page(index, false)
+                .and_then(|page| page.pin_resident());
+            map = self.map.lock();
+            // unmap, mprotect, replacement and fork invalidate the snapshot.
+            // A successful pin also prevents reclaim from forcing disk I/O
+            // inside resolve_fault or PTE installation below.
+            if map.timestamp() != timestamp {
+                continue;
+            }
+            break Some(loaded?);
+        };
         let resolved = map.resolve_fault(address, access)?;
         let page = resolved.page.clone();
         self.pmap
@@ -536,14 +554,17 @@ impl VmSpace {
         address: VirtAddr,
         access: FaultAccess,
     ) -> Result<(Arc<VmPage>, PhysAddr)> {
-        // Always fault first, like the copy paths do: a mapping whose
-        // protection already grants `access` may still be lazily backed
-        // (zero-fill or COW), so its PTE does not necessarily reference the
-        // frame the logical page will commit to. Faulting forces that
-        // commitment before the alias is taken.
-        self.fault(address, access)?;
         let aligned = address.align_down();
         let required = required_protection(access);
+        // An installed PTE already embodies COW and protection decisions.
+        // Writable windows fault only if that PTE does not permit writing.
+        if !self
+            .pmap
+            .mapped_page(aligned)
+            .is_some_and(|(_, protection)| protection.contains(required))
+        {
+            self.fault(address, access)?;
+        }
         let (page, protection) = self.pmap.mapped_page(aligned).ok_or(Error::NotMapped)?;
         if !protection.contains(required) {
             return Err(Error::Protection);

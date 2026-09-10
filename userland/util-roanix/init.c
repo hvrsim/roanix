@@ -5,9 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+#define ROOT_DEVICE "/dev/nvme0n1p1"
+#define ROOT_FILESYSTEM "ext4"
+#define ROOT_READY "ROANIX_ROOT_READY"
 
 static void clear_terminal(void) {
     printf("\033[2J\033[H");
@@ -49,6 +54,28 @@ static int open_console(void) {
     if (serial > STDERR_FILENO)
         close(serial);
     return 0;
+}
+
+static int mount_system_root(void) {
+    if (getenv(ROOT_READY) != NULL)
+        return 0;
+
+    for (unsigned attempt = 0; attempt < 10; attempt++) {
+        if (mount(ROOT_DEVICE, "/", ROOT_FILESYSTEM, MS_RDONLY, NULL) == 0) {
+            if (setenv(ROOT_READY, "1", 1) < 0)
+                return -1;
+            if (chdir("/") < 0)
+                return -1;
+            execl("/sbin/init", "/sbin/init", (char *)NULL);
+            return -1;
+        }
+
+        if (errno != ENOENT && errno != ENODEV && errno != EIO)
+            break;
+        sleep(1);
+    }
+
+    return -1;
 }
 
 static int parse_cursor_position(
@@ -167,12 +194,23 @@ static void run_shell(void) {
 }
 
 int main(void) {
-    if (create_tmp() < 0)
+    int bootstrapping = getenv(ROOT_READY) == NULL;
+    if (bootstrapping && create_tmp() < 0) {
+        perror("init: create /tmp");
         return 1;
-    if (open_console() < 0)
+    }
+    if (bootstrapping && open_console() < 0) {
+        perror("init: open console");
         return 1;
+    }
     if (setenv("TERM", "vt220", 0) < 0)
         return 1;
+
+    if (bootstrapping && mount_system_root() < 0) {
+        fprintf(stderr, "init: cannot mount %s as root: %s\n",
+                ROOT_DEVICE, strerror(errno));
+        fprintf(stderr, "init: continuing with the emergency initramfs\n");
+    }
 
     detect_terminal_size();
     clear_terminal();

@@ -13,19 +13,19 @@ use core::{
 };
 
 use crate::{
+    dev::{
+        block::{self, BlockDevice, BlockOps},
+        console::{self, ConsoleOps},
+        node::{self as chardev, DevNodeId, NodeOps},
+    },
     mem::VirtAddr,
     sys::{clock, event::Event, klog, random, smp},
 };
 
 use super::{
     super::{
-        class::{
-            chardev::{self, DevNodeId, NodeOps},
-            console::{self, ConsoleOps, TtyProviderOps},
-        },
         core::{
             bus::{self, Bus, BusOps},
-            class::{self, Class, ClassDevice, ClassOps, Membership},
             device::{self, Device, DeviceBuilder},
             driver::{self, Driver, DriverOps, Registration},
             fwnode,
@@ -40,7 +40,6 @@ use super::{
         io::{
             dma::{self, DmaBuffer},
             mmio::{self, Mapping},
-            port,
         },
         irq::{self, DomainOps, HandlerFn, IrqAction, IrqDomain, ThreadFn},
         obj::{self, Object},
@@ -144,19 +143,6 @@ pub struct BusRegistration {
     pub context: *mut c_void,
 }
 
-/// Class callbacks supplied from C.
-#[repr(C)]
-pub struct ClassRegistration {
-    /// Size of this record.
-    pub size: u32,
-    /// Optional callback invoked when a member joins.
-    pub attach: Option<unsafe extern "C" fn(*mut c_void, *const c_void) -> i32>,
-    /// Optional callback invoked when a member leaves.
-    pub detach: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
-    /// Context passed to every callback.
-    pub context: *mut c_void,
-}
-
 /// Interrupt controller callbacks supplied from C.
 #[repr(C)]
 pub struct DomainRegistration {
@@ -200,25 +186,24 @@ pub mod scope {
 /// Guards C ABI records against drift from the installed headers.
 mod layout {
     use super::*;
-    use crate::driver::{
-        class::{chardev::IoctlIdentity, console::SerialFraming},
-        io::dma::DmaOps,
+    use crate::{
+        dev::{console::SerialFraming, node::IoctlIdentity},
+        driver::io::dma::DmaOps,
     };
 
     const _: () = assert!(size_of::<crate::driver::abi::types::ModuleDef>() == 48);
     const _: () = assert!(size_of::<NodeOps>() == 120);
     const _: () = assert!(size_of::<ConsoleOps>() == 160);
-    const _: () = assert!(size_of::<TtyProviderOps>() == 32);
     const _: () = assert!(size_of::<MatchDef>() == 72);
     const _: () = assert!(size_of::<DriverDef>() == 80);
     const _: () = assert!(size_of::<MmioWindow>() == 24);
     const _: () = assert!(size_of::<DmaWindow>() == 32);
     const _: () = assert!(size_of::<BusRegistration>() == 48);
-    const _: () = assert!(size_of::<ClassRegistration>() == 32);
     const _: () = assert!(size_of::<DomainRegistration>() == 96);
     const _: () = assert!(size_of::<IoctlIdentity>() == 24);
     const _: () = assert!(size_of::<SerialFraming>() == 8);
     const _: () = assert!(size_of::<DmaOps>() == 32);
+    const _: () = assert!(size_of::<BlockOps>() == 64);
 }
 
 include!("shims.rs");
@@ -231,7 +216,7 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         ($name:expr; $($service:ident => $function:ident),* $(,)?) => {
             match $name {
                 $(
-                    concat!("rdf_api_v1_", stringify!($service)) => {
+                    concat!("rdf_api_v2_", stringify!($service)) => {
                         Some($function as *const () as usize)
                     }
                 )*
@@ -283,18 +268,6 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         bus_set_dma_ops => shim_bus_set_dma_ops,
         driver_register => shim_driver_register,
         driver_unregister => shim_driver_unregister,
-        class_register => shim_class_register,
-        class_unregister => shim_class_unregister,
-        class_find => shim_class_find,
-        class_add => shim_class_add,
-        class_remove => shim_class_remove,
-        class_member_ops => shim_class_member_ops,
-        class_member_name => shim_class_member_name,
-        class_member_device => shim_class_member_device,
-        class_member_data => shim_class_member_data,
-        class_member_set_data => shim_class_member_set_data,
-        class_member_count => shim_class_member_count,
-        class_member => shim_class_member,
         iface_publish => shim_iface_publish,
         iface_withdraw => shim_iface_withdraw,
         iface_bind => shim_iface_bind,
@@ -319,12 +292,6 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         mmio_map => shim_mmio_map,
         mmio_unmap => shim_mmio_unmap,
         mmio_direct => shim_mmio_direct,
-        port_read8 => shim_port_read8,
-        port_read16 => shim_port_read16,
-        port_read32 => shim_port_read32,
-        port_write8 => shim_port_write8,
-        port_write16 => shim_port_write16,
-        port_write32 => shim_port_write32,
         dma_alloc => shim_dma_alloc,
         dma_free => shim_dma_free,
         dma_map => shim_dma_map,
@@ -359,46 +326,18 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         devfs_create => shim_devfs_create,
         devfs_remove => shim_devfs_remove,
         devfs_lookup => shim_devfs_lookup,
+        block_register => shim_block_register,
+        block_unregister => shim_block_unregister,
+        block_rescan => shim_block_rescan,
         tty_register => shim_tty_register,
         tty_unregister => shim_tty_unregister,
         klog_level => shim_klog_level,
         klog_set_level => shim_klog_set_level,
         klog_console_level => shim_klog_console_level,
         klog_set_console_level => shim_klog_set_console_level,
-        tty_provider_register => shim_tty_provider_register,
-        tty_provider_unregister => shim_tty_provider_unregister,
         event_wait_any => shim_event_wait_any,
         event_wait_timeout => shim_event_wait_timeout,
         worker_spawn => shim_worker_spawn,
         worker_join => shim_worker_join,
-        process_group_signal => shim_process_group_signal,
-        fs_provider_register => shim_fs_provider_register,
-        fs_provider_unregister => shim_fs_provider_unregister,
-        fs_page_account_create => shim_fs_page_account_create,
-        fs_page_account_release => shim_fs_page_account_release,
-        fs_page_account_limit => shim_fs_page_account_limit,
-        fs_page_account_used => shim_fs_page_account_used,
-        fs_memory_object_create => shim_fs_memory_object_create,
-        fs_memory_object_retain => shim_fs_memory_object_retain,
-        fs_memory_object_release => shim_fs_memory_object_release,
-        fs_memory_object_read => shim_fs_memory_object_read,
-        fs_memory_object_write => shim_fs_memory_object_write,
-        fs_memory_object_truncate => shim_fs_memory_object_truncate,
-        fs_memory_object_page_count => shim_fs_memory_object_page_count,
-        fs_total_physical_pages => shim_fs_total_physical_pages,
-        devfs_broker_register => shim_devfs_broker_register,
-        devfs_broker_unregister => shim_devfs_broker_unregister,
-        devfs_endpoint_open => shim_devfs_endpoint_open,
-        devfs_endpoint_close => shim_devfs_endpoint_close,
-        devfs_endpoint_initial_offset => shim_devfs_endpoint_initial_offset,
-        devfs_endpoint_read => shim_devfs_endpoint_read,
-        devfs_endpoint_write => shim_devfs_endpoint_write,
-        devfs_endpoint_size => shim_devfs_endpoint_size,
-        devfs_endpoint_sync => shim_devfs_endpoint_sync,
-        devfs_endpoint_poll => shim_devfs_endpoint_poll,
-        devfs_endpoint_event => shim_devfs_endpoint_event,
-        devfs_endpoint_terminal_state => shim_devfs_endpoint_terminal_state,
-        devfs_endpoint_ioctl => shim_devfs_endpoint_ioctl,
-        devfs_endpoint_release => shim_devfs_endpoint_release,
     )
 }

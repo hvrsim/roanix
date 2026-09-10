@@ -29,7 +29,6 @@ use super::{
         obj::{ObjHeader, ObjKind, framework_object},
     },
     bus::Bus,
-    class::ClassDevice,
     driver::Driver,
     fwnode::Fwnode,
     iface::Interface,
@@ -100,7 +99,6 @@ struct DeviceInner {
     children: Vec<Arc<Device>>,
     driver: Option<Arc<Driver>>,
     interfaces: Vec<Arc<Interface>>,
-    classes: Vec<Arc<ClassDevice>>,
 }
 
 /// A node in the device tree.
@@ -297,22 +295,6 @@ impl Device {
         self.inner.lock().interfaces.clone()
     }
 
-    pub(super) fn attach_class(&self, member: Arc<ClassDevice>) {
-        self.inner.lock().classes.push(member);
-    }
-
-    pub(super) fn detach_class(&self, member: &Arc<ClassDevice>) {
-        self.inner
-            .lock()
-            .classes
-            .retain(|entry| !Arc::ptr_eq(entry, member));
-    }
-
-    /// Returns this device's class memberships.
-    pub fn class_devices(&self) -> Vec<Arc<ClassDevice>> {
-        self.inner.lock().classes.clone()
-    }
-
     /// Returns whether `ancestor` is this device or one of its ancestors.
     pub fn is_descendant_of(&self, ancestor: &Arc<Device>) -> bool {
         let mut current = self.arc();
@@ -437,7 +419,6 @@ pub(crate) fn init() {
                 children: Vec::new(),
                 driver: None,
                 interfaces: Vec::new(),
-                classes: Vec::new(),
             }),
             self_ref: Mutex::new(Weak::new()),
         });
@@ -511,7 +492,6 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
             children: Vec::new(),
             driver: None,
             interfaces: Vec::new(),
-            classes: Vec::new(),
         }),
         self_ref: Mutex::new(Weak::new()),
     });
@@ -580,9 +560,6 @@ pub fn remove(device: &Arc<Device>) -> Result<()> {
 
     super::probe::detach(device);
 
-    for member in device.class_devices() {
-        super::class::remove_device(&member);
-    }
     for interface in device.interfaces() {
         let _ = super::iface::withdraw(&interface);
     }

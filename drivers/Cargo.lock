@@ -10,22 +10,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "console"
-version = "0.1.0"
-dependencies = [
- "ddk",
-]
-
-[[package]]
 name = "ddk"
 version = "0.1.0"
-
-[[package]]
-name = "devfs"
-version = "0.1.0"
-dependencies = [
- "ddk",
-]
 
 [[package]]
 name = "fdt"
@@ -57,27 +43,6 @@ dependencies = [
 
 [[package]]
 name = "plic"
-version = "0.1.0"
-dependencies = [
- "ddk",
-]
-
-[[package]]
-name = "pty"
-version = "0.1.0"
-dependencies = [
- "ddk",
-]
-
-[[package]]
-name = "special"
-version = "0.1.0"
-dependencies = [
- "ddk",
-]
-
-[[package]]
-name = "tmpfs"
 version = "0.1.0"
 dependencies = [
  "ddk",

@@ -41,12 +41,8 @@ pub enum ObjKind {
     Driver = 3,
     /// A bus type.
     Bus = 4,
-    /// A device class.
-    Class = 5,
     /// A published interface.
     Interface = 6,
-    /// A class membership record.
-    ClassDevice = 7,
     /// An interrupt controller domain.
     IrqDomain = 8,
     /// A work queue.
@@ -55,14 +51,8 @@ pub enum ObjKind {
     Timer = 10,
     /// A firmware description node.
     Fwnode = 11,
-    /// A registered filesystem provider.
-    Filesystem = 12,
-    /// One mounted filesystem instance.
-    Mount = 13,
-    /// A live filesystem vnode adapter.
-    Vnode = 14,
-    /// A device endpoint published through devfs.
-    DeviceNode = 15,
+    /// A kernel-managed block device.
+    BlockDevice = 12,
 }
 
 impl ObjKind {
@@ -390,27 +380,6 @@ pub unsafe fn upgrade<T: Object>(handle: *const c_void) -> Result<Arc<T>> {
 /// Returns the driver-visible handle for an object.
 pub fn handle<T: Object>(object: &Arc<T>) -> *const c_void {
     Arc::as_ptr(object).cast()
-}
-
-/// Converts an owned reference into a handle that keeps the object alive.
-///
-/// The caller becomes responsible for balancing this with [`release`].
-pub fn into_handle<T: Object>(object: Arc<T>) -> *const c_void {
-    Arc::into_raw(object).cast()
-}
-
-/// Drops a reference previously produced by [`into_handle`].
-///
-/// # Safety
-///
-/// `handle` must have come from [`into_handle`] for the same type and must not
-/// be released twice.
-pub unsafe fn release<T: Object>(handle: *const c_void) {
-    if handle.is_null() {
-        return;
-    }
-    // SAFETY: forwarded from this function's caller.
-    drop(unsafe { Arc::from_raw(handle.cast::<T>()) });
 }
 
 /// Declares a framework object type with an embedded header.

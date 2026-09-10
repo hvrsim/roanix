@@ -23,9 +23,10 @@ use core::{
     mem, ptr,
 };
 #[cfg(target_arch = "riscv64")]
-use ddk::DriverRegistration;
+use ddk::{Bus, DriverRegistration};
 use ddk::{
-    Bus, Device, DeviceBuilder, Error, Mmio, Module, RESOURCE_MEMORY, Result, TicketLock, raw,
+    BusRegistration, Device, DeviceBuilder, Error, Mmio, Module, RESOURCE_MEMORY, Result,
+    TicketLock, raw,
 };
 #[cfg(target_arch = "x86_64")]
 use ddk::{InterfacePublication, IrqDomain};
@@ -102,7 +103,7 @@ struct Function {
     msi: Option<MsiState>,
 }
 struct State {
-    bus: Option<Bus>,
+    bus: Option<BusRegistration>,
     ecams: Vec<Ecam>,
     functions: Vec<Function>,
     #[cfg(target_arch = "x86_64")]
@@ -339,7 +340,12 @@ fn publish_function(s: &mut State, parent: Option<Device>, a: Address) -> Result
     s.write16(a, COMMAND, saved | COMMAND_MEMORY | COMMAND_BUS_MASTER);
     let mut n = [0u8; 24];
     let mut b = DeviceBuilder::new(function_name(a, &mut n))?;
-    b.set_bus(s.bus.ok_or(Error::from_status(ddk::EINVAL))?)?;
+    b.set_bus(
+        s.bus
+            .as_ref()
+            .ok_or(Error::from_status(ddk::EINVAL))?
+            .bus()?,
+    )?;
     if let Some(p) = parent {
         b.set_parent(p)?;
     }
@@ -892,7 +898,7 @@ fn discover_mcfg(s: &mut State) -> Result<()> {
 }
 
 fn init_inner() -> Result<()> {
-    let bus = unsafe { Bus::register(c"pci", &BUS_DEFINITION) }?;
+    let bus = unsafe { BusRegistration::register(c"pci", &BUS_DEFINITION) }?;
     STATE.lock().bus = Some(bus);
     #[cfg(target_arch = "x86_64")]
     {
@@ -964,7 +970,7 @@ fn exit(_module: Module) {
     if let Some(mut d) = STATE.lock().domain.take() {
         let _ = d.unregister();
     }
-    if let Some(bus) = bus {
+    if let Some(mut bus) = bus {
         let _ = bus.unregister();
     }
 }

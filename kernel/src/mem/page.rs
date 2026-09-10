@@ -21,6 +21,7 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 enum PageBacking {
     Zero,
+    File,
     Resident(&'static phys::Page),
     Swapped(SwapHandle),
 }
@@ -28,6 +29,8 @@ enum PageBacking {
 /// Current storage location of a managed page.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PageLocation {
+    /// Clean file page whose contents can be read again from its pager.
+    File,
     /// The page is logically zero and consumes no physical frame.
     Zero,
     /// The page has a resident physical frame.
@@ -70,6 +73,15 @@ pub struct VmPage {
     /// Swap configuration generation that rejected these unchanged contents.
     swap_reject_generation: AtomicU64,
     permanent: bool,
+    pager: Option<Arc<dyn super::VmPager>>,
+}
+
+/// A resident frame wire retained across a fault's map-lock revalidation.
+pub(super) struct PagePin(Arc<VmPage>);
+impl Drop for PagePin {
+    fn drop(&mut self) {
+        self.0.release_window();
+    }
 }
 
 impl VmPage {
@@ -82,7 +94,41 @@ impl VmPage {
             mappings: Mutex::new(Vec::new()),
             swap_reject_generation: AtomicU64::new(0),
             permanent: false,
+            pager: None,
         })
+    }
+
+    pub(super) fn from_pager(
+        index: u64,
+        pager: Arc<dyn super::VmPager>,
+        bytes: &[u8],
+    ) -> Result<Arc<Self>> {
+        assert_eq!(bytes.len(), PAGE_BYTES);
+        let frame = super::allocate_physical_page()?;
+        // SAFETY: this newly allocated, unpublished frame is exclusively ours;
+        // the caller supplies exactly one initialized page.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                mem::phys_to_virt(frame.paddr()).as_mut_ptr(),
+                PAGE_BYTES,
+            );
+        }
+        let page = Arc::new(Self {
+            id: super::allocate_page_id(),
+            index,
+            owner_kind: PageOwnerKind::File,
+            backing: Mutex::new(PageBacking::Resident(frame)),
+            mappings: Mutex::new(Vec::new()),
+            swap_reject_generation: AtomicU64::new(0),
+            permanent: false,
+            pager: Some(pager),
+        });
+        frame.bind_owner(&page, PageOwnerKind::File);
+        frame.mark_clean();
+        frame.mark_referenced();
+        phys::activate_managed(frame, &page);
+        Ok(page)
     }
 
     pub(super) fn new_shared_zero() -> Result<Arc<Self>> {
@@ -95,6 +141,7 @@ impl VmPage {
             mappings: Mutex::new(Vec::new()),
             swap_reject_generation: AtomicU64::new(0),
             permanent: true,
+            pager: None,
         });
         frame.bind_owner(&page, PageOwnerKind::Kernel);
         frame.wire();
@@ -115,6 +162,15 @@ impl VmPage {
     /// Returns a state snapshot suitable for diagnostics.
     pub fn info(&self) -> PageInfo {
         match &*self.backing.lock() {
+            PageBacking::File => PageInfo {
+                id: self.id,
+                index: self.index,
+                location: PageLocation::File,
+                mappings: 0,
+                wires: 0,
+                dirty: false,
+                referenced: false,
+            },
             PageBacking::Zero => PageInfo {
                 id: self.id,
                 index: self.index,
@@ -166,8 +222,9 @@ impl VmPage {
                     frame.mark_referenced();
                     // SAFETY: the backing lock prevents reclamation and the
                     // validated range remains within the HHDM-mapped frame.
+                    // The user buffer may alias this page through mmap.
                     unsafe {
-                        ptr::copy_nonoverlapping(
+                        ptr::copy(
                             mem::phys_to_virt(frame.paddr()).as_ptr::<u8>().add(offset),
                             output.as_mut_ptr(),
                             output.len(),
@@ -175,7 +232,7 @@ impl VmPage {
                     }
                     return Ok(());
                 }
-                PageBacking::Swapped(_) => drop(backing),
+                PageBacking::Swapped(_) | PageBacking::File => drop(backing),
             }
             self.ensure_resident()?;
         }
@@ -198,8 +255,9 @@ impl VmPage {
             frame.mark_dirty();
             // SAFETY: the backing lock prevents reclamation and the validated
             // range remains within the HHDM-mapped frame.
+            // The user buffer may alias this page through mmap.
             unsafe {
-                ptr::copy_nonoverlapping(
+                ptr::copy(
                     input.as_ptr(),
                     mem::phys_to_virt(frame.paddr())
                         .as_mut_ptr::<u8>()
@@ -345,6 +403,11 @@ impl VmPage {
         Ok(frame.paddr())
     }
 
+    pub(super) fn pin_resident(self: &Arc<Self>) -> Result<PagePin> {
+        let _ = self.acquire_window()?;
+        Ok(PagePin(self.clone()))
+    }
+
     /// Releases one direct-map window pinned by [`Self::acquire_window`].
     pub(super) fn release_window(&self) {
         if self.permanent {
@@ -438,6 +501,17 @@ impl VmPage {
             drop(backing);
             phys::activate_managed(frame, self);
             return false;
+        }
+
+        if self.pager.is_some() && !frame.flags().contains(phys::PageFlags::DIRTY) {
+            *backing = PageBacking::File;
+            let _ = frame.unbusy();
+            frame.clear_owner();
+            super::page_reclaimed();
+            // SAFETY: the clean file backing is authoritative; the frame has
+            // no mappings or wires and was removed from the reclaim queue.
+            unsafe { phys::free_page(frame) };
+            return true;
         }
 
         // SAFETY: the busy frame is unmapped, unwired, owner-locked by
@@ -542,6 +616,28 @@ impl VmPage {
                 *backing = PageBacking::Resident(frame);
                 Ok(true)
             }
+            PageBacking::File => {
+                let frame = super::allocate_pagein_physical_page()?;
+                // SAFETY: the unpublished page-in frame is exclusively owned.
+                let output = unsafe {
+                    &mut *mem::phys_to_virt(frame.paddr()).as_mut_ptr::<[u8; PAGE_BYTES]>()
+                };
+                let result = self
+                    .pager
+                    .as_ref()
+                    .ok_or(Error::Io)
+                    .and_then(|pager| pager.read(self.index * PAGE_SIZE, output));
+                if let Err(error) = result {
+                    // SAFETY: no owner, mapping or wire was published.
+                    unsafe { phys::free_page(frame) };
+                    return Err(error);
+                }
+                frame.bind_owner(self, self.owner_kind);
+                frame.mark_clean();
+                frame.mark_referenced();
+                *backing = PageBacking::Resident(frame);
+                Ok(true)
+            }
             PageBacking::Swapped(handle) => {
                 let frame = super::allocate_pagein_physical_page()?;
                 // SAFETY: the new managed frame is exclusively owned and
@@ -583,7 +679,7 @@ impl Drop for VmPage {
     fn drop(&mut self) {
         let backing = self.backing.get_mut();
         match *backing {
-            PageBacking::Zero => {}
+            PageBacking::Zero | PageBacking::File => {}
             PageBacking::Resident(frame) => {
                 phys::remove_managed(frame);
                 frame.clear_owner();

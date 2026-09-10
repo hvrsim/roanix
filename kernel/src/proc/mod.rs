@@ -362,6 +362,15 @@ impl Process {
         Ok(())
     }
 
+    /// Reanchors this process at a newly installed global root filesystem.
+    pub(crate) fn reset_cwd(&self) -> Result<()> {
+        *self.cwd.lock() = WorkingDirectory {
+            path: b"/".to_vec(),
+            anchor: crate::fs::root_anchor()?,
+        };
+        Ok(())
+    }
+
     /// Returns the process working directory.
     pub(crate) fn cwd(&self) -> Vec<u8> {
         self.cwd.lock().path.clone()
@@ -674,7 +683,7 @@ impl Process {
                     session_id: self.session() as i32,
                     is_session_leader: true,
                 },
-                crate::driver::class::console::TIOCNOTTY,
+                crate::dev::tty::TIOCNOTTY,
                 0,
                 &mut [],
             );

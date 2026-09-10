@@ -1,9 +1,9 @@
 //! Memory objects and the unified filesystem page cache.
 //!
-//! A vnode has one `VmObject`, shared by descriptor I/O and every mapping, so
-//! coherence does not require a second buffer or copy. Missing indexes are
-//! sparse zeros; instantiated pages use the ordinary VM resident/swap state
-//! and therefore participate in the same reclaim policy as anonymous memory.
+//! A vnode has one `VmObject`, shared by descriptor I/O and every mapping.
+//! Anonymous/tmpfs missing indexes are sparse zeros. Disk-backed objects load
+//! missing indexes through a pager, and clean file frames can be discarded
+//! and read again instead of occupying swap.
 //!
 //! # Synchronization invariants
 //!
@@ -15,7 +15,7 @@
 //! * Object accounting is charged once when an index is inserted and released
 //!   once when that index is removed or the object is destroyed.
 
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     cmp,
     sync::atomic::{AtomicU64, Ordering},
@@ -26,7 +26,15 @@ use crate::{mem::PAGE_SIZE, sys::sync::Mutex};
 use super::{Error, IoSink, IoSource, Result, VmPage};
 
 /// Pages resolved per index acquisition during bulk transfers.
-const LOOKUP_BATCH: usize = 16;
+const LOOKUP_BATCH: usize = 32;
+
+/// Immutable backing store for demand-loaded objects. Implementations must
+/// initialize the entire output, zeroing holes and bytes past their EOF. They
+/// operate on kernel buffers and must not recurse into the object they back.
+pub trait VmPager: Send + Sync {
+    /// Loads a logical byte range, or returns an error without publishing it.
+    fn read(&self, offset: u64, output: &mut [u8]) -> Result<()>;
+}
 
 /// Snapshot of one unified page cache.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -43,6 +51,8 @@ pub struct PageCacheStats {
     pub zero: u64,
     /// Resident pages modified since materialization.
     pub dirty: u64,
+    /// Nonresident clean pages that can be loaded again from the file.
+    pub file: u64,
 }
 
 /// Memory object's semantic owner.
@@ -128,6 +138,10 @@ pub struct VmObject {
     pages: Mutex<BTreeMap<u64, Arc<VmPage>>>,
     account: Option<Arc<PageAccount>>,
     length: AtomicU64,
+    pager: Option<Arc<dyn VmPager>>,
+    fill: [Mutex<()>; 16],
+    next_read: AtomicU64,
+    next_fault: AtomicU64,
 }
 
 impl VmObject {
@@ -148,12 +162,103 @@ impl VmObject {
             pages: Mutex::new(BTreeMap::new()),
             account,
             length: AtomicU64::new(0),
+            pager: None,
+            fill: core::array::from_fn(|_| Mutex::new(())),
+            next_read: AtomicU64::new(u64::MAX),
+            next_fault: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// Creates an immutable file object without loading file contents.
+    pub fn with_pager(length: u64, pager: Arc<dyn VmPager>) -> Arc<Self> {
+        Arc::new(Self {
+            id: super::allocate_object_id(),
+            kind: ObjectKind::Vnode,
+            pages: Mutex::new(BTreeMap::new()),
+            account: None,
+            length: AtomicU64::new(length),
+            pager: Some(pager),
+            fill: core::array::from_fn(|_| Mutex::new(())),
+            next_read: AtomicU64::new(u64::MAX),
+            next_fault: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// Fill a bounded run of missing pages. The sleepable fill gate coalesces
+    /// concurrent overlapping misses; disjoint stripes progress independently.
+    /// Cache hits never take a fill gate. No index lock crosses I/O.
+    fn populate(&self, index: u64, wanted: usize) -> Result<()> {
+        let Some(pager) = &self.pager else {
+            return Ok(());
+        };
+        if self.page(index).is_some() {
+            return Ok(());
+        }
+        let _fill = self.fill[(index / LOOKUP_BATCH as u64) as usize % self.fill.len()].lock();
+        if self.page(index).is_some() {
+            return Ok(());
+        }
+        let end = self.length().div_ceil(PAGE_SIZE);
+        if index >= end {
+            return Err(Error::InvalidAddress);
+        }
+        let boundary = LOOKUP_BATCH - (index % LOOKUP_BATCH as u64) as usize;
+        let mut count = wanted.clamp(1, boundary).min((end - index) as usize);
+        {
+            let pages = self.pages.lock();
+            for next in 1..count {
+                if pages.contains_key(&(index + next as u64)) {
+                    count = next;
+                    break;
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(count * PAGE_SIZE as usize)
+            .map_err(|_| Error::OutOfMemory)?;
+        bytes.resize(count * PAGE_SIZE as usize, 0);
+        if let Err(error) = pager.read(index * PAGE_SIZE, &mut bytes) {
+            if count == 1 {
+                return Err(error);
+            }
+            // A speculative neighbour must not make the requested page fail.
+            pager.read(index * PAGE_SIZE, &mut bytes[..PAGE_SIZE as usize])?;
+            count = 1;
+            bytes.truncate(PAGE_SIZE as usize);
+        }
+        // Prepare every page before making any of this batch visible.
+        let mut ready = Vec::new();
+        ready
+            .try_reserve_exact(count)
+            .map_err(|_| Error::OutOfMemory)?;
+        for (slot, bytes) in bytes
+            .as_chunks::<{ PAGE_SIZE as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            ready.push(VmPage::from_pager(
+                index + slot as u64,
+                pager.clone(),
+                bytes,
+            )?);
+        }
+        let mut pages = self.pages.lock();
+        for page in ready {
+            pages.insert(page.index(), page);
+        }
+        Ok(())
     }
 
     /// Returns the stable object identifier.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Whether the backing store currently supports only immutable pages.
+    pub fn is_read_only(&self) -> bool {
+        self.pager.is_some()
     }
 
     /// Returns the object kind.
@@ -183,6 +288,7 @@ impl VmObject {
             let info = page.info();
             match info.location {
                 super::PageLocation::Zero => stats.zero += 1,
+                super::PageLocation::File => stats.file += 1,
                 super::PageLocation::Resident => stats.resident += 1,
                 super::PageLocation::Swapped => stats.swapped += 1,
             }
@@ -198,6 +304,7 @@ impl VmObject {
 
     /// Returns an existing page or instantiates a zero-filled page.
     pub fn get_or_create_page(&self, index: u64) -> Result<Arc<VmPage>> {
+        self.populate(index, 1)?;
         let mut pages = self.pages.lock();
         if let Some(page) = pages.get(&index) {
             return Ok(page.clone());
@@ -206,7 +313,14 @@ impl VmObject {
     }
 
     /// Returns the page used for a read or write fault.
-    pub fn fault_page(&self, index: u64, _write: bool) -> Result<Arc<VmPage>> {
+    pub fn fault_page(&self, index: u64, write: bool) -> Result<Arc<VmPage>> {
+        if write && self.pager.is_some() {
+            return Err(Error::Protection);
+        }
+        let previous = self
+            .next_fault
+            .swap(index.saturating_add(1), Ordering::Relaxed);
+        self.populate(index, if previous == index { LOOKUP_BATCH } else { 1 })?;
         let mut pages = self.pages.lock();
         // The index check and insertion share the same lock as truncate's
         // split, preventing a stale pre-truncate fault from recreating a page
@@ -241,7 +355,16 @@ impl VmObject {
 
     /// Reads bytes into a sink, returning zeros for holes.
     pub fn read_into(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
-        let total = sink.len();
+        let total = if self.pager.is_some() {
+            sink.len()
+                .min(usize::try_from(self.length().saturating_sub(offset)).unwrap_or(usize::MAX))
+        } else {
+            sink.len()
+        };
+        let sequential = self
+            .next_read
+            .swap(offset.saturating_add(total as u64), Ordering::Relaxed)
+            == offset;
         let mut read = 0usize;
         let mut batch: [Option<Arc<VmPage>>; LOOKUP_BATCH] = [const { None }; LOOKUP_BATCH];
         let mut batch_index = u64::MAX;
@@ -267,16 +390,40 @@ impl VmObject {
                 }
             }
 
+            if self.pager.is_some() && batch[(page_index - batch_index) as usize].is_none() {
+                let wanted = (total - read)
+                    .saturating_add(page_offset)
+                    .div_ceil(PAGE_SIZE as usize);
+                let wanted = if sequential {
+                    wanted.max(LOOKUP_BATCH)
+                } else {
+                    wanted
+                };
+                if let Err(error) = self.populate(page_index, wanted) {
+                    return if read != 0 { Ok(read) } else { Err(error) };
+                }
+                batch_index = u64::MAX;
+                continue;
+            }
+
             // The page reference is taken before the sink window is resolved so
             // that no page backing lock is held across a user page fault.
             let page = batch[(page_index - batch_index) as usize].clone();
-            let mut window = sink.window(read, limit)?;
+            let mut window = match sink.window(read, limit) {
+                Ok(window) => window,
+                Err(_) if read != 0 => return Ok(read),
+                Err(error) => return Err(error),
+            };
             if window.is_empty() {
                 return Err(Error::InvalidAddress);
             }
             let count = window.len();
             match page {
-                Some(page) => page.read(page_offset, &mut window)?,
+                Some(page) => {
+                    if let Err(error) = page.read(page_offset, &mut window) {
+                        return if read != 0 { Ok(read) } else { Err(error) };
+                    }
+                }
                 None => window.fill(0),
             }
             read += count;
@@ -291,6 +438,9 @@ impl VmObject {
 
     /// Writes bytes from a source and returns the number accepted.
     pub fn write_from(&self, offset: u64, source: &IoSource<'_>) -> Result<usize> {
+        if self.pager.is_some() {
+            return Err(Error::Protection);
+        }
         let total = source.len();
         let mut written = 0usize;
         while written < total {
@@ -342,6 +492,9 @@ impl VmObject {
 
     /// Removes pages beyond `size` and zeroes a retained partial tail.
     pub fn truncate(&self, size: u64) -> Result<u64> {
+        if self.pager.is_some() {
+            return Err(Error::Protection);
+        }
         let mut pages = self.pages.lock();
         let old_size = self.length.load(Ordering::Acquire);
         if size == old_size {

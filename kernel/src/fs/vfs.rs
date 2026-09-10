@@ -133,6 +133,22 @@ pub(crate) fn init_root(filesystem: FileSystemRef) -> Result<()> {
     Ok(())
 }
 
+/// Replaces the bootstrap root and drops every mount attached to it.
+///
+/// This is intentionally narrower than a general-purpose `pivot_root`: early
+/// userspace has no reason to retain the initramfs once the real system volume
+/// is available. Callers must recreate any kernel filesystems they need below
+/// the new root after this operation succeeds.
+pub(crate) fn replace_root(filesystem: FileSystemRef) -> Result<()> {
+    let namespace = namespace()?;
+    let root = Mount::root(filesystem)?;
+    let mut state = namespace.state.lock();
+    state.root = root;
+    state.mounted_at.clear();
+    COVERED_MOUNTS.store(0, Ordering::Release);
+    Ok(())
+}
+
 /// Looks up a path from the global root namespace.
 pub fn lookup(path: &[u8]) -> Result<Vnode> {
     Ok(resolve(None, path, true)?.vnode)

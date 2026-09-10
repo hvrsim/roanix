@@ -100,7 +100,7 @@ unsafe extern "C" fn shim_module_find(name: *const c_char, out: *mut *const c_vo
         let name = unsafe { borrow_str(name) }?;
         let module = super::super::core::module::find(name)?;
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(module)) };
+        unsafe { write_out(out, obj::handle(&module)) };
         Ok(())
     })())
 }
@@ -333,7 +333,7 @@ unsafe extern "C" fn shim_device_add(handle: *mut c_void, out: *mut *const c_voi
         let builder = unsafe { alloc::boxed::Box::from_raw(handle.cast::<DeviceBuilder>()) };
         let device = device::add(*builder)?;
         // SAFETY: the ABI requires a writable output pointer or null.
-        unsafe { write_out(out, obj::into_handle(device)) };
+        unsafe { write_out(out, obj::handle(&device)) };
         Ok(())
     })())
 }
@@ -359,7 +359,7 @@ unsafe extern "C" fn shim_device_root(out: *mut *const c_void) -> i32 {
     status((|| -> Result<()> {
         let root = device::root()?;
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(root)) };
+        unsafe { write_out(out, obj::handle(&root)) };
         Ok(())
     })())
 }
@@ -378,7 +378,7 @@ unsafe extern "C" fn shim_device_parent(handle: *const c_void) -> *const c_void 
         return core::ptr::null();
     };
     match device.parent() {
-        Some(parent) => obj::into_handle(parent),
+        Some(parent) => obj::handle(&parent),
         None => core::ptr::null(),
     }
 }
@@ -394,7 +394,7 @@ unsafe extern "C" fn shim_device_child(handle: *const c_void, index: usize) -> *
         return core::ptr::null();
     };
     match device.children().get(index) {
-        Some(child) => obj::into_handle(child.clone()),
+        Some(child) => obj::handle(child),
         None => core::ptr::null(),
     }
 }
@@ -553,7 +553,7 @@ unsafe extern "C" fn shim_device_fwnode(
     })())
 }
 
-// --- Buses, drivers, and classes --------------------------------------------
+// --- Buses and drivers ------------------------------------------------------
 
 unsafe extern "C" fn shim_bus_register(
     module: *const c_void,
@@ -584,7 +584,7 @@ unsafe extern "C" fn shim_bus_register(
         // executable until the bus is unregistered.
         let bus = unsafe { bus::register(owner.as_ref(), name, ops) }?;
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(bus)) };
+        unsafe { write_out(out, obj::handle(&bus)) };
         Ok(())
     })())
 }
@@ -602,7 +602,7 @@ unsafe extern "C" fn shim_bus_find(name: *const c_char, out: *mut *const c_void)
         let name = unsafe { borrow_str(name) }?;
         let bus = bus::find(name)?;
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(bus)) };
+        unsafe { write_out(out, obj::handle(&bus)) };
         Ok(())
     })())
 }
@@ -675,7 +675,7 @@ unsafe extern "C" fn shim_driver_register(
         // executable until the driver is unregistered.
         let driver = unsafe { driver::register(owner.as_ref(), registration) }?;
         // SAFETY: the ABI requires a writable output pointer or null.
-        unsafe { write_out(out, obj::into_handle(driver)) };
+        unsafe { write_out(out, obj::handle(&driver)) };
         Ok(())
     })())
 }
@@ -685,158 +685,6 @@ unsafe extern "C" fn shim_driver_unregister(handle: *const c_void) -> i32 {
         let driver = object::<Driver>(handle)?;
         driver::unregister(&driver)
     })())
-}
-
-unsafe extern "C" fn shim_class_register(
-    module: *const c_void,
-    name: *const c_char,
-    registration: *const ClassRegistration,
-    out: *mut *const c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let owner = module_ref(module)?;
-        // SAFETY: the ABI requires a NUL-terminated string.
-        let name = unsafe { borrow_str(name) }?;
-        if registration.is_null() {
-            return Err(Error::InvalidArgument);
-        }
-        // SAFETY: the ABI requires a readable registration record.
-        let registration = unsafe { &*registration };
-        if (registration.size as usize) < size_of::<ClassRegistration>() {
-            return Err(Error::InvalidArgument);
-        }
-        let ops = ClassOps {
-            attach: registration.attach,
-            detach: registration.detach,
-            context: registration.context,
-        };
-        // SAFETY: the module contract requires these callbacks to stay
-        // executable until the class is unregistered.
-        let class = unsafe { class::register(owner.as_ref(), name, ops) }?;
-        // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(class)) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_class_unregister(handle: *const c_void) -> i32 {
-    status((|| -> Result<()> {
-        let class = object::<Class>(handle)?;
-        class::unregister(&class)
-    })())
-}
-
-unsafe extern "C" fn shim_class_find(name: *const c_char, out: *mut *const c_void) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a NUL-terminated string.
-        let name = unsafe { borrow_str(name) }?;
-        let class = class::find(name)?;
-        // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(class)) };
-        Ok(())
-    })())
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn shim_class_add(
-    module: *const c_void,
-    class: *const c_void,
-    device: *const c_void,
-    name: *const c_char,
-    ops: *const c_void,
-    ops_size: usize,
-    context: *mut c_void,
-    out: *mut *const c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let owner = module_ref(module)?;
-        let class = object::<Class>(class)?;
-        let device = optional_object::<Device>(device)?;
-        // SAFETY: the ABI requires a NUL-terminated string.
-        let name = unsafe { borrow_str(name) }?;
-        let membership = Membership {
-            name: alloc::string::String::from(name).into(),
-            ops,
-            ops_size,
-            context,
-        };
-        // SAFETY: the module contract requires the member table to stay valid
-        // until the membership is removed.
-        let member =
-            unsafe { class::add_device(owner.as_ref(), &class, device.as_ref(), membership) }?;
-        // SAFETY: the ABI requires a writable output pointer or null.
-        unsafe { write_out(out, obj::into_handle(member)) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_class_remove(handle: *const c_void) {
-    if let Ok(member) = object::<ClassDevice>(handle) {
-        class::remove_device(&member);
-    }
-}
-
-unsafe extern "C" fn shim_class_member_ops(
-    handle: *const c_void,
-    ops: *mut *const c_void,
-    context: *mut *mut c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let member = object::<ClassDevice>(handle)?;
-        // SAFETY: the ABI requires writable output pointers or null.
-        unsafe {
-            write_out(ops, member.ops());
-            write_out(context, member.context());
-        }
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_class_member_name(handle: *const c_void) -> *const c_char {
-    // SAFETY: the handle came from the framework.
-    match unsafe { obj::borrow::<ClassDevice>(handle) } {
-        Ok(member) => member.name_c_ptr(),
-        Err(_) => core::ptr::null(),
-    }
-}
-
-unsafe extern "C" fn shim_class_member_device(handle: *const c_void) -> *const c_void {
-    // SAFETY: the handle came from the framework.
-    let Ok(member) = (unsafe { obj::borrow::<ClassDevice>(handle) }) else {
-        return core::ptr::null();
-    };
-    match member.device() {
-        Some(device) => obj::into_handle(device),
-        None => core::ptr::null(),
-    }
-}
-
-unsafe extern "C" fn shim_class_member_data(handle: *const c_void) -> usize {
-    // SAFETY: the handle came from the framework.
-    unsafe { obj::borrow::<ClassDevice>(handle) }.map_or(0, ClassDevice::class_data)
-}
-
-unsafe extern "C" fn shim_class_member_set_data(handle: *const c_void, value: usize) {
-    // SAFETY: the handle came from the framework.
-    if let Ok(member) = unsafe { obj::borrow::<ClassDevice>(handle) } {
-        member.set_class_data(value);
-    }
-}
-
-unsafe extern "C" fn shim_class_member_count(handle: *const c_void) -> usize {
-    // SAFETY: the handle came from the framework.
-    unsafe { obj::borrow::<Class>(handle) }.map_or(0, |class| class.members().len())
-}
-
-unsafe extern "C" fn shim_class_member(handle: *const c_void, index: usize) -> *const c_void {
-    // SAFETY: the handle came from the framework.
-    let Ok(class) = (unsafe { obj::borrow::<Class>(handle) }) else {
-        return core::ptr::null();
-    };
-    match class.members().get(index) {
-        Some(member) => obj::into_handle(member.clone()),
-        None => core::ptr::null(),
-    }
 }
 
 // --- Interfaces -------------------------------------------------------------
@@ -876,7 +724,7 @@ unsafe extern "C" fn shim_iface_publish(
             None => unsafe { iface::publish_global(owner.as_ref(), publication) }?,
         };
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(interface)) };
+        unsafe { write_out(out, obj::handle(&interface)) };
         Ok(())
     })())
 }
@@ -967,7 +815,7 @@ unsafe extern "C" fn shim_iface_provider(
         return core::ptr::null();
     };
     match entries.get(index) {
-        Some(interface) => obj::into_handle(interface.clone()),
+        Some(interface) => obj::handle(interface),
         None => core::ptr::null(),
     }
 }
@@ -1016,7 +864,7 @@ unsafe extern "C" fn shim_irq_domain_register(
         let domain =
             unsafe { irq::register_domain(owner.as_ref(), name, flags, hwirq_count, ops) }?;
         // SAFETY: the ABI requires a writable output pointer.
-        unsafe { write_out(out, obj::into_handle(domain)) };
+        unsafe { write_out(out, obj::handle(&domain)) };
         Ok(())
     })())
 }
@@ -1206,30 +1054,6 @@ unsafe extern "C" fn shim_mmio_direct(physical: u64, out: *mut *mut c_void) -> i
         unsafe { write_out(out, address.as_mut_ptr::<c_void>()) };
         Ok(())
     })())
-}
-
-unsafe extern "C" fn shim_port_read8(port: u16) -> u32 {
-    port::read8(port).map_or(u32::MAX, u32::from)
-}
-
-unsafe extern "C" fn shim_port_read16(port: u16) -> u32 {
-    port::read16(port).map_or(u32::MAX, u32::from)
-}
-
-unsafe extern "C" fn shim_port_read32(port: u16) -> u32 {
-    port::read32(port).unwrap_or(u32::MAX)
-}
-
-unsafe extern "C" fn shim_port_write8(port: u16, value: u8) {
-    let _ = port::write8(port, value);
-}
-
-unsafe extern "C" fn shim_port_write16(port: u16, value: u16) {
-    let _ = port::write16(port, value);
-}
-
-unsafe extern "C" fn shim_port_write32(port: u16, value: u32) {
-    let _ = port::write32(port, value);
 }
 
 unsafe extern "C" fn shim_dma_alloc(
@@ -1657,7 +1481,6 @@ unsafe extern "C" fn shim_devfs_mkdir(
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn shim_devfs_create(
     module: *const c_void,
-    device: *const c_void,
     parent: u64,
     name: *const c_char,
     node_kind: u32,
@@ -1667,7 +1490,12 @@ unsafe extern "C" fn shim_devfs_create(
 ) -> i32 {
     status((|| -> Result<()> {
         let owner = module_ref(module)?;
-        let device = optional_object::<Device>(device)?;
+        if node_kind != chardev::kind::CHARACTER {
+            // Block endpoints are owned by the native block layer; allowing a
+            // module to publish one here would bypass geometry, partitions and
+            // mount lifetime checks.
+            return Err(Error::WrongKind);
+        }
         // SAFETY: the ABI requires a NUL-terminated string.
         let name = unsafe { borrow_str(name) }?;
         if ops.is_null() {
@@ -1681,7 +1509,6 @@ unsafe extern "C" fn shim_devfs_create(
         let (node, _) = unsafe {
             chardev::create_node(
                 owner.as_ref(),
-                device.as_ref(),
                 DevNodeId::from_raw(parent),
                 name,
                 node_kind,
@@ -1713,10 +1540,44 @@ unsafe extern "C" fn shim_devfs_lookup(path: *const c_char, out: *mut u64) -> i3
     })())
 }
 
+// --- Block devices ---------------------------------------------------------
+
+unsafe extern "C" fn shim_block_register(
+    module: *const c_void,
+    name: *const c_char,
+    operations: *const BlockOps,
+    out: *mut *const c_void,
+) -> i32 {
+    status((|| -> Result<()> {
+        let owner = module_ref(module)?.ok_or(Error::PermissionDenied)?;
+        // SAFETY: the ABI requires a NUL-terminated name.
+        let name = unsafe { borrow_str(name) }?;
+        // SAFETY: the ABI requires a readable size-prefixed operation table.
+        let operations = unsafe { block::copy_ops(operations) }?;
+        let device = block::register_module(owner, name, operations)?;
+        // SAFETY: the ABI requires writable output storage.
+        unsafe { write_out(out, obj::handle(&device)) };
+        Ok(())
+    })())
+}
+
+unsafe extern "C" fn shim_block_unregister(handle: *const c_void) -> i32 {
+    status((|| -> Result<()> {
+        let device = object::<BlockDevice>(handle)?;
+        block::unregister(&device)
+    })())
+}
+
+unsafe extern "C" fn shim_block_rescan(handle: *const c_void) -> i32 {
+    status((|| -> Result<()> {
+        let device = object::<BlockDevice>(handle)?;
+        block::rescan(&device)
+    })())
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn shim_tty_register(
     module: *const c_void,
-    device: *const c_void,
     parent: u64,
     name: *const c_char,
     mode: u16,
@@ -1726,7 +1587,6 @@ unsafe extern "C" fn shim_tty_register(
 ) -> i32 {
     status((|| -> Result<()> {
         let owner = module_ref(module)?;
-        let device = optional_object::<Device>(device)?;
         // SAFETY: the ABI requires a NUL-terminated string.
         let name = unsafe { borrow_str(name) }?;
         if name.is_empty() {
@@ -1735,17 +1595,23 @@ unsafe extern "C" fn shim_tty_register(
         if ops.is_null() {
             return Err(Error::InvalidArgument);
         }
-        // SAFETY: the module contract requires this callback table to stay
-        // executable until the terminal receipt is removed.
+        // SAFETY: the size prefix proves the full table is readable; copying
+        // it avoids retaining a reference into module data.
+        if unsafe { (*ops).size as usize } < core::mem::size_of::<ConsoleOps>() {
+            return Err(Error::InvalidArgument);
+        }
+        // SAFETY: validated immediately above.
+        let table = unsafe { core::ptr::read(ops) };
+        // SAFETY: callback code remains executable while the terminal receipt
+        // pins its owning hardware module.
         let terminal = unsafe {
             console::register(
                 owner.as_ref(),
-                device.as_ref(),
                 DevNodeId::from_raw(parent),
-                name.as_ptr().cast(),
+                name,
                 mode,
                 baud,
-                ops,
+                table,
             )
         }?;
         // SAFETY: the ABI requires a writable output pointer.
@@ -1764,385 +1630,6 @@ unsafe extern "C" fn shim_tty_unregister(handle: *mut c_void) -> i32 {
         drop(unsafe { claim_receipt::<console::Terminal>(handle) }?);
         Ok(())
     })())
-}
-
-unsafe extern "C" fn shim_tty_provider_register(
-    module: *const c_void,
-    ops: *const TtyProviderOps,
-    out: *mut *mut c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let owner = module_ref(module)?;
-        if ops.is_null() {
-            return Err(Error::InvalidArgument);
-        }
-        // SAFETY: only the mandatory size prefix is read before accepting
-        // the full append-only provider table.
-        if unsafe { (*ops).size as usize } < core::mem::size_of::<TtyProviderOps>() {
-            return Err(Error::InvalidArgument);
-        }
-        // SAFETY: the declared size now proves the full current table is
-        // readable, and the broker copies it before returning.
-        let ops = unsafe { core::ptr::read(ops) };
-        // SAFETY: the module contract keeps the source callback table and
-        // context valid until the returned provider receipt is consumed.
-        let provider = unsafe { console::register_provider(owner.as_ref(), ops) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, receipt(provider)) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_tty_provider_unregister(handle: *mut c_void) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: keep the receipt available when live terminals make the
-        // provider busy, allowing the module to retry teardown later.
-        let provider = unsafe { borrow_receipt::<console::Provider>(handle) }?;
-        console::unregister_provider(&provider)?;
-        // SAFETY: provider removal succeeded, so consume its receipt.
-        drop(unsafe { claim_receipt::<console::Provider>(handle) }?);
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_process_group_signal(group: i32, signal: u8) -> i32 {
-    status((|| -> Result<()> {
-        let group = usize::try_from(group).map_err(|_| Error::InvalidArgument)?;
-        if group == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        crate::proc::signal::send_kernel_process_group(group, signal);
-        Ok(())
-    })())
-}
-
-// --- Filesystem providers ---------------------------------------------------
-
-unsafe extern "C" fn shim_fs_provider_register(
-    module: *const c_void,
-    name: *const c_char,
-    operations: *const crate::fs::provider::FsProviderOps,
-    out: *mut *mut c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let owner = module_ref(module)?;
-        // SAFETY: the ABI requires a NUL-terminated provider name.
-        let name = unsafe { borrow_str(name) }?;
-        // SAFETY: the module supplies a readable, immutable provider table
-        // whose callback lifetime is protected by its module registration.
-        let provider =
-            unsafe { crate::fs::provider::register(owner.as_ref(), name, operations) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, receipt(provider)) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_provider_unregister(handle: *mut c_void) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: retain the receipt if a malformed removal reports an error.
-        let provider = unsafe { borrow_receipt::<crate::fs::provider::Provider>(handle) }?;
-        crate::fs::provider::unregister(&provider)?;
-        // SAFETY: successful removal consumes the registration receipt.
-        drop(unsafe {
-            claim_receipt::<crate::fs::provider::Provider>(handle)?
-        });
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_page_account_create(limit: u64, out: *mut *mut c_void) -> i32 {
-    let account = crate::fs::provider::page_account_create(limit);
-    // SAFETY: the ABI requires writable output storage or null.
-    unsafe { write_out(out, account) };
-    STATUS_OK
-}
-
-unsafe extern "C" fn shim_fs_page_account_release(account: *mut c_void) {
-    // SAFETY: page-account receipts are created only by the matching service
-    // and consumed exactly once by this ABI operation.
-    unsafe { crate::fs::provider::page_account_release(account) };
-}
-
-unsafe extern "C" fn shim_fs_page_account_limit(account: *mut c_void, out: *mut u64) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live account receipt.
-        let limit = unsafe { crate::fs::provider::page_account_limit(account) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, limit) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_page_account_used(account: *mut c_void, out: *mut u64) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live account receipt.
-        let used = unsafe { crate::fs::provider::page_account_used(account) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, used) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_memory_object_create(
-    account: *mut c_void,
-    out: *mut *mut c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live account receipt.
-        let object = unsafe { crate::fs::provider::memory_object_create(account) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, object) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_memory_object_retain(object: *mut c_void) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live object receipt.
-        unsafe { crate::fs::provider::memory_object_retain(object) }?;
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_memory_object_release(object: *mut c_void) {
-    // SAFETY: object receipts are owned values created or retained through the
-    // matching page-cache services.
-    unsafe { crate::fs::provider::memory_object_release(object) };
-}
-
-unsafe extern "C" fn shim_fs_memory_object_read(
-    object: *mut c_void,
-    offset: u64,
-    buffer: *mut u8,
-    length: usize,
-) -> i64 {
-    // SAFETY: the ABI requires a live object and `length` writable bytes.
-    match unsafe { crate::fs::provider::memory_object_read(object, offset, buffer, length) } {
-        Ok(read) => i64::try_from(read).unwrap_or(i64::MAX),
-        Err(error) => i64::from(Error::from(error).to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_fs_memory_object_write(
-    object: *mut c_void,
-    offset: u64,
-    buffer: *const u8,
-    length: usize,
-) -> i64 {
-    // SAFETY: the ABI requires a live object and `length` readable bytes.
-    match unsafe { crate::fs::provider::memory_object_write(object, offset, buffer, length) } {
-        Ok(written) => i64::try_from(written).unwrap_or(i64::MAX),
-        Err(error) => i64::from(Error::from(error).to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_fs_memory_object_truncate(
-    object: *mut c_void,
-    size: u64,
-    out: *mut u64,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live object receipt.
-        let removed = unsafe { crate::fs::provider::memory_object_truncate(object, size) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, removed) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_memory_object_page_count(
-    object: *mut c_void,
-    out: *mut u64,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: the ABI requires a live object receipt.
-        let count = unsafe { crate::fs::provider::memory_object_page_count(object) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, count) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_fs_total_physical_pages() -> u64 {
-    crate::fs::provider::total_physical_pages()
-}
-
-unsafe extern "C" fn shim_devfs_broker_register(
-    module: *const c_void,
-    operations: *const crate::fs::provider::DevfsBrokerOps,
-    out: *mut *mut c_void,
-) -> i32 {
-    status((|| -> Result<()> {
-        let owner = module_ref(module)?;
-        // SAFETY: the module supplies a readable, immutable broker table.
-        let broker =
-            unsafe { crate::fs::provider::register_devfs_broker(owner.as_ref(), operations) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, receipt(broker)) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_devfs_broker_unregister(handle: *mut c_void) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: preserve ownership if broker withdrawal fails.
-        let broker = unsafe { borrow_receipt::<crate::fs::provider::DevfsBroker>(handle) }?;
-        crate::fs::provider::unregister_devfs_broker(&broker)?;
-        // SAFETY: successful removal consumes the registration receipt.
-        drop(unsafe {
-            claim_receipt::<crate::fs::provider::DevfsBroker>(handle)?
-        });
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_open(
-    endpoint: *mut c_void,
-    flags: u32,
-    out: *mut usize,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: devfs owns a live endpoint receipt for this callback.
-        let file = unsafe { chardev::endpoint_open(endpoint, flags) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, file) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_close(endpoint: *mut c_void, file: usize, flags: u32) {
-    // SAFETY: the endpoint receipt and file context are owned by devfs.
-    unsafe { chardev::endpoint_close(endpoint, file, flags) };
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_initial_offset(
-    endpoint: *mut c_void,
-    file: usize,
-    flags: u32,
-    out: *mut u64,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: devfs owns a live endpoint receipt and file context.
-        let offset = unsafe { chardev::endpoint_initial_offset(endpoint, file, flags) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, offset) };
-        Ok(())
-    })())
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_read(
-    endpoint: *mut c_void,
-    file: usize,
-    offset: u64,
-    buffer: *mut u8,
-    length: usize,
-    flags: u32,
-) -> i64 {
-    // SAFETY: the ABI requires `buffer` writable for `length` bytes.
-    match unsafe { chardev::endpoint_read(endpoint, file, offset, buffer, length, flags) } {
-        Ok(read) => read,
-        Err(error) => i64::from(error.to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_write(
-    endpoint: *mut c_void,
-    file: usize,
-    offset: u64,
-    buffer: *const u8,
-    length: usize,
-    flags: u32,
-) -> i64 {
-    // SAFETY: the ABI requires `buffer` readable for `length` bytes.
-    match unsafe { chardev::endpoint_write(endpoint, file, offset, buffer, length, flags) } {
-        Ok(written) => written,
-        Err(error) => i64::from(error.to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_size(endpoint: *mut c_void) -> u64 {
-    // SAFETY: the ABI requires a live endpoint receipt.
-    unsafe { chardev::endpoint_size(endpoint) }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_sync(endpoint: *mut c_void) -> i32 {
-    // SAFETY: devfs owns a live endpoint receipt for this callback.
-    status(unsafe { chardev::endpoint_sync(endpoint) })
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_poll(
-    endpoint: *mut c_void,
-    file: usize,
-    offset: u64,
-    events: u16,
-    flags: u32,
-) -> i64 {
-    // SAFETY: the ABI requires a live endpoint receipt.
-    match unsafe { chardev::endpoint_poll(endpoint, file, offset, events, flags) } {
-        Ok(ready) => i64::from(ready),
-        Err(error) => i64::from(error.to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_event(
-    endpoint: *mut c_void,
-    file: usize,
-    selector: u32,
-) -> usize {
-    // SAFETY: the ABI requires a live endpoint receipt.
-    unsafe { chardev::endpoint_event(endpoint, file, selector) }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_terminal_state(
-    endpoint: *mut c_void,
-    out: *mut crate::fs::provider::FsTerminalState,
-) -> i32 {
-    status((|| -> Result<()> {
-        // SAFETY: devfs owns a live endpoint receipt for this callback.
-        let state = unsafe { chardev::endpoint_terminal_state(endpoint) }?;
-        // SAFETY: the ABI requires writable output storage or null.
-        unsafe { write_out(out, state) };
-        Ok(())
-    })())
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn shim_devfs_endpoint_ioctl(
-    endpoint: *mut c_void,
-    file: usize,
-    process: u64,
-    group: i32,
-    session: i32,
-    session_leader: u8,
-    request: u64,
-    value: u64,
-    argument: *mut u8,
-    length: usize,
-) -> i64 {
-    // SAFETY: the ABI requires `argument` writable for `length` bytes.
-    match unsafe {
-        chardev::endpoint_ioctl(
-            endpoint,
-            file,
-            process,
-            group,
-            session,
-            session_leader != 0,
-            request,
-            value,
-            argument,
-            length,
-        )
-    } {
-        Ok(result) => i64::try_from(result).unwrap_or(i64::MAX),
-        Err(error) => i64::from(error.to_status()),
-    }
-}
-
-unsafe extern "C" fn shim_devfs_endpoint_release(endpoint: *mut c_void) {
-    // SAFETY: devfs invokes this exactly once for the endpoint receipt it owns.
-    unsafe { chardev::endpoint_release(endpoint) };
 }
 
 // --- Kernel log -------------------------------------------------------------

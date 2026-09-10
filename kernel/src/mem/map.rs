@@ -477,6 +477,46 @@ impl VmMap {
         Ok(())
     }
 
+    /// Snapshots a file dependency so the caller can load and pin it without
+    /// holding the address-space lock. The map timestamp must be revalidated.
+    pub(super) fn file_fault(
+        &self,
+        address: VirtAddr,
+        access: FaultAccess,
+    ) -> Result<Option<(Arc<VmObject>, u64)>> {
+        let address = address.align_down().as_u64();
+        let entry = self
+            .entries
+            .range(..=address)
+            .next_back()
+            .map(|(_, entry)| entry)
+            .filter(|entry| entry.contains(address))
+            .ok_or(Error::NotMapped)?;
+        let required = match access {
+            FaultAccess::Read => VmProtection::READ,
+            FaultAccess::Write => VmProtection::WRITE,
+            FaultAccess::Execute => VmProtection::EXECUTE,
+        };
+        if !entry.protection.contains(required) {
+            return Err(Error::Protection);
+        }
+        let Some(object) = entry.object.as_ref().filter(|object| object.is_read_only()) else {
+            return Ok(None);
+        };
+        if !entry.private && entry.protection.contains(VmProtection::WRITE) {
+            return Err(Error::Protection);
+        }
+        let relative = entry.page_offset(address);
+        if entry
+            .amap
+            .as_ref()
+            .is_some_and(|amap| amap.lookup(entry.amap_offset + relative).is_some())
+        {
+            return Ok(None);
+        }
+        Ok(Some((object.clone(), entry.object_offset + relative)))
+    }
+
     /// Resolves a fault using the flat anonymous-overlay/object model.
     pub fn resolve_fault(
         &mut self,
@@ -508,6 +548,17 @@ impl VmMap {
         let anon_index = entry.amap_offset + relative;
         let object_index = entry.object_offset + relative;
         let write = access == FaultAccess::Write;
+        // A read fault must not install a writable shared PTE for an immutable
+        // pager: that would bypass fault_page's write permission check later.
+        if !entry.private
+            && entry.protection.contains(VmProtection::WRITE)
+            && entry
+                .object
+                .as_ref()
+                .is_some_and(|object| object.is_read_only())
+        {
+            return Err(Error::Protection);
+        }
 
         if write && entry.private {
             if entry.needs_copy {

@@ -19,7 +19,8 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    driver::class::chardev::{self, DeviceNodeOps},
+    dev::node,
+    fs::devfs::DeviceNodeOps,
     fs::{Error, OpenFlags, PollEvents, Result, vnode::IoctlContext},
     mem::{IoSink, IoSource},
     sys::{event::Event, sync::Mutex},
@@ -375,17 +376,17 @@ const MAX_USER_WRITE: usize = 4096;
 
 /// Publishes `/dev/klog` and `/dev/kmsg`.
 pub(crate) fn register() -> Result<()> {
-    let root = chardev::root().map_err(Error::from)?;
+    let root = node::root().map_err(Error::from)?;
 
     for (name, encoding, mode) in [
         (&b"klog"[..], Encoding::Packets, 0o600),
         (&b"kmsg"[..], Encoding::Text, 0o600),
     ] {
-        chardev::create_native_node(
+        node::create_native_node(
             None,
             root,
             core::str::from_utf8(name).map_err(|_| Error::InvalidArgument)?,
-            chardev::kind::CHARACTER,
+            node::kind::CHARACTER,
             mode,
             Arc::new(LogDevice { encoding }),
         )

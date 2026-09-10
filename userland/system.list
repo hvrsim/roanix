@@ -1,8 +1,9 @@
 # Roanix system package manifest
 #
-# This file defines the userland that xtool (x.py) assembles into the sysroot,
-# the initramfs, and the bootable images. It is the only place you need to edit
-# after adding a new recipe under userland/recipes/.
+# This file defines the complete userland that xtool (x.py) assembles into the
+# sysroot and ext4 root disk. The bootstrap initramfs has a fixed minimal
+# package set in x.py. This is the only file you need to edit after adding a new
+# recipe under userland/recipes/.
 #
 #   [install]  top-level packages installed into the system image. Their
 #              runtime dependencies come along automatically, so there is no

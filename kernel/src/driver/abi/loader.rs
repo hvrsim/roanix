@@ -43,7 +43,7 @@ use super::{
         core::module::{self, Module, ModuleBacking, ModuleDefinition},
         error::{Error, Result},
     },
-    types::{ABI_MAJOR, ABI_MINOR, ModuleDef, ModuleEntryFn, borrow_opt_str, borrow_str},
+    types::{ABI_MAJOR, ModuleDef, ModuleEntryFn, borrow_opt_str, borrow_str},
 };
 
 /// File name suffix identifying a module image.
@@ -335,10 +335,7 @@ fn validate_descriptor(
     if (descriptor.size as usize) < mem::size_of::<ModuleDef>() {
         return Err(Error::InvalidArgument);
     }
-    if descriptor.abi_major != ABI_MAJOR
-        || descriptor.abi_minor > ABI_MINOR
-        || descriptor.flags != 0
-    {
+    if descriptor.abi_major != ABI_MAJOR || descriptor.abi_reserved != 0 || descriptor.flags != 0 {
         return Err(Error::Unsupported);
     }
     if !image.contains_string(descriptor.name) || !image.contains_string(descriptor.description) {

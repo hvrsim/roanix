@@ -18,9 +18,7 @@ extern "C" {
 #endif
 
 /* Incompatible ABI generation. */
-#define RDF_ABI_MAJOR 1u
-/* Append-only ABI revision. */
-#define RDF_ABI_MINOR 3u
+#define RDF_ABI_MAJOR 2u
 
 /* Success. */
 #define RDF_OK 0
@@ -103,16 +101,9 @@ struct rdf_module;
 struct rdf_device;
 struct rdf_driver;
 struct rdf_bus;
-struct rdf_class;
-struct rdf_class_device;
 struct rdf_iface;
 struct rdf_irq_domain;
-struct rdf_tty_provider;
-struct rdf_fs_provider;
-struct rdf_fs_page_account;
-struct rdf_fs_memory_object;
-struct rdf_devfs_broker;
-struct rdf_devfs_endpoint;
+struct rdf_block_device;
 
 /* Opaque receipts returned by the call that creates a resource. */
 struct rdf_device_builder;

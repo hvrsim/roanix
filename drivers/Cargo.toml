@@ -7,11 +7,6 @@ members = [
     "irqchip/ioapic",
     "irqchip/plic",
     "tty/uart8250",
-    "tty/console",
-    "tty/pty",
-    "tty/special",
-    "fs/tmpfs",
-    "fs/devfs",
     "storage/nvme",
 ]
 resolver = "3"

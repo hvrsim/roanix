@@ -1,8 +1,7 @@
-//! Core object model: modules, devices, drivers, buses, classes, and
+//! Core object model for hardware modules, devices, buses, drivers, and
 //! interfaces.
 
 pub mod bus;
-pub mod class;
 pub mod device;
 pub mod driver;
 pub mod fwnode;
@@ -20,7 +19,6 @@ pub(super) fn init() {
     device::init();
     driver::init();
     bus::init();
-    class::init();
     iface::init();
     probe::init();
 }

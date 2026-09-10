@@ -1,6 +1,6 @@
 //! Module lifetime, reference counting, and the inter-module dependency graph.
 //!
-//! A module is the unit of code ownership. Every device, driver, bus, class,
+//! A module is the unit of code ownership. Every device, driver, bus,
 //! interface, interrupt, mapping, and worker is attributed to one module, and a
 //! module can only be unloaded once nothing else depends on it.
 //!
@@ -371,12 +371,11 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
         return Err(Error::Busy);
     }
 
-    // Terminal receipts deliberately lease their backends. Release any
-    // backend-owned receipts while the module is still live so the normal
-    // driver teardown below is reachable rather than deadlocking on its own
-    // lease. A busy devfs node remains registered and keeps unload rejected.
-    super::super::class::console::remove_module_terminals(module);
-    super::super::class::chardev::try_remove_module_nodes(module)?;
+    // Reject obviously busy device nodes before entering the serialized
+    // unload transition. The check is repeated after new callbacks have been
+    // blocked to close the validation/open race.
+    crate::dev::node::try_remove_module_nodes(module)?;
+    crate::dev::block::try_remove_module_devices(module)?;
     if module.lease_count() != 0 {
         return Err(Error::Busy);
     }
@@ -405,18 +404,32 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
         module.state.store(state::LIVE, Ordering::Release);
         return Err(Error::Busy);
     }
+    if let Err(error) = crate::dev::node::try_remove_module_nodes(module) {
+        module.state.store(state::LIVE, Ordering::Release);
+        return Err(error);
+    }
+    if let Err(error) = crate::dev::block::try_remove_module_devices(module) {
+        module.state.store(state::LIVE, Ordering::Release);
+        return Err(error);
+    }
 
-    module
-        .header
-        .set_state(super::super::obj::ObjState::Removing);
-    teardown(module);
+    // No new module callback can begin now and every node is idle, so terminal
+    // teardown cannot leave a failed unload with a half-shut-down console.
+    crate::dev::console::remove_module_terminals(module);
 
     if let Some(exit) = module.exit {
         let handle = super::super::obj::handle(module);
         // SAFETY: the module contract keeps `exit` executable until unload
-        // completes, and every consumer of this module has been detached.
+        // completes. The unloading state blocks new callbacks while leaving
+        // the module's registration receipts valid for orderly cleanup.
         unsafe { exit(handle) };
     }
+
+    module
+        .header
+        .set_state(super::super::obj::ObjState::Removing);
+    // Sweep anything a missing or faulty exit callback left registered.
+    teardown(module);
 
     drop_edges(module);
     module.state.store(state::DEAD, Ordering::Release);
@@ -434,18 +447,19 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
 /// consumers can still complete their own teardown.
 fn teardown(module: &Arc<Module>) {
     super::driver::remove_module_drivers(module);
+    // Hardware remove callbacks get the first chance to withdraw their block
+    // registrations while callback contexts are still intact. Sweep only
+    // registrations a missing or faulty callback left behind.
+    crate::dev::block::remove_module_devices(module);
     super::device::remove_module_devices(module);
-    super::super::class::console::remove_module_terminals(module);
-    super::class::remove_module_classes(module);
+    crate::dev::console::remove_module_terminals(module);
     super::bus::remove_module_buses(module);
     super::iface::remove_module_interfaces(module);
     super::super::irq::remove_module_interrupts(module);
     super::super::work::remove_module_workers(module);
     super::super::io::dma::remove_module_buffers(module);
     super::super::io::mmio::remove_module_mappings(module);
-    super::super::class::chardev::remove_module_nodes(module);
-    crate::fs::provider::remove_module_devfs_broker(module);
-    crate::fs::provider::remove_module_providers(module);
+    crate::dev::node::remove_module_nodes(module);
     super::super::abi::events::remove_module_events(module);
 }
 

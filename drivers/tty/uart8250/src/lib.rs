@@ -931,16 +931,7 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         let port = lock.lock_irqsave();
         // SAFETY: this static port retains the operation table until terminal
         // removal unregisters it.
-        unsafe {
-            Tty::register(
-                Some(device),
-                root,
-                name(serial, &mut text),
-                0o660,
-                115_200,
-                &port.ops,
-            )
-        }
+        unsafe { Tty::register(root, name(serial, &mut text), 0o660, 115_200, &port.ops) }
     };
     match registration {
         Ok(tty) => {
