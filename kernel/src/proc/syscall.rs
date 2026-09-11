@@ -8,11 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     proc,
-    sys::{
-        clock,
-        event::Event,
-        sync::{Mutex, Once},
-    },
+    sys::{clock, event::Event, sync::Mutex},
     syscall::{
         Errno, current_process, map_memory_error, map_process_error, read_user_bytes,
         read_user_i32, read_user_path, read_user_path_array, read_user_timespec,
@@ -26,7 +22,16 @@ const WCONTINUED: u64 = 8;
 /// Longest thread name the kernel stores, excluding the terminator.
 const THREAD_NAME_CAPACITY: usize = crate::sys::thread::ThreadName::CAPACITY;
 
-static FUTEXES: Once<Mutex<BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>>> = Once::new();
+const FUTEX_BUCKETS: usize = 64;
+type FutexTable = Mutex<BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>>;
+
+// Independent futex addresses must not serialize behind one system-wide
+// mutex. Separate bucket locks also avoid sharing their writable cache lines.
+#[repr(align(64))]
+struct FutexBucket(FutexTable);
+
+static FUTEXES: [FutexBucket; FUTEX_BUCKETS] =
+    [const { FutexBucket(Mutex::new(BTreeMap::new())) }; FUTEX_BUCKETS];
 
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct FutexKey {
@@ -84,7 +89,7 @@ const INTERRUPT_EVENT: usize = 1;
 
 /// Publishes `waiter` on the queue for `key` so wakers can find it.
 fn futex_enqueue(key: FutexKey, waiter: &Arc<FutexWaiter>) {
-    futexes()
+    futexes(key)
         .lock()
         .entry(key)
         .or_default()
@@ -96,7 +101,7 @@ fn futex_enqueue(key: FutexKey, waiter: &Arc<FutexWaiter>) {
 /// Returns whether the waiter was still queued, which distinguishes a timeout
 /// or a signal from a wake that raced with them.
 fn futex_dequeue(key: FutexKey, waiter: &Arc<FutexWaiter>) -> bool {
-    let mut futexes = futexes().lock();
+    let mut futexes = futexes(key).lock();
     let Some(queue) = futexes.get_mut(&key) else {
         return false;
     };
@@ -218,7 +223,7 @@ crate::syscall_handler! {
         // Detach the chosen waiters under the lock but release them outside it,
         // so a woken thread never has to wait on this lock to make progress.
         let woken = {
-            let mut futexes = futexes().lock();
+            let mut futexes = futexes(key).lock();
             let Some(queue) = futexes.get_mut(&key) else {
                 return Ok(0);
             };
@@ -416,6 +421,8 @@ crate::syscall_handler! {
     }
 }
 
-fn futexes() -> &'static Mutex<BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>> {
-    FUTEXES.call_once(|| Mutex::new(BTreeMap::new()))
+fn futexes(key: FutexKey) -> &'static FutexTable {
+    let word = (key.address >> 2) ^ (key.address_space as u64).rotate_left(17);
+    let hash = word.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &FUTEXES[(hash >> (64 - FUTEX_BUCKETS.ilog2())) as usize].0
 }

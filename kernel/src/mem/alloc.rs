@@ -17,7 +17,7 @@ use log::debug;
 use crate::{
     arch,
     mem::{self, PAGE_SIZE, PhysAddr, VirtAddr, VmFlags, pages_for_len, phys, tlb},
-    sys::{self, sync::Mutex},
+    sys::{self, smp::IrqSpinLock, sync::Mutex},
 };
 
 /// Base virtual address for the kernel heap window.
@@ -37,6 +37,131 @@ const SIZE_CLASSES: [usize; 9] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 const TLB_RETIRE_CAPACITY: usize = 1 << 12;
 /// Maximum retired pages reclaimed in one heap-lock critical section.
 const RETIRED_RECLAIM_BATCH: usize = 256;
+/// Bounded retention per CPU and size class. Cached slots remain allocated
+/// in their slabs, so freeing a different slot cannot unmap a cached pointer.
+const MAGAZINE_CAPACITY: usize = 8;
+
+struct Magazine {
+    slots: [*mut u8; MAGAZINE_CAPACITY],
+    len: usize,
+}
+
+impl Magazine {
+    const fn new() -> Self {
+        Self {
+            slots: [null_mut(); MAGAZINE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn pop(&mut self) -> Option<*mut u8> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(core::mem::replace(&mut self.slots[self.len], null_mut()))
+    }
+
+    fn push(&mut self, pointer: *mut u8) {
+        self.slots[self.len] = pointer;
+        self.len += 1;
+    }
+}
+
+#[repr(align(64))]
+struct HeapCache {
+    classes: [Magazine; SIZE_CLASSES.len()],
+}
+
+// SAFETY: cache slots exclusively own allocated objects. Their pointers move
+// only under the cache lock and are never dereferenced while cached.
+unsafe impl Send for HeapCache {}
+
+static HEAP_CACHES: [IrqSpinLock<HeapCache>; tlb::MAX_TLB_CPUS] = [const {
+    IrqSpinLock::new(HeapCache {
+        classes: [const { Magazine::new() }; SIZE_CLASSES.len()],
+    })
+}; tlb::MAX_TLB_CPUS];
+
+fn local_cache() -> Option<&'static IrqSpinLock<HeapCache>> {
+    if sys::smp::online_cpus() <= 1 {
+        return None;
+    }
+    HEAP_CACHES.get(arch::thiscpu_opt()?.id)
+}
+
+fn allocate(layout: Layout) -> *mut u8 {
+    if layout.size() != 0
+        && let Some(class) = class_index(layout)
+        && let Some(cache) = local_cache()
+        && let Some(pointer) = cache.lock().classes[class].pop()
+    {
+        return pointer;
+    }
+    let pointer = heap_lock().alloc(layout);
+    if pointer.is_null() && sys::smp::online_cpus() > 1 {
+        drain_caches();
+        return heap_lock().alloc(layout);
+    }
+    pointer
+}
+
+#[cold]
+fn drain_caches() {
+    // Cache retention must not turn reclaimable objects into an allocation
+    // failure. Detach each cache before touching the global heap.
+    for cache in HEAP_CACHES.iter().take(sys::smp::cpu_count()) {
+        let classes = core::mem::replace(
+            &mut cache.lock().classes,
+            [const { Magazine::new() }; SIZE_CLASSES.len()],
+        );
+        let mut heap = heap_lock();
+        for (class, mut magazine) in classes.into_iter().enumerate() {
+            let layout = Layout::from_size_align(SIZE_CLASSES[class], SIZE_CLASSES[class]).unwrap();
+            while let Some(pointer) = magazine.pop() {
+                heap.dealloc(pointer, layout);
+            }
+        }
+    }
+    let mut heap = heap_lock();
+    if heap.retired.len != 0 {
+        tlb::flush_everything();
+        heap.drain_retired();
+    }
+}
+
+fn cache_deallocation(pointer: *mut u8, layout: Layout) -> bool {
+    if layout.size() == 0 {
+        return false;
+    }
+    let Some(class) = class_index(layout) else {
+        return false;
+    };
+    let Some(cache) = local_cache() else {
+        return false;
+    };
+    let mut spilled = [null_mut(); MAGAZINE_CAPACITY / 2];
+    {
+        let mut cache = cache.lock();
+        let magazine = &mut cache.classes[class];
+        if magazine.len == MAGAZINE_CAPACITY {
+            for slot in &mut spilled {
+                *slot = magazine.pop().unwrap();
+            }
+        }
+        magazine.push(pointer);
+    }
+    if !spilled[0].is_null() {
+        // Never take the sleeping heap mutex while holding a cache spinlock.
+        // Returning half the magazine amortizes global locking and keeps
+        // retained memory bounded even for cross-CPU allocation/free traffic.
+        let mut heap = heap_lock();
+        for pointer in spilled {
+            heap.dealloc(pointer, layout);
+        }
+    }
+    true
+}
 
 /// Marker stored inside freed slab objects.
 #[repr(C)]
@@ -376,9 +501,19 @@ impl HeapState {
         let pages = self.pages[start].aux as usize;
         let root = arch::paging::active_root();
 
-        for idx in start..(start + pages) {
-            let page = self.take_mapped_page(root, idx, "large");
-            self.retire_page(idx, page, start + pages - idx);
+        for base in (start..start + pages).step_by(tlb::Shootdown::INLINE) {
+            let count = (start + pages - base).min(tlb::Shootdown::INLINE);
+            let mut retired = [None; tlb::Shootdown::INLINE];
+            for (offset, page) in retired[..count].iter_mut().enumerate() {
+                *page = Some(self.take_mapped_page(root, base + offset, "large"));
+            }
+            // One publication and IPI round for the whole batch. Publishing
+            // before every leaf was removed would allow premature reuse.
+            let sequence = tlb::publish_async_range(heap_page_virt(base), count);
+            for (offset, page) in retired[..count].iter_mut().enumerate() {
+                let idx = base + offset;
+                self.quarantine_page(idx, page.take().unwrap(), start + pages - idx, sequence);
+            }
         }
 
         self.search_hint = self.search_hint.min(start);
@@ -517,10 +652,18 @@ impl HeapState {
     }
 
     /// Quarantines an unmapped heap page until its frame can be reused.
-    ///
-    /// Returns the virtual address whose invalidation must be published once
-    /// the heap lock is released.
     fn retire_page(&mut self, page_idx: usize, page: &'static phys::Page, span: usize) {
+        let sequence = tlb::publish_async_range(heap_page_virt(page_idx), 1);
+        self.quarantine_page(page_idx, page, span, sequence);
+    }
+
+    fn quarantine_page(
+        &mut self,
+        page_idx: usize,
+        page: &'static phys::Page,
+        span: usize,
+        sequence: u64,
+    ) {
         if sys::smp::online_cpus() <= 1 {
             // SAFETY: the page was unmapped above and no remote TLB can retain
             // an alias in the single-CPU case.
@@ -536,7 +679,6 @@ impl HeapState {
             aux: span as u32,
         };
 
-        let sequence = tlb::publish_async(heap_page_virt(page_idx));
         if self.enqueue_retired(page_idx, page.paddr(), sequence) {
             return;
         }
@@ -621,19 +763,22 @@ struct HeapGuard<'a> {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
-// SAFETY: all allocator entry points serialize heap metadata through `HEAP`;
-// returned regions are disjoint and page mappings remain live until dealloc.
+// SAFETY: slab/page metadata is serialized through `HEAP`. Cached objects
+// remain allocated in their slabs and are exclusively owned by one locked
+// magazine until returned to a caller or the heap. Regions remain disjoint.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        heap_lock().alloc(layout)
+        allocate(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        heap_lock().dealloc(ptr, layout);
+        if !cache_deallocation(ptr, layout) {
+            heap_lock().dealloc(ptr, layout);
+        }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = heap_lock().alloc(layout);
+        let ptr = allocate(layout);
         if !ptr.is_null() && layout.size() != 0 {
             // SAFETY: a successful allocation is writable for `layout.size()`.
             unsafe { ptr::write_bytes(ptr, 0, layout.size()) };
@@ -655,6 +800,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return layout.align() as *mut u8;
         }
 
+        // Keep the backing class consistent with the layout used on the next
+        // free. In particular, shrinking a large allocation into a slab class
+        // must not retain that large backing in a small-object magazine.
+        // SAFETY: `layout.align()` is a valid allocation alignment.
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         let current = {
             let heap = heap_lock();
             heap.usable_size(ptr)
@@ -662,12 +812,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
         if let Some(current) = current
             && new_size <= current
+            && class_index(layout) == class_index(new_layout)
         {
             return ptr;
         }
 
-        // SAFETY: `layout.align()` is a valid allocation alignment.
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
         // SAFETY: delegated to the `GlobalAlloc` contract of `realloc`.
         let new_ptr = unsafe { self.alloc(new_layout) };
         if new_ptr.is_null() {

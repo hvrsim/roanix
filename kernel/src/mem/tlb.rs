@@ -129,7 +129,7 @@ impl Shootdown {
         self.count += 1;
     }
 
-    /// Escalates the batch to a full flush on every CPU.
+    /// Escalates the batch to a full flush of the targeted address space.
     ///
     /// Used when the affected addresses are not enumerable, such as after a
     /// bulk kernel remapping.
@@ -139,13 +139,13 @@ impl Shootdown {
 
     /// Publishes the batch and waits until every relevant CPU has applied it.
     ///
-    /// The local CPU is invalidated inline by the architecture routines that
-    /// edited the page tables, so only remote CPUs are awaited.
-    pub(super) fn commit(self) {
+    /// Also replays older pending records locally before acknowledging this
+    /// batch. Returns its sequence, or zero when no publication was needed.
+    pub(super) fn commit(self) -> u64 {
         if self.is_empty() {
-            return;
+            return 0;
         }
-        commit_batch(self.root, &self.addresses[..self.count], self.saturated);
+        commit_batch(self.root, &self.addresses[..self.count], self.saturated)
     }
 }
 
@@ -154,6 +154,18 @@ impl Shootdown {
 /// Runs both from the shootdown inter-processor interrupt and from explicit
 /// polling points such as address-space activation.
 pub(crate) fn poll() {
+    // A replay and its acknowledgement belong to one CPU. Prevent migration
+    // and nested IPI replay from advancing the acknowledgement past work that
+    // the interrupted replay has not applied yet.
+    let restore_irqs = arch::irqstate();
+    arch::irqset(false);
+    poll_local();
+    if restore_irqs {
+        arch::irqset(true);
+    }
+}
+
+fn poll_local() {
     let Some(cpu) = arch::thiscpu_opt() else {
         return;
     };
@@ -203,29 +215,31 @@ pub(crate) fn overflow_flushes() -> usize {
 /// Callers that quarantine the underlying resource use the returned sequence
 /// with [`acknowledged_through`] to learn when releasing it is safe, which
 /// keeps the publishing path free of inter-processor round trips.
-pub(super) fn publish_async(address: VirtAddr) -> u64 {
+pub(super) fn publish_async_range(address: VirtAddr, count: usize) -> u64 {
+    if count == 0 || smp::online_cpus() <= 1 {
+        return 0;
+    }
+    assert!(count <= Shootdown::INLINE);
+    let _pin = super::MigrationPin::current();
     let sequence = {
         let mut next = ENGINE.producer.lock();
-        let sequence = next.checked_add(1).expect("mem/tlb: sequence wrapped");
-        publish_record(sequence, ROOT_GLOBAL, address.align_down().as_u64());
-        ENGINE.overflow.fetch_max(
-            sequence.saturating_sub(RING_CAPACITY as u64),
-            Ordering::AcqRel,
-        );
+        let sequence = next
+            .checked_add(count as u64)
+            .expect("mem/tlb: sequence wrapped");
+        prepare_records(sequence);
+        for offset in 0..count {
+            publish_record(
+                *next + offset as u64 + 1,
+                ROOT_GLOBAL,
+                address.align_down().as_u64() + offset as u64 * super::PAGE_SIZE,
+            );
+        }
         *next = sequence;
         ENGINE.published.store(sequence, Ordering::Release);
         sequence
     };
 
-    if let Some(cpu) = arch::thiscpu_opt()
-        && cpu.id < MAX_TLB_CPUS
-    {
-        // The caller invalidated this address locally while unmapping it, but
-        // earlier records may still be outstanding here, so only a genuine
-        // replay may advance this CPU's acknowledgement.
-        poll();
-        ENGINE.acked[cpu.id].0.fetch_max(sequence, Ordering::AcqRel);
-    }
+    poll();
 
     fence(Ordering::SeqCst);
     let _ = smp::send_ipi(poll, smp::IpiTarget::All);
@@ -252,8 +266,7 @@ pub(super) fn acknowledged_through() -> u64 {
 pub(super) fn flush_everything() -> u64 {
     let mut shootdown = Shootdown::global();
     shootdown.saturate();
-    shootdown.commit();
-    ENGINE.published.load(Ordering::Acquire)
+    shootdown.commit()
 }
 
 /// Replays `(seen, published]` on the current CPU.
@@ -272,17 +285,25 @@ fn apply_range(cpu: &smp::CoreLocal, seen: u64, published: u64) -> bool {
         if root != ROOT_GLOBAL && root != active {
             continue;
         }
-        arch::paging::flush_page(VirtAddr::new(record.address.load(Ordering::Relaxed)));
+        let address = record.address.load(Ordering::Relaxed);
+        if address != 0 {
+            arch::paging::flush_page(VirtAddr::new(address));
+        } else if root == ROOT_GLOBAL {
+            arch::paging::flush_all_global();
+        } else {
+            arch::paging::flush_all();
+        }
     }
 
     // Records may have been recycled while they were being replayed, so the
     // bound is rechecked before the applied range is acknowledged.
+    fence(Ordering::Acquire);
     seen >= ENGINE.overflow.load(Ordering::Acquire)
 }
 
-fn commit_batch(root: u64, addresses: &[u64], saturated: bool) {
+fn commit_batch(root: u64, addresses: &[u64], saturated: bool) -> u64 {
     if smp::online_cpus() <= 1 {
-        return;
+        return 0;
     }
 
     // Migrating between reserving a sequence and waiting for it would leave
@@ -297,19 +318,16 @@ fn commit_batch(root: u64, addresses: &[u64], saturated: bool) {
             .checked_add(count)
             .expect("mem/tlb: shootdown sequence wrapped");
 
+        prepare_records(end);
         if saturated {
-            // A full flush is expressed as a record no responder can match by
-            // address, combined with an overflow bound that forces the
-            // fallback path.
+            // Zero is outside the user and kernel mapping windows. Keep the
+            // root tag so a large user batch does not flush unrelated roots
+            // or discard global kernel translations on every CPU.
             publish_record(end, root, 0);
-            ENGINE.overflow.fetch_max(end, Ordering::AcqRel);
         } else {
             for (offset, address) in addresses.iter().enumerate() {
                 publish_record(start + offset as u64 + 1, root, *address);
             }
-            ENGINE
-                .overflow
-                .fetch_max(end.saturating_sub(RING_CAPACITY as u64), Ordering::AcqRel);
         }
 
         *next = end;
@@ -317,13 +335,9 @@ fn commit_batch(root: u64, addresses: &[u64], saturated: bool) {
         end
     };
 
-    if let Some(cpu) = arch::thiscpu_opt()
-        && cpu.id < MAX_TLB_CPUS
-    {
-        // The architecture routines already invalidated these addresses
-        // locally while editing the leaves.
-        ENGINE.acked[cpu.id].0.fetch_max(sequence, Ordering::AcqRel);
-    }
+    // Local leaf edits cover only this batch. A concurrent producer may have
+    // published earlier records that this CPU still needs to apply.
+    poll();
 
     // The page-table edits and the published records must be globally visible
     // before remote address-space roots are sampled. Without this barrier a
@@ -331,8 +345,32 @@ fn commit_batch(root: u64, addresses: &[u64], saturated: bool) {
     // installs that root and walks a stale entry.
     fence(Ordering::SeqCst);
 
-    let _ = smp::send_ipi(poll, smp::IpiTarget::All);
+    if root == ROOT_GLOBAL {
+        let _ = smp::send_ipi(poll, smp::IpiTarget::All);
+    } else {
+        let local = arch::thiscpu_opt().map(|cpu| cpu.id);
+        for cpu_id in 0..smp::cpu_count().min(MAX_TLB_CPUS) {
+            if Some(cpu_id) != local
+                && smp::is_online(cpu_id)
+                && let Some(cpu) = smp::core_local(cpu_id)
+                && cpu.active_address_root.load(Ordering::Acquire) == root
+            {
+                let _ = smp::send_ipi(poll, smp::IpiTarget::Single(cpu_id));
+            }
+        }
+    }
     wait_for_acknowledgements(root, sequence);
+    sequence
+}
+
+fn prepare_records(end: u64) {
+    // Announce overwritten records BEFORE recycling their storage. A reader
+    // observing any replacement field synchronizes through these fences and
+    // must see the new bound at its final check, even before publication.
+    ENGINE
+        .overflow
+        .store(end.saturating_sub(RING_CAPACITY as u64), Ordering::Relaxed);
+    fence(Ordering::Release);
 }
 
 fn publish_record(sequence: u64, root: u64, address: u64) {
@@ -367,6 +405,9 @@ fn wait_for_acknowledgements(root: u64, sequence: u64) {
         if !pending {
             return;
         }
+        // Callers can enter with interrupts masked. Service concurrent
+        // producers here so two CPUs cannot spin awaiting each other's IPI.
+        poll();
         core::hint::spin_loop();
     }
 }

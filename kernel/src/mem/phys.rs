@@ -455,6 +455,7 @@ struct PmmState {
     unswappable: LinkedList<ManagedPageAdapter>,
 }
 
+#[repr(align(64))]
 struct PageCache {
     dirty: [u32; PAGE_CACHE_CAPACITY],
     dirty_len: usize,

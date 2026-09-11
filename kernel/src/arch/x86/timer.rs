@@ -140,6 +140,17 @@ pub fn handle_interrupt(vec: u64) -> InterruptAction {
 }
 
 fn calibrate_tsc<R: CpuIdReader>(cpuid: &CpuId<R>) -> u64 {
+    // Prefer the virtual counter's advertised frequency. A PIT measurement
+    // can include time when the vCPU was descheduled, especially while many
+    // APs are starting, and processor base MHz need not describe the TSC.
+    if let Some(khz) = cpuid
+        .get_hypervisor_info()
+        .and_then(|info| info.tsc_frequency())
+        .filter(|khz| *khz != 0)
+    {
+        return u64::from(khz) * 1000;
+    }
+
     let tsc_hz = cpuid
         .get_tsc_info()
         .and_then(|info| info.tsc_frequency())

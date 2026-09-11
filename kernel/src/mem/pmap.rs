@@ -2,8 +2,9 @@
 //!
 //! # Lock order
 //!
-//! Address-space operations acquire `VmSpace::map`, then `PmapInner::mappings`,
-//! then a page's reverse-mapping list. Reclaim detaches the reverse list before
+//! Address-space operations acquire `VmSpace::map` (shared for faults), then
+//! the fault's map entry, then `PmapInner::mappings`, then a page's reverse list.
+//! Structural changes take the map exclusively. Reclaim detaches the reverse list before
 //! trying a pmap lock, so it never inverts that order or sleeps behind a fault.
 
 use alloc::{collections::BTreeMap, sync::Arc};
@@ -12,7 +13,7 @@ use core::ptr;
 use crate::{
     arch,
     mem::{PAGE_SIZE, PhysAddr, VirtAddr, VmFlags},
-    sys::sync::Mutex,
+    sys::sync::{Mutex, RwLock},
 };
 
 use super::{
@@ -86,6 +87,11 @@ impl Pmap {
                 && current.protection == protection
                 && Arc::ptr_eq(&current.page, &page)
             {
+                // RISC-V may cache invalid leaves and old permissions. If a
+                // sibling hart installed this PTE, a local fault still needs
+                // SFENCE.VMA or it can keep faulting on the stale entry.
+                #[cfg(target_arch = "riscv64")]
+                arch::paging::flush_page(address);
                 return Ok(());
             }
         }
@@ -131,8 +137,8 @@ impl Pmap {
         drop(mappings);
 
         let Some(previous) = previous else {
-            // A newly present leaf cannot be cached anywhere, so no remote
-            // invalidation is required.
+            // No remote present translation needs revoking. RISC-V harts
+            // caching an invalid leaf fence lazily on the resulting fault.
             return Ok(());
         };
         let mut shootdown = Shootdown::for_root(self.inner.root);
@@ -222,6 +228,42 @@ impl Pmap {
                 break;
             }
             mapping.protection = protection;
+            shootdown.push(VirtAddr::new(*address));
+        }
+        drop(mappings);
+        shootdown.commit();
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Revokes permissions without discarding resident pages. Permissions
+    /// absent from the old PTE remain absent: adding WRITE must still fault
+    /// through COW classification before it can expose a writable leaf.
+    fn restrict(&self, start: VirtAddr, length: u64, protection: VmProtection) -> Result<()> {
+        let end = checked_page_end(start.as_u64(), length)?;
+        let mut mappings = self.inner.mappings.lock();
+        if mappings.range(start.as_u64()..end).any(|(_, mapping)| {
+            !(mapping.protection & protection).contains(VmProtection::READ)
+        }) {
+            // A present x86 leaf always permits reads. Remove leaves when
+            // there is no representable readable intersection (PROT_NONE
+            // included); subsequent faults will apply the new map policy.
+            drop(mappings);
+            return self.remove(start, length);
+        }
+        let mut shootdown = Shootdown::for_root(self.inner.root);
+        let mut failure = None;
+        for (address, mapping) in mappings.range_mut(start.as_u64()..end) {
+            let restricted = mapping.protection & protection;
+            if restricted == mapping.protection {
+                continue;
+            }
+            // SAFETY: the mapping lock excludes leaf changes; the existing
+            // mapping reference pins the frame until this update completes.
+            if unsafe { arch::paging::protect_page(self.inner.root, VirtAddr::new(*address), pmap_flags(restricted)) }.is_err() {
+                failure = Some(Error::Pmap);
+                break;
+            }
+            mapping.protection = restricted;
             shootdown.push(VirtAddr::new(*address));
         }
         drop(mappings);
@@ -413,7 +455,7 @@ pub(super) fn remove_mappings_for_pages(pages: &[Arc<VmPage>]) {
 
 /// Complete virtual address space: MI map plus MD pmap.
 pub struct VmSpace {
-    map: Mutex<VmMap>,
+    map: RwLock<VmMap>,
     pmap: Pmap,
 }
 
@@ -421,7 +463,7 @@ impl VmSpace {
     /// Creates an empty user address space.
     pub fn new() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            map: Mutex::new(VmMap::new()),
+            map: RwLock::new(VmMap::new()),
             pmap: Pmap::new()?,
         }))
     }
@@ -438,17 +480,17 @@ impl VmSpace {
 
     /// Returns whether a user range is entirely unmapped.
     pub fn is_free(&self, start: VirtAddr, length: u64) -> bool {
-        self.map.lock().is_free(start, length)
+        self.map.read().is_free(start, length)
     }
 
     /// Returns the user address space not covered by any mapping.
     pub fn available(&self) -> u64 {
-        self.map.lock().available()
+        self.map.read().available()
     }
 
     /// Installs a mapping into a currently free range.
     pub fn map(&self, mapping: VmMapping) -> Result<VirtAddr> {
-        self.map.lock().map(mapping)
+        self.map.write().map(mapping)
     }
 
     /// Atomically replaces the fixed range described by `mapping`.
@@ -456,7 +498,7 @@ impl VmSpace {
         let VmPlacement::Fixed(start) = mapping.placement else {
             return Err(Error::InvalidAddress);
         };
-        let mut map = self.map.lock();
+        let mut map = self.map.write();
         match map.unmap(start, mapping.length) {
             Ok(()) | Err(Error::NotMapped) => {}
             Err(error) => return Err(error),
@@ -469,30 +511,30 @@ impl VmSpace {
 
     /// Updates the access-pattern hint for a range.
     pub fn advise(&self, start: VirtAddr, length: u64, advice: VmAdvice) -> Result<()> {
-        self.map.lock().advise(start, length, advice)
+        self.map.write().advise(start, length, advice)
     }
 
     /// Removes a range from both the map and pmap.
     pub fn unmap(&self, start: VirtAddr, length: u64) -> Result<()> {
-        let mut map = self.map.lock();
+        let mut map = self.map.write();
         map.unmap(start, length)?;
         self.pmap.remove(start, length)
     }
 
-    /// Changes permissions and removes resident translations for reclassification.
+    /// Changes permissions, retaining resident translations where possible.
     ///
     /// Re-faulting is required when write permission is added: an existing
     /// leaf may still reference a private page shared by a fork, and upgrading
     /// that leaf in place would bypass copy-on-write.
     pub fn protect(&self, start: VirtAddr, length: u64, protection: VmProtection) -> Result<()> {
-        let mut map = self.map.lock();
+        let mut map = self.map.write();
         map.protect(start, length, protection)?;
-        self.pmap.remove(start, length)
+        self.pmap.restrict(start, length, protection)
     }
 
     /// Resolves and enters one page fault.
     pub fn fault(&self, address: VirtAddr, access: FaultAccess) -> Result<()> {
-        let mut map = self.map.lock();
+        let mut map = self.map.read();
         let _file_pin = loop {
             let Some((object, index)) = map.file_fault(address, access)? else {
                 break None;
@@ -502,7 +544,7 @@ impl VmSpace {
             let loaded = object
                 .fault_page(index, false)
                 .and_then(|page| page.pin_resident());
-            map = self.map.lock();
+            map = self.map.read();
             // unmap, mprotect, replacement and fork invalidate the snapshot.
             // A successful pin also prevents reclaim from forcing disk I/O
             // inside resolve_fault or PTE installation below.
@@ -511,21 +553,22 @@ impl VmSpace {
             }
             break Some(loaded?);
         };
-        let resolved = map.resolve_fault(address, access)?;
-        let page = resolved.page.clone();
-        self.pmap
-            .enter(address.align_down(), resolved.page, resolved.protection)?;
-        if let Some(fault) = resolved.object_fault
-            && !fault.object.validates_fault(fault.index, &page)
-        {
-            // The map lock prevents another fault from replacing this leaf
-            // before cleanup. Truncate either already won (this branch) or
-            // will observe the reverse mapping and remove it itself.
-            self.pmap.remove(address.align_down(), PAGE_SIZE)?;
-            return Err(Error::InvalidAddress);
-        }
-        super::record_fault(resolved.promoted);
-        Ok(())
+        map.with_fault(address, access, |resolved| {
+            let page = resolved.page.clone();
+            self.pmap
+                .enter(address.align_down(), resolved.page, resolved.protection)?;
+            if let Some(fault) = resolved.object_fault
+                && !fault.object.validates_fault(fault.index, &page)
+            {
+                // The map lock prevents another fault from replacing this leaf
+                // before cleanup. Truncate either already won (this branch) or
+                // will observe the reverse mapping and remove it itself.
+                self.pmap.remove(address.align_down(), PAGE_SIZE)?;
+                return Err(Error::InvalidAddress);
+            }
+            super::record_fault(resolved.promoted);
+            Ok(())
+        })
     }
 
     /// Validates that a user range is entirely inside the user address window.
@@ -657,12 +700,12 @@ impl VmSpace {
     /// Forks the map with lazy anonymous-overlay COW.
     pub fn fork(&self) -> Result<Arc<Self>> {
         let child_pmap = Pmap::new()?;
-        let mut map = self.map.lock();
+        let mut map = self.map.write();
         self.pmap.write_protect_all()?;
         let child_map = map.fork();
         drop(map);
         Ok(Arc::new(Self {
-            map: Mutex::new(child_map),
+            map: RwLock::new(child_map),
             pmap: child_pmap,
         }))
     }

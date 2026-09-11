@@ -577,7 +577,7 @@ fn scan_inactive(maximum: usize, target: usize) -> usize {
     reclaimed
 }
 
-fn activate_kernel_space() {
+pub(crate) fn activate_kernel_space() {
     if arch::paging::active_root() != kernel_root() {
         // SAFETY: the root was captured from the bootloader-provided kernel
         // page table and remains live for the kernel lifetime.

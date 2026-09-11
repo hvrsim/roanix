@@ -9,6 +9,7 @@ use crate::mem::{
 };
 
 use super::{Error, Result, VmObject, VmPage};
+use crate::sys::sync::Mutex;
 
 #[cfg(target_arch = "x86_64")]
 /// Exclusive upper bound of the architecture user virtual address range.
@@ -229,6 +230,97 @@ impl VmMapEntry {
         (address - self.start) / PAGE_SIZE
     }
 
+    fn resolve_fault(&mut self, address: u64, access: FaultAccess) -> Result<ResolvedPage> {
+        let required = match access {
+            FaultAccess::Read => VmProtection::READ,
+            FaultAccess::Write => VmProtection::WRITE,
+            FaultAccess::Execute => VmProtection::EXECUTE,
+        };
+        if !self.protection.contains(required) {
+            return Err(Error::Protection);
+        }
+
+        let relative = self.page_offset(address);
+        let anon_index = self.amap_offset + relative;
+        let object_index = self.object_offset + relative;
+        let write = access == FaultAccess::Write;
+        // A read fault must not install a writable shared PTE for an immutable
+        // pager: that would bypass fault_page's write permission check later.
+        if !self.private
+            && self.protection.contains(VmProtection::WRITE)
+            && self
+                .object
+                .as_ref()
+                .is_some_and(|object| object.is_read_only())
+        {
+            return Err(Error::Protection);
+        }
+
+        if write && self.private {
+            if self.needs_copy {
+                let amap = self.amap.get_or_insert_with(AnonMap::new);
+                if Arc::strong_count(amap) > 1 {
+                    self.amap = Some(amap.private_copy());
+                }
+                self.needs_copy = false;
+            }
+            let source = if let Some(amap) = &self.amap
+                && let Some((page, _)) = amap.lookup(anon_index)
+            {
+                page
+            } else if let Some(object) = &self.object {
+                object.fault_page(object_index, false)?
+            } else {
+                super::shared_zero_page()
+            };
+            let amap = self.amap.get_or_insert_with(AnonMap::new);
+            let page = amap.cow_page(anon_index, &source)?;
+            return Ok(ResolvedPage {
+                page,
+                protection: self.protection,
+                promoted: true,
+                object_fault: None,
+            });
+        }
+
+        if let Some(amap) = &self.amap
+            && let Some((page, exclusive)) = amap.lookup(anon_index)
+        {
+            let mut protection = self.protection;
+            if self.private && (self.needs_copy || !exclusive) {
+                protection.remove(VmProtection::WRITE);
+            }
+            return Ok(ResolvedPage {
+                page,
+                protection,
+                promoted: false,
+                object_fault: None,
+            });
+        }
+
+        let (page, object_fault) = if let Some(object) = &self.object {
+            (
+                object.fault_page(object_index, write && !self.private)?,
+                Some(ObjectFault {
+                    object: object.clone(),
+                    index: object_index,
+                }),
+            )
+        } else {
+            (super::shared_zero_page(), None)
+        };
+        let mut protection = self.protection;
+        if self.private || super::is_shared_zero_page(&page) {
+            protection.remove(VmProtection::WRITE);
+        }
+        Ok(ResolvedPage {
+            page,
+            protection,
+            promoted: false,
+            object_fault,
+        })
+    }
+
     fn clipped(&self, start: u64, end: u64) -> Self {
         let page_delta = (start - self.start) / PAGE_SIZE;
         let mut clipped = self.clone();
@@ -270,7 +362,7 @@ pub(super) struct ObjectFault {
 /// two structures are kept in exact correspondence: every entry owns one arena
 /// allocation with the same base and length.
 pub struct VmMap {
-    entries: BTreeMap<u64, VmMapEntry>,
+    entries: BTreeMap<u64, Mutex<VmMapEntry>>,
     space: Vmem,
     size: u64,
     timestamp: u64,
@@ -413,7 +505,8 @@ impl VmMap {
             let entry = self
                 .entries
                 .remove(&key)
-                .expect("mem/map: overlapping entry vanished");
+                .expect("mem/map: overlapping entry vanished")
+                .into_inner();
             self.size -= entry.end - entry.start;
 
             let mut pieces = [(0u64, 0u64); 2];
@@ -431,12 +524,12 @@ impl VmMap {
             if entry.start < start {
                 let left = entry.clipped(entry.start, start);
                 self.size += left.end - left.start;
-                self.entries.insert(left.start, left);
+                self.entries.insert(left.start, Mutex::new(left));
             }
             if entry.end > end {
                 let right = entry.clipped(end, entry.end);
                 self.size += right.end - right.start;
-                self.entries.insert(right.start, right);
+                self.entries.insert(right.start, Mutex::new(right));
             }
         }
         self.bump_timestamp();
@@ -457,7 +550,8 @@ impl VmMap {
             let entry = self
                 .entries
                 .get(key)
-                .expect("mem/map: protected entry vanished during validation");
+                .expect("mem/map: protected entry vanished during validation")
+                .lock();
             if !entry.maximum_protection.contains(protection) {
                 return Err(Error::Protection);
             }
@@ -489,7 +583,7 @@ impl VmMap {
             .entries
             .range(..=address)
             .next_back()
-            .map(|(_, entry)| entry)
+            .map(|(_, entry)| entry.lock())
             .filter(|entry| entry.contains(address))
             .ok_or(Error::NotMapped)?;
         let required = match access {
@@ -517,118 +611,31 @@ impl VmMap {
         Ok(Some((object.clone(), entry.object_offset + relative)))
     }
 
-    /// Resolves a fault using the flat anonymous-overlay/object model.
-    pub fn resolve_fault(
-        &mut self,
+    /// Resolves a page and installs it while holding its entry lock. Keeping
+    /// classification and installation together prevents an old read fault
+    /// from replacing a concurrent COW write with the shared source page.
+    pub(super) fn with_fault<T>(
+        &self,
         address: VirtAddr,
         access: FaultAccess,
-    ) -> Result<ResolvedPage> {
+        install: impl FnOnce(ResolvedPage) -> Result<T>,
+    ) -> Result<T> {
         let address = address.align_down().as_u64();
-        let key = self
+        let mut entry = self
             .entries
             .range(..=address)
             .next_back()
-            .and_then(|(key, entry)| entry.contains(address).then_some(*key))
+            .map(|(_, entry)| entry.lock())
+            .filter(|entry| entry.contains(address))
             .ok_or(Error::NotMapped)?;
-        let entry = self
-            .entries
-            .get_mut(&key)
-            .expect("mem/map: fault entry vanished");
-
-        let required = match access {
-            FaultAccess::Read => VmProtection::READ,
-            FaultAccess::Write => VmProtection::WRITE,
-            FaultAccess::Execute => VmProtection::EXECUTE,
-        };
-        if !entry.protection.contains(required) {
-            return Err(Error::Protection);
-        }
-
-        let relative = entry.page_offset(address);
-        let anon_index = entry.amap_offset + relative;
-        let object_index = entry.object_offset + relative;
-        let write = access == FaultAccess::Write;
-        // A read fault must not install a writable shared PTE for an immutable
-        // pager: that would bypass fault_page's write permission check later.
-        if !entry.private
-            && entry.protection.contains(VmProtection::WRITE)
-            && entry
-                .object
-                .as_ref()
-                .is_some_and(|object| object.is_read_only())
-        {
-            return Err(Error::Protection);
-        }
-
-        if write && entry.private {
-            if entry.needs_copy {
-                let amap = entry.amap.get_or_insert_with(AnonMap::new);
-                if Arc::strong_count(amap) > 1 {
-                    entry.amap = Some(amap.private_copy());
-                }
-                entry.needs_copy = false;
-            }
-            let source = if let Some(amap) = &entry.amap
-                && let Some((page, _)) = amap.lookup(anon_index)
-            {
-                page
-            } else if let Some(object) = &entry.object {
-                object.fault_page(object_index, false)?
-            } else {
-                super::shared_zero_page()
-            };
-            let amap = entry.amap.get_or_insert_with(AnonMap::new);
-            let page = amap.cow_page(anon_index, &source)?;
-            return Ok(ResolvedPage {
-                page,
-                protection: entry.protection,
-                promoted: true,
-                object_fault: None,
-            });
-        }
-
-        if let Some(amap) = &entry.amap
-            && let Some((page, exclusive)) = amap.lookup(anon_index)
-        {
-            let mut protection = entry.protection;
-            if entry.private && (entry.needs_copy || !exclusive) {
-                protection.remove(VmProtection::WRITE);
-            }
-            return Ok(ResolvedPage {
-                page,
-                protection,
-                promoted: false,
-                object_fault: None,
-            });
-        }
-
-        let (page, object_fault) = if let Some(object) = &entry.object {
-            (
-                object.fault_page(object_index, write && !entry.private)?,
-                Some(ObjectFault {
-                    object: object.clone(),
-                    index: object_index,
-                }),
-            )
-        } else {
-            (super::shared_zero_page(), None)
-        };
-        let mut protection = entry.protection;
-        if entry.private || super::is_shared_zero_page(&page) {
-            protection.remove(VmProtection::WRITE);
-        }
-        Ok(ResolvedPage {
-            page,
-            protection,
-            promoted: false,
-            object_fault,
-        })
+        install(entry.resolve_fault(address, access)?)
     }
 
     /// Creates a child map and installs lazy COW state in copy-inherited entries.
     pub fn fork(&mut self) -> Self {
         let mut child = Self::new();
-        for entry in self.entries.values_mut() {
+        for locked in self.entries.values_mut() {
+            let entry = locked.get_mut();
             match entry.inheritance {
                 VmInheritance::None => continue,
                 VmInheritance::Share => {}
@@ -647,7 +654,9 @@ impl VmMap {
                 .alloc_fixed(child_entry.start, child_entry.end - child_entry.start)
                 .expect("mem/map: inherited range is not free in a fresh map");
             child.size += child_entry.end - child_entry.start;
-            child.entries.insert(child_entry.start, child_entry);
+            child
+                .entries
+                .insert(child_entry.start, Mutex::new(child_entry));
         }
         self.bump_timestamp();
         child.timestamp = self.timestamp;
@@ -659,7 +668,10 @@ impl VmMap {
         self.entries
             .range(..=address.as_u64())
             .next_back()
-            .and_then(|(_, entry)| entry.contains(address.as_u64()).then(|| entry.clone()))
+            .and_then(|(_, entry)| {
+                let entry = entry.lock();
+                entry.contains(address.as_u64()).then(|| entry.clone())
+            })
     }
 
     /// Publishes an entry whose range is already reserved in the arena.
@@ -679,13 +691,13 @@ impl VmMap {
             self.entries
                 .range(..entry.end)
                 .next_back()
-                .is_none_or(|(_, previous)| previous.end <= entry.start),
+                .is_none_or(|(_, previous)| previous.lock().end <= entry.start),
             "mem/map: the arena handed out a range that is already mapped"
         );
 
         let start = VirtAddr::new(entry.start);
         self.size += entry.end - entry.start;
-        self.entries.insert(entry.start, entry);
+        self.entries.insert(entry.start, Mutex::new(entry));
         self.bump_timestamp();
         Ok(start)
     }
@@ -709,7 +721,7 @@ impl VmMap {
     fn overlapping_keys(&self, start: u64, end: u64) -> alloc::vec::Vec<u64> {
         self.entries
             .range(..end)
-            .filter_map(|(key, entry)| (entry.end > start).then_some(*key))
+            .filter_map(|(key, entry)| (entry.lock().end > start).then_some(*key))
             .collect()
     }
 
@@ -718,7 +730,7 @@ impl VmMap {
         let keys = self.overlapping_keys(start, end);
         let mut covered = start;
         for key in &keys {
-            let entry = &self.entries[key];
+            let entry = self.entries[key].lock();
             if entry.start > covered {
                 return Err(Error::NotMapped);
             }
@@ -742,7 +754,8 @@ impl VmMap {
             let entry = self
                 .entries
                 .remove(&key)
-                .expect("mem/map: rewritten entry vanished");
+                .expect("mem/map: rewritten entry vanished")
+                .into_inner();
             let middle_start = entry.start.max(start);
             let middle_end = entry.end.min(end);
             let pieces = [
@@ -754,14 +767,14 @@ impl VmMap {
 
             if entry.start < middle_start {
                 let left = entry.clipped(entry.start, middle_start);
-                self.entries.insert(left.start, left);
+                self.entries.insert(left.start, Mutex::new(left));
             }
             let mut middle = entry.clipped(middle_start, middle_end);
             update(&mut middle);
-            self.entries.insert(middle.start, middle);
+            self.entries.insert(middle.start, Mutex::new(middle));
             if middle_end < entry.end {
                 let right = entry.clipped(middle_end, entry.end);
-                self.entries.insert(right.start, right);
+                self.entries.insert(right.start, Mutex::new(right));
             }
         }
     }

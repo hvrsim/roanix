@@ -26,6 +26,7 @@ package() {
     install -Dm755 vm-test "${dest_dir}/usr/bin/vm-test"
     install -Dm755 vm-swap-test "${dest_dir}/usr/bin/vm-swap-test"
     install -Dm755 fs-cache-test "${dest_dir}/usr/bin/fs-cache-test"
+    install -Dm755 smp-test "${dest_dir}/usr/bin/smp-test"
     install -Dm644 roanix-root "${dest_dir}/etc/roanix-root"
     install -Dm644 roanix-root "${dest_dir}/dev/.roanix-keep"
     install -Dm644 roanix-root "${dest_dir}/tmp/.roanix-keep"

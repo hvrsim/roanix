@@ -32,6 +32,9 @@ const SPIN_BACKOFF_MIN: u32 = 1;
 const SPIN_BACKOFF_MAX: u32 = 64;
 const ACTIVE_SPIN_ITERS: usize = 8;
 
+mod rwlock;
+pub use rwlock::RwLock;
+
 const ONCE_STATE_INCOMPLETE: u8 = 0;
 const ONCE_STATE_RUNNING: u8 = 1;
 const ONCE_STATE_COMPLETE: u8 = 2;
@@ -515,13 +518,16 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     fn unlock(&self) {
         assert_mutex_context();
+        // Clear ownership before publishing the unlocked state. Clearing it
+        // afterwards can erase the next CPU's owner and disable inheritance.
+        // A contended release installs its successor under the waiters lock.
+        self.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
         if self
             .state
             .compare_exchange(STATE_LOCKED, 0, Ordering::Release, Ordering::Relaxed)
             .is_ok()
         {
             // Uncontended release: no waiter ever lent anything.
-            self.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
             return;
         }
 

@@ -2,11 +2,11 @@
 CFLAGS ?= -O2 -pipe
 LDFLAGS ?=
 
-PROGRAMS = init dmesg pthread-test proc-test vm-test vm-swap-test fs-cache-test
+PROGRAMS = init dmesg pthread-test proc-test vm-test vm-swap-test fs-cache-test smp-test
 
 all: $(PROGRAMS)
 
-pthread-test: LDLIBS = -lpthread
+pthread-test smp-test: LDLIBS = -lpthread
 
 %: %.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)

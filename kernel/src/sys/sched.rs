@@ -343,6 +343,7 @@ impl RunQueue {
 /// counters atomically keeps those surveys free of cross-CPU lock traffic.
 /// The record lives in [`crate::sys::smp::CoreLocal`] so it is cache-line
 /// separated from other CPUs' summaries.
+#[repr(align(64))]
 pub(crate) struct CpuSummary {
     load: AtomicUsize,
     online: AtomicBool,
@@ -494,7 +495,7 @@ impl CpuState {
     fn dequeue_thread(&mut self, thread: ThreadPtr) {
         let thread_ref = thread_ref(thread);
         let emptied = self.runq.remove(thread_ref.rqindex, thread);
-        if (MIN_BATCH..=MAX_BATCH).contains(&thread_ref.priority)
+        if (MIN_BATCH..=MAX_BATCH).contains(&thread_ref.rqindex)
             && emptied
             && self.ts_pick_cursor + MIN_BATCH == thread_ref.rqindex
         {
@@ -1766,7 +1767,14 @@ impl Scheduler {
         cpu.user_stack = 0;
         cpu.current_thread = thread.id;
         crate::arch::cpu::set_kernel_stack(thread.stack_top.as_u64());
-        crate::mem::activate_thread_space(thread.address_space());
+        if thread.is_idle() {
+            // A tickless idle CPU must not retain a user root indefinitely.
+            // Otherwise every thread that sleeps leaves another target for
+            // synchronous user shootdowns and delays address-space teardown.
+            crate::mem::activate_kernel_space();
+        } else {
+            crate::mem::activate_thread_space(thread.address_space());
+        }
         // SAFETY: the frame belongs to `thread`, was validated above, and is
         // exclusively prepared on the local scheduler path.
         unsafe {
@@ -1998,29 +2006,40 @@ impl Scheduler {
     /// Recomputes a thread's priority under its owning CPU's lock, moving it
     /// between run-queue buckets when it is queued.
     fn reprioritize(&self, thread: ThreadPtr, update: impl FnOnce(&Self, &mut Thread)) {
-        let owner_cpu = thread_ref(thread).cpu();
-        let mut cpu = self.cpu(owner_cpu).lock();
-        // The owner can change while the lock is being taken; a stale update
-        // is harmless because the next statclock tick recomputes anyway.
-        if thread_ref(thread).cpu() != owner_cpu {
-            return;
-        }
+        let mut cpu = loop {
+            let owner_cpu = thread_ref(thread).cpu();
+            let cpu = self.cpu(owner_cpu).lock();
+            if thread_ref(thread).cpu() == owner_cpu {
+                break cpu;
+            }
+            // A boost/release changes a reference count. Dropping it on a
+            // migration race leaks or loses inheritance; statclock cannot
+            // reconstruct that count.
+        };
 
         let thread_mut = thread_mut(thread);
         if thread_mut.state == ThreadState::Exited {
             return;
         }
 
+        let previous_priority = thread_mut.priority;
+        update(self, thread_mut);
+        if thread_mut.priority == previous_priority {
+            return;
+        }
+
         if !thread_mut.is_runq_linked() {
-            update(self, thread_mut);
-            if cpu.current_thread() == Some(thread) {
+            if cpu.current_thread() == Some(thread)
+                && cpu.best_runnable().is_some_and(|next| {
+                    should_preempt(thread_ref(next).priority, thread_mut.priority, false)
+                })
+            {
                 cpu.need_resched = true;
             }
             return;
         }
 
         cpu.dequeue_thread(thread);
-        update(self, thread_mut);
         cpu.enqueue_existing(thread_mut, EnqueueKind::Normal);
     }
 }
