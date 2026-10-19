@@ -100,8 +100,32 @@ pub(crate) struct SignalAction {
 /// Applies pending signal state to the frame selected for userspace return.
 #[unsafe(no_mangle)]
 extern "C" fn rsignal_return(frame: &mut TrapFrame) -> *mut TrapFrame {
+    #[cfg(debug_assertions)]
+    {
+        let marker = 0u8;
+        let thread = sched::current_thread();
+        assert!(
+            // SAFETY: the scheduler retains the current thread while it executes.
+            unsafe { &*thread }.contains_stack_address(core::ptr::addr_of!(marker) as usize),
+            "signal return is using another thread's stack"
+        );
+    }
+    // A timer may interrupt a syscall while it owns locks or is publishing
+    // process exit. Let that kernel continuation finish its cleanup before
+    // terminating the thread at the next userspace return.
+    if !frame.is_user() {
+        return frame;
+    }
+    // We are on the selected thread's stack. Signal locks and user-frame
+    // faults may sleep, so interrupts must be deliverable during this work.
+    crate::arch::irqset(true);
     super::exit_current_thread_if_process_exited();
-    deliver_pending(frame);
+    if let Err(signal) = deliver_pending(frame) {
+        // Return through the delivery scopes before abandoning this stack,
+        // releasing every temporary process and address-space reference.
+        super::exit_current_signal(signal);
+    }
+    crate::arch::irqset(false);
     frame
 }
 
@@ -155,6 +179,7 @@ struct SignalState {
 
 /// Process-owned signal dispositions, pending queue, and wait event.
 pub(crate) struct SignalManager {
+    pending_work: AtomicBool,
     state: Mutex<SignalState>,
     event: Event,
 }
@@ -172,11 +197,14 @@ struct UserSignalFrame {
     old_mask: u64,
     saved: TrapFrame,
     info: [u8; SIGNALFD_RECORD_SIZE],
+    #[cfg(target_arch = "x86_64")]
+    fpu: [u8; 512],
 }
 
 impl SignalManager {
     pub(crate) fn new() -> Self {
         Self {
+            pending_work: AtomicBool::new(false),
             state: Mutex::new(SignalState {
                 actions: [SignalAction::DEFAULT; SIGNAL_MAX + 1],
                 pending: VecDeque::new(),
@@ -192,6 +220,7 @@ impl SignalManager {
     pub(crate) fn fork_from(parent: &Self) -> Self {
         let parent = parent.state.lock();
         Self {
+            pending_work: AtomicBool::new(false),
             state: Mutex::new(SignalState {
                 actions: parent.actions,
                 pending: VecDeque::new(),
@@ -271,6 +300,7 @@ impl SignalManager {
             state.suspend_restore_mask = Some(state.mask);
         }
         state.mask = mask & !unblockable_mask();
+        self.pending_work.store(true, Ordering::Release);
     }
 
     /// Returns the event signalled when a signal becomes pending.
@@ -279,7 +309,12 @@ impl SignalManager {
     }
 
     fn take_suspend_restore_mask(&self) -> Option<u64> {
-        self.state.lock().suspend_restore_mask.take()
+        let mut state = self.state.lock();
+        let restore = state.suspend_restore_mask.take();
+        if state.pending.is_empty() {
+            self.pending_work.store(false, Ordering::Release);
+        }
+        restore
     }
 
     /// Arms interruption for a blocking wait.
@@ -348,6 +383,7 @@ impl SignalManager {
                 signal < SIGRTMIN && state.pending.iter().any(|pending| pending.signal == signal);
             if !ignored && !duplicate {
                 state.pending.push_back(info);
+                self.pending_work.store(true, Ordering::Release);
                 self.event.signal();
             }
         }
@@ -617,26 +653,28 @@ pub(crate) fn send_current(signal: u8) {
 }
 
 /// Delivers one pending signal before returning to userspace.
-pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
-    if !frame.is_user() {
-        return;
-    }
+fn deliver_pending(frame: &mut TrapFrame) -> core::result::Result<(), u8> {
     let Some(process) = super::current() else {
-        return;
+        return Ok(());
     };
+    // Queue insertion and suspend setup publish this hint under the state
+    // lock; only an empty queue with no saved mask clears it under that lock.
+    if !process.signals.pending_work.load(Ordering::Acquire) {
+        return Ok(());
+    }
 
     loop {
         let Some(info) = process.signals.take_deliverable() else {
             if let Some(mask) = process.signals.take_suspend_restore_mask() {
                 process.signals.restore_mask(mask);
             }
-            return;
+            return Ok(());
         };
         let signal = info.signal;
         let mut action = process.signals.action(signal);
 
         if signal == SIGKILL {
-            super::exit_current_signal(signal);
+            return Err(signal);
         }
         if signal == SIGSTOP || (action.handler == SIG_DFL && is_stop_signal(signal)) {
             let thread = sched::current_thread();
@@ -651,7 +689,7 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
             continue;
         }
         if action.handler == SIG_DFL {
-            super::exit_current_signal(signal);
+            return Err(signal);
         }
 
         let active_mask = process.signals.mask();
@@ -674,6 +712,8 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
             old_mask: restore_mask,
             saved: *frame,
             info: siginfo(info),
+            #[cfg(target_arch = "x86_64")]
+            fpu: crate::arch::cpu::FpuState::capture().into_bytes(),
         };
         let stack = if action.flags & SA_ONSTACK != 0 {
             process
@@ -688,10 +728,10 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
         let Some((frame_address, handler_stack, return_slot)) =
             signal_frame_addresses(stack, size_of::<UserSignalFrame>() as u64)
         else {
-            super::exit_current_signal(SIGSEGV);
+            return Err(SIGSEGV);
         };
         if write_signal_frame(&process, frame_address, &signal_frame).is_err() {
-            super::exit_current_signal(SIGSEGV);
+            return Err(SIGSEGV);
         }
         if let Some(return_slot) = return_slot
             && process
@@ -699,7 +739,7 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
                 .write_user(VirtAddr::new(return_slot), &action.restorer.to_ne_bytes())
                 .is_err()
         {
-            super::exit_current_signal(SIGSEGV);
+            return Err(SIGSEGV);
         }
 
         let info_address = frame_address + offset_of!(UserSignalFrame, info) as u64;
@@ -712,7 +752,7 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
             info_address,
             context_address,
         );
-        return;
+        return Ok(());
     }
 }
 
@@ -918,10 +958,17 @@ fn wait_for_matching_signal(
 fn restore_signal_frame(frame: &mut TrapFrame) -> SyscallResult<i64> {
     let process = current_process()?;
     let signal_frame = read_signal_frame(&process, frame.user_stack())?;
+    #[cfg(target_arch = "x86_64")]
+    let fpu = crate::arch::cpu::FpuState::from_user(signal_frame.fpu).ok_or(Errno::Fault)?;
     if signal_frame.magic != SIGNAL_FRAME_MAGIC || !frame.restore_signal(&signal_frame.saved) {
         return Err(Errno::Fault);
     }
     process.signals.restore_mask(signal_frame.old_mask);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: this is the current thread's signal return, with validated state.
+    unsafe {
+        fpu.restore();
+    }
     Ok(frame.syscall_result())
 }
 

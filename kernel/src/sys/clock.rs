@@ -324,8 +324,13 @@ impl LocalClockState {
         if self.next_scheduler_deadline_ns != 0 && self.next_scheduler_deadline_ns <= now_ns {
             self.next_scheduler_deadline_ns = 0;
         }
-        self.armed_deadline_ns = 0;
-        self.refresh_programmed_deadline()
+        // An expired level-triggered timer remains asserted until hardware is
+        // reprogrammed, including when there is no next deadline. Treating
+        // zero as already disarmed here skips timer.stop() and traps forever
+        // before a preemption-disabled thread can resume.
+        let next = self.combined_deadline();
+        self.armed_deadline_ns = next;
+        Some(next)
     }
 
     fn set_scheduler_deadline(&mut self, deadline_ns: u64) -> Option<u64> {

@@ -216,6 +216,16 @@ pub(crate) fn overflow_flushes() -> usize {
 /// with [`acknowledged_through`] to learn when releasing it is safe, which
 /// keeps the publishing path free of inter-processor round trips.
 pub(super) fn publish_async_range(address: VirtAddr, count: usize) -> u64 {
+    assert!(count <= Shootdown::INLINE);
+    let mut addresses = [0; Shootdown::INLINE];
+    for (offset, slot) in addresses[..count].iter_mut().enumerate() {
+        *slot = address.align_down().as_u64() + offset as u64 * super::PAGE_SIZE;
+    }
+    publish_async_pages(&addresses[..count])
+}
+
+pub(super) fn publish_async_pages(addresses: &[u64]) -> u64 {
+    let count = addresses.len();
     if count == 0 || smp::online_cpus() <= 1 {
         return 0;
     }
@@ -227,12 +237,8 @@ pub(super) fn publish_async_range(address: VirtAddr, count: usize) -> u64 {
             .checked_add(count as u64)
             .expect("mem/tlb: sequence wrapped");
         prepare_records(sequence);
-        for offset in 0..count {
-            publish_record(
-                *next + offset as u64 + 1,
-                ROOT_GLOBAL,
-                address.align_down().as_u64() + offset as u64 * super::PAGE_SIZE,
-            );
+        for (offset, address) in addresses.iter().enumerate() {
+            publish_record(*next + offset as u64 + 1, ROOT_GLOBAL, *address);
         }
         *next = sequence;
         ENGINE.published.store(sequence, Ordering::Release);

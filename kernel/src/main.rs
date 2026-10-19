@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(alloc_error_handler)]
+#![feature(alloc_error_handler, allocator_api, arbitrary_self_types)]
 #![doc = include_str!("../../README.md")]
 
 extern crate alloc;

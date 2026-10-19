@@ -33,7 +33,7 @@ const SPIN_BACKOFF_MAX: u32 = 64;
 const ACTIVE_SPIN_ITERS: usize = 8;
 
 mod rwlock;
-pub use rwlock::RwLock;
+pub use rwlock::{ReadGuard, RwLock, WriteGuard};
 
 const ONCE_STATE_INCOMPLETE: u8 = 0;
 const ONCE_STATE_RUNNING: u8 = 1;

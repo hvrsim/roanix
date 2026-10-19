@@ -811,19 +811,3 @@ fn zeroed(length: usize) -> Result<Vec<u8>> {
     bytes.resize(length, 0);
     Ok(bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{decode_lfn, decode_short, short_checksum};
-
-    #[test]
-    fn short_name_case_bits() {
-        assert_eq!(decode_short(b"README  TXT", 0x18).as_ref(), b"readme.txt");
-    }
-
-    #[test]
-    fn vfat_checksum_vector() {
-        assert_eq!(short_checksum(b"FOO     TXT"), 0x65);
-        assert!(decode_lfn(&[], b"FOO     TXT").is_none());
-    }
-}

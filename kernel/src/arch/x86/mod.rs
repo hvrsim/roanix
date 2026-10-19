@@ -137,6 +137,26 @@ pub fn thiscpu_opt() -> Option<&'static CoreLocal> {
     Some(unsafe { &*ptr })
 }
 
+/// Reads the running thread in one CPU-relative instruction.
+///
+/// # Safety
+/// The current CPU's kernel-local register must be initialized.
+#[inline(always)]
+pub(crate) unsafe fn current_thread_pointer() -> usize {
+    let pointer;
+    // SAFETY: the caller establishes the local base. A single aligned load
+    // cannot be interrupted between selecting a CPU and reading its thread.
+    unsafe {
+        asm!(
+            "mov {pointer}, gs:[{offset}]",
+            pointer = out(reg) pointer,
+            offset = const core::mem::offset_of!(CoreLocal, current_thread_pointer),
+            options(readonly, nostack, preserves_flags)
+        );
+    }
+    pointer
+}
+
 /// Returns mutable core-local context for the current CPU.
 ///
 /// # Safety

@@ -8,22 +8,34 @@
 //! # Synchronization invariants
 //!
 //! * Filesystems serialize writes that change logical length with truncation.
-//! * The page-index lock is released before resolving user windows or taking a
-//!   page backing lock on normal transfers.
+//! * The index and page state use the same owner lock. Transfers release it
+//!   before resolving user windows, allocating physical frames, or doing I/O.
 //! * Truncation deliberately holds the index lock as a fault gate until old
 //!   PTEs are removed and bytes newly outside/inside EOF are sanitized.
 //! * Object accounting is charged once when an index is inserted and released
 //!   once when that index is removed or the object is destroyed.
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use crate::mem::PageRef;
+use alloc::sync::Arc;
 use core::{
     cmp,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{mem::PAGE_SIZE, sys::sync::Mutex};
+use crate::mem::PAGE_SIZE;
 
-use super::{Error, IoSink, IoSource, Result, VmPage};
+use super::{
+    Error, IoSink, IoSource, Result, VmPage,
+    index::{Index, Node},
+    owner::{Owned, OwnerLock},
+    pool::Pool,
+};
+
+static PAGE_INDEX_POOL: Pool<Node<PageRef>> = Pool::new();
+
+pub(super) fn drain_pool() {
+    PAGE_INDEX_POOL.drain();
+}
 
 /// Pages resolved per index acquisition during bulk transfers.
 const LOOKUP_BATCH: usize = 32;
@@ -127,21 +139,45 @@ impl PageAccount {
     }
 }
 
+/// Object-page membership survives an unlocked pager operation through a
+/// weak handle. Clean file eviction removes the index entry under the same
+/// owner capability that protects the frame (uvm_pagefree).
+pub(super) struct ObjectPages(Owned<Index<PageRef>>);
+impl ObjectPages {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Owned::new(
+            OwnerLock::new().expect("mem: object owner allocation failed"),
+            Index::new(&PAGE_INDEX_POOL),
+        )))
+    }
+    pub(super) fn retire(&self, page: &PageRef, owner: &mut super::owner::OwnerWrite<'_>) {
+        let pages = self.0.get_locked_mut(owner);
+        if pages
+            .get(&page.index())
+            .is_some_and(|current| Arc::ptr_eq(current, page))
+        {
+            pages.remove(&page.index());
+        }
+    }
+}
+impl core::ops::Deref for ObjectPages {
+    type Target = Owned<Index<PageRef>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Page-cache object indexed by logical page number.
 pub struct VmObject {
     id: u64,
     kind: ObjectKind,
-    /// Protects index membership. Ordinary transfers never hold it while
-    /// faulting user memory or acquiring a page backing lock. Truncate is the
-    /// deliberate exception: it holds the index as a fault gate while it
-    /// invalidates mappings and sanitizes the retained tail page.
-    pages: Mutex<BTreeMap<u64, Arc<VmPage>>>,
+    /// The object owner protects both index membership and its pages' state.
+    /// Transfers drop it before faulting user memory; truncate holds it while
+    /// invalidating mappings and sanitizing an already-pinned tail page.
+    pages: Arc<ObjectPages>,
     account: Option<Arc<PageAccount>>,
     length: AtomicU64,
     pager: Option<Arc<dyn VmPager>>,
-    fill: [Mutex<()>; 16],
-    next_read: AtomicU64,
-    next_fault: AtomicU64,
 }
 
 impl VmObject {
@@ -159,13 +195,10 @@ impl VmObject {
         Arc::new(Self {
             id: super::allocate_object_id(),
             kind,
-            pages: Mutex::new(BTreeMap::new()),
+            pages: ObjectPages::new(),
             account,
             length: AtomicU64::new(0),
             pager: None,
-            fill: core::array::from_fn(|_| Mutex::new(())),
-            next_read: AtomicU64::new(u64::MAX),
-            next_fault: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -174,79 +207,57 @@ impl VmObject {
         Arc::new(Self {
             id: super::allocate_object_id(),
             kind: ObjectKind::Vnode,
-            pages: Mutex::new(BTreeMap::new()),
+            pages: ObjectPages::new(),
             account: None,
             length: AtomicU64::new(length),
             pager: Some(pager),
-            fill: core::array::from_fn(|_| Mutex::new(())),
-            next_read: AtomicU64::new(u64::MAX),
-            next_fault: AtomicU64::new(u64::MAX),
         })
     }
 
-    /// Fill a bounded run of missing pages. The sleepable fill gate coalesces
-    /// concurrent overlapping misses; disjoint stripes progress independently.
-    /// Cache hits never take a fill gate. No index lock crosses I/O.
+    /// Publish pager pages under the object owner lock before loading them.
+    /// Each page's busy/wanted state coalesces overlapping misses; neither
+    /// physical allocation nor pager I/O holds the object lock.
     fn populate(&self, index: u64, wanted: usize) -> Result<()> {
         let Some(pager) = &self.pager else {
             return Ok(());
         };
-        if self.page(index).is_some() {
-            return Ok(());
-        }
-        let _fill = self.fill[(index / LOOKUP_BATCH as u64) as usize % self.fill.len()].lock();
-        if self.page(index).is_some() {
-            return Ok(());
-        }
         let end = self.length().div_ceil(PAGE_SIZE);
         if index >= end {
             return Err(Error::InvalidAddress);
         }
-        let boundary = LOOKUP_BATCH - (index % LOOKUP_BATCH as u64) as usize;
-        let mut count = wanted.clamp(1, boundary).min((end - index) as usize);
-        {
-            let pages = self.pages.lock();
-            for next in 1..count {
-                if pages.contains_key(&(index + next as u64)) {
-                    count = next;
-                    break;
-                }
+        let count = wanted.clamp(1, LOOKUP_BATCH).min((end - index) as usize);
+        for next in index..index + count as u64 {
+            let result = (|| {
+                let page = match self.page(next) {
+                    Some(page) => page,
+                    None => {
+                        let candidate = VmPage::file_in(
+                            next,
+                            pager.clone(),
+                            self.pages.owner().clone(),
+                            Some(Arc::downgrade(&self.pages)),
+                        )?;
+                        let mut pages = self.pages.lock();
+                        if next >= self.length().div_ceil(PAGE_SIZE) {
+                            return Err(Error::InvalidAddress);
+                        }
+                        if let Some(page) = pages.get(&next) {
+                            page.clone()
+                        } else {
+                            let reserved = pages.reserve(next)?;
+                            pages.insert(next, candidate.clone(), reserved);
+                            candidate
+                        }
+                    }
+                };
+                page.pin_resident().map(|_| ())
+            })();
+            // Failure of speculative pages never changes the center's result.
+            if next == index {
+                result?;
+            } else if result.is_err() {
+                break;
             }
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(count * PAGE_SIZE as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bytes.resize(count * PAGE_SIZE as usize, 0);
-        if let Err(error) = pager.read(index * PAGE_SIZE, &mut bytes) {
-            if count == 1 {
-                return Err(error);
-            }
-            // A speculative neighbour must not make the requested page fail.
-            pager.read(index * PAGE_SIZE, &mut bytes[..PAGE_SIZE as usize])?;
-            count = 1;
-            bytes.truncate(PAGE_SIZE as usize);
-        }
-        // Prepare every page before making any of this batch visible.
-        let mut ready = Vec::new();
-        ready
-            .try_reserve_exact(count)
-            .map_err(|_| Error::OutOfMemory)?;
-        for (slot, bytes) in bytes
-            .as_chunks::<{ PAGE_SIZE as usize }>()
-            .0
-            .iter()
-            .enumerate()
-        {
-            ready.push(VmPage::from_pager(
-                index + slot as u64,
-                pager.clone(),
-                bytes,
-            )?);
-        }
-        let mut pages = self.pages.lock();
-        for page in ready {
-            pages.insert(page.index(), page);
         }
         Ok(())
     }
@@ -285,7 +296,7 @@ impl VmObject {
         let pages = self.pages.lock();
         stats.pages = pages.len() as u64;
         for page in pages.values() {
-            let info = page.info();
+            let info = page.info_locked(pages.capability());
             match info.location {
                 super::PageLocation::Zero => stats.zero += 1,
                 super::PageLocation::File => stats.file += 1,
@@ -298,59 +309,68 @@ impl VmObject {
     }
 
     /// Looks up an instantiated page.
-    pub fn page(&self, index: u64) -> Option<Arc<VmPage>> {
+    pub fn page(&self, index: u64) -> Option<PageRef> {
         self.pages.lock().get(&index).cloned()
     }
 
     /// Returns an existing page or instantiates a zero-filled page.
-    pub fn get_or_create_page(&self, index: u64) -> Result<Arc<VmPage>> {
+    pub fn get_or_create_page(&self, index: u64) -> Result<PageRef> {
         self.populate(index, 1)?;
-        let mut pages = self.pages.lock();
-        if let Some(page) = pages.get(&index) {
-            return Ok(page.clone());
-        }
-        self.create_page_locked(&mut pages, index)
+        self.find_or_create_page(index, false)
     }
 
     /// Returns the page used for a read or write fault.
-    pub fn fault_page(&self, index: u64, write: bool) -> Result<Arc<VmPage>> {
+    pub fn fault_page(&self, index: u64, write: bool) -> Result<PageRef> {
         if write && self.pager.is_some() {
             return Err(Error::Protection);
         }
-        let previous = self
-            .next_fault
-            .swap(index.saturating_add(1), Ordering::Relaxed);
-        self.populate(index, if previous == index { LOOKUP_BATCH } else { 1 })?;
-        let mut pages = self.pages.lock();
-        // The index check and insertion share the same lock as truncate's
-        // split, preventing a stale pre-truncate fault from recreating a page
-        // beyond the new EOF after truncation has removed it.
+        self.populate(index, 1)?;
+        self.find_or_create_page(index, true)
+    }
+
+    /// Validates object identity and publishes the PTE while truncation is
+    /// excluded. The fault must pin the page before taking this index lock,
+    /// so installation cannot perform I/O or reclaim behind the truncate gate.
+    pub(super) fn with_fault(
+        &self,
+        index: u64,
+        page: &PageRef,
+        install: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let pages = self.pages.lock();
         if self.kind == ObjectKind::Vnode
             && index >= self.length.load(Ordering::Acquire).div_ceil(PAGE_SIZE)
         {
             return Err(Error::InvalidAddress);
         }
-        if let Some(page) = pages.get(&index) {
-            return Ok(page.clone());
-        }
-        self.create_page_locked(&mut pages, index)
-    }
-
-    /// Confirms that a just-installed translation still names a live index.
-    ///
-    /// Truncate holds the same index lock while removing PTEs. Validation
-    /// after `Pmap::enter` closes the remaining race where a fault acquired an
-    /// `Arc<VmPage>` immediately before truncate acquired the lock.
-    pub(super) fn validates_fault(&self, index: u64, page: &Arc<VmPage>) -> bool {
-        let pages = self.pages.lock();
-        if self.kind == ObjectKind::Vnode
-            && index >= self.length.load(Ordering::Acquire).div_ceil(PAGE_SIZE)
-        {
-            return false;
-        }
-        pages
+        if !pages
             .get(&index)
             .is_some_and(|current| Arc::ptr_eq(current, page))
+        {
+            return Err(Error::NotMapped);
+        }
+        install()
+    }
+
+    /// The locked pager lookup used for neighbors. Busy/nonresident pages are
+    /// skipped; only the center fault may release locks to perform I/O.
+    pub(super) fn with_neighbors(
+        &self,
+        start: u64,
+        count: usize,
+        visit: impl FnOnce(&[Option<PageRef>], &mut super::owner::OwnerWrite<'_>),
+    ) {
+        assert!(count <= 16);
+        let mut pages = self.pages.lock();
+        let end = self.length().div_ceil(PAGE_SIZE);
+        let found: [Option<PageRef>; 16] = core::array::from_fn(|offset| {
+            let index = start + offset as u64;
+            if offset >= count || (self.kind == ObjectKind::Vnode && index >= end) {
+                return None;
+            }
+            pages.get(&index).cloned()
+        });
+        visit(&found[..count], pages.capability_mut());
     }
 
     /// Reads bytes into a sink, returning zeros for holes.
@@ -361,12 +381,8 @@ impl VmObject {
         } else {
             sink.len()
         };
-        let sequential = self
-            .next_read
-            .swap(offset.saturating_add(total as u64), Ordering::Relaxed)
-            == offset;
         let mut read = 0usize;
-        let mut batch: [Option<Arc<VmPage>>; LOOKUP_BATCH] = [const { None }; LOOKUP_BATCH];
+        let mut batch: [Option<PageRef>; LOOKUP_BATCH] = [const { None }; LOOKUP_BATCH];
         let mut batch_index = u64::MAX;
 
         while read < total {
@@ -394,11 +410,6 @@ impl VmObject {
                 let wanted = (total - read)
                     .saturating_add(page_offset)
                     .div_ceil(PAGE_SIZE as usize);
-                let wanted = if sequential {
-                    wanted.max(LOOKUP_BATCH)
-                } else {
-                    wanted
-                };
                 if let Err(error) = self.populate(page_index, wanted) {
                     return if read != 0 { Ok(read) } else { Err(error) };
                 }
@@ -420,7 +431,7 @@ impl VmObject {
             let count = window.len();
             match page {
                 Some(page) => {
-                    if let Err(error) = page.read(page_offset, &mut window) {
+                    if let Err(error) = window.read_page(&page, page_offset) {
                         return if read != 0 { Ok(read) } else { Err(error) };
                     }
                 }
@@ -465,6 +476,9 @@ impl VmObject {
             position
                 .checked_add(count as u64)
                 .ok_or(Error::InvalidAddress)?;
+            if written == 0 && position > self.length() {
+                self.zero_exposed_tail(self.length(), position)?;
+            }
             let page = match self.get_or_create_page(page_index) {
                 Ok(page) => page,
                 Err(error) => {
@@ -474,7 +488,7 @@ impl VmObject {
                     return Err(error);
                 }
             };
-            if let Err(error) = page.write(page_offset, &window) {
+            if let Err(error) = window.write_page(&page, page_offset) {
                 if written != 0 {
                     return self.finish_write(offset, written);
                 }
@@ -490,77 +504,165 @@ impl VmObject {
         self.write_from(offset, &IoSource::kernel(input))
     }
 
-    /// Removes pages beyond `size` and zeroes a retained partial tail.
+    /// Removes pages beyond `size` and sanitizes a retained tail. Page-in is
+    /// performed without the object lock; EOF and identity are revalidated
+    /// before any PTE or index change (uvm_vnp_setsize/PG_BUSY protocol).
     pub fn truncate(&self, size: u64) -> Result<u64> {
         if self.pager.is_some() {
             return Err(Error::Protection);
         }
-        let mut pages = self.pages.lock();
-        let old_size = self.length.load(Ordering::Acquire);
-        if size == old_size {
-            return Ok(0);
-        }
-
-        if size > old_size {
-            let old_tail = (old_size % PAGE_SIZE) as usize;
-            if old_tail != 0
-                && let Some(page) = pages.get(&(old_size / PAGE_SIZE))
+        loop {
+            let old_size = self.length();
+            if size == old_size {
+                return Ok(0);
+            }
+            let tail_offset = if size > old_size { old_size } else { size };
+            let tail = (tail_offset % PAGE_SIZE) as usize;
+            let page = if tail != 0 {
+                self.page(tail_offset / PAGE_SIZE)
+            } else {
+                None
+            };
+            let pin = page
+                .as_ref()
+                .filter(|page| page.info().location != super::PageLocation::Zero)
+                .map(|page| page.pin_resident())
+                .transpose()?;
+            let mut pages = self.pages.lock();
+            if self.length() != old_size
+                || (tail != 0 && !same_page(pages.get(&(tail_offset / PAGE_SIZE)), page.as_ref()))
             {
-                // A shared mapping may have written into the rounded portion
-                // beyond EOF. Retire its PTE before exposing that range, then
-                // restore the filesystem guarantee that a grown hole is zero.
+                continue;
+            }
+            if size > old_size {
+                if let Some(page) = &page {
+                    super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+                    if page
+                        .zero_locked(
+                            tail,
+                            cmp::min(size - old_size, PAGE_SIZE - tail as u64) as usize,
+                            pages.capability_mut(),
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                self.length.store(size, Ordering::Release);
+                return Ok(0);
+            }
+            let first_removed = size.div_ceil(PAGE_SIZE);
+            for page in pages.range(first_removed..).map(|(_, page)| page) {
                 super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
-                let exposed = cmp::min(size - old_size, PAGE_SIZE - old_tail as u64) as usize;
-                page.zero(old_tail, exposed)?;
+            }
+            if let Some(page) = &page {
+                super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
+                if page
+                    .zero_locked(tail, PAGE_SIZE as usize - tail, pages.capability_mut())
+                    .is_err()
+                {
+                    continue;
+                }
             }
             self.length.store(size, Ordering::Release);
-            return Ok(0);
+            let removed = pages.split_off(&first_removed);
+            let count = removed.len() as u64;
+            drop(pages);
+            drop(pin);
+            drop(removed);
+            if let Some(account) = &self.account {
+                account.release(count);
+            }
+            return Ok(count);
         }
-
-        let first_removed = size.div_ceil(PAGE_SIZE);
-        let tail = (size % PAGE_SIZE) as usize;
-        let tail_page = if tail == 0 {
-            None
-        } else {
-            pages.get(&(size / PAGE_SIZE)).cloned()
-        };
-
-        // Faults cannot pass the index lock while resident translations are
-        // retired. Once the shootdown completes, no userspace CPU can race the
-        // tail zeroing through an old writable PTE.
-        for page in pages.range(first_removed..).map(|(_, page)| page) {
-            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
-        }
-        if let Some(page) = tail_page.as_ref() {
-            super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
-        }
-        if let Some(page) = tail_page {
-            page.zero(tail, PAGE_SIZE as usize - tail)?;
-        }
-
-        // Publish EOF under the same lock checked by `fault_page`, then remove
-        // the now-unreachable indexes before allowing another fault through.
-        self.length.store(size, Ordering::Release);
-        let removed = pages.split_off(&first_removed);
-        let removed_count = removed.len() as u64;
-        drop(pages);
-        drop(removed);
-        if let Some(account) = &self.account {
-            account.release(removed_count);
-        }
-        Ok(removed_count)
     }
 
-    fn create_page_locked(
-        &self,
-        pages: &mut BTreeMap<u64, Arc<VmPage>>,
-        index: u64,
-    ) -> Result<Arc<VmPage>> {
+    fn zero_exposed_tail(&self, old_size: u64, new_size: u64) -> Result<()> {
+        let tail = (old_size % PAGE_SIZE) as usize;
+        if tail == 0 || new_size <= old_size {
+            return Ok(());
+        }
+        loop {
+            let page = self.page(old_size / PAGE_SIZE);
+            let Some(page) = page else {
+                return Ok(());
+            };
+            let _pin = (page.info().location != super::PageLocation::Zero)
+                .then(|| page.pin_resident())
+                .transpose()?;
+            let mut pages = self.pages.lock();
+            if self.length() != old_size {
+                return Ok(());
+            }
+            if !same_page(pages.get(&(old_size / PAGE_SIZE)), Some(&page)) {
+                continue;
+            }
+            super::pmap::remove_mappings_for_pages(core::slice::from_ref(&page));
+            if page
+                .zero_locked(
+                    tail,
+                    cmp::min(new_size - old_size, PAGE_SIZE - tail as u64) as usize,
+                    pages.capability_mut(),
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn find_or_create_page(&self, index: u64, check_length: bool) -> Result<PageRef> {
+        let validate = || {
+            if check_length
+                && self.kind == ObjectKind::Vnode
+                && index >= self.length.load(Ordering::Acquire).div_ceil(PAGE_SIZE)
+            {
+                Err(Error::InvalidAddress)
+            } else {
+                Ok(())
+            }
+        };
+        if self.pager.is_some() {
+            loop {
+                let pages = self.pages.lock();
+                validate()?;
+                if let Some(page) = pages.get(&index) {
+                    return Ok(page.clone());
+                }
+                drop(pages);
+                self.populate(index, 1)?;
+            }
+        }
+        {
+            let pages = self.pages.lock();
+            validate()?;
+            if let Some(page) = pages.get(&index) {
+                return Ok(page.clone());
+            }
+        }
+        let page = VmPage::new_zero_in(
+            index,
+            // tmpfs exposes a vnode view of its underlying anonymous object;
+            // those swap-backed pages count as aobj pages in UVM's clock.
+            if self.kind == ObjectKind::Vnode && self.pager.is_none() {
+                super::phys::PageOwnerKind::Anonymous
+            } else {
+                super::page::owner_kind_for_object(self.kind)
+            },
+            self.pages.owner().clone(),
+        )?;
+        let mut pages = self.pages.lock();
+        // Allocation dropped the index lock. Recheck EOF and identity before
+        // charging or publishing, including concurrent truncate and creators.
+        validate()?;
+        if let Some(existing) = pages.get(&index) {
+            return Ok(existing.clone());
+        }
+        let reserved = pages.reserve(index)?;
         if let Some(account) = &self.account {
             account.reserve()?;
         }
-        let page = VmPage::new_zero(index, super::page::owner_kind_for_object(self.kind));
-        pages.insert(index, page.clone());
+        pages.insert(index, page.clone(), reserved);
         Ok(page)
     }
 
@@ -579,11 +681,20 @@ impl VmObject {
 
 impl Drop for VmObject {
     fn drop(&mut self) {
-        for page in self.pages.get_mut().values() {
+        let pages = self.pages.lock();
+        for page in pages.values() {
             super::pmap::remove_mappings_for_pages(core::slice::from_ref(page));
         }
         if let Some(account) = &self.account {
-            account.release(self.pages.get_mut().len() as u64);
+            account.release(pages.len() as u64);
         }
+    }
+}
+
+fn same_page(left: Option<&PageRef>, right: Option<&PageRef>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }

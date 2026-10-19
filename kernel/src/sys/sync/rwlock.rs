@@ -52,6 +52,11 @@ impl<T> RwLock<T> {
         }
     }
 
+    /// Returns exclusive access without locking when the lock is uniquely borrowed.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// Acquires shared access without taking the writer mutex when uncontended.
     pub fn read(&self) -> ReadGuard<'_, T> {
         assert_mutex_context();
@@ -80,6 +85,18 @@ impl<T> RwLock<T> {
                 Err(current) => state = current,
             }
         }
+    }
+
+    /// Acquires exclusive access only if no writer or reader holds the lock.
+    pub fn try_write(&self) -> Option<WriteGuard<'_, T>> {
+        let writer = self.writer.try_lock()?;
+        self.state
+            .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(WriteGuard {
+            lock: self,
+            _writer: writer,
+        })
     }
 
     /// Blocks new readers, then waits for existing readers to finish.

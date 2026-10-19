@@ -843,6 +843,8 @@ pub(crate) fn exec_current(
     // SAFETY: `frame` is the current thread's live syscall frame.
     unsafe {
         crate::arch::cpu::init_user_thread_frame(frame, image.entry, image.stack);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::cpu::FpuState::new().restore();
     }
     Ok(())
 }
@@ -1066,7 +1068,7 @@ pub(crate) fn exit_current(status: i32) -> ! {
             panic!("init exited with status {status}");
         }
         process.mark_exited((status & 0xff) << 8);
-        finish_current_process_thread_exit(&process);
+        finish_current_process_thread_exit(process);
     }
     sched::exit_current()
 }
@@ -1082,7 +1084,7 @@ pub(crate) fn exit_current_signal(signal: u8) -> ! {
             panic!("init killed by signal {signal}");
         }
         process.mark_exited(i32::from(signal & 0x7f));
-        finish_current_process_thread_exit(&process);
+        finish_current_process_thread_exit(process);
     }
     sched::exit_current()
 }
@@ -1104,14 +1106,18 @@ pub(crate) fn exit_current_thread_if_process_exited() {
         return;
     };
     if process.is_exited() {
-        finish_current_process_thread_exit(&process);
+        finish_current_process_thread_exit(process);
     }
 }
 
-fn finish_current_process_thread_exit(process: &Process) -> ! {
+fn finish_current_process_thread_exit(process: Arc<Process>) -> ! {
     // The active-thread decrement and scheduler removal must be atomic with
     // trap return, which also retires threads belonging to an exited process.
     crate::arch::irqset(false);
     process.unregister_thread();
+    // Context switching abandons this stack without running destructors. The
+    // thread record retains the process until reaping; release our temporary
+    // owner now so its address space can eventually be destroyed.
+    drop(process);
     sched::exit_current()
 }

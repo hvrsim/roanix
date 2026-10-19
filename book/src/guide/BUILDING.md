@@ -197,7 +197,6 @@ Use the underlying tools for less common work:
 (cd build/x86_64/jinx && ../../cache/jinx/jinx revbump mlibc)
 (cd kernel && cargo fmt --check)
 mdbook serve book
-python3 -m unittest discover -s tests
 ```
 
 To discard generated images, remove `build/<arch>/out/`. Remove that

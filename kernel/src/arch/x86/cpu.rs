@@ -79,6 +79,55 @@ static BSP_STARTUP: Once<()> = Once::new();
 const TSS_SELECTOR: u16 = 9 * 8;
 const TSS_SIZE: usize = 104;
 
+#[repr(C, align(16))]
+pub(crate) struct FpuState {
+    bytes: [u8; 512],
+}
+
+impl FpuState {
+    pub(crate) fn new() -> Self {
+        let mut bytes = [0; 512];
+        bytes[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        Self { bytes }
+    }
+
+    pub(crate) fn capture() -> Self {
+        let mut state = Self::new();
+        state.save();
+        state
+    }
+
+    pub(crate) fn save(&mut self) {
+        // SAFETY: this aligned buffer holds the full image; CPU bring-up enables FXSR.
+        unsafe {
+            core::arch::asm!("fxsave64 [{}]", in(reg) self.bytes.as_mut_ptr(), options(nostack, preserves_flags));
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> [u8; 512] {
+        self.bytes
+    }
+
+    pub(crate) fn from_user(bytes: [u8; 512]) -> Option<Self> {
+        let hardware = Self::capture();
+        let mask = u32::from_le_bytes(hardware.bytes[28..32].try_into().unwrap());
+        let mask = if mask == 0 { 0xffbf } else { mask };
+        let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        (mxcsr & !mask == 0).then_some(Self { bytes })
+    }
+
+    /// # Safety
+    /// The caller must own the current CPU's execution context. Kernel code must
+    /// not use floating-point registers across this call.
+    pub(crate) unsafe fn restore(&self) {
+        // SAFETY: private construction validates MXCSR and the buffer is aligned.
+        unsafe {
+            core::arch::asm!("fxrstor64 [{}]", in(reg) self.bytes.as_ptr(), options(nostack, preserves_flags));
+        }
+    }
+}
+
 bitflags! {
     /// Bitmap of supported x86 extensions.
     pub struct CpuFeatures: u32 {
@@ -480,7 +529,9 @@ pub fn enable_features(core_local: *const CoreLocal) -> CpuFeatures {
         // SAFETY: `enable_features` is only called during CPU bring-up before
         // concurrent execution starts on this core.
         Efer::write(
-            Efer::read() | EferFlags::SYSTEM_CALL_EXTENSIONS | EferFlags::NO_EXECUTE_ENABLE,
+            (Efer::read() & !EferFlags::FAST_FXSAVE_FXRSTOR)
+                | EferFlags::SYSTEM_CALL_EXTENSIONS
+                | EferFlags::NO_EXECUTE_ENABLE,
         );
         Star::write_raw(0, 0x28);
     }
@@ -494,7 +545,7 @@ pub fn enable_features(core_local: *const CoreLocal) -> CpuFeatures {
         // SAFETY: `enable_features` is only called during CPU bring-up before
         // concurrent execution starts on this core.
         Cr0::write(
-            (Cr0::read() & !Cr0Flags::EMULATE_COPROCESSOR)
+            (Cr0::read() & !(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED))
                 | Cr0Flags::MONITOR_COPROCESSOR
                 | Cr0Flags::WRITE_PROTECT,
         );
@@ -566,7 +617,8 @@ pub fn enable_features(core_local: *const CoreLocal) -> CpuFeatures {
     // SAFETY: `enable_features` is only called during CPU bring-up before
     // concurrent execution starts on this core.
     unsafe {
-        Cr4::write(Cr4::read() | bits);
+        // Only x87 and SSE state is supported by the context-switch image.
+        Cr4::write((Cr4::read() & !Cr4Flags::OSXSAVE) | bits);
     }
     // SAFETY: this CPU exclusively owns its core-local GDT and TSS during
     // bring-up, and the shared IDT has completed one-time initialization.

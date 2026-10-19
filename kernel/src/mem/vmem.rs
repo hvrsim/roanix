@@ -1,38 +1,14 @@
-//!
-//! # VMem Resource Allocator
-//!
-//! General-purpose resource allocator following Bonwick and Adams' vmem
-//! design. It allocates arbitrary integer resources — virtual addresses here —
-//! in constant time regardless of arena size or fragmentation.
-//!
-//! An arena describes the same segments through three views:
-//!
-//! * an address-ordered chain used for coalescing,
-//! * per-power-of-two free lists giving constant-time "instant fit", and
-//! * a hash table of allocated segments keyed by base, so freeing needs only
-//!   an address and never a scan.
-//!
-//! A sorted index additionally resolves "which segment contains this address"
-//! in logarithmic time, which fixed-placement requests need.
-//!
-//! Segments live in a densely packed vector and are referenced by 32-bit
-//! index, avoiding one heap allocation per segment and keeping every link
-//! four bytes wide.
-//!
+use core::{cell::Cell, ops::Bound, ptr::NonNull};
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use super::{
+    index::{Index, Node},
+    pool::{Pool, Pooled},
+};
 
-/// Sentinel index representing the absence of a segment.
-const NIL: u32 = u32::MAX;
-
-/// One free list per power of two, covering the full 64-bit resource space.
 const FREELIST_COUNT: usize = 64;
+static TAG_POOL: Pool<Node<Segment>> = Pool::new();
 
-/// Initial number of buckets in the allocated-segment hash table.
-const INITIAL_HASH_BUCKETS: usize = 64;
-
-/// Average allocated segments per bucket before the hash table grows.
-const HASH_LOAD_FACTOR: usize = 2;
+type Link = Option<NonNull<Segment>>;
 
 /// Allocation placement policy.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -48,6 +24,8 @@ pub enum VmemFit {
 pub enum VmemError {
     /// No free segment satisfies the request.
     NoSpace,
+    /// Boundary-tag storage is unavailable without waiting.
+    NoMemory,
     /// The request itself is malformed.
     Invalid,
 }
@@ -55,163 +33,111 @@ pub enum VmemError {
 /// Result type produced by arena operations.
 pub type Result<T> = core::result::Result<T, VmemError>;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SegmentKind {
-    /// Boundary marker describing an imported resource range.
-    Span,
-    /// Available resource.
-    Free,
-    /// Resource handed out to a caller.
-    Allocated,
-}
-
-#[derive(Copy, Clone)]
 struct Segment {
     base: u64,
-    size: u64,
-    kind: SegmentKind,
-    /// Address-ordered neighbours.
-    prev: u32,
-    next: u32,
-    /// Free-list or hash-chain neighbours.
-    link_prev: u32,
-    link_next: u32,
+    size: Cell<u64>,
+    span: u64,
+    free: Cell<bool>,
+    previous: Cell<Link>,
+    next: Cell<Link>,
 }
 
 impl Segment {
-    const EMPTY: Self = Self {
-        base: 0,
-        size: 0,
-        kind: SegmentKind::Span,
-        prev: NIL,
-        next: NIL,
-        link_prev: NIL,
-        link_next: NIL,
-    };
+    fn new(base: u64, size: u64, span: u64, free: bool) -> Self {
+        Self {
+            base,
+            size: Cell::new(size),
+            span,
+            free: Cell::new(free),
+            previous: Cell::new(None),
+            next: Cell::new(None),
+        }
+    }
 
     fn end(&self) -> u64 {
-        self.base.saturating_add(self.size)
+        self.base + self.size.get()
     }
 }
 
-/// Constant-time allocator for a contiguous integer resource.
+/// Metadata reserved before publishing a fixed-placement map edit.
+pub(super) struct Reservation {
+    base: u64,
+    size: u64,
+    start: Option<Pooled<Node<Segment>>>,
+    end: Option<Pooled<Node<Segment>>>,
+}
+
+/// Address-ordered boundary tags with segregated free lists. All metadata
+/// comes from a nonblocking pool; returning space never allocates.
 pub struct Vmem {
-    segments: Vec<Segment>,
-    recycled: Vec<u32>,
-    /// Head and tail of the address-ordered chain.
-    head: u32,
-    tail: u32,
-    freelists: [u32; FREELIST_COUNT],
-    /// Bitmap of non-empty free lists, reducing instant fit to a bit scan.
+    segments: Index<Segment>,
+    freelists: [Link; FREELIST_COUNT],
     freelist_map: u64,
-    /// Base-ordered index over every non-span segment.
-    by_base: BTreeMap<u64, u32>,
-    hash: Vec<u32>,
-    allocated_count: usize,
-    /// Smallest allocation unit; every base and size is a multiple of it.
     quantum: u64,
     total: u64,
     used: u64,
 }
 
+// SAFETY: the arena owns every linked tag. Moving it keeps pool addresses
+// stable; all tag/link mutation requires exclusive access to the arena.
+unsafe impl Send for Vmem {}
+// SAFETY: shared operations only read tags. Cells are mutated exclusively by
+// methods taking &mut Vmem, and no tag reference escapes this module.
+unsafe impl Sync for Vmem {}
+
+pub(super) fn drain_pool() {
+    TAG_POOL.drain();
+}
+
 impl Vmem {
-    /// Creates an empty arena whose allocations are multiples of `quantum`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `quantum` is not a power of two.
     pub fn new(quantum: u64) -> Self {
-        assert!(
-            quantum.is_power_of_two(),
-            "mem/vmem: quantum must be a power of two"
-        );
+        assert!(quantum.is_power_of_two(), "mem/vmem: invalid quantum");
         Self {
-            segments: Vec::new(),
-            recycled: Vec::new(),
-            head: NIL,
-            tail: NIL,
-            freelists: [NIL; FREELIST_COUNT],
+            segments: Index::new(&TAG_POOL),
+            freelists: [None; FREELIST_COUNT],
             freelist_map: 0,
-            by_base: BTreeMap::new(),
-            hash: Vec::new(),
-            allocated_count: 0,
             quantum,
             total: 0,
             used: 0,
         }
     }
 
-    /// Returns the total resource added to the arena.
     pub fn total(&self) -> u64 {
         self.total
     }
-
-    /// Returns the resource currently allocated.
     pub fn used(&self) -> u64 {
         self.used
     }
-
-    /// Returns the resource currently available.
     pub fn available(&self) -> u64 {
-        self.total - self.used
+        self.total() - self.used()
     }
 
-    /// Adds `[base, base + size)` to the arena.
-    ///
-    /// Spans must not overlap resource already present in the arena.
     pub fn add_span(&mut self, base: u64, size: u64) -> Result<()> {
-        let Some(end) = base.checked_add(size) else {
-            return Err(VmemError::Invalid);
-        };
-        let Some(total) = self.total.checked_add(size) else {
-            return Err(VmemError::Invalid);
-        };
-        if size == 0 || !base.is_multiple_of(self.quantum) || !size.is_multiple_of(self.quantum) {
+        let end = base.checked_add(size).ok_or(VmemError::Invalid)?;
+        let total = self.total.checked_add(size).ok_or(VmemError::Invalid)?;
+        if size == 0
+            || !base.is_multiple_of(self.quantum)
+            || !size.is_multiple_of(self.quantum)
+            || self
+                .segments
+                .range(..end)
+                .next_back()
+                .is_some_and(|(_, tag)| tag.end() > base)
+        {
             return Err(VmemError::Invalid);
         }
-
-        // Span markers also keep adjacent imports from coalescing. Locate the
-        // insertion point in address order and reject any intersecting span.
-        let mut before = NIL;
-        let mut index = self.head;
-        while index != NIL {
-            let segment = self.segments[index as usize];
-            if segment.kind == SegmentKind::Span {
-                if base < segment.end() && segment.base < end {
-                    return Err(VmemError::Invalid);
-                }
-                if base < segment.base {
-                    before = index;
-                    break;
-                }
-            }
-            index = segment.next;
-        }
-
-        let span = self.new_segment(base, size, SegmentKind::Span);
-        if before == NIL {
-            self.link_after(self.tail, span);
-        } else {
-            self.link_before(before, span);
-        }
-        let free = self.new_segment(base, size, SegmentKind::Free);
-        self.link_after(span, free);
-        self.push_free(free);
-        self.by_base.insert(base, free);
+        let tag = self.reserve_tag(base)?;
+        self.segments
+            .insert(base, Segment::new(base, size, base, true), Some(tag));
+        self.push_free(base);
         self.total = total;
         Ok(())
     }
 
-    /// Allocates `size` resource honouring `align`.
     pub fn alloc(&mut self, size: u64, align: u64, fit: VmemFit) -> Result<u64> {
         self.xalloc(size, align, 0, u64::MAX, fit)
     }
 
-    /// Allocates `size` resource within `[min, max)` honouring `align`.
-    ///
-    /// Unconstrained instant-fit requests inspect a single free list and are
-    /// therefore constant time. Bounded, over-aligned, or best-fit requests
-    /// walk the free lists that can hold a suitable segment.
     pub fn xalloc(
         &mut self,
         size: u64,
@@ -225,119 +151,201 @@ impl Vmem {
             return Err(VmemError::Invalid);
         }
         let align = align.max(self.quantum);
-
-        let unconstrained = min == 0 && max == u64::MAX && align == self.quantum;
-        let found = if unconstrained && fit == VmemFit::Instant {
-            self.instant_fit(size)
-        } else {
-            self.scan_fit(size, align, min, max, fit == VmemFit::Best)
-        };
-
+        let found =
+            if min == 0 && max == u64::MAX && align == self.quantum && fit == VmemFit::Instant {
+                self.instant_fit(size)
+            } else {
+                self.scan_fit(size, align, min, max, fit == VmemFit::Best)
+            };
         let (segment, base) = found.ok_or(VmemError::NoSpace)?;
-        self.take(segment, base, size);
+        let reservation = self.prepare_take(segment, base, size)?;
+        self.take(segment, reservation);
         Ok(base)
     }
 
-    /// Allocates `size` resource at a randomized base honouring `align`.
-    ///
-    /// The offset is drawn from the slack of the selected free segment, which
-    /// spreads placements across the arena while remaining constant time.
     pub fn alloc_random(&mut self, size: u64, align: u64, entropy: u64) -> Result<u64> {
         let size = self.round_size(size)?;
         if align == 0 || !align.is_power_of_two() {
             return Err(VmemError::Invalid);
         }
         let align = align.max(self.quantum);
-        let (segment, segment_base) = self.instant_fit(size).ok_or(VmemError::NoSpace)?;
-
-        let start = segment_base
-            .checked_add(align - 1)
-            .ok_or(VmemError::NoSpace)?
-            & !(align - 1);
-        let end = self.segments[segment as usize].end();
-        let slack = end
-            .saturating_sub(start)
-            .checked_sub(size)
-            .ok_or(VmemError::NoSpace)?;
+        let (segment, start) = if align == self.quantum {
+            self.instant_fit(size)
+        } else {
+            self.scan_fit(size, align, 0, u64::MAX, false)
+        }
+        .ok_or(VmemError::NoSpace)?;
+        let slack = self.tag(segment).end() - start - size;
         let base = start + (entropy % (slack / align + 1)) * align;
-
-        self.take(segment, base, size);
+        let reservation = self.prepare_take(segment, base, size)?;
+        self.take(segment, reservation);
         Ok(base)
     }
 
-    /// Allocates exactly `[base, base + size)`.
     pub fn alloc_fixed(&mut self, base: u64, size: u64) -> Result<()> {
-        let size = self.round_size(size)?;
-        if !base.is_multiple_of(self.quantum) {
-            return Err(VmemError::Invalid);
-        }
-        let end = base.checked_add(size).ok_or(VmemError::Invalid)?;
+        let size = self.fixed_size(base, size)?;
         let segment = self
             .free_segment_containing(base)
-            .filter(|index| self.segments[*index as usize].end() >= end)
+            .filter(|&key| self.tag(key).end() >= base + size)
             .ok_or(VmemError::NoSpace)?;
-        self.take(segment, base, size);
+        let reservation = self.prepare_take(segment, base, size)?;
+        self.take(segment, reservation);
         Ok(())
     }
 
-    /// Returns whether `[base, base + size)` is entirely free.
-    pub fn is_free(&self, base: u64, size: u64) -> bool {
-        let Some(end) = base.checked_add(size) else {
-            return false;
-        };
-        self.free_segment_containing(base)
-            .is_some_and(|index| self.segments[index as usize].end() >= end)
+    pub(super) fn reserve_fixed(&self, base: u64, size: u64) -> Result<Reservation> {
+        let size = self.fixed_size(base, size)?;
+        Ok(Reservation {
+            base,
+            size,
+            start: Some(self.reserve_tag(base)?),
+            end: Some(self.reserve_tag(base + size)?),
+        })
     }
 
-    /// Releases a previously allocated `base` and returns its size.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `base` was not returned by this arena.
+    pub(super) fn alloc_reserved(&mut self, reservation: Reservation) {
+        let segment = self
+            .free_segment_containing(reservation.base)
+            .filter(|&key| self.tag(key).end() >= reservation.base + reservation.size)
+            .expect("mem/vmem: reserved range is not free");
+        self.take(segment, reservation);
+    }
+
+    pub fn is_free(&self, base: u64, size: u64) -> bool {
+        base.checked_add(size).is_some_and(|end| {
+            self.free_segment_containing(base)
+                .is_some_and(|key| self.tag(key).end() >= end)
+        })
+    }
+
     pub fn free(&mut self, base: u64) -> u64 {
-        let index = self
-            .hash_remove(base)
-            .expect("mem/vmem: freeing an address this arena never allocated");
-        let size = self.segments[index as usize].size;
+        let tag = self.tag(base);
+        assert!(!tag.free.get(), "mem/vmem: double free");
+        let size = tag.size.get();
+        let span = tag.span;
+        let next = self
+            .segments
+            .range((Bound::Excluded(base), Bound::Unbounded))
+            .next()
+            .filter(|(_, next)| next.free.get() && next.span == span && next.base == tag.end())
+            .map(|(&key, _)| key);
+        if let Some(next) = next {
+            self.pop_free(next);
+            self.tag(base)
+                .size
+                .set(self.tag(base).size.get() + self.tag(next).size.get());
+            self.segments.remove(&next);
+        }
+        let previous = self
+            .segments
+            .range(..base)
+            .next_back()
+            .filter(|(_, prev)| prev.free.get() && prev.span == span && prev.end() == base)
+            .map(|(&key, _)| key);
+        let free = if let Some(previous) = previous {
+            self.pop_free(previous);
+            self.tag(previous)
+                .size
+                .set(self.tag(previous).size.get() + self.tag(base).size.get());
+            self.segments.remove(&base);
+            previous
+        } else {
+            self.tag(base).free.set(true);
+            base
+        };
+        self.push_free(free);
         self.used -= size;
-        self.allocated_count -= 1;
-        self.segments[index as usize].kind = SegmentKind::Free;
-        self.coalesce(index);
         size
     }
 
-    /// Constant-time selection of a segment guaranteed to fit `size`.
-    fn instant_fit(&self, size: u64) -> Option<(u32, u64)> {
-        // Free list `n` holds segments sized `[2^n, 2^(n+1))`, so every member
-        // of the list whose lower bound reaches `size` is large enough.
-        let guaranteed = guaranteed_freelist(size);
-        let mask = if guaranteed >= FREELIST_COUNT {
-            0
-        } else {
-            !0u64 << guaranteed
-        };
-        let candidates = self.freelist_map & mask;
-        if candidates != 0 {
-            let index = self.freelists[candidates.trailing_zeros() as usize];
-            return Some((index, self.segments[index as usize].base));
-        }
+    fn tag(&self, base: u64) -> &Segment {
+        self.segments
+            .get(&base)
+            .expect("mem/vmem: missing boundary tag")
+    }
 
-        // Only the list straddling `size` can still hold a fitting segment.
-        let straddling = freelist_index(size);
-        if straddling == guaranteed || self.freelist_map & (1u64 << straddling) == 0 {
-            return None;
+    fn reserve_tag(&self, base: u64) -> Result<Pooled<Node<Segment>>> {
+        self.segments
+            .reserve_new(base)
+            .map_err(|_| VmemError::NoMemory)
+    }
+
+    fn prepare_take(&self, segment: u64, base: u64, size: u64) -> Result<Reservation> {
+        let tag = self.tag(segment);
+        Ok(Reservation {
+            base,
+            size,
+            start: (base != segment)
+                .then(|| self.reserve_tag(base))
+                .transpose()?,
+            end: (base + size != tag.end())
+                .then(|| self.reserve_tag(base + size))
+                .transpose()?,
+        })
+    }
+
+    fn take(&mut self, segment: u64, reservation: Reservation) {
+        let Reservation {
+            base,
+            size,
+            start,
+            end: trailing,
+        } = reservation;
+        let original = self.tag(segment);
+        let end = original.end();
+        let span = original.span;
+        self.pop_free(segment);
+        if segment < base {
+            self.tag(segment).size.set(base - segment);
+            self.push_free(segment);
+            self.segments
+                .insert(base, Segment::new(base, size, span, false), start);
+        } else {
+            self.tag(segment).size.set(size);
+            self.tag(segment).free.set(false);
         }
-        let mut index = self.freelists[straddling];
-        while index != NIL {
-            if self.segments[index as usize].size >= size {
-                return Some((index, self.segments[index as usize].base));
+        if base + size < end {
+            self.segments.insert(
+                base + size,
+                Segment::new(base + size, end - base - size, span, true),
+                trailing,
+            );
+            self.push_free(base + size);
+        }
+        self.used += size;
+    }
+
+    fn free_segment_containing(&self, address: u64) -> Option<u64> {
+        self.segments
+            .range(..=address)
+            .next_back()
+            .filter(|(_, tag)| tag.free.get() && address < tag.end())
+            .map(|(&base, _)| base)
+    }
+
+    fn instant_fit(&self, size: u64) -> Option<(u64, u64)> {
+        let guaranteed = guaranteed_freelist(size);
+        let candidates = if guaranteed < FREELIST_COUNT {
+            self.freelist_map & (!0 << guaranteed)
+        } else {
+            0
+        };
+        if candidates != 0 {
+            let tag = self.link(self.freelists[candidates.trailing_zeros() as usize].unwrap());
+            return Some((tag.base, tag.base));
+        }
+        let straddling = freelist_index(size);
+        let mut next = self.freelists[straddling];
+        while let Some(pointer) = next {
+            let tag = self.link(pointer);
+            if tag.size.get() >= size {
+                return Some((tag.base, tag.base));
             }
-            index = self.segments[index as usize].link_next;
+            next = tag.next.get();
         }
         None
     }
 
-    /// Free-list walk honouring alignment and bounds.
     fn scan_fit(
         &self,
         size: u64,
@@ -345,261 +353,73 @@ impl Vmem {
         min: u64,
         max: u64,
         best: bool,
-    ) -> Option<(u32, u64)> {
-        let mut chosen: Option<(u32, u64, u64)> = None;
+    ) -> Option<(u64, u64)> {
         for list in freelist_index(size)..FREELIST_COUNT {
-            if self.freelist_map & (1u64 << list) == 0 {
-                continue;
-            }
-            let mut index = self.freelists[list];
-            while index != NIL {
-                let segment = &self.segments[index as usize];
-                if let Some(base) = placement(segment, size, align, min, max) {
+            let mut chosen: Option<(u64, u64, u64)> = None;
+            let mut next = self.freelists[list];
+            while let Some(pointer) = next {
+                let tag = self.link(pointer);
+                if let Some(base) = placement(tag, size, align, min, max) {
                     if !best {
-                        return Some((index, base));
+                        return Some((tag.base, base));
                     }
-                    if chosen.is_none_or(|(_, _, chosen_size)| segment.size < chosen_size) {
-                        chosen = Some((index, base, segment.size));
+                    if chosen.is_none_or(|(_, _, chosen_size)| tag.size.get() < chosen_size) {
+                        chosen = Some((tag.base, base, tag.size.get()));
                     }
                 }
-                index = segment.link_next;
+                next = tag.next.get();
             }
-            // Every segment in a higher list is strictly larger, so the first
-            // list yielding a candidate already holds the best fit.
-            if let Some((index, base, _)) = chosen {
-                return Some((index, base));
+            if let Some((segment, base, _)) = chosen {
+                return Some((segment, base));
             }
         }
         None
     }
 
-    /// Converts free segment `index` into an allocation of `size` at `base`,
-    /// returning any leading and trailing remainder to the arena.
-    fn take(&mut self, index: u32, base: u64, size: u64) {
-        self.pop_free(index);
-        let original = self.segments[index as usize];
-        debug_assert!(base >= original.base && base + size <= original.end());
-
-        if base > original.base {
-            let leading = self.new_segment(original.base, base - original.base, SegmentKind::Free);
-            self.link_before(index, leading);
-            self.push_free(leading);
-            self.by_base.insert(original.base, leading);
-            self.segments[index as usize].base = base;
-            self.segments[index as usize].size = original.end() - base;
-            self.by_base.insert(base, index);
-        }
-
-        let remainder = self.segments[index as usize].size - size;
-        if remainder > 0 {
-            let trailing = self.new_segment(base + size, remainder, SegmentKind::Free);
-            self.link_after(index, trailing);
-            self.push_free(trailing);
-            self.by_base.insert(base + size, trailing);
-            self.segments[index as usize].size = size;
-        }
-
-        self.segments[index as usize].kind = SegmentKind::Allocated;
-        self.hash_insert(index);
-        self.used += size;
-        self.allocated_count += 1;
+    fn link(&self, pointer: NonNull<Segment>) -> &Segment {
+        // SAFETY: free links only name stable, initialized index payloads.
+        // A tag is unlinked before removal, and links cannot escape the arena.
+        unsafe { pointer.as_ref() }
     }
 
-    /// Merges free segment `index` with any free neighbours.
-    fn coalesce(&mut self, index: u32) {
-        let next = self.segments[index as usize].next;
-        if next != NIL && self.segments[next as usize].kind == SegmentKind::Free {
-            self.pop_free(next);
-            self.by_base.remove(&self.segments[next as usize].base);
-            self.segments[index as usize].size += self.segments[next as usize].size;
-            self.unlink(next);
-        }
-
-        let prev = self.segments[index as usize].prev;
-        if prev != NIL && self.segments[prev as usize].kind == SegmentKind::Free {
-            self.pop_free(prev);
-            self.segments[prev as usize].size += self.segments[index as usize].size;
-            self.by_base.remove(&self.segments[index as usize].base);
-            self.unlink(index);
-            self.push_free(prev);
-            return;
-        }
-
-        self.push_free(index);
-    }
-
-    fn new_segment(&mut self, base: u64, size: u64, kind: SegmentKind) -> u32 {
-        let segment = Segment {
-            base,
-            size,
-            kind,
-            ..Segment::EMPTY
-        };
-        if let Some(index) = self.recycled.pop() {
-            self.segments[index as usize] = segment;
-            return index;
-        }
-        let index = u32::try_from(self.segments.len()).expect("mem/vmem: segment table overflow");
-        assert!(index != NIL, "mem/vmem: segment table overflow");
-        self.segments.push(segment);
-        index
-    }
-
-    fn free_segment_containing(&self, address: u64) -> Option<u32> {
-        let (_, index) = self.by_base.range(..=address).next_back()?;
-        let segment = &self.segments[*index as usize];
-        (segment.kind == SegmentKind::Free && address < segment.end()).then_some(*index)
-    }
-
-    fn link_after(&mut self, after: u32, index: u32) {
-        if after == NIL {
-            let old_head = self.head;
-            self.segments[index as usize].prev = NIL;
-            self.segments[index as usize].next = old_head;
-            if old_head != NIL {
-                self.segments[old_head as usize].prev = index;
-            } else {
-                self.tail = index;
-            }
-            self.head = index;
-            return;
-        }
-
-        let next = self.segments[after as usize].next;
-        self.segments[index as usize].prev = after;
-        self.segments[index as usize].next = next;
-        self.segments[after as usize].next = index;
-        if next != NIL {
-            self.segments[next as usize].prev = index;
-        } else {
-            self.tail = index;
-        }
-    }
-
-    fn link_before(&mut self, before: u32, index: u32) {
-        let prev = self.segments[before as usize].prev;
-        self.link_after(prev, index);
-    }
-
-    fn unlink(&mut self, index: u32) {
-        let Segment { prev, next, .. } = self.segments[index as usize];
-        if prev != NIL {
-            self.segments[prev as usize].next = next;
-        } else {
-            self.head = next;
-        }
-        if next != NIL {
-            self.segments[next as usize].prev = prev;
-        } else {
-            self.tail = prev;
-        }
-        self.segments[index as usize] = Segment::EMPTY;
-        self.recycled.push(index);
-    }
-
-    fn push_free(&mut self, index: u32) {
-        let list = freelist_index(self.segments[index as usize].size);
+    fn push_free(&mut self, base: u64) {
+        let tag = self.tag(base);
+        let list = freelist_index(tag.size.get());
         let head = self.freelists[list];
-        self.segments[index as usize].link_prev = NIL;
-        self.segments[index as usize].link_next = head;
-        if head != NIL {
-            self.segments[head as usize].link_prev = index;
+        let pointer = NonNull::from(tag);
+        tag.previous.set(None);
+        tag.next.set(head);
+        if let Some(head) = head {
+            self.link(head).previous.set(Some(pointer));
         }
-        self.freelists[list] = index;
-        self.freelist_map |= 1u64 << list;
+        self.freelists[list] = Some(pointer);
+        self.freelist_map |= 1 << list;
     }
 
-    fn pop_free(&mut self, index: u32) {
-        let Segment {
-            link_prev,
-            link_next,
-            size,
-            ..
-        } = self.segments[index as usize];
-        let list = freelist_index(size);
-        if link_prev != NIL {
-            self.segments[link_prev as usize].link_next = link_next;
+    fn pop_free(&mut self, base: u64) {
+        let tag = self.tag(base);
+        let list = freelist_index(tag.size.get());
+        let previous = tag.previous.replace(None);
+        let next = tag.next.replace(None);
+        if let Some(previous) = previous {
+            self.link(previous).next.set(next);
         } else {
-            self.freelists[list] = link_next;
-            if link_next == NIL {
-                self.freelist_map &= !(1u64 << list);
+            self.freelists[list] = next;
+            if next.is_none() {
+                self.freelist_map &= !(1 << list);
             }
         }
-        if link_next != NIL {
-            self.segments[link_next as usize].link_prev = link_prev;
+        if let Some(next) = next {
+            self.link(next).previous.set(previous);
         }
-        self.segments[index as usize].link_prev = NIL;
-        self.segments[index as usize].link_next = NIL;
     }
 
-    fn hash_insert(&mut self, index: u32) {
-        if self.hash.is_empty() {
-            self.hash = alloc::vec![NIL; INITIAL_HASH_BUCKETS];
-        } else if self.allocated_count >= self.hash.len() * HASH_LOAD_FACTOR {
-            self.rehash();
+    fn fixed_size(&self, base: u64, size: u64) -> Result<u64> {
+        let size = self.round_size(size)?;
+        if !base.is_multiple_of(self.quantum) || base.checked_add(size).is_none() {
+            return Err(VmemError::Invalid);
         }
-
-        let bucket = self.bucket_of(self.segments[index as usize].base);
-        let head = self.hash[bucket];
-        self.segments[index as usize].link_prev = NIL;
-        self.segments[index as usize].link_next = head;
-        if head != NIL {
-            self.segments[head as usize].link_prev = index;
-        }
-        self.hash[bucket] = index;
-    }
-
-    fn hash_remove(&mut self, base: u64) -> Option<u32> {
-        if self.hash.is_empty() {
-            return None;
-        }
-        let bucket = self.bucket_of(base);
-        let mut index = self.hash[bucket];
-        while index != NIL {
-            let segment = self.segments[index as usize];
-            if segment.base != base {
-                index = segment.link_next;
-                continue;
-            }
-            if segment.link_prev != NIL {
-                self.segments[segment.link_prev as usize].link_next = segment.link_next;
-            } else {
-                self.hash[bucket] = segment.link_next;
-            }
-            if segment.link_next != NIL {
-                self.segments[segment.link_next as usize].link_prev = segment.link_prev;
-            }
-            self.segments[index as usize].link_prev = NIL;
-            self.segments[index as usize].link_next = NIL;
-            return Some(index);
-        }
-        None
-    }
-
-    fn rehash(&mut self) {
-        let buckets = self.hash.len() * 2;
-        let mut fresh = alloc::vec![NIL; buckets];
-        for bucket in 0..self.hash.len() {
-            let mut index = self.hash[bucket];
-            while index != NIL {
-                let next = self.segments[index as usize].link_next;
-                let target =
-                    bucket_index(self.segments[index as usize].base, self.quantum, buckets);
-                let head = fresh[target];
-                self.segments[index as usize].link_prev = NIL;
-                self.segments[index as usize].link_next = head;
-                if head != NIL {
-                    self.segments[head as usize].link_prev = index;
-                }
-                fresh[target] = index;
-                index = next;
-            }
-        }
-        self.hash = fresh;
-    }
-
-    fn bucket_of(&self, base: u64) -> usize {
-        bucket_index(base, self.quantum, self.hash.len())
+        Ok(size)
     }
 
     fn round_size(&self, size: u64) -> Result<u64> {
@@ -607,42 +427,20 @@ impl Vmem {
             return Err(VmemError::Invalid);
         }
         size.checked_add(self.quantum - 1)
-            .map(|value| value & !(self.quantum - 1))
+            .map(|n| n & !(self.quantum - 1))
             .ok_or(VmemError::Invalid)
     }
 }
 
-/// Returns the lowest base within `segment` satisfying every constraint.
 fn placement(segment: &Segment, size: u64, align: u64, min: u64, max: u64) -> Option<u64> {
-    if segment.kind != SegmentKind::Free {
-        return None;
-    }
-    let start = segment.base.max(min);
-    let base = start.checked_add(align - 1)? & !(align - 1);
+    let base = segment.base.max(min).checked_add(align - 1)? & !(align - 1);
     let end = base.checked_add(size)?;
     (end <= segment.end() && end <= max).then_some(base)
 }
 
-/// Returns the free list holding segments of `size`.
-#[inline]
 fn freelist_index(size: u64) -> usize {
     (63 - size.max(1).leading_zeros()) as usize
 }
-
-/// Returns the lowest free list whose every member satisfies `size`.
-#[inline]
 fn guaranteed_freelist(size: u64) -> usize {
-    let floor = freelist_index(size);
-    if size.is_power_of_two() {
-        floor
-    } else {
-        floor + 1
-    }
-}
-
-#[inline]
-fn bucket_index(base: u64, quantum: u64, buckets: usize) -> usize {
-    // Bases are quantum-aligned, so the low bits carry no information.
-    let mixed = (base / quantum).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 24;
-    (mixed & (buckets as u64 - 1)) as usize
+    freelist_index(size) + usize::from(!size.is_power_of_two())
 }

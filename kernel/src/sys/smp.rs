@@ -93,9 +93,11 @@ pub struct CoreLocal {
 
     /// Currently running thread ID on this CPU, if any.
     pub current_thread: usize,
+    pub(crate) current_thread_pointer: AtomicUsize,
 
     /// Page-table root currently active on this CPU.
     pub(crate) active_address_root: AtomicU64,
+    pub(crate) previous_address_root: AtomicU64,
 
     /// Nesting depth for trap/interrupt handling on this CPU.
     pub interrupt_depth: usize,
@@ -104,6 +106,9 @@ pub struct CoreLocal {
     ///
     /// Used to catch code that tries to sleep while holding a spinlock.
     pub(crate) spinlock_depth: AtomicUsize,
+
+    pub(crate) preempt_depth: AtomicUsize,
+    pub(crate) preempt_pending: AtomicBool,
 
     /// Timer state owned by this CPU.
     pub(crate) clock: Once<PerCpuClock>,
@@ -154,9 +159,13 @@ impl CoreLocal {
             kernel_stack: 0,
             user_stack: 0,
             current_thread: 0,
+            current_thread_pointer: AtomicUsize::new(0),
             active_address_root: AtomicU64::new(0),
+            previous_address_root: AtomicU64::new(0),
             interrupt_depth: 0,
             spinlock_depth: AtomicUsize::new(0),
+            preempt_depth: AtomicUsize::new(0),
+            preempt_pending: AtomicBool::new(false),
             clock: Once::new(),
             scheduler: Once::new(),
             sched_summary: CpuSummary::new(),
@@ -726,6 +735,40 @@ fn leave_spinlock() {
     }
 }
 
+/// Pins execution to the current CPU while leaving interrupts deliverable.
+#[must_use]
+pub(crate) struct PreemptGuard {
+    _nosend: PhantomData<*mut ()>,
+}
+
+pub(crate) fn disable_preemption() -> PreemptGuard {
+    let restore_irqs = arch::irqstate();
+    arch::irqset(false);
+    arch::thiscpu()
+        .preempt_depth
+        .fetch_add(1, Ordering::Relaxed);
+    arch::irqset(restore_irqs);
+    PreemptGuard {
+        _nosend: PhantomData,
+    }
+}
+
+impl Drop for PreemptGuard {
+    fn drop(&mut self) {
+        let restore_irqs = arch::irqstate();
+        arch::irqset(false);
+        let cpu = arch::thiscpu();
+        let previous = cpu.preempt_depth.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous != 0, "smp: preemption depth underflow");
+        let reschedule =
+            previous == 1 && restore_irqs && cpu.preempt_pending.swap(false, Ordering::Relaxed);
+        arch::irqset(restore_irqs);
+        if reschedule {
+            arch::reschedule();
+        }
+    }
+}
+
 /// Returns the number of IRQ spinlocks held by the current CPU.
 ///
 /// Sleeping while holding one deadlocks, so blocking primitives assert on this
@@ -743,6 +786,10 @@ pub(crate) fn spinlock_depth() -> usize {
 /// held and the CPU must not be inside a trap handler.
 #[inline]
 pub(crate) fn assert_blockable(context: &str) {
+    debug_assert!(
+        arch::thiscpu_opt().is_none_or(|cpu| cpu.preempt_depth.load(Ordering::Relaxed) == 0),
+        "{context}: blocked with preemption disabled"
+    );
     debug_assert!(
         spinlock_depth() == 0,
         "{context}: blocked while holding {} IRQ spinlock(s)",
@@ -765,6 +812,7 @@ pub(crate) fn assert_blockable(context: &str) {
 ///
 /// Returns the number of CPUs that accepted a new queued callback.
 pub fn send_ipi(callback: fn(), target: IpiTarget) -> usize {
+    let _preempt = arch::thiscpu_opt().map(|_| disable_preemption());
     let this_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
     let slot = IPI_REGISTRY.slot_for(callback);
     let mut queued = 0usize;

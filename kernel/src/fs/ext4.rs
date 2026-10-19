@@ -409,9 +409,10 @@ impl Ext4 {
         length: usize,
     ) -> Result<()> {
         let mut copied = 0usize;
+        let mut buffer = [0u8; 1024];
         while copied < length {
             let mut window = sink
-                .window(sink_offset + copied, length - copied)
+                .window(sink_offset + copied, (length - copied).min(buffer.len()))
                 .map_err(ext4_memory_error)?;
             if window.is_empty() {
                 return Err(Error::InvalidArgument);
@@ -420,8 +421,9 @@ impl Ext4 {
             read_exact(
                 self.device(),
                 disk_offset.checked_add(copied as u64).ok_or(Error::Io)?,
-                &mut window,
+                &mut buffer[..count],
             )?;
+            window.copy_from_slice(&buffer[..count]);
             copied += count;
         }
         Ok(())

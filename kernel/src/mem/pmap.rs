@@ -1,28 +1,172 @@
+/*
+ * Copyright (c) 2008, 2010, 2016, 2017, 2019, 2020 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Andrew Doran, and by Maxime Villard.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * Copyright (c) 2007 Manuel Bouyer.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * Copyright (c) 2006 Mathieu Ropert <mro@adviseo.fr>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * Copyright 2001 (c) Wasabi Systems, Inc.
+ * All rights reserved.
+ *
+ * Written by Frank van der Linden for Wasabi Systems, Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *      This product includes software developed for the NetBSD Project by
+ *      Wasabi Systems, Inc.
+ * 4. The name of Wasabi Systems, Inc. may not be used to endorse
+ *    or promote products derived from this software without specific prior
+ *    written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY WASABI SYSTEMS, INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL WASABI SYSTEMS, INC
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * Copyright (c) 1997 Charles D. Cranor and Washington University.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! Machine-independent pmap ownership and address-space integration.
 //!
 //! # Lock order
 //!
 //! Address-space operations acquire `VmSpace::map` (shared for faults), then
-//! the fault's map entry, then `PmapInner::mappings`, then a page's reverse list.
-//! Structural changes take the map exclusively. Reclaim detaches the reverse list before
-//! trying a pmap lock, so it never inverts that order or sleeps behind a fault.
+//! the anonymous index, the object index, `PmapInner::mappings`, and the page's
+//! reverse list. Faults release the map before allocation or I/O and revalidate
+//! before entering a pinned page. Structural changes take the map exclusively.
+//! P->V operations use UVM's direct PV->pmap try-lock handoff; contention
+//! drops PV before waiting and restarting, preserving the V->P lock order.
 
-use alloc::{collections::BTreeMap, sync::Arc};
-use core::ptr;
+use crate::mem::PageRef;
+use alloc::sync::Arc;
+use core::{
+    ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     arch,
     mem::{PAGE_SIZE, PhysAddr, VirtAddr, VmFlags},
-    sys::sync::{Mutex, RwLock},
 };
 
 use super::{
     Error, FaultAccess, ObjectKind, Result, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmMap,
-    VmMapping, VmObject, VmPage, VmPlacement, VmProtection, tlb::Shootdown,
+    VmMapping, VmObject, VmPlacement, VmProtection,
+    index::{Index, Node},
+    page::PagePin,
+    pool::{Pool, Pooled},
+    tlb::Shootdown,
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::sys::sync::{Mutex as MappingLock, MutexGuard as MappingGuard};
+#[cfg(target_arch = "riscv64")]
+use crate::sys::sync::{RwLock as MappingLock, WriteGuard as MappingGuard};
+static MAPPING_POOL: Pool<Node<Mapping>> = Pool::new();
+
 struct Mapping {
-    page: Arc<VmPage>,
+    page: PageRef,
     protection: VmProtection,
 }
 
@@ -30,6 +174,93 @@ struct Mapping {
 pub(super) struct ReverseMapping {
     pub(super) pmap: alloc::sync::Weak<PmapInner>,
     pub(super) address: u64,
+    next: Option<Pooled<Self>>,
+}
+
+static REVERSE_POOL: Pool<ReverseMapping> = Pool::new();
+
+pub(super) fn drain_pools() {
+    REVERSE_POOL.drain();
+    MAPPING_POOL.drain();
+}
+
+#[derive(Default)]
+pub(super) struct ReverseMappings {
+    head: Option<Pooled<ReverseMapping>>,
+}
+
+impl ReverseMappings {
+    pub(super) fn allocate(pmap: &Arc<PmapInner>, address: u64) -> Result<Pooled<ReverseMapping>> {
+        REVERSE_POOL
+            .try_alloc(ReverseMapping {
+                pmap: Arc::downgrade(pmap),
+                address,
+                next: None,
+            })
+            .map_err(|_| Error::OutOfMemory)
+    }
+
+    pub(super) fn push(&mut self, mut mapping: Pooled<ReverseMapping>) {
+        mapping.next = self.head.take();
+        self.head = Some(mapping);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    pub(super) fn remove(
+        &mut self,
+        pmap: *const PmapInner,
+        address: u64,
+    ) -> Option<Pooled<ReverseMapping>> {
+        let mut link = &mut self.head;
+        while let Some(mapping) = link.as_ref() {
+            if mapping.pmap.as_ptr() == pmap && mapping.address == address {
+                let mut removed = link.take().unwrap();
+                *link = removed.next.take();
+                return Some(removed);
+            }
+            link = &mut link.as_mut().unwrap().next;
+        }
+        None
+    }
+
+    fn after(
+        &self,
+        cursor: Option<&(alloc::sync::Weak<PmapInner>, u64)>,
+    ) -> Option<&ReverseMapping> {
+        if let Some((pmap, address)) = cursor {
+            let mut current = self.head.as_deref();
+            while let Some(mapping) = current {
+                if mapping.address == *address && alloc::sync::Weak::ptr_eq(&mapping.pmap, pmap) {
+                    return mapping.next.as_deref();
+                }
+                current = mapping.next.as_deref();
+            }
+            // A V->P operation removed the cursor. Restart the remaining PV
+            // list, as pmap_test_attrs does when the handoff races removal.
+        }
+        self.head.as_deref()
+    }
+}
+
+impl Drop for ReverseMappings {
+    fn drop(&mut self) {
+        while let Some(mut mapping) = self.head.take() {
+            self.head = mapping.next.take();
+        }
+    }
+}
+
+impl Iterator for ReverseMappings {
+    type Item = Pooled<ReverseMapping>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut mapping = self.head.take()?;
+        self.head = mapping.next.take();
+        Some(mapping)
+    }
 }
 
 /// Hardware page map owned by one virtual address space.
@@ -39,7 +270,30 @@ pub struct Pmap {
 
 pub(super) struct PmapInner {
     root: PhysAddr,
-    mappings: Mutex<BTreeMap<u64, Mapping>>,
+    mappings: MappingLock<Index<Mapping>>,
+}
+
+impl PmapInner {
+    fn lock(&self) -> MappingGuard<'_, Index<Mapping>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.mappings.lock()
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.mappings.write()
+        }
+    }
+    fn try_lock(&self) -> Option<MappingGuard<'_, Index<Mapping>>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.mappings.try_lock()
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.mappings.try_write()
+        }
+    }
 }
 
 impl Pmap {
@@ -52,7 +306,7 @@ impl Pmap {
         Ok(Self {
             inner: Arc::new(PmapInner {
                 root,
-                mappings: Mutex::new(BTreeMap::new()),
+                mappings: MappingLock::new(Index::new(&MAPPING_POOL)),
             }),
         })
     }
@@ -74,46 +328,65 @@ impl Pmap {
     /// Re-entering an identical mapping is the common case when a fault races
     /// another CPU or when a syscall walks user memory, so it is detected
     /// before any page-table write and costs no invalidation.
-    pub fn enter(
+    pub(super) fn enter(
         &self,
         address: VirtAddr,
-        page: Arc<VmPage>,
+        pin: &PagePin,
         protection: VmProtection,
     ) -> Result<()> {
         let address = address.align_down();
-        {
-            let mappings = self.inner.mappings.lock();
-            if let Some(current) = mappings.get(&address.as_u64())
-                && current.protection == protection
-                && Arc::ptr_eq(&current.page, &page)
-            {
-                // RISC-V may cache invalid leaves and old permissions. If a
-                // sibling hart installed this PTE, a local fault still needs
-                // SFENCE.VMA or it can keep faulting on the stale entry.
-                #[cfg(target_arch = "riscv64")]
-                arch::paging::flush_page(address);
-                return Ok(());
-            }
+        let page = pin.page();
+        if protection.contains(VmProtection::EXECUTE) {
+            let frame = super::phys::phys_to_page(pin.address())
+                .expect("uvm: executable pin lost its frame");
+            page.note_executable(frame);
         }
-
-        let paddr = page.acquire_mapping()?;
+        let mut mappings = self.inner.lock();
+        let current = mappings.get(&address.as_u64());
+        if let Some(current) = current
+            && current.protection == protection
+            && Arc::ptr_eq(&current.page, page)
+        {
+            // RISC-V may cache invalid leaves and old permissions. If a
+            // sibling hart installed this PTE, a local fault still needs
+            // SFENCE.VMA or it can keep faulting on the stale entry.
+            #[cfg(target_arch = "riscv64")]
+            arch::paging::flush_all();
+            return Ok(());
+        }
+        let same_page = current.is_some_and(|current| Arc::ptr_eq(&current.page, page));
+        let reserved = mappings.reserve(address.as_u64())?;
+        if !same_page {
+            page.add_reverse_mapping(&self.inner, address.as_u64())?;
+        }
+        let paddr = pin.acquire_mapping();
+        if protection.contains(VmProtection::WRITE) {
+            super::phys::phys_to_page(paddr)
+                .expect("uvm: mapping lost PFN")
+                .mark_unknown();
+        }
         let flags = pmap_flags(protection);
-        let mut mappings = self.inner.mappings.lock();
 
-        let existing = mappings.contains_key(&address.as_u64());
+        let existing = reserved.is_none();
         let result = if existing {
             // SAFETY: the pmap lock serializes leaf changes and `paddr` remains
             // wired by the new mapping reference.
             unsafe { arch::paging::remap_page(self.inner.root, address, paddr, flags) }
         } else {
-            // SAFETY: the pmap lock serializes page-table construction and the
-            // page remains resident through its mapping reference.
+            // SAFETY: the pmap lock serializes leaf changes; parent tables are
+            // published atomically and the pin retains the mapped frame.
             unsafe { arch::paging::map_page(self.inner.root, address, paddr, flags) }
         };
-        if result.is_err() {
+        if let Err(error) = result {
+            if !same_page {
+                page.remove_reverse_mapping(Arc::as_ptr(&self.inner), address.as_u64());
+            }
             drop(mappings);
             page.release_mapping();
-            return Err(Error::Pmap);
+            return Err(match error {
+                arch::paging::PagingError::OutOfMemory => Error::OutOfMemory,
+                _ => Error::Pmap,
+            });
         }
 
         let previous = mappings.insert(
@@ -122,17 +395,12 @@ impl Pmap {
                 page: page.clone(),
                 protection,
             },
+            reserved,
         );
-        let same_page = previous
-            .as_ref()
-            .is_some_and(|previous| Arc::ptr_eq(&previous.page, &page));
-        if !same_page {
-            if let Some(previous) = &previous {
-                previous
-                    .page
-                    .remove_reverse_mapping(Arc::as_ptr(&self.inner), address.as_u64());
-            }
-            page.add_reverse_mapping(&self.inner, address.as_u64());
+        if !same_page && let Some(previous) = &previous {
+            previous
+                .page
+                .remove_reverse_mapping(Arc::as_ptr(&self.inner), address.as_u64());
         }
         drop(mappings);
 
@@ -160,40 +428,43 @@ impl Pmap {
         let start = start.align_down().as_u64();
         let end = checked_page_end(start, length)?;
         let mut failure = None;
-        let mut mappings = self.inner.mappings.lock();
+        {
+            let mut mappings = self.inner.lock();
 
-        loop {
-            let mut retired: [Option<Arc<VmPage>>; Shootdown::INLINE] =
-                [const { None }; Shootdown::INLINE];
-            let mut count = 0;
-            let mut shootdown = Shootdown::for_root(self.inner.root);
-            while count < retired.len() {
-                let Some(key) = mappings.range(start..end).next().map(|(key, _)| *key) else {
-                    break;
-                };
-                // SAFETY: the pmap lock excludes concurrent changes to this leaf.
-                if unsafe { arch::paging::unmap_page(self.inner.root, VirtAddr::new(key)) }.is_err()
-                {
-                    failure = Some(Error::Pmap);
+            loop {
+                let mut retired: [Option<PageRef>; Shootdown::INLINE] =
+                    [const { None }; Shootdown::INLINE];
+                let mut count = 0;
+                let mut shootdown = Shootdown::for_root(self.inner.root);
+                while count < retired.len() {
+                    let Some(key) = mappings.range(start..end).next().map(|(key, _)| *key) else {
+                        break;
+                    };
+                    // SAFETY: the pmap lock excludes concurrent changes to this leaf.
+                    if unsafe { arch::paging::unmap_page(self.inner.root, VirtAddr::new(key)) }
+                        .is_err()
+                    {
+                        failure = Some(Error::Pmap);
+                        break;
+                    }
+                    let mapping = mappings
+                        .remove(&key)
+                        .expect("mem/pmap: removed mapping vanished");
+                    mapping
+                        .page
+                        .remove_reverse_mapping(Arc::as_ptr(&self.inner), key);
+                    shootdown.push(VirtAddr::new(key));
+                    retired[count] = Some(mapping.page);
+                    count += 1;
+                }
+
+                shootdown.commit();
+                for page in retired[..count].iter_mut().filter_map(Option::take) {
+                    page.release_mapping();
+                }
+                if failure.is_some() || count < retired.len() {
                     break;
                 }
-                let mapping = mappings
-                    .remove(&key)
-                    .expect("mem/pmap: removed mapping vanished");
-                mapping
-                    .page
-                    .remove_reverse_mapping(Arc::as_ptr(&self.inner), key);
-                shootdown.push(VirtAddr::new(key));
-                retired[count] = Some(mapping.page);
-                count += 1;
-            }
-
-            shootdown.commit();
-            for page in retired[..count].iter_mut().filter_map(Option::take) {
-                page.release_mapping();
-            }
-            if failure.is_some() || count < retired.len() {
-                break;
             }
         }
         failure.map_or(Ok(()), Err)
@@ -204,33 +475,36 @@ impl Pmap {
     /// Leaves are downgraded in place, so the pass needs no side table and
     /// cannot fail part way through for want of memory.
     pub fn write_protect_all(&self) -> Result<()> {
-        let mut mappings = self.inner.mappings.lock();
         let mut shootdown = Shootdown::for_root(self.inner.root);
         let mut failure = None;
 
-        for (address, mapping) in mappings.iter_mut() {
-            if !mapping.protection.contains(VmProtection::WRITE) {
-                continue;
+        {
+            let mut mappings = self.inner.lock();
+            for (address, mapping) in mappings.iter_mut() {
+                if !mapping.protection.contains(VmProtection::WRITE)
+                    || mapping.page.write_windows.load(Ordering::Acquire) != 0
+                {
+                    continue;
+                }
+                let mut protection = mapping.protection;
+                protection.remove(VmProtection::WRITE);
+                // SAFETY: the pmap lock serializes this leaf update and the entry
+                // keeps its frame pinned through the mapping reference.
+                let result = unsafe {
+                    arch::paging::protect_page(
+                        self.inner.root,
+                        VirtAddr::new(*address),
+                        pmap_flags(protection),
+                    )
+                };
+                if result.is_err() {
+                    failure = Some(Error::Pmap);
+                    break;
+                }
+                mapping.protection = protection;
+                shootdown.push(VirtAddr::new(*address));
             }
-            let mut protection = mapping.protection;
-            protection.remove(VmProtection::WRITE);
-            // SAFETY: the pmap lock serializes this leaf update and the entry
-            // keeps its frame pinned through the mapping reference.
-            let result = unsafe {
-                arch::paging::protect_page(
-                    self.inner.root,
-                    VirtAddr::new(*address),
-                    pmap_flags(protection),
-                )
-            };
-            if result.is_err() {
-                failure = Some(Error::Pmap);
-                break;
-            }
-            mapping.protection = protection;
-            shootdown.push(VirtAddr::new(*address));
         }
-        drop(mappings);
         shootdown.commit();
         failure.map_or(Ok(()), Err)
     }
@@ -240,41 +514,48 @@ impl Pmap {
     /// through COW classification before it can expose a writable leaf.
     fn restrict(&self, start: VirtAddr, length: u64, protection: VmProtection) -> Result<()> {
         let end = checked_page_end(start.as_u64(), length)?;
-        let mut mappings = self.inner.mappings.lock();
-        if mappings.range(start.as_u64()..end).any(|(_, mapping)| {
-            !(mapping.protection & protection).contains(VmProtection::READ)
-        }) {
-            // A present x86 leaf always permits reads. Remove leaves when
-            // there is no representable readable intersection (PROT_NONE
-            // included); subsequent faults will apply the new map policy.
-            drop(mappings);
+        let remove = self
+            .inner
+            .lock()
+            .range(start.as_u64()..end)
+            .any(|(_, mapping)| !(mapping.protection & protection).contains(VmProtection::READ));
+        if remove {
             return self.remove(start, length);
         }
         let mut shootdown = Shootdown::for_root(self.inner.root);
         let mut failure = None;
-        for (address, mapping) in mappings.range_mut(start.as_u64()..end) {
-            let restricted = mapping.protection & protection;
-            if restricted == mapping.protection {
-                continue;
+        {
+            let mut mappings = self.inner.lock();
+            for (address, mapping) in mappings.range_mut(start.as_u64()..end) {
+                let restricted = mapping.protection & protection;
+                if restricted == mapping.protection {
+                    continue;
+                }
+                // SAFETY: the mapping lock excludes leaf changes; the existing
+                // mapping reference pins the frame until this update completes.
+                if unsafe {
+                    arch::paging::protect_page(
+                        self.inner.root,
+                        VirtAddr::new(*address),
+                        pmap_flags(restricted),
+                    )
+                }
+                .is_err()
+                {
+                    failure = Some(Error::Pmap);
+                    break;
+                }
+                mapping.protection = restricted;
+                shootdown.push(VirtAddr::new(*address));
             }
-            // SAFETY: the mapping lock excludes leaf changes; the existing
-            // mapping reference pins the frame until this update completes.
-            if unsafe { arch::paging::protect_page(self.inner.root, VirtAddr::new(*address), pmap_flags(restricted)) }.is_err() {
-                failure = Some(Error::Pmap);
-                break;
-            }
-            mapping.protection = restricted;
-            shootdown.push(VirtAddr::new(*address));
         }
-        drop(mappings);
         shootdown.commit();
         failure.map_or(Ok(()), Err)
     }
 
     /// Returns the logical page and permissions currently mapped at `address`.
-    pub(super) fn mapped_page(&self, address: VirtAddr) -> Option<(Arc<VmPage>, VmProtection)> {
+    pub(super) fn mapped_page(&self, address: VirtAddr) -> Option<(PageRef, VmProtection)> {
         self.inner
-            .mappings
             .lock()
             .get(&address.as_u64())
             .map(|mapping| (mapping.page.clone(), mapping.protection))
@@ -282,7 +563,7 @@ impl Pmap {
 
     /// Returns the physical address currently mapped at `address`.
     pub fn extract(&self, address: VirtAddr) -> Option<PhysAddr> {
-        let _mappings = self.inner.mappings.lock();
+        let _mappings = self.inner.lock();
         // SAFETY: this pmap owns the hierarchy and its mapping lock excludes
         // concurrent page-table writes for the duration of the walk.
         unsafe { arch::paging::translate(self.inner.root, address) }
@@ -290,181 +571,161 @@ impl Pmap {
 
     /// Returns the number of tracked resident mappings.
     pub fn resident_count(&self) -> usize {
-        self.inner.mappings.lock().len()
+        self.inner.lock().len()
     }
 }
 
 impl Drop for PmapInner {
     fn drop(&mut self) {
-        let mappings = core::mem::take(self.mappings.get_mut());
-        let mut shootdown = Shootdown::for_root(self.root);
-        for (address, mapping) in &mappings {
-            // SAFETY: `&mut self` excludes concurrent pmap operations.
-            let _ = unsafe { arch::paging::unmap_page(self.root, VirtAddr::new(*address)) };
-            mapping
-                .page
-                .remove_reverse_mapping(ptr::from_ref(self), *address);
-            shootdown.push(VirtAddr::new(*address));
+        super::retire_address_space_root(self.root);
+        let identity = ptr::from_ref(self);
+        {
+            let mappings = core::mem::replace(self.mappings.get_mut(), Index::new(&MAPPING_POOL));
+            let mut shootdown = Shootdown::for_root(self.root);
+            for (address, mapping) in mappings.iter() {
+                // SAFETY: `&mut self` excludes concurrent pmap operations.
+                let _ = unsafe { arch::paging::unmap_page(self.root, VirtAddr::new(*address)) };
+                mapping.page.remove_reverse_mapping(identity, *address);
+                shootdown.push(VirtAddr::new(*address));
+            }
+            shootdown.commit();
+            for (_, mapping) in mappings.into_entries() {
+                mapping.page.release_mapping();
+            }
         }
-        shootdown.commit();
-        for (_, mapping) in mappings {
-            mapping.page.release_mapping();
-        }
-        // SAFETY: all user leaves were removed, this root is inactive because
-        // every owning `VmSpace` reference has been released, and the shared
+        // SAFETY: all user leaves were removed, the retirement barrier has
+        // released every borrowed or outgoing hardware reference, and the shared
         // kernel half is not freed by the architecture routine.
         unsafe { arch::paging::destroy_user_root(self.root) };
     }
 }
 
-/// Best-effort teardown used by reclaim, which must not sleep behind a pmap.
-pub(super) fn try_remove_all_mappings(page: &Arc<VmPage>) {
-    let mut mappings = page.take_reverse_mappings();
-    if mappings.is_empty() {
+/// UVM pmap_pp_remove / pmap_test_attrs handoff: reference the pmap and
+/// try its lock with PV held, release PV, and if contended wait then restart.
+/// The Arc outlives both guards, so its final destructor never runs at IPL_VM.
+fn visit_reverse_mappings(
+    page: &PageRef,
+    mut visit: impl FnMut(&PmapInner, &mut Index<Mapping>, u64) -> bool,
+) {
+    let mut cursor = None;
+    loop {
+        let pmap;
+        let mut reverse = page.reverse_mappings();
+        let Some(mapping) = reverse.after(cursor.as_ref()) else {
+            break;
+        };
+        let address = mapping.address;
+        let identity = mapping.pmap.as_ptr();
+        let next_cursor = (mapping.pmap.clone(), address);
+        pmap = match mapping.pmap.upgrade() {
+            Some(pmap) => pmap,
+            None => {
+                let retired = reverse.remove(identity, address);
+                drop(reverse);
+                drop(retired);
+                cursor = None;
+                continue;
+            }
+        };
+        let locked = pmap.try_lock();
+        drop(reverse);
+        let Some(mut locked) = locked else {
+            drop(pmap.lock());
+            cursor = None;
+            continue;
+        };
+        if !locked
+            .get(&address)
+            .is_some_and(|mapping| Arc::ptr_eq(&mapping.page, page))
+        {
+            page.remove_reverse_mapping(identity, address);
+            cursor = None;
+            continue;
+        }
+        cursor = visit(&pmap, &mut locked, address).then_some(next_cursor);
+    }
+}
+
+/// Remove every mapping and complete its TLB visibility before returning.
+/// The MI owner stays held across revocation and PG_BUSY/identity changes.
+pub(super) fn remove_all_mappings(page: &PageRef) {
+    if page.reverse_mappings().is_empty() {
         return;
     }
-    let mut shootdown = Shootdown::global();
-    let mut removed = 0usize;
-    mappings.retain(|mapping| {
-        let Some(pmap) = mapping.pmap.upgrade() else {
-            return false;
-        };
-        let Some(mut locked) = pmap.mappings.try_lock() else {
-            return true;
-        };
-        let Some(current) = locked.get(&mapping.address) else {
-            return false;
-        };
-        if !Arc::ptr_eq(&current.page, page) {
-            return false;
-        }
-        // SAFETY: the pmap lock serializes leaf removal.
-        if unsafe { arch::paging::unmap_page(pmap.root, VirtAddr::new(mapping.address)) }.is_err() {
-            return true;
-        }
-        locked
-            .remove(&mapping.address)
-            .expect("mem/pmap: reverse mapping vanished");
-        drop(locked);
-        shootdown.push(VirtAddr::new(mapping.address));
-        removed += 1;
+    visit_reverse_mappings(page, |pmap, mappings, address| {
+        // SAFETY: direct PV->pmap handoff retained the mapping identity and
+        // this pmap lock exclusively owns its leaf and table hierarchy.
+        unsafe { arch::paging::unmap_page(pmap.root, VirtAddr::new(address)) }
+            .expect("uvm: tracked PV mapping lacks a leaf");
+        mappings.remove(&address).expect("uvm: PV mapping vanished");
+        page.remove_reverse_mapping(ptr::from_ref(pmap), address);
+        let mut shootdown = Shootdown::for_root(pmap.root);
+        shootdown.push(VirtAddr::new(address));
+        shootdown.commit();
+        page.release_mapping();
         false
     });
-
-    page.restore_reverse_mappings(mappings);
-    if removed != 0 {
-        shootdown.commit();
-        for _ in 0..removed {
-            page.release_mapping();
-        }
-    }
 }
 
-/// Folds hardware accessed and dirty bits back into logical page state.
-///
-/// The reverse-mapping list is detached once per page rather than sampled per
-/// index, so no mapping is skipped when the list is rearranged concurrently.
-pub(super) fn harvest_page_states(pages: &[Option<Arc<VmPage>>]) {
+pub(super) fn harvest_page_state_locked(page: &PageRef, owner: &mut super::owner::OwnerWrite<'_>) {
+    let mut referenced = false;
+    let mut dirty = false;
     let mut shootdown = Shootdown::global();
-    for page in pages.iter().flatten() {
-        let mut referenced = false;
-        let mut dirty = false;
-        let mut mappings = page.take_reverse_mappings();
-        mappings.retain(|mapping| {
-            let Some(pmap) = mapping.pmap.upgrade() else {
-                return false;
-            };
-            let Some(locked) = pmap.mappings.try_lock() else {
-                // Reclaim must never sleep behind a fault or map operation.
-                // Treat contention as a recent reference so this page stays
-                // resident until a later scan can inspect it safely.
-                referenced = true;
-                return true;
-            };
-            let Some(current) = locked.get(&mapping.address) else {
-                return false;
-            };
-            if !Arc::ptr_eq(&current.page, page) {
-                return false;
+    visit_reverse_mappings(page, |pmap, _, address| {
+        // SAFETY: the handoff holds the pmap lock and retains its root; the
+        // MI owner keeps this frame's identity stable through the shootdown.
+        let hardware =
+            unsafe { arch::paging::take_accessed_dirty(pmap.root, VirtAddr::new(address)) };
+        if let Ok((was_referenced, was_dirty)) = hardware {
+            referenced |= was_referenced;
+            dirty |= was_dirty;
+            if was_referenced || was_dirty {
+                shootdown.push(VirtAddr::new(address));
             }
-            // SAFETY: the pmap lock serializes this leaf update and the root
-            // remains owned by the upgraded pmap.
-            if let Ok((was_referenced, was_dirty)) = unsafe {
-                arch::paging::take_accessed_dirty(pmap.root, VirtAddr::new(mapping.address))
-            } {
-                referenced |= was_referenced;
-                dirty |= was_dirty;
-                if was_referenced || was_dirty {
-                    shootdown.push(VirtAddr::new(mapping.address));
-                }
-            }
-            drop(locked);
-            true
-        });
-
-        page.restore_reverse_mappings(mappings);
-        page.record_hardware_state(referenced, dirty);
-    }
+        }
+        true
+    });
     shootdown.commit();
+    page.record_hardware_state_locked(referenced, dirty, owner);
 }
 
-/// Tears down every hardware mapping before object pages are invalidated.
-///
-/// Unlike reclaim, truncation and object destruction must wait for pmap locks:
-/// returning while an old leaf is reachable could expose data past a new EOF.
-pub(super) fn remove_mappings_for_pages(pages: &[Arc<VmPage>]) {
+pub(super) fn remove_mappings_for_pages(pages: &[PageRef]) {
     for page in pages {
-        loop {
-            let mappings = page.take_reverse_mappings();
-            if mappings.is_empty() {
-                break;
-            }
-            let mut shootdown = Shootdown::global();
-            let mut removed = 0usize;
-            for mapping in mappings {
-                let Some(pmap) = mapping.pmap.upgrade() else {
-                    continue;
-                };
-                let mut locked = pmap.mappings.lock();
-                let Some(current) = locked.get(&mapping.address) else {
-                    continue;
-                };
-                if !Arc::ptr_eq(&current.page, page) {
-                    continue;
-                }
-                // SAFETY: the pmap lock serializes leaf removal. A tracked
-                // mapping must have a leaf; failure is internal corruption.
-                unsafe { arch::paging::unmap_page(pmap.root, VirtAddr::new(mapping.address)) }
-                    .expect("mem/pmap: tracked mapping has no removable leaf");
-                locked
-                    .remove(&mapping.address)
-                    .expect("mem/pmap: reverse mapping vanished");
-                drop(locked);
-                shootdown.push(VirtAddr::new(mapping.address));
-                removed += 1;
-            }
-            if removed != 0 {
-                shootdown.commit();
-                for _ in 0..removed {
-                    page.release_mapping();
-                }
-            }
+        remove_all_mappings(page);
+    }
+}
+
+pub(super) struct UserPagePin<'a> {
+    pin: PagePin,
+    writers: Option<&'a AtomicUsize>,
+}
+
+impl Drop for UserPagePin<'_> {
+    fn drop(&mut self) {
+        if let Some(writers) = self.writers {
+            self.pin
+                .page()
+                .write_windows
+                .fetch_sub(1, Ordering::Release);
+            writers.fetch_sub(1, Ordering::Release);
         }
     }
 }
 
 /// Complete virtual address space: MI map plus MD pmap.
 pub struct VmSpace {
-    map: RwLock<VmMap>,
+    map: super::map_lock::MapLock,
     pmap: Pmap,
+    write_windows: AtomicUsize,
 }
 
 impl VmSpace {
     /// Creates an empty user address space.
     pub fn new() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            map: RwLock::new(VmMap::new()),
+            map: super::map_lock::MapLock::new(VmMap::new()?),
             pmap: Pmap::new()?,
+            write_windows: AtomicUsize::new(0),
         }))
     }
 
@@ -499,13 +760,15 @@ impl VmSpace {
             return Err(Error::InvalidAddress);
         };
         let mut map = self.map.write();
-        match map.unmap(start, mapping.length) {
-            Ok(()) | Err(Error::NotMapped) => {}
+        let detached = match map.unmap(start, mapping.length) {
+            Ok(detached) => Some(detached),
+            Err(Error::NotMapped) => None,
             Err(error) => return Err(error),
-        }
+        };
         // Every tracked leaf must be retired before the old mapping's pages
         // can drop. With the map lock held no fault can repopulate this range.
         self.pmap.remove(start, mapping.length)?;
+        drop(detached);
         map.map(mapping)
     }
 
@@ -517,8 +780,10 @@ impl VmSpace {
     /// Removes a range from both the map and pmap.
     pub fn unmap(&self, start: VirtAddr, length: u64) -> Result<()> {
         let mut map = self.map.write();
-        map.unmap(start, length)?;
-        self.pmap.remove(start, length)
+        let detached = map.unmap(start, length)?;
+        self.pmap.remove(start, length)?;
+        drop(detached);
+        Ok(())
     }
 
     /// Changes permissions, retaining resident translations where possible.
@@ -534,41 +799,46 @@ impl VmSpace {
 
     /// Resolves and enters one page fault.
     pub fn fault(&self, address: VirtAddr, access: FaultAccess) -> Result<()> {
-        let mut map = self.map.read();
-        let _file_pin = loop {
-            let Some((object, index)) = map.file_fault(address, access)? else {
-                break None;
+        let mut narrow = false;
+        loop {
+            let ticket = super::prepare_memory_wait();
+            let map = self.map.read();
+            let Some(snapshot) = map.fault_snapshot(address, access)? else {
+                drop(map);
+                let result = self.map.write().prepare_copy(address, access);
+                match result {
+                    Ok(()) => {}
+                    Err(Error::OutOfMemory) => super::wait_for_memory(ticket)?,
+                    Err(error) => return Err(error),
+                }
+                continue;
             };
+            if !narrow {
+                snapshot.enter_neighbors(&self.pmap);
+                narrow = true;
+            }
             let timestamp = map.timestamp();
             drop(map);
-            let loaded = object
-                .fault_page(index, false)
-                .and_then(|page| page.pin_resident());
-            map = self.map.read();
-            // unmap, mprotect, replacement and fork invalidate the snapshot.
-            // A successful pin also prevents reclaim from forcing disk I/O
-            // inside resolve_fault or PTE installation below.
+            let prepared = snapshot.resolve();
+            let map = self.map.read();
+            // Even an I/O error belongs to the old mapping if its version
+            // changed. Retry before reporting it or installing any PTE.
             if map.timestamp() != timestamp {
                 continue;
             }
-            break Some(loaded?);
-        };
-        map.with_fault(address, access, |resolved| {
-            let page = resolved.page.clone();
-            self.pmap
-                .enter(address.align_down(), resolved.page, resolved.protection)?;
-            if let Some(fault) = resolved.object_fault
-                && !fault.object.validates_fault(fault.index, &page)
+            match prepared
+                .and_then(|prepared| snapshot.commit(prepared, &self.pmap, address.align_down()))
             {
-                // The map lock prevents another fault from replacing this leaf
-                // before cleanup. Truncate either already won (this branch) or
-                // will observe the reverse mapping and remove it itself.
-                self.pmap.remove(address.align_down(), PAGE_SIZE)?;
-                return Err(Error::InvalidAddress);
+                Ok(true) => return Ok(()),
+                Ok(false) | Err(Error::NotMapped) => {}
+                Err(Error::OutOfMemory) => {
+                    drop(map);
+                    drop(snapshot);
+                    super::wait_for_memory(ticket)?;
+                }
+                Err(error) => return Err(error),
             }
-            super::record_fault(resolved.promoted);
-            Ok(())
-        })
+        }
     }
 
     /// Validates that a user range is entirely inside the user address window.
@@ -590,38 +860,35 @@ impl VmSpace {
     /// Returns the logical page and its frame's physical address. The wire
     /// blocks reclamation, which is what makes a direct-map alias of the
     /// returned address safe to hold across an arbitrary-length operation;
-    /// [`Self::fault_and_extract`] offers no such guarantee. Release the pin
-    /// with `VmPage::release_window` while still holding the page handle.
+    /// [`Self::fault_and_extract`] offers no such guarantee. Dropping the guard
+    /// releases the wire and the writable-window ownership registration.
     pub(super) fn pin_user_page(
         &self,
         address: VirtAddr,
         access: FaultAccess,
-    ) -> Result<(Arc<VmPage>, PhysAddr)> {
-        let aligned = address.align_down();
-        let required = required_protection(access);
-        // An installed PTE already embodies COW and protection decisions.
-        // Writable windows fault only if that PTE does not permit writing.
-        if !self
-            .pmap
-            .mapped_page(aligned)
-            .is_some_and(|(_, protection)| protection.contains(required))
-        {
-            self.fault(address, access)?;
+    ) -> Result<(UserPagePin<'_>, PhysAddr)> {
+        loop {
+            let page = self.resolve_user_page(address, access)?;
+            let pin = page.pin_resident()?;
+            let _map = self.map.read();
+            if !self
+                .pmap
+                .mapped_page(address.align_down())
+                .is_some_and(|(mapped, protection)| {
+                    Arc::ptr_eq(&page, &mapped) && protection.contains(required_protection(access))
+                })
+            {
+                continue;
+            }
+            let writers = (access == FaultAccess::Write).then(|| {
+                page.record_hardware_state(false, true);
+                page.write_windows.fetch_add(1, Ordering::Relaxed);
+                self.write_windows.fetch_add(1, Ordering::Relaxed);
+                &self.write_windows
+            });
+            let physical = PhysAddr::new(pin.address().as_u64() + address.as_u64() % PAGE_SIZE);
+            return Ok((UserPagePin { pin, writers }, physical));
         }
-        let (page, protection) = self.pmap.mapped_page(aligned).ok_or(Error::NotMapped)?;
-        if !protection.contains(required) {
-            return Err(Error::Protection);
-        }
-        // The frame base plus the intra-page offset of `address`: callers
-        // expect an alias of exactly this byte onward, matching what a PTE
-        // walk of `address` would have produced.
-        let physical = page
-            .acquire_window()?
-            .as_u64()
-            .checked_add(address.as_u64() % super::PAGE_SIZE)
-            .map(PhysAddr::new)
-            .ok_or(Error::InvalidAddress)?;
-        Ok((page, physical))
     }
     /// Copies bytes from this address space into a kernel buffer.
     ///
@@ -658,7 +925,7 @@ impl VmSpace {
         address: VirtAddr,
         length: usize,
         access: FaultAccess,
-        mut transfer: impl FnMut(&Arc<VmPage>, usize, usize, usize) -> Result<()>,
+        mut transfer: impl FnMut(&PageRef, usize, usize, usize) -> Result<()>,
     ) -> Result<()> {
         validate_user_range(address, length)?;
         let mut copied = 0usize;
@@ -669,6 +936,19 @@ impl VmSpace {
             let page_offset = (current.as_u64() % PAGE_SIZE) as usize;
             let span = ((PAGE_SIZE as usize) - page_offset).min(length - copied);
             let page = self.resolve_user_page(current, access)?;
+            let _pin = page.pin_resident()?;
+            let _map = self.map.read();
+            if !self
+                .pmap
+                .mapped_page(current.align_down())
+                .is_some_and(|(mapped, protection)| {
+                    Arc::ptr_eq(&page, &mapped) && protection.contains(required_protection(access))
+                })
+            {
+                continue;
+            }
+            // The pin excludes page-in during the copy; the map guard keeps
+            // fork and protection changes from invalidating its COW decision.
             transfer(&page, page_offset, span, copied)?;
             copied += span;
         }
@@ -681,38 +961,51 @@ impl VmSpace {
     /// faulted first, which is what performs copy-on-write promotion; writing
     /// through a mapping that only permits reads would corrupt a page shared
     /// with another address space.
-    fn resolve_user_page(&self, address: VirtAddr, access: FaultAccess) -> Result<Arc<VmPage>> {
+    fn resolve_user_page(&self, address: VirtAddr, access: FaultAccess) -> Result<PageRef> {
         let aligned = address.align_down();
         let required = required_protection(access);
-        if let Some((page, protection)) = self.pmap.mapped_page(aligned)
-            && protection.contains(required)
-        {
-            return Ok(page);
+        loop {
+            if let Some((page, protection)) = self.pmap.mapped_page(aligned)
+                && protection.contains(required)
+            {
+                return Ok(page);
+            }
+            // Fork or reclaim can change the translation immediately after
+            // a successful fault. Only the next fault can establish an error.
+            self.fault(address, access)?;
         }
-        self.fault(address, access)?;
-        let (page, protection) = self.pmap.mapped_page(aligned).ok_or(Error::NotMapped)?;
-        if !protection.contains(required) {
-            return Err(Error::Protection);
-        }
-        Ok(page)
     }
 
     /// Forks the map with lazy anonymous-overlay COW.
     pub fn fork(&self) -> Result<Arc<Self>> {
         let child_pmap = Pmap::new()?;
         let mut map = self.map.write();
+        let child_map = map.fork(self.write_windows.load(Ordering::Acquire) != 0)?;
         self.pmap.write_protect_all()?;
-        let child_map = map.fork();
         drop(map);
         Ok(Arc::new(Self {
-            map: RwLock::new(child_map),
+            map: super::map_lock::MapLock::new(child_map),
             pmap: child_pmap,
+            write_windows: AtomicUsize::new(0),
         }))
     }
 
     /// Creates a private anonymous object suitable for shared-memory APIs.
     pub fn anonymous_object() -> Arc<VmObject> {
         VmObject::new(ObjectKind::Anonymous)
+    }
+}
+
+impl Drop for VmSpace {
+    fn drop(&mut self) {
+        // UVM releases arefs only after pmap-level references are gone.
+        // The final VmSpace owner excludes user execution and new faults.
+        self.pmap
+            .remove(
+                VirtAddr::new(USER_ADDRESS_MIN),
+                USER_ADDRESS_MAX - USER_ADDRESS_MIN,
+            )
+            .expect("mem: failed to detach final address-space mappings");
     }
 }
 

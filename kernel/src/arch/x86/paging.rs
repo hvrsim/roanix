@@ -157,29 +157,34 @@ pub unsafe fn map_page(
     // writable for the duration of this walk.
     unsafe {
         for idx in [idx_l4, idx_l3, idx_l2] {
-            let entry_ptr = entry_ptr(table, idx);
-            let entry = entry_ptr.read_volatile();
-
-            if entry & PTE_PRESENT != 0 {
-                if entry & PTE_HUGE != 0 {
-                    return Err(PagingError::HugePageConflict);
-                }
-                table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
-                continue;
+            let parent = table_entry(table, idx);
+            let mut entry = parent.load(Ordering::Acquire);
+            if entry & PTE_PRESENT == 0 {
+                let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
+                    .ok_or(PagingError::OutOfMemory)?;
+                let bits = PTE_PRESENT | PTE_WRITE | if user { PTE_USER } else { 0 };
+                let new = frame.as_u64() | bits;
+                entry = match parent.compare_exchange(
+                    entry,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => new,
+                    Err(installed) => {
+                        free_table_page(frame);
+                        installed
+                    }
+                };
             }
-
-            let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
-                .ok_or(PagingError::OutOfMemory)?;
-            let mut bits = PTE_PRESENT | PTE_WRITE;
-            if user {
-                bits |= PTE_USER;
+            if entry & PTE_HUGE != 0 {
+                return Err(PagingError::HugePageConflict);
             }
-            entry_ptr.write_volatile(frame.as_u64() | bits);
-            table = frame;
+            table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
         }
 
-        let leaf_ptr = entry_ptr(table, idx_l1);
-        if leaf_ptr.read_volatile() & PTE_PRESENT != 0 {
+        let leaf_ptr = table_entry(table, idx_l1);
+        if leaf_ptr.load(Ordering::Acquire) & PTE_PRESENT != 0 {
             return Err(PagingError::AlreadyMapped);
         }
 
@@ -202,7 +207,7 @@ pub unsafe fn map_page(
             bits |= PTE_NX;
         }
 
-        leaf_ptr.write_volatile((phys.as_u64() & ENTRY_ADDR_MASK) | bits);
+        leaf_ptr.store((phys.as_u64() & ENTRY_ADDR_MASK) | bits, Ordering::Release);
         tlb::flush(X86VirtAddr::new(v));
         Ok(())
     }
@@ -226,10 +231,14 @@ pub unsafe fn remap_page(
     // SAFETY: the caller guarantees exclusive page-table mutation.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        if leaf_ptr.read_volatile() & PTE_PRESENT == 0 {
+        if leaf_ptr.load(Ordering::Acquire) & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
         }
-        leaf_ptr.write_volatile((phys.as_u64() & ENTRY_ADDR_MASK) | leaf_bits(flags));
+        let previous = leaf_ptr.swap(
+            (phys.as_u64() & ENTRY_ADDR_MASK) | leaf_bits(flags),
+            Ordering::AcqRel,
+        );
+        record_hardware_state(previous);
         tlb::flush(X86VirtAddr::new(virt.as_u64()));
     }
     Ok(())
@@ -248,7 +257,7 @@ pub unsafe fn take_accessed_dirty(root: PhysAddr, virt: VirtAddr) -> Result<(boo
     // SAFETY: the caller guarantees a stable, writable hierarchy.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let leaf = &*leaf_ptr.cast::<AtomicU64>();
+        let leaf = leaf_ptr;
         let value = leaf.load(Ordering::Acquire);
         if value & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
@@ -283,12 +292,13 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
     // exclusively writable during the removal.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let leaf = leaf_ptr.read_volatile();
+        let leaf = leaf_ptr.load(Ordering::Acquire);
         if leaf & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
         }
 
-        leaf_ptr.write_volatile(0);
+        let leaf = leaf_ptr.swap(0, Ordering::AcqRel);
+        record_hardware_state(leaf);
         tlb::flush(X86VirtAddr::new(virt.as_u64()));
         Ok(Some(PhysAddr::new(leaf & ENTRY_ADDR_MASK)))
     }
@@ -335,12 +345,16 @@ pub unsafe fn protect_page(root: PhysAddr, virt: VirtAddr, flags: VmFlags) -> Re
     // SAFETY: the caller guarantees a stable, exclusively writable hierarchy.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let leaf = leaf_ptr.read_volatile();
+        let leaf = leaf_ptr.load(Ordering::Acquire);
         if leaf & PTE_PRESENT == 0 {
             return Err(PagingError::NotMapped);
         }
         let frame = leaf & ENTRY_ADDR_MASK;
-        leaf_ptr.write_volatile(frame | leaf_bits(flags));
+        leaf_ptr
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |entry| {
+                Some(frame | leaf_bits(flags) | (entry & (PTE_ACCESSED | PTE_DIRTY)))
+            })
+            .expect("x86/paging: unconditional leaf update failed");
         tlb::flush(X86VirtAddr::new(virt.as_u64()));
         Ok(PhysAddr::new(frame))
     }
@@ -360,13 +374,13 @@ pub unsafe fn populate_kernel_tables(root: PhysAddr) -> Result<()> {
     // exclusively mutated during early initialization.
     unsafe {
         for index in 256..512 {
-            let entry_ptr = entry_ptr(root, index);
-            if entry_ptr.read_volatile() & PTE_PRESENT != 0 {
+            let parent = table_entry(root, index);
+            if parent.load(Ordering::Acquire) & PTE_PRESENT != 0 {
                 continue;
             }
             let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
                 .ok_or(PagingError::OutOfMemory)?;
-            entry_ptr.write_volatile(frame.as_u64() | PTE_PRESENT | PTE_WRITE);
+            parent.store(frame.as_u64() | PTE_PRESENT | PTE_WRITE, Ordering::Release);
         }
     }
     Ok(())
@@ -384,8 +398,8 @@ pub unsafe fn create_user_root(kernel_root: PhysAddr) -> Result<PhysAddr> {
     // copied entry points at a shared table that outlives this root.
     unsafe {
         for index in 256..512 {
-            let entry = entry_ptr(kernel_root, index).read_volatile();
-            entry_ptr(root, index).write_volatile(entry);
+            let entry = table_entry(kernel_root, index).load(Ordering::Acquire);
+            table_entry(root, index).store(entry, Ordering::Release);
         }
     }
     Ok(root)
@@ -400,14 +414,14 @@ pub unsafe fn destroy_user_root(root: PhysAddr) {
     // SAFETY: the caller guarantees this hierarchy is inactive and exclusive.
     unsafe {
         for index in 0..256 {
-            let entry = entry_ptr(root, index).read_volatile();
+            let entry = table_entry(root, index).load(Ordering::Acquire);
             if entry & PTE_PRESENT == 0 {
                 continue;
             }
             if entry & PTE_HUGE == 0 {
                 destroy_table(PhysAddr::new(entry & ENTRY_ADDR_MASK), 3);
             }
-            entry_ptr(root, index).write_volatile(0);
+            table_entry(root, index).store(0, Ordering::Release);
         }
         free_table_page(root);
     }
@@ -426,13 +440,13 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     // SAFETY: the caller guarantees that every present table remains mapped
     // for the duration of this read-only walk.
     unsafe {
-        let l4e = entry_ptr(root, idx_l4).read_volatile();
+        let l4e = table_entry(root, idx_l4).load(Ordering::Acquire);
         if l4e & PTE_PRESENT == 0 {
             return None;
         }
 
         let l3_tbl = PhysAddr::new(l4e & ENTRY_ADDR_MASK);
-        let l3e = entry_ptr(l3_tbl, idx_l3).read_volatile();
+        let l3e = table_entry(l3_tbl, idx_l3).load(Ordering::Acquire);
         if l3e & PTE_PRESENT == 0 {
             return None;
         }
@@ -443,7 +457,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
         }
 
         let l2_tbl = PhysAddr::new(l3e & ENTRY_ADDR_MASK);
-        let l2e = entry_ptr(l2_tbl, idx_l2).read_volatile();
+        let l2e = table_entry(l2_tbl, idx_l2).load(Ordering::Acquire);
         if l2e & PTE_PRESENT == 0 {
             return None;
         }
@@ -454,7 +468,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
         }
 
         let l1_tbl = PhysAddr::new(l2e & ENTRY_ADDR_MASK);
-        let l1e = entry_ptr(l1_tbl, idx_l1).read_volatile();
+        let l1e = table_entry(l1_tbl, idx_l1).load(Ordering::Acquire);
         if l1e & PTE_PRESENT == 0 {
             return None;
         }
@@ -477,14 +491,14 @@ fn page_table_indexes(virt: u64) -> [usize; 4] {
 ///
 /// # Safety
 ///
-/// `root` must own a valid hierarchy that stays mapped for the walk.
-unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
+/// `root` must own a hierarchy that remains mapped for the returned borrow.
+unsafe fn walk_to_leaf<'a>(root: PhysAddr, virt: VirtAddr) -> Result<&'a AtomicU64> {
     let [idx_l4, idx_l3, idx_l2, idx_l1] = page_table_indexes(virt.as_u64());
     let mut table = root;
     // SAFETY: the caller guarantees every present table remains mapped.
     unsafe {
         for idx in [idx_l4, idx_l3, idx_l2] {
-            let entry = entry_ptr(table, idx).read_volatile();
+            let entry = table_entry(table, idx).load(Ordering::Acquire);
             if entry & PTE_PRESENT == 0 {
                 return Err(PagingError::NotMapped);
             }
@@ -493,14 +507,25 @@ unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
             }
             table = PhysAddr::new(entry & ENTRY_ADDR_MASK);
         }
-        Ok(entry_ptr(table, idx_l1))
+        Ok(table_entry(table, idx_l1))
     }
 }
 
-unsafe fn entry_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
+unsafe fn table_entry<'a>(table: PhysAddr, idx: usize) -> &'a AtomicU64 {
     // SAFETY: callers guarantee `table` is a mapped page table and `idx` is a
-    // valid page-table index.
-    unsafe { mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx) }
+    // valid index; the table remains mapped for the returned borrow.
+    unsafe { &*mem::phys_to_virt(table).as_mut_ptr::<AtomicU64>().add(idx) }
+}
+
+fn record_hardware_state(entry: u64) {
+    if let Some(page) = phys::phys_to_page(PhysAddr::new(entry & ENTRY_ADDR_MASK)) {
+        if entry & PTE_ACCESSED != 0 {
+            page.mark_referenced();
+        }
+        if entry & PTE_DIRTY != 0 {
+            page.mark_dirty();
+        }
+    }
 }
 
 fn leaf_bits(flags: VmFlags) -> u64 {
@@ -531,14 +556,14 @@ unsafe fn destroy_table(table: PhysAddr, level: usize) {
     // SAFETY: the caller owns the inactive user hierarchy.
     unsafe {
         for index in 0..512 {
-            let entry = entry_ptr(table, index).read_volatile();
+            let entry = table_entry(table, index).load(Ordering::Acquire);
             if entry & PTE_PRESENT == 0 {
                 continue;
             }
             if level > 1 && entry & PTE_HUGE == 0 {
                 destroy_table(PhysAddr::new(entry & ENTRY_ADDR_MASK), level - 1);
             }
-            entry_ptr(table, index).write_volatile(0);
+            table_entry(table, index).store(0, Ordering::Release);
         }
         free_table_page(table);
     }

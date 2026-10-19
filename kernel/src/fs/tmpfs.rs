@@ -328,10 +328,7 @@ impl TmpfsNode {
     }
 
     fn truncate_locked(&self, file: &mut TmpfsFile, size: u64) -> Result<()> {
-        let old_size = self.size.load(Ordering::Acquire);
-        if size < old_size {
-            file.object.truncate(size).map_err(mem_error)?;
-        }
+        file.object.truncate(size).map_err(mem_error)?;
         self.size.store(size, Ordering::Release);
         self.touch_modified();
         Ok(())

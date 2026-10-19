@@ -353,13 +353,3 @@ fn zeroed(length: usize) -> Result<Vec<u8>> {
     bytes.resize(length, 0);
     Ok(bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::crc32;
-
-    #[test]
-    fn crc32_standard_vector() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-    }
-}

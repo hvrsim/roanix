@@ -27,6 +27,7 @@ use crate::{
     proc::Process,
     sys::{
         clock,
+        event::Event,
         smp::{self, IrqSpinLock},
         sync::{Mutex, Once},
         thread::{
@@ -90,6 +91,17 @@ const _: () = assert!(PRI_BATCH_RANGE == 109);
 
 static SCHEDULER: Once<Scheduler> = Once::new();
 static ALL_THREADS: IrqSpinLock<Option<LinkedList<AllThreadAdapter>>> = IrqSpinLock::new(None);
+static REAP_READY: Event = Event::new();
+
+/// Publish the notification only after the enclosing CPU lock is released.
+#[must_use]
+struct ReapNotice;
+
+impl Drop for ReapNotice {
+    fn drop(&mut self) {
+        REAP_READY.signal();
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum EnqueueKind {
@@ -161,11 +173,12 @@ impl ExitedThreads {
         }
     }
 
-    fn push(&mut self, thread: ThreadPtr) {
+    fn push(&mut self, thread: ThreadPtr) -> ReapNotice {
         // SAFETY: exited threads are scheduler-owned allocations that stay
         // live until the reaper frees them, and the reap link is unused.
         self.list
             .push_back(unsafe { UnsafeRef::from_raw(thread.as_ptr()) });
+        ReapNotice
     }
 
     fn pop(&mut self) -> Option<ThreadPtr> {
@@ -895,6 +908,8 @@ impl Scheduler {
             stack,
             thread_pointer,
         );
+        #[cfg(target_arch = "x86_64")]
+        thread.fpu.save();
         self.enqueue_new_thread(NonNull::from(thread))
     }
 
@@ -1133,6 +1148,7 @@ impl Scheduler {
     }
 
     fn trap_return(&self, cpu_id: usize, frame: &mut TrapFrame) -> *mut TrapFrame {
+        let mut _reap = None;
         smp::drain_ipi_queue();
         let now_ns = clock::monotonic_ns();
 
@@ -1142,7 +1158,7 @@ impl Scheduler {
         let (resume_frame, deadline_ns, try_switch_steal, try_idle_pull) = {
             let mut cpu = self.cpu(cpu_id).lock();
             if let Some(thread) = cpu.deferred_exit.take() {
-                cpu.exited.push(thread);
+                _reap = Some(cpu.exited.push(thread));
             }
 
             let Some(current_ptr) = cpu.current_thread() else {
@@ -1165,13 +1181,28 @@ impl Scheduler {
             let should_switch = current.state != ThreadState::Running
                 || cpu.need_resched
                 || (current.is_idle() && cpu.runq.has_runnable());
-            if !should_switch {
+            let preempt_disabled = arch::thiscpu().preempt_depth.load(Ordering::Relaxed) != 0;
+            if preempt_disabled && should_switch {
+                assert_eq!(
+                    current.state,
+                    ThreadState::Running,
+                    "sched: blocked with preemption disabled"
+                );
+                arch::thiscpu()
+                    .preempt_pending
+                    .store(true, Ordering::Relaxed);
+            }
+            if !should_switch || preempt_disabled {
                 cpu.unwinding = None;
-                let idle_pull = current.is_idle() && !cpu.runq.has_runnable();
+                let idle_pull = !preempt_disabled && current.is_idle() && !cpu.runq.has_runnable();
                 let deadline_ns = self.deadline_for(&cpu, now_ns);
                 (Some(frame as *mut TrapFrame), deadline_ns, false, idle_pull)
             } else {
                 cpu.need_resched = false;
+
+                // Save before publishing the outgoing thread for migration.
+                #[cfg(target_arch = "x86_64")]
+                current.fpu.save();
 
                 if current.state == ThreadState::Running && !current.is_idle() {
                     let kind = if current.take_slice_end() {
@@ -1273,13 +1304,15 @@ impl Scheduler {
         }
     }
 
-    fn exit_current(&self, cpu_id: usize) -> ! {
+    fn exit_current(&self) -> ! {
         arch::irqset(false);
+        let cpu_id = arch::thiscpu().id;
 
         {
+            let mut _reap = None;
             let mut cpu = self.cpu(cpu_id).lock();
             if let Some(thread) = cpu.deferred_exit.take() {
-                cpu.exited.push(thread);
+                _reap = Some(cpu.exited.push(thread));
             }
 
             let current = cpu
@@ -1319,20 +1352,13 @@ impl Scheduler {
         (next, deadline_ns)
     }
 
-    fn current_thread(&self, cpu_id: usize) -> *mut Thread {
-        self.current_thread_opt(cpu_id)
-            .expect("sched: current thread unavailable")
-            .as_ptr()
-    }
-
-    fn current_thread_opt(&self, cpu_id: usize) -> Option<ThreadPtr> {
-        self.cpu(cpu_id).lock().current_thread()
-    }
-
-    fn park_current(&self, cpu_id: usize, thread: *mut Thread, seq: u64) {
+    fn park_current(&self, thread: *mut Thread, seq: u64) {
         let thread_ptr = NonNull::new(thread).expect("sched: park received null thread");
-        let irqs_were_enabled = arch::irqstate();
-        let current = {
+        // Selecting the run queue and marking its current thread blocked
+        // must be one non-preemptible operation, just like taking its lock.
+        arch::irqset(false);
+        let cpu_id = arch::thiscpu().id;
+        let parked = {
             let mut cpu = self.cpu(cpu_id).lock();
             let current = cpu
                 .current_thread()
@@ -1349,20 +1375,20 @@ impl Scheduler {
             let current_thread = thread_mut(thread_ptr);
             assert!(!current_thread.is_idle(), "sched: idle thread cannot sleep");
 
-            if !current_thread.mark_parked(seq) {
-                if !irqs_were_enabled {
-                    arch::irqset(true);
-                }
-                return;
+            if current_thread.mark_parked(seq) {
+                current_thread.mark_blocked(clock::monotonic_ns());
+                cpu.need_resched = true;
+                true
+            } else {
+                false
             }
-
-            current_thread.mark_blocked(clock::monotonic_ns());
-            cpu.need_resched = true;
-            thread_ptr
         };
 
-        if !irqs_were_enabled {
-            arch::irqset(true);
+        // Even a wake that wins before parking must release the CPU lock
+        // before enabling interrupts: trap return acquires that same lock.
+        arch::irqset(true);
+        if !parked {
+            return;
         }
 
         // A local reschedule request is asynchronous on some platforms. Spin
@@ -1375,7 +1401,7 @@ impl Scheduler {
         // `arch::reschedule()` should trap immediately and switch this blocked
         // thread off-CPU instead of burning the full sleep interval.
         arch::reschedule();
-        while thread_ref(current).observed_state() != ThreadState::Running {
+        while thread_ref(thread_ptr).observed_state() != ThreadState::Running {
             core::hint::spin_loop();
         }
     }
@@ -1766,6 +1792,8 @@ impl Scheduler {
         cpu.kernel_stack = thread.stack_top.as_u64();
         cpu.user_stack = 0;
         cpu.current_thread = thread.id;
+        cpu.current_thread_pointer
+            .store(core::ptr::from_ref(thread) as usize, Ordering::Release);
         crate::arch::cpu::set_kernel_stack(thread.stack_top.as_u64());
         if thread.is_idle() {
             // A tickless idle CPU must not retain a user root indefinitely.
@@ -1779,6 +1807,8 @@ impl Scheduler {
         // exclusively prepared on the local scheduler path.
         unsafe {
             crate::arch::cpu::prepare_thread_frame(thread.frame, thread.thread_pointer());
+            #[cfg(target_arch = "x86_64")]
+            thread.fpu.restore();
         }
     }
 
@@ -1945,11 +1975,15 @@ impl Scheduler {
         }
     }
 
-    fn publish_deferred_exit(&self, cpu_id: usize) {
-        let mut cpu = self.cpu(cpu_id).lock();
-        if let Some(thread) = cpu.deferred_exit.take() {
-            cpu.exited.push(thread);
-        }
+    fn publish_deferred_exit(&self) {
+        let _preempt = smp::disable_preemption();
+        let cpu_id = arch::thiscpu().id;
+        let _reap = {
+            let mut cpu = self.cpu(cpu_id).lock();
+            cpu.deferred_exit
+                .take()
+                .map(|thread| cpu.exited.push(thread))
+        };
     }
 
     /// Applies a new nice value and re-places the thread if it is queued.
@@ -1970,7 +2004,9 @@ impl Scheduler {
     /// priority rather than at the preemption point, so a caller spinning on a
     /// lock cannot starve the thread it is waiting for. The switch itself is
     /// left to `trap_return`, which already runs on the way out of the syscall.
-    fn yield_current(&self, cpu_id: usize) {
+    fn yield_current(&self) {
+        let _preempt = smp::disable_preemption();
+        let cpu_id = arch::thiscpu().id;
         let mut cpu = self.cpu(cpu_id).lock();
         let Some(current_ptr) = cpu.current_thread() else {
             return;
@@ -2175,12 +2211,23 @@ pub(crate) fn request_deadline_refresh_ipi() {
 // hot path and in ordinary thread context.
 fn maintenance_thread() {
     let mut random = clock::monotonic_ns() ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_balance = clock::monotonic_ns().saturating_add(balance_delay_ns(&mut random));
     loop {
+        // Reset before draining: a concurrent publication is either included
+        // in this pass or leaves a persistent notification for the next one.
+        REAP_READY.reset();
         scheduler().reap_all_exited();
-        clock::sleep(Duration::from_nanos(balance_delay_ns(&mut random)));
-        if scheduler().cpu_count > 1 {
-            let _ = scheduler().rebalance_once();
+        let now = clock::monotonic_ns();
+        if now >= next_balance {
+            if scheduler().cpu_count > 1 {
+                let _ = scheduler().rebalance_once();
+            }
+            next_balance = now.saturating_add(balance_delay_ns(&mut random));
         }
+        let _ = clock::wait_timeout(
+            &REAP_READY,
+            Duration::from_nanos(next_balance.saturating_sub(now)),
+        );
     }
 }
 
@@ -2269,16 +2316,16 @@ pub(crate) use crate::sys::thread::NICE_MAX;
 
 /// Returns the thread currently executing on this CPU.
 pub(crate) fn current_thread() -> *mut Thread {
-    scheduler().current_thread(arch::thiscpu().id)
+    current_thread_opt().expect("sched: current thread unavailable")
 }
 
 /// Returns the current thread on this CPU, if scheduling has started.
 pub(crate) fn current_thread_opt() -> Option<*mut Thread> {
-    let cpu_id = arch::thiscpu_opt()?.id;
-    SCHEDULER
-        .get()?
-        .current_thread_opt(cpu_id)
-        .map(ThreadPtr::as_ptr)
+    arch::thiscpu_opt()?;
+    // SAFETY: the local base was initialized before the check above and stays
+    // valid on every CPU to which this continuation can migrate.
+    let thread = unsafe { arch::current_thread_pointer() } as *mut Thread;
+    NonNull::new(thread).map(NonNull::as_ptr)
 }
 
 /// Applies `nice` to every live thread of `pid`.
@@ -2338,12 +2385,12 @@ pub(crate) fn unboost_priority(thread: *mut Thread) {
 
 /// Publishes a thread whose final stack switch has completed.
 pub(crate) fn publish_deferred_exit() {
-    scheduler().publish_deferred_exit(arch::thiscpu().id);
+    scheduler().publish_deferred_exit();
 }
 
 /// Parks the current thread until a matching wake event occurs.
 pub(crate) fn park_current(thread: *mut Thread, seq: u64) {
-    scheduler().park_current(arch::thiscpu().id, thread, seq)
+    scheduler().park_current(thread, seq)
 }
 
 /// Wakes a previously parked thread and requeues it on a target CPU.
@@ -2353,18 +2400,18 @@ pub(crate) fn wake(thread: *mut Thread, seq: u64) -> bool {
 
 /// Terminates the current thread and immediately schedules a replacement.
 pub fn exit_current() -> ! {
-    scheduler().exit_current(arch::thiscpu().id)
+    scheduler().exit_current()
 }
 
 /// Yields the rest of the current thread's timeslice to other runnable work.
 pub(crate) fn yield_current() {
-    let Some(cpu) = arch::thiscpu_opt() else {
+    if arch::thiscpu_opt().is_none() {
         return;
-    };
+    }
     let Some(scheduler) = SCHEDULER.get() else {
         return;
     };
-    scheduler.yield_current(cpu.id);
+    scheduler.yield_current();
 }
 
 /// Returns whether `tid` is a live thread of `pid`.

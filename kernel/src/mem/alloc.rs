@@ -6,10 +6,11 @@
 
 use core::{
     alloc::{GlobalAlloc, Layout},
+    cell::UnsafeCell,
     cmp,
     mem::size_of,
-    ops::{Deref, DerefMut},
     ptr::{self, null_mut},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use log::debug;
@@ -40,6 +41,7 @@ const RETIRED_RECLAIM_BATCH: usize = 256;
 /// Bounded retention per CPU and size class. Cached slots remain allocated
 /// in their slabs, so freeing a different slot cannot unmap a cached pointer.
 const MAGAZINE_CAPACITY: usize = 8;
+const SLAB_RESERVE: usize = 16;
 
 struct Magazine {
     slots: [*mut u8; MAGAZINE_CAPACITY],
@@ -91,23 +93,130 @@ fn local_cache() -> Option<&'static IrqSpinLock<HeapCache>> {
 }
 
 fn allocate(layout: Layout) -> *mut u8 {
-    if layout.size() != 0
-        && let Some(class) = class_index(layout)
+    if !READY.load(Ordering::Acquire) {
+        return null_mut();
+    }
+    if layout.size() == 0 {
+        return layout.align() as *mut u8;
+    }
+    if let Some(class) = class_index(layout)
         && let Some(cache) = local_cache()
         && let Some(pointer) = cache.lock().classes[class].pop()
     {
         return pointer;
     }
-    let pointer = heap_lock().alloc(layout);
-    if pointer.is_null() && sys::smp::online_cpus() > 1 {
+    let pointer = allocate_uncached(layout);
+    if pointer.is_null() {
         drain_caches();
-        return heap_lock().alloc(layout);
+        return allocate_uncached(layout);
     }
     pointer
 }
 
+fn allocate_uncached(layout: Layout) -> *mut u8 {
+    if let Some(class) = class_index(layout) {
+        let owner = arch::thiscpu_opt().map_or(0, |cpu| cpu.id);
+        POOLS[owner]
+            .lock()
+            .alloc_slab(class, owner)
+            .unwrap_or(null_mut())
+    } else {
+        alloc_large(layout).unwrap_or(null_mut())
+    }
+}
+
+fn alloc_large(layout: Layout) -> Option<*mut u8> {
+    let pages = pages_for_len(layout.size() as u64) as usize;
+    let align_pages = cmp::max(1, pages_for_len(layout.align() as u64) as usize);
+    let start = {
+        let mut arena = arena_lock();
+        arena.collect_retired();
+        arena.reserve_run(pages, align_pages)?
+    };
+    let root = heap_root();
+    let mut mapped = 0usize;
+
+    while mapped < pages {
+        let phys_page = match phys::alloc_zeroed_page(phys::PageUse::KernelHeap) {
+            Some(page) => page,
+            None => {
+                rollback_large(root, start, mapped);
+                arena_lock().clear_run(start, pages);
+                return None;
+            }
+        };
+
+        let virt = heap_page_virt(start + mapped);
+        // SAFETY: this reserved virtual page is currently unmapped and the
+        // physical page is exclusively owned by this allocation.
+        let res = unsafe { arch::paging::map_page(root, virt, phys_page.paddr(), heap_flags()) };
+        if res.is_err() {
+            // SAFETY: mapping failed, so no alias to this page was exposed.
+            unsafe { phys::free_page(phys_page) };
+            rollback_large(root, start, mapped);
+            arena_lock().clear_run(start, pages);
+            return None;
+        }
+
+        mapped += 1;
+    }
+
+    let mut arena = arena_lock();
+    arena.pages[start] = HeapPageMeta {
+        kind: PageKind::LargeHead,
+        aux: pages as u32,
+    };
+
+    for idx in (start + 1)..(start + pages) {
+        arena.pages[idx] = HeapPageMeta {
+            kind: PageKind::LargeTail,
+            aux: (start + pages - idx) as u32,
+        };
+    }
+
+    Some(heap_page_virt(start).as_mut_ptr())
+}
+
+fn rollback_large(root: PhysAddr, start: usize, mapped: usize) {
+    for idx in start..(start + mapped) {
+        let page = take_mapped_page(root, idx, "rollback");
+        // SAFETY: rollback removed the only heap mapping of this page.
+        unsafe { phys::free_page(page) };
+    }
+}
+
+fn take_mapped_page(root: PhysAddr, page_idx: usize, context: &str) -> &'static phys::Page {
+    let virt = heap_page_virt(page_idx);
+    // SAFETY: the caller owns this reserved heap address, and the mapping is no longer accessible after removal.
+    let phys = unsafe { arch::paging::unmap_page(root, virt) }
+        .unwrap_or_else(|_| panic!("mem/alloc: failed to unmap {context} heap page"))
+        .unwrap_or_else(|| panic!("mem/alloc: missing {context} heap mapping"));
+    phys::phys_to_page(phys)
+        .unwrap_or_else(|| panic!("mem/alloc: {context} heap page missing PFN metadata"))
+}
+
+fn deallocate_uncached(pointer: *mut u8, layout: Layout) {
+    if layout.size() == 0 {
+        return;
+    }
+    if let Some(class) = class_index(layout) {
+        let index = ptr_page_index(pointer).expect("mem/alloc: pointer outside heap window");
+        // SAFETY: a live slot keeps its slab mapped. The owner is immutable;
+        // only the disjoint slab state changes while the slot remains live.
+        let owner = unsafe { (*heap_page_virt(index).as_mut_ptr::<SlabHeader>()).owner };
+        POOLS[owner].lock().dealloc_slab(index, pointer, class);
+    } else {
+        arena_lock().dealloc(pointer, layout);
+    }
+}
+
 #[cold]
 fn drain_caches() {
+    super::pmap::drain_pools();
+    super::object::drain_pool();
+    super::anon::drain_pool();
+    super::map::drain_pool();
+    super::metadata::drain();
     // Cache retention must not turn reclaimable objects into an allocation
     // failure. Detach each cache before touching the global heap.
     for cache in HEAP_CACHES.iter().take(sys::smp::cpu_count()) {
@@ -115,15 +224,18 @@ fn drain_caches() {
             &mut cache.lock().classes,
             [const { Magazine::new() }; SIZE_CLASSES.len()],
         );
-        let mut heap = heap_lock();
         for (class, mut magazine) in classes.into_iter().enumerate() {
             let layout = Layout::from_size_align(SIZE_CLASSES[class], SIZE_CLASSES[class]).unwrap();
             while let Some(pointer) = magazine.pop() {
-                heap.dealloc(pointer, layout);
+                deallocate_uncached(pointer, layout);
             }
         }
     }
-    let mut heap = heap_lock();
+    for pool in POOLS.iter().take(sys::smp::cpu_count().max(1)) {
+        pool.lock().trim();
+    }
+    let mut heap = arena_lock();
+    heap.flush_pending();
     if heap.retired.len != 0 {
         tlb::flush_everything();
         heap.drain_retired();
@@ -153,11 +265,9 @@ fn cache_deallocation(pointer: *mut u8, layout: Layout) -> bool {
     }
     if !spilled[0].is_null() {
         // Never take the sleeping heap mutex while holding a cache spinlock.
-        // Returning half the magazine amortizes global locking and keeps
-        // retained memory bounded even for cross-CPU allocation/free traffic.
-        let mut heap = heap_lock();
+        // Spill outside the cache lock; slots may belong to other CPU pools.
         for pointer in spilled {
-            heap.dealloc(pointer, layout);
+            deallocate_uncached(pointer, layout);
         }
     }
     true
@@ -172,6 +282,12 @@ struct FreeNode {
 /// Per-slab header placed at the front of each slab page.
 #[repr(C, align(64))]
 struct SlabHeader {
+    owner: usize,
+    state: UnsafeCell<SlabState>,
+}
+
+#[repr(C)]
+struct SlabState {
     next: u32,
     prev: u32,
     class: u16,
@@ -187,7 +303,6 @@ struct SlabHeader {
 enum PageKind {
     Free = 0,
     Busy = 1,
-    Slab = 2,
     LargeHead = 3,
     LargeTail = 4,
     Retired = 5,
@@ -197,28 +312,23 @@ enum PageKind {
 #[derive(Copy, Clone)]
 struct HeapPageMeta {
     kind: PageKind,
-    class: u8,
-    _reserved: u16,
     aux: u32,
 }
 
 impl HeapPageMeta {
     const FREE: Self = Self {
         kind: PageKind::Free,
-        class: 0,
-        _reserved: 0,
         aux: 0,
     };
 }
 
 /// Global allocator state guarded by the kernel heap mutex.
-struct HeapState {
-    initialized: bool,
+struct HeapArena {
     search_hint: usize,
-    partial: [u32; SIZE_CLASSES.len()],
-    empty_cache: [u32; SIZE_CLASSES.len()],
     pages: [HeapPageMeta; HEAP_PAGES],
     retired: RetireQueue,
+    pending: [Option<(usize, &'static phys::Page)>; tlb::Shootdown::INLINE],
+    pending_count: usize,
 }
 
 /// One heap page awaiting the invalidation that makes its frame reusable.
@@ -279,81 +389,33 @@ impl RetireQueue {
     }
 }
 
-impl HeapState {
-    const fn new() -> Self {
-        Self {
-            initialized: false,
-            search_hint: 0,
-            partial: [NONE_PAGE; SIZE_CLASSES.len()],
-            empty_cache: [NONE_PAGE; SIZE_CLASSES.len()],
-            pages: [HeapPageMeta::FREE; HEAP_PAGES],
-            retired: RetireQueue::new(),
-        }
-    }
+#[repr(align(64))]
+struct SlabPool {
+    partial: [u32; SIZE_CLASSES.len()],
+    empty_cache: [u32; SIZE_CLASSES.len()],
+    next_page: usize,
+    spare_pages: usize,
+}
 
-    fn init(&mut self) {
-        if self.initialized {
-            return;
-        }
+static READY: AtomicBool = AtomicBool::new(false);
+static HEAP_ROOT: AtomicU64 = AtomicU64::new(0);
+static POOLS: [Mutex<SlabPool>; tlb::MAX_TLB_CPUS] = [const {
+    Mutex::new(SlabPool {
+        partial: [NONE_PAGE; SIZE_CLASSES.len()],
+        empty_cache: [NONE_PAGE; SIZE_CLASSES.len()],
+        next_page: 0,
+        spare_pages: 0,
+    })
+}; tlb::MAX_TLB_CPUS];
 
-        self.initialized = true;
-    }
-
-    fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        self.collect_retired();
-
-        if !self.initialized {
-            return null_mut();
-        }
-
-        if layout.size() == 0 {
-            return layout.align() as *mut u8;
-        }
-
-        if let Some(class) = class_index(layout) {
-            return self.alloc_slab(class).unwrap_or(null_mut());
-        }
-
-        self.alloc_large(layout).unwrap_or(null_mut())
-    }
-
-    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        self.collect_retired();
-
-        if layout.size() == 0 {
-            return;
-        }
-
-        let page_idx = ptr_page_index(ptr).expect("mem/alloc: pointer outside heap window");
-        let meta = self.pages[page_idx];
-
-        match meta.kind {
-            PageKind::Slab => self.dealloc_slab(page_idx, ptr),
-            PageKind::LargeHead => self.dealloc_large(page_idx),
-            PageKind::LargeTail => panic!("mem/alloc: dealloc on non-head large allocation"),
-            _ => panic!("mem/alloc: invalid heap page state during free"),
-        }
-    }
-
-    fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
-        let page_idx = ptr_page_index(ptr)?;
-        let meta = self.pages[page_idx];
-
-        match meta.kind {
-            PageKind::Slab => Some(SIZE_CLASSES[meta.class as usize]),
-            PageKind::LargeHead => Some(meta.aux as usize * PAGE_SIZE as usize),
-            _ => None,
-        }
-    }
-
-    fn alloc_slab(&mut self, class: usize) -> Option<*mut u8> {
+impl SlabPool {
+    fn alloc_slab(&mut self, class: usize, owner: usize) -> Option<*mut u8> {
         let mut page_idx = self.partial[class];
         if page_idx == NONE_PAGE {
-            page_idx = self.grow_slab(class)?;
+            page_idx = self.grow_slab(class, owner)?;
         }
 
-        // SAFETY: partial lists only contain mapped slab pages and the heap
-        // lock gives this operation unique access.
+        // SAFETY: the owning pool lock exclusively protects this mapped slab.
         let slab = unsafe { slab_header(page_idx as usize) };
         let node = slab.free_head;
         if node.is_null() {
@@ -376,11 +438,11 @@ impl HeapState {
         Some(node.cast::<u8>())
     }
 
-    fn dealloc_slab(&mut self, page_idx: usize, ptr: *mut u8) {
-        let class = self.pages[page_idx].class as usize;
-        // SAFETY: `page_idx` was derived from an allocation owned by this slab
-        // and the heap lock gives unique access.
+    fn dealloc_slab(&mut self, page_idx: usize, ptr: *mut u8, class: usize) {
+        // SAFETY: the live slot pins the slab and its owning pool is locked.
         let slab = unsafe { slab_header(page_idx) };
+        debug_assert_eq!(slab.class as usize, class);
+        debug_assert!(slab.free_count < slab.capacity);
         let was_full = slab.free_count == 0;
         let node = ptr.cast::<FreeNode>();
 
@@ -406,20 +468,29 @@ impl HeapState {
         }
 
         self.remove_partial(class, page_idx as u32);
-        self.release_page(page_idx);
+        arena_lock().release_page(page_idx);
     }
 
-    fn grow_slab(&mut self, class: usize) -> Option<u32> {
-        let page_idx = self.reserve_run(1, 1)?;
+    fn grow_slab(&mut self, class: usize, owner: usize) -> Option<u32> {
+        if self.spare_pages == 0 {
+            let mut arena = arena_lock();
+            arena.collect_retired();
+            let (start, count) = arena
+                .reserve_run(SLAB_RESERVE, 1)
+                .map(|start| (start, SLAB_RESERVE))
+                .or_else(|| arena.reserve_run(1, 1).map(|start| (start, 1)))?;
+            for page in &mut arena.pages[start..start + count] {
+                // Slabs are retired independently, so no span may skip a
+                // freed neighbor when the shared arena searches for space.
+                page.aux = 1;
+            }
+            self.next_page = start;
+            self.spare_pages = count;
+        }
+        let page_idx = self.next_page;
         let page_va = heap_page_virt(page_idx);
-        let root = arch::paging::active_root();
-        let Some(phys_page) = phys::alloc_zeroed_page(phys::PageUse::KernelHeap) else {
-            // `reserve_run` changes side metadata before physical allocation.
-            // Roll it back on pressure or this virtual page remains Busy
-            // forever and slowly shrinks the heap window after each failure.
-            self.clear_run(page_idx, 1);
-            return None;
-        };
+        let root = heap_root();
+        let phys_page = phys::alloc_zeroed_page(phys::PageUse::KernelHeap)?;
 
         // SAFETY: the reserved heap virtual page is currently unmapped and the
         // new physical page is exclusively owned by the allocator.
@@ -428,84 +499,106 @@ impl HeapState {
         if mapped.is_err() {
             // SAFETY: mapping failed, so no alias to this page was published.
             unsafe { phys::free_page(phys_page) };
-            self.clear_run(page_idx, 1);
             return None;
         }
 
         // SAFETY: the page was just mapped exclusively for this slab class.
-        unsafe { init_slab_page(page_idx, class) };
-        self.pages[page_idx] = HeapPageMeta {
-            kind: PageKind::Slab,
-            class: class as u8,
-            _reserved: 0,
-            aux: 0,
-        };
+        unsafe { init_slab_page(page_idx, class, owner) };
+        self.next_page += 1;
+        self.spare_pages -= 1;
         self.insert_partial(class, page_idx as u32);
 
         Some(page_idx as u32)
     }
 
-    fn alloc_large(&mut self, layout: Layout) -> Option<*mut u8> {
-        let pages = pages_for_len(layout.size() as u64) as usize;
-        let align_pages = cmp::max(1, pages_for_len(layout.align() as u64) as usize);
-        let start = self.reserve_run(pages, align_pages)?;
-        let root = arch::paging::active_root();
-        let mut mapped = 0usize;
-
-        while mapped < pages {
-            let phys_page = match phys::alloc_zeroed_page(phys::PageUse::KernelHeap) {
-                Some(page) => page,
-                None => {
-                    self.rollback_large(root, start, mapped);
-                    self.clear_run(start, pages);
-                    return None;
-                }
-            };
-
-            let virt = heap_page_virt(start + mapped);
-            // SAFETY: this reserved virtual page is currently unmapped and the
-            // physical page is exclusively owned by this allocation.
-            let res =
-                unsafe { arch::paging::map_page(root, virt, phys_page.paddr(), heap_flags()) };
-            if res.is_err() {
-                // SAFETY: mapping failed, so no alias to this page was exposed.
-                unsafe { phys::free_page(phys_page) };
-                self.rollback_large(root, start, mapped);
-                self.clear_run(start, pages);
-                return None;
+    fn trim(&mut self) {
+        let mut arena = arena_lock();
+        arena.clear_run(self.next_page, self.spare_pages);
+        self.spare_pages = 0;
+        for class in 0..SIZE_CLASSES.len() {
+            let page = self.empty_cache[class];
+            if page != NONE_PAGE {
+                self.remove_partial(class, page);
+                self.empty_cache[class] = NONE_PAGE;
+                arena.release_page(page as usize);
             }
+        }
+    }
 
-            mapped += 1;
+    fn insert_partial(&mut self, class: usize, page_idx: u32) {
+        // SAFETY: the owning pool lock protects its partial-list links.
+        let slab = unsafe { slab_header(page_idx as usize) };
+        slab.prev = NONE_PAGE;
+        slab.next = self.partial[class];
+
+        if slab.next != NONE_PAGE {
+            // SAFETY: `slab.next` names another mapped slab in this list.
+            unsafe { slab_header(slab.next as usize) }.prev = page_idx;
         }
 
-        self.pages[start] = HeapPageMeta {
-            kind: PageKind::LargeHead,
-            class: 0,
-            _reserved: 0,
-            aux: pages as u32,
-        };
+        self.partial[class] = page_idx;
+    }
 
-        for idx in (start + 1)..(start + pages) {
-            self.pages[idx] = HeapPageMeta {
-                kind: PageKind::LargeTail,
-                class: 0,
-                _reserved: 0,
-                aux: (start + pages - idx) as u32,
-            };
+    fn remove_partial(&mut self, class: usize, page_idx: u32) {
+        // SAFETY: the owning pool lock protects its partial-list links.
+        let slab = unsafe { slab_header(page_idx as usize) };
+        let next = slab.next;
+        let prev = slab.prev;
+
+        if prev != NONE_PAGE {
+            // SAFETY: `prev` names another mapped slab in this list.
+            unsafe { slab_header(prev as usize) }.next = next;
+        } else {
+            self.partial[class] = next;
         }
 
-        Some(heap_page_virt(start).as_mut_ptr())
+        if next != NONE_PAGE {
+            // SAFETY: `next` names another mapped slab in this list.
+            unsafe { slab_header(next as usize) }.prev = prev;
+        }
+
+        slab.next = NONE_PAGE;
+        slab.prev = NONE_PAGE;
+    }
+}
+
+impl HeapArena {
+    const fn new() -> Self {
+        Self {
+            search_hint: 0,
+            pages: [HeapPageMeta::FREE; HEAP_PAGES],
+            retired: RetireQueue::new(),
+            pending: [None; tlb::Shootdown::INLINE],
+            pending_count: 0,
+        }
+    }
+
+    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        self.collect_retired();
+
+        if layout.size() == 0 {
+            return;
+        }
+
+        let page_idx = ptr_page_index(ptr).expect("mem/alloc: pointer outside heap window");
+        let meta = self.pages[page_idx];
+
+        match meta.kind {
+            PageKind::LargeHead => self.dealloc_large(page_idx),
+            PageKind::LargeTail => panic!("mem/alloc: dealloc on non-head large allocation"),
+            _ => panic!("mem/alloc: invalid heap page state during free"),
+        }
     }
 
     fn dealloc_large(&mut self, start: usize) {
         let pages = self.pages[start].aux as usize;
-        let root = arch::paging::active_root();
+        let root = heap_root();
 
         for base in (start..start + pages).step_by(tlb::Shootdown::INLINE) {
             let count = (start + pages - base).min(tlb::Shootdown::INLINE);
             let mut retired = [None; tlb::Shootdown::INLINE];
             for (offset, page) in retired[..count].iter_mut().enumerate() {
-                *page = Some(self.take_mapped_page(root, base + offset, "large"));
+                *page = Some(take_mapped_page(root, base + offset, "large"));
             }
             // One publication and IPI round for the whole batch. Publishing
             // before every leaf was removed would allow premature reuse.
@@ -528,8 +621,6 @@ impl HeapState {
         for idx in start..(start + pages) {
             self.pages[idx] = HeapPageMeta {
                 kind: PageKind::Busy,
-                class: 0,
-                _reserved: 0,
                 aux: (start + pages - idx) as u32,
             };
         }
@@ -584,77 +675,39 @@ impl HeapState {
         None
     }
 
-    fn insert_partial(&mut self, class: usize, page_idx: u32) {
-        // SAFETY: partial-list links are only manipulated under the heap lock.
-        let slab = unsafe { slab_header(page_idx as usize) };
-        slab.prev = NONE_PAGE;
-        slab.next = self.partial[class];
-
-        if slab.next != NONE_PAGE {
-            // SAFETY: `slab.next` names another mapped slab in this list.
-            unsafe { slab_header(slab.next as usize) }.prev = page_idx;
-        }
-
-        self.partial[class] = page_idx;
-    }
-
-    fn remove_partial(&mut self, class: usize, page_idx: u32) {
-        // SAFETY: partial-list links are only manipulated under the heap lock.
-        let slab = unsafe { slab_header(page_idx as usize) };
-        let next = slab.next;
-        let prev = slab.prev;
-
-        if prev != NONE_PAGE {
-            // SAFETY: `prev` names another mapped slab in this list.
-            unsafe { slab_header(prev as usize) }.next = next;
-        } else {
-            self.partial[class] = next;
-        }
-
-        if next != NONE_PAGE {
-            // SAFETY: `next` names another mapped slab in this list.
-            unsafe { slab_header(next as usize) }.prev = prev;
-        }
-
-        slab.next = NONE_PAGE;
-        slab.prev = NONE_PAGE;
-    }
-
     fn release_page(&mut self, page_idx: usize) {
-        let root = arch::paging::active_root();
-        let page = self.take_mapped_page(root, page_idx, "slab");
-        self.retire_page(page_idx, page, 1);
+        let root = heap_root();
+        let page = take_mapped_page(root, page_idx, "slab");
+        if sys::smp::online_cpus() <= 1 {
+            self.quarantine_page(page_idx, page, 1, 0);
+        } else {
+            self.pages[page_idx] = HeapPageMeta {
+                kind: PageKind::Retired,
+                aux: 1,
+            };
+            self.pending[self.pending_count] = Some((page_idx, page));
+            self.pending_count += 1;
+            if self.pending_count == self.pending.len() {
+                self.flush_pending();
+            }
+        }
         self.search_hint = self.search_hint.min(page_idx);
     }
 
-    fn rollback_large(&mut self, root: PhysAddr, start: usize, mapped: usize) {
-        for idx in start..(start + mapped) {
-            let page = self.take_mapped_page(root, idx, "rollback");
-            // SAFETY: rollback removed the only heap mapping of this page.
-            unsafe { phys::free_page(page) };
+    fn flush_pending(&mut self) {
+        let count = core::mem::replace(&mut self.pending_count, 0);
+        if count == 0 {
+            return;
         }
-    }
-
-    fn take_mapped_page(
-        &self,
-        root: PhysAddr,
-        page_idx: usize,
-        context: &str,
-    ) -> &'static phys::Page {
-        let virt = heap_page_virt(page_idx);
-        // SAFETY: the heap lock serializes page-table changes for this reserved
-        // heap address, and the mapping is no longer accessible after removal.
-        let phys = unsafe { arch::paging::unmap_page(root, virt) }
-            .unwrap_or_else(|_| panic!("mem/alloc: failed to unmap {context} heap page"))
-            .unwrap_or_else(|| panic!("mem/alloc: missing {context} heap mapping"));
-        phys::phys_to_page(phys)
-            .unwrap_or_else(|| panic!("mem/alloc: {context} heap page missing PFN metadata"))
-    }
-
-    /// Quarantines an unmapped heap page until its frame can be reused.
-    fn retire_page(&mut self, page_idx: usize, page: &'static phys::Page, span: usize) {
-        let sequence = tlb::publish_async_range(heap_page_virt(page_idx), 1);
-        self.quarantine_page(page_idx, page, span, sequence);
+        let mut addresses = [0; tlb::Shootdown::INLINE];
+        for (index, address) in addresses[..count].iter_mut().enumerate() {
+            *address = heap_page_virt(self.pending[index].unwrap().0).as_u64();
+        }
+        let sequence = tlb::publish_async_pages(&addresses[..count]);
+        for index in 0..count {
+            let (page_idx, page) = self.pending[index].take().unwrap();
+            self.quarantine_page(page_idx, page, 1, sequence);
+        }
     }
 
     fn quarantine_page(
@@ -674,8 +727,6 @@ impl HeapState {
 
         self.pages[page_idx] = HeapPageMeta {
             kind: PageKind::Retired,
-            class: 0,
-            _reserved: 0,
             aux: span as u32,
         };
 
@@ -705,6 +756,7 @@ impl HeapState {
 
     /// Releases quarantined pages whose invalidation every CPU has applied.
     fn collect_retired(&mut self) {
+        self.flush_pending();
         if self.retired.len == 0 {
             return;
         }
@@ -749,23 +801,17 @@ impl HeapState {
 
 /// Global allocator facade wired into Rust's allocation hooks.
 ///
-/// This type is installed as the kernel's single heap allocator through
-/// [`GLOBAL_ALLOCATOR`], which delegates all operations to the page-backed
-/// heap state guarded by [`HEAP`].
+/// Small allocations use CPU slab pools; page runs are owned by [`HEAP`].
 pub struct KernelAllocator;
 
-static HEAP: Mutex<HeapState> = Mutex::new(HeapState::new());
-
-struct HeapGuard<'a> {
-    guard: crate::sys::sync::MutexGuard<'a, HeapState>,
-}
+static HEAP: Mutex<HeapArena> = Mutex::new(HeapArena::new());
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
-// SAFETY: slab/page metadata is serialized through `HEAP`. Cached objects
-// remain allocated in their slabs and are exclusively owned by one locked
-// magazine until returned to a caller or the heap. Regions remain disjoint.
+// SAFETY: pools serialize their slab state, and HEAP owns disjoint page runs.
+// Cached slots retain their allocation until returned to a pool or caller;
+// retired frames remain quarantined through remote TLB acknowledgement.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         allocate(layout)
@@ -773,7 +819,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if !cache_deallocation(ptr, layout) {
-            heap_lock().dealloc(ptr, layout);
+            deallocate_uncached(ptr, layout);
         }
     }
 
@@ -805,15 +851,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // must not retain that large backing in a small-object magazine.
         // SAFETY: `layout.align()` is a valid allocation alignment.
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let current = {
-            let heap = heap_lock();
-            heap.usable_size(ptr)
-        };
-
-        if let Some(current) = current
-            && new_size <= current
-            && class_index(layout) == class_index(new_layout)
-        {
+        let current = class_index(layout).map_or_else(
+            || pages_for_len(layout.size() as u64) as usize * PAGE_SIZE as usize,
+            |class| SIZE_CLASSES[class],
+        );
+        if new_size <= current && class_index(layout) == class_index(new_layout) {
             return ptr;
         }
 
@@ -835,8 +877,8 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 /// Initializes the global heap allocator.
 pub fn init() {
-    let mut heap = heap_lock();
-    heap.init();
+    HEAP_ROOT.store(arch::paging::active_root().as_u64(), Ordering::Relaxed);
+    READY.store(true, Ordering::Release);
 
     debug!(
         "heap window [0x{:x}-0x{:x}], {} MiB",
@@ -882,7 +924,6 @@ fn occupied_span(meta: HeapPageMeta) -> usize {
     match meta.kind {
         PageKind::Free => 1,
         PageKind::Busy | PageKind::LargeTail | PageKind::Retired => cmp::max(meta.aux as usize, 1),
-        PageKind::Slab => 1,
         PageKind::LargeHead => cmp::max(meta.aux as usize, 1),
     }
 }
@@ -902,13 +943,17 @@ fn ptr_page_index(ptr: *mut u8) -> Option<usize> {
     Some(((raw - HEAP_BASE) / PAGE_SIZE) as usize)
 }
 
-unsafe fn slab_header(page_idx: usize) -> &'static mut SlabHeader {
-    // SAFETY: callers only request mapped slab pages while holding the heap
-    // lock, which guarantees unique access to the header.
-    unsafe { &mut *heap_page_virt(page_idx).as_mut_ptr::<SlabHeader>() }
+unsafe fn slab_header<'a>(page_idx: usize) -> &'a mut SlabState {
+    // SAFETY: callers retain the owning pool lock for the returned borrow,
+    // and the slab remains mapped until it is removed from that pool.
+    unsafe {
+        &mut *(*heap_page_virt(page_idx).as_mut_ptr::<SlabHeader>())
+            .state
+            .get()
+    }
 }
 
-unsafe fn init_slab_page(page_idx: usize, class: usize) {
+unsafe fn init_slab_page(page_idx: usize, class: usize, owner: usize) {
     let base = heap_page_virt(page_idx).as_mut_ptr::<u8>();
     let slot_size = SIZE_CLASSES[class];
     let slots_offset = mem::align_up(size_of::<SlabHeader>() as u64, slot_size as u64) as usize;
@@ -924,17 +969,20 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
         ptr::write(
             base.cast::<SlabHeader>(),
             SlabHeader {
-                next: NONE_PAGE,
-                prev: NONE_PAGE,
-                class: class as u16,
-                capacity: capacity as u16,
-                free_count: capacity as u16,
-                _reserved: 0,
-                free_head: null_mut(),
+                owner,
+                state: UnsafeCell::new(SlabState {
+                    next: NONE_PAGE,
+                    prev: NONE_PAGE,
+                    class: class as u16,
+                    capacity: capacity as u16,
+                    free_count: capacity as u16,
+                    _reserved: 0,
+                    free_head: null_mut(),
+                }),
             },
         );
 
-        let slab = &mut *base.cast::<SlabHeader>();
+        let slab = slab_header(page_idx);
         let mut free_head = null_mut();
 
         for slot in (0..capacity).rev() {
@@ -948,27 +996,11 @@ unsafe fn init_slab_page(page_idx: usize, class: usize) {
 }
 
 #[inline]
-fn heap_lock() -> HeapGuard<'static> {
-    HeapGuard::new(HEAP.lock())
+fn heap_root() -> PhysAddr {
+    PhysAddr::new(HEAP_ROOT.load(Ordering::Relaxed))
 }
 
-impl<'a> HeapGuard<'a> {
-    #[inline]
-    fn new(guard: crate::sys::sync::MutexGuard<'a, HeapState>) -> Self {
-        Self { guard }
-    }
-}
-
-impl Deref for HeapGuard<'_> {
-    type Target = HeapState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for HeapGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
+#[inline]
+fn arena_lock() -> crate::sys::sync::MutexGuard<'static, HeapArena> {
+    HEAP.lock()
 }

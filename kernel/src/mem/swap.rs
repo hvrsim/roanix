@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 1995, 1996, 1997, 2009 Matthew R. Green
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * from: NetBSD: vm_swap.c,v 1.52 1997/12/02 13:47:37 pk Exp
+ * from: Id: uvm_swap.c,v 1.1.2.42 1998/02/02 20:38:06 chuck Exp
+ */
+
 //! Compressed front-swap and optional external swap backend.
 
 use alloc::{sync::Arc, vec::Vec};
@@ -68,6 +97,7 @@ struct CompressedSlot {
     /// Temporarily taken during page-in so decompression does not hold the lock.
     data: Option<Vec<u8>>,
     checksum: u64,
+    resident: bool,
 }
 
 struct SwapState {
@@ -78,6 +108,8 @@ struct SwapState {
     maximum_slots: usize,
     backend: Option<Arc<dyn SwapBackend>>,
     external_ops: usize,
+    resident_pages: usize,
+    resident_bytes: u64,
 }
 
 impl SwapState {
@@ -105,6 +137,7 @@ impl SwapState {
         self.compressed.push(CompressedSlot {
             data: None,
             checksum: 0,
+            resident: false,
         });
         Some((self.compressed.len() - 1) as u32)
     }
@@ -146,6 +179,60 @@ pub struct SwapStats {
 
 static SWAP: Once<SwapManager> = Once::new();
 
+pub(super) fn has_capacity() -> bool {
+    let Some(manager) = SWAP.get() else {
+        return false;
+    };
+    let state = manager.state.lock();
+    state.backend.is_some()
+        || (manager.compressed_bytes.load(Ordering::Acquire) < manager.maximum_compressed_bytes
+            && (!state.free_slots.is_empty() || state.compressed.len() < state.maximum_slots))
+}
+
+/// uvm_swapisfull counts swap-only pages, excluding backing still held by
+/// resident pages. Allocated slots can be exhausted while dropswap can still
+/// recover them. The reference discounts the final 1% for busy/contended slots.
+pub(super) fn is_full() -> bool {
+    let Some(manager) = SWAP.get() else {
+        return true;
+    };
+    let state = manager.state.lock();
+    if state.backend.is_some() {
+        return false;
+    }
+    let only_pages = state.compressed.len() - state.free_slots.len() - state.resident_pages;
+    let only_bytes = manager.compressed_bytes.load(Ordering::Relaxed) - state.resident_bytes;
+    only_pages.saturating_mul(100) / 99 >= state.maximum_slots
+        || only_bytes.saturating_mul(100) / 99 >= manager.maximum_compressed_bytes
+}
+
+/// The page owner serializes transitions between swpgonly and resident
+/// backing. Fill values need no finite storage slot; the external adapter
+/// retains its existing capacity contract.
+pub(super) fn set_resident(handle: SwapHandle, resident: bool) {
+    let SwapHandle::Compressed(slot) = handle else {
+        return;
+    };
+    let mut state = manager().state.lock();
+    let entry = &mut state.compressed[slot as usize];
+    if entry.resident == resident {
+        return;
+    }
+    let bytes = entry
+        .data
+        .as_ref()
+        .expect("uvm: resident transition during swap I/O")
+        .len() as u64;
+    entry.resident = resident;
+    if resident {
+        state.resident_pages += 1;
+        state.resident_bytes += bytes;
+    } else {
+        state.resident_pages -= 1;
+        state.resident_bytes -= bytes;
+    }
+}
+
 /// Initializes compressed swap with a payload-byte limit.
 pub(super) fn init(maximum_compressed_bytes: u64, maximum_slots: usize) {
     SWAP.call_once(|| {
@@ -167,6 +254,8 @@ pub(super) fn init(maximum_compressed_bytes: u64, maximum_slots: usize) {
                 maximum_slots,
                 backend: None,
                 external_ops: 0,
+                resident_pages: 0,
+                resident_bytes: 0,
             }),
         }
     });
@@ -234,7 +323,7 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
                 && let Some(slot) = state.take_slot()
             {
                 let entry = &mut state.compressed[slot as usize];
-                debug_assert!(entry.data.is_none());
+                debug_assert!(entry.data.is_none() && !entry.resident);
                 entry.data = Some(payload);
                 entry.checksum = checksum;
                 manager.compressed_bytes.store(next, Ordering::Relaxed);
@@ -275,8 +364,10 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
     Ok(handle)
 }
 
-/// Restores a page and releases its swap storage as one logical operation.
-pub(super) fn load_and_free(
+/// Restores a page without consuming its backing slot. UVM keeps resident
+/// swap backing until it becomes stale, is dropped under swap pressure, or
+/// its anon/object is destroyed. The page owner serializes slot users.
+pub(super) fn load(
     handle: SwapHandle,
     page: &mut [u8; PAGE_BYTES],
 ) -> core::result::Result<(), SwapError> {
@@ -286,23 +377,22 @@ pub(super) fn load_and_free(
             for word in page.as_chunks_mut::<8>().0 {
                 *word = fill.to_ne_bytes();
             }
-            manager.same_fill_pages.fetch_sub(1, Ordering::Relaxed);
         }
         SwapHandle::Compressed(slot) => {
-            // Claim the payload but leave the slot unavailable until decoding
-            // succeeds. On corruption the bytes are restored, so a later drop
-            // cannot accidentally free a slot that has already been reused.
+            // Temporarily own the bytes so decoding runs without the swap
+            // manager lock. Restore the payload on success as well as error;
+            // the page's owner/busy protocol excludes another slot user.
             let (data, checksum) = {
                 let mut state = manager.state.lock();
                 let entry = state
                     .compressed
                     .get_mut(slot as usize)
                     .ok_or(SwapError::Corrupt)?;
-                let data = entry.data.take().ok_or(SwapError::Corrupt)?;
-                (data, entry.checksum)
+                (entry.data.take().ok_or(SwapError::Corrupt)?, entry.checksum)
             };
             let result = decompress_into(&data, page);
-            if !matches!(result, Ok(PAGE_BYTES)) || page_checksum(page) != checksum {
+            let valid = matches!(result, Ok(PAGE_BYTES)) && page_checksum(page) == checksum;
+            {
                 let mut state = manager.state.lock();
                 let entry = state
                     .compressed
@@ -310,31 +400,14 @@ pub(super) fn load_and_free(
                     .ok_or(SwapError::Corrupt)?;
                 debug_assert!(entry.data.is_none());
                 entry.data = Some(data);
+            }
+            if !valid {
                 return Err(SwapError::Corrupt);
             }
-
-            let length = data.len() as u64;
-            let mut state = manager.state.lock();
-            let entry = state
-                .compressed
-                .get_mut(slot as usize)
-                .ok_or(SwapError::Corrupt)?;
-            debug_assert!(entry.data.is_none());
-            entry.checksum = 0;
-            debug_assert!(state.free_slots.len() < state.free_slots.capacity());
-            state.free_slots.push(slot as u32);
-            manager
-                .compressed_bytes
-                .fetch_sub(length, Ordering::Relaxed);
-            manager.compressed_pages.fetch_sub(1, Ordering::Relaxed);
-            drop(state);
-            drop(data);
         }
         SwapHandle::External(slot) => {
             let backend = manager.state.lock().backend.clone().ok_or(SwapError::Io)?;
             backend.load(slot, page)?;
-            backend.free(slot);
-            manager.external_pages.fetch_sub(1, Ordering::Relaxed);
         }
     }
     trace_page_in(manager, handle);
@@ -355,6 +428,10 @@ pub(super) fn free(handle: SwapHandle) {
             if let Some(data) = entry.data.take() {
                 entry.checksum = 0;
                 let length = data.len() as u64;
+                if core::mem::replace(&mut entry.resident, false) {
+                    state.resident_pages -= 1;
+                    state.resident_bytes -= length;
+                }
                 manager
                     .compressed_bytes
                     .fetch_sub(length, Ordering::Relaxed);

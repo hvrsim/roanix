@@ -1,3 +1,93 @@
+/*-
+ * Copyright (c) 2019, 2020 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Andrew Doran.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * Copyright (c) 1997 Charles D. Cranor and Washington University.
+ * Copyright (c) 1991, 1993, The Regents of the University of California.
+ *
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to Berkeley by
+ * The Mach Operating System project at Carnegie-Mellon University.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ *	@(#)vm_page.c   8.3 (Berkeley) 3/21/94
+ * from: Id: uvm_page.c,v 1.1.2.18 1998/02/06 05:24:42 chs Exp
+ *
+ *
+ * Copyright (c) 1987, 1990 Carnegie-Mellon University.
+ * All rights reserved.
+ *
+ * Permission to use, copy, modify and distribute this software and
+ * its documentation is hereby granted, provided that both the copyright
+ * notice and this permission notice appear in all copies of the
+ * software, derivative works or modified versions, and any portions
+ * thereof, and that both notices appear in supporting documentation.
+ *
+ * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
+ * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND
+ * FOR ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
+ *
+ * Carnegie Mellon requests users of this software to return to
+ *
+ *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
+ *  School of Computer Science
+ *  Carnegie Mellon University
+ *  Pittsburgh PA 15213-3890
+ *
+ * any improvements or extensions that they make and grant Carnegie the
+ * rights to redistribute these changes.
+ */
+
 //!
 //! # Physical Memory Manager
 //!
@@ -5,7 +95,8 @@
 //! and managed-page queues.
 //!
 
-use alloc::sync::{Arc, Weak};
+use crate::mem::{PageRef, PageWeak};
+use alloc::sync::Arc;
 use core::{
     mem::size_of,
     ptr,
@@ -22,9 +113,8 @@ use crate::{
     mem::{
         self, PhysAddr, VirtAddr, VmFlags,
         addr::{PAGE_SIZE, align_down, align_up, pages_for_len},
-        page::VmPage,
     },
-    sys::smp::IrqSpinLock,
+    sys::{smp::IrqSpinLock, sync::Once},
 };
 
 /// Virtual base address where the PFN database is mapped.
@@ -41,6 +131,8 @@ bitflags! {
     pub struct PageAllocFlags: u8 {
         /// Return a page whose contents are all zero.
         const ZERO = 1 << 0;
+        /// Allow the caller to consume the kernel reserve (UVM_PGA_USERESERVE).
+        const USERESERVE = 1 << 1;
     }
 }
 
@@ -64,6 +156,12 @@ bitflags! {
         const ANON = 1 << 6;
         /// Page belongs to a vnode-backed object.
         const FILE = 1 << 7;
+        /// Temporary traversal marker belonging to the clock policy.
+        const MARKER = 1 << 8;
+        /// Vnode page used by an executable mapping.
+        const EXECUTABLE = 1 << 9;
+        /// Hardware modified bits have not yet resolved clean/dirty state.
+        const DIRTY_UNKNOWN = 1 << 10;
     }
 }
 
@@ -123,31 +221,30 @@ pub enum PageQueue {
     Active = 1,
     /// Reclamation candidate.
     Inactive = 2,
-    /// Unchanged page that no configured swap tier can represent.
-    Unswappable = 3,
+    // The clock policy has only active and inactive queues.
 }
 
 /// Authoritative metadata for one physical page frame.
 ///
 /// The database holds one entry per frame of usable memory, so its size is a
-/// fixed fraction of RAM. The layout is packed into a single cache line and
-/// deliberately holds no owning collections: reverse mappings belong to the
-/// logical page, and the physical address is derived from the entry's own
-/// position in the database.
+/// fixed fraction of RAM. Separate free and replacement links permit deferred
+/// policy updates. The entry deliberately holds no owning collections: reverse mappings belong to the
+/// logical page. Each entry records its immutable physical frame number;
+/// UVM physical segments select its slice of the compact page array.
 #[repr(C, align(64))]
 pub struct Page {
-    /// Free-list or page-queue membership.
-    ///
-    /// A frame is either available to the allocator or owned by a subsystem,
-    /// never both, so the two roles share one link.
+    /// Physical allocator free-list membership (independent of pdqueue).
     link: LinkedListLink,
+    pub(super) policy_link: LinkedListLink,
+    frame_number: u32,
+    pub(super) policy_flags: AtomicU32,
     flags: AtomicU32,
     /// Packed [`PageState`], [`PageUse`], [`PageQueue`] and [`PageOwnerKind`].
     status: AtomicU32,
     wire_count: AtomicU32,
     loan_count: AtomicU32,
     map_count: AtomicU32,
-    owner: IrqSpinLock<Option<Weak<VmPage>>>,
+    pub(super) owner: IrqSpinLock<Option<PageWeak>>,
 }
 
 /// Bit position of each packed status field.
@@ -157,12 +254,11 @@ const QUEUE_SHIFT: u32 = 16;
 const OWNER_KIND_SHIFT: u32 = 24;
 const FIELD_MASK: u32 = 0xff;
 
-// The database holds one entry per frame, so its footprint is a fixed
-// proportion of installed memory. Keeping an entry within a single cache line
-// bounds that overhead and keeps page-daemon scans to one line per frame.
+// Free and replacement queues need distinct links: a freed frame can still
+// have a deferred dequeue intent, exactly as in UVM's pageq/pdqueue layout.
 const _: () = assert!(
-    size_of::<Page>() == 64,
-    "mem/phys: a frame database entry must occupy exactly one cache line"
+    size_of::<Page>() <= 128 && size_of::<Page>().is_power_of_two(),
+    "mem/phys: invalid frame database entry size"
 );
 
 const fn pack_status(
@@ -178,8 +274,11 @@ const fn pack_status(
 }
 
 impl Page {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
+            policy_link: LinkedListLink::new(),
+            frame_number: 0,
+            policy_flags: AtomicU32::new(0),
             link: LinkedListLink::new(),
             flags: AtomicU32::new(0),
             status: AtomicU32::new(pack_status(
@@ -195,17 +294,21 @@ impl Page {
         }
     }
 
+    pub(super) fn new_marker() -> Self {
+        let page = Self::new();
+        page.flags
+            .store(PageFlags::MARKER.bits(), Ordering::Relaxed);
+        page
+    }
+
     /// Returns the physical base address.
     pub fn paddr(&self) -> PhysAddr {
         PhysAddr::new(self.pfn() as u64 * PAGE_SIZE)
     }
 
-    /// Returns the PFN index.
-    ///
-    /// Entries are stored contiguously from [`PAGEDB_ADDR`] in frame order, so
-    /// an entry's index — and therefore its frame — follows from its address.
+    /// Returns the immutable physical frame number, independent of array position.
     pub fn pfn(&self) -> usize {
-        (ptr::from_ref(self).addr() - PAGEDB_ADDR as usize) / size_of::<Page>()
+        self.frame_number as usize
     }
 
     /// Returns allocator state.
@@ -220,7 +323,7 @@ impl Page {
 
     /// Returns page-daemon queue membership.
     pub fn queue(&self) -> PageQueue {
-        decode_page_queue(self.status_field(QUEUE_SHIFT))
+        super::policy::queue(self)
     }
 
     /// Returns managed owner category.
@@ -270,42 +373,67 @@ impl Page {
         }
     }
 
-    pub(crate) fn bind_owner(&'static self, owner: &Arc<VmPage>, kind: PageOwnerKind) {
+    pub(crate) fn bind_owner(&'static self, owner: &PageRef, kind: PageOwnerKind) {
+        let mut interlock = self.owner.lock();
         assert_eq!(self.usage(), PageUse::Managed);
         assert_eq!(self.owner_kind(), PageOwnerKind::None);
-        *self.owner.lock() = Some(Arc::downgrade(owner));
+        *interlock = Some(Arc::downgrade(owner));
         self.set_status_field(OWNER_KIND_SHIFT, kind as u8);
-        let owner_flag = match kind {
+        let executable = kind == PageOwnerKind::File && owner.is_executable();
+        let mut owner_flag = match kind {
             PageOwnerKind::Anonymous => PageFlags::ANON,
             PageOwnerKind::File => PageFlags::FILE,
             PageOwnerKind::Kernel | PageOwnerKind::None => PageFlags::empty(),
         };
+        if executable {
+            owner_flag |= PageFlags::EXECUTABLE;
+        }
         self.flags
             .fetch_or((PageFlags::TABLED | owner_flag).bits(), Ordering::AcqRel);
         MANAGED_PAGES.fetch_add(1, Ordering::AcqRel);
+        super::policy::account(kind, executable, 1);
     }
 
     pub(crate) fn clear_owner(&self) {
+        let mut interlock = self.owner.lock();
         if self.owner_kind() != PageOwnerKind::None {
+            super::policy::account(
+                self.owner_kind(),
+                self.flags().contains(PageFlags::EXECUTABLE),
+                -1,
+            );
             MANAGED_PAGES.fetch_sub(1, Ordering::AcqRel);
         }
-        *self.owner.lock() = None;
+        *interlock = None;
         self.set_status_field(OWNER_KIND_SHIFT, PageOwnerKind::None as u8);
         self.flags.fetch_and(
-            !(PageFlags::TABLED | PageFlags::ANON | PageFlags::FILE).bits(),
+            !(PageFlags::TABLED | PageFlags::ANON | PageFlags::FILE | PageFlags::EXECUTABLE).bits(),
             Ordering::AcqRel,
         );
     }
 
-    /// Adds one wire that prevents reclamation.
-    pub fn wire(&self) {
-        self.wire_count.fetch_add(1, Ordering::AcqRel);
+    pub(super) fn note_executable(&self) {
+        let _interlock = self.owner.lock();
+        if self.owner_kind() == PageOwnerKind::File
+            && self
+                .flags
+                .fetch_or(PageFlags::EXECUTABLE.bits(), Ordering::Relaxed)
+                & PageFlags::EXECUTABLE.bits()
+                == 0
+        {
+            super::policy::account(PageOwnerKind::File, false, -1);
+            super::policy::account(PageOwnerKind::File, true, 1);
+        }
     }
 
-    /// Removes one wire.
-    pub fn unwire(&self) {
-        let previous = self.wire_count.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous != 0, "mem/phys: page wire count underflow");
+    /// Adds one wire that prevents reclamation.
+    pub fn wire(&'static self) {
+        super::policy::wire(self, &self.wire_count);
+    }
+
+    /// Removes a wire and activates the page after the final wire is released.
+    pub fn unwire(&'static self) {
+        super::policy::unwire(self, &self.wire_count);
     }
 
     /// Adds one transient page loan.
@@ -329,13 +457,33 @@ impl Page {
     }
 
     pub(crate) fn mark_dirty(&self) {
-        self.flags
-            .fetch_or(PageFlags::DIRTY.bits(), Ordering::Release);
+        let _ = self
+            .flags
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |flags| {
+                Some((flags | PageFlags::DIRTY.bits()) & !PageFlags::DIRTY_UNKNOWN.bits())
+            });
     }
-
     pub(crate) fn mark_clean(&self) {
+        self.flags.fetch_and(
+            !(PageFlags::DIRTY | PageFlags::DIRTY_UNKNOWN).bits(),
+            Ordering::Release,
+        );
+    }
+    pub(crate) fn mark_unknown(&self) {
+        let _ = self
+            .flags
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |flags| {
+                Some(if flags & PageFlags::DIRTY.bits() == 0 {
+                    flags | PageFlags::DIRTY_UNKNOWN.bits()
+                } else {
+                    flags
+                })
+            });
+    }
+    /// All PTEs have been revoked and their A/D bits folded into this PFN.
+    pub(crate) fn resolve_unknown(&self) {
         self.flags
-            .fetch_and(!PageFlags::DIRTY.bits(), Ordering::Release);
+            .fetch_and(!PageFlags::DIRTY_UNKNOWN.bits(), Ordering::Release);
     }
 
     pub(crate) fn mark_referenced(&self) {
@@ -383,10 +531,6 @@ impl Page {
             && self.loan_count() == 0
             && self.map_count() == 0
             && !self.flags().contains(PageFlags::BUSY)
-    }
-
-    fn owner(&self) -> Option<Arc<VmPage>> {
-        self.owner.lock().as_ref()?.upgrade()
     }
 
     /// Claims a free frame for `usage`.
@@ -442,17 +586,13 @@ unsafe impl Send for Page {}
 // SAFETY: shared access observes atomic fields or lock-protected owner state.
 unsafe impl Sync for Page {}
 
-// Both adapters project the same link because free lists and page-daemon
-// queues hold disjoint sets of frames.
+// Free lists use their own link; deferred policy updates use policy_link.
 intrusive_adapter!(FreePageAdapter = &'static Page: Page { link: LinkedListLink });
-intrusive_adapter!(ManagedPageAdapter = &'static Page: Page { link: LinkedListLink });
 
 struct PmmState {
     free: LinkedList<FreePageAdapter>,
     zero: LinkedList<FreePageAdapter>,
-    active: LinkedList<ManagedPageAdapter>,
-    inactive: LinkedList<ManagedPageAdapter>,
-    unswappable: LinkedList<ManagedPageAdapter>,
+    nfree: usize,
 }
 
 #[repr(align(64))]
@@ -505,7 +645,8 @@ static PMM: IrqSpinLock<Option<PmmState>> = IrqSpinLock::new(None);
 static PAGE_CACHES: [IrqSpinLock<PageCache>; MAX_PAGE_CPUS] =
     [const { IrqSpinLock::new(PageCache::new()) }; MAX_PAGE_CPUS];
 static READY: AtomicBool = AtomicBool::new(false);
-static DATABASE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static MAX_PFN: AtomicUsize = AtomicUsize::new(0);
+static SEGMENTS: Once<&'static [super::physseg::Segment]> = Once::new();
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 static USED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static FREE_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -535,6 +676,7 @@ pub fn init() {
     let mmap = mem::memory_map_entries();
     let mut max_usable_end = 0u64;
     let mut usable_pages = 0usize;
+    let mut segment_count = 0usize;
 
     info!("memory map structure:");
     for entry in mmap.iter() {
@@ -548,23 +690,27 @@ pub fn init() {
         if let Some((start, usable_end)) = usable_page_range(entry) {
             max_usable_end = max_usable_end.max(usable_end);
             usable_pages += ((usable_end - start) / PAGE_SIZE) as usize;
+            segment_count += 1;
         }
     }
     assert!(max_usable_end != 0, "mem/phys: no usable memory");
 
-    let database_entries = pages_for_len(max_usable_end) as usize;
+    let maximum_pfn = pages_for_len(max_usable_end) as usize;
+    let database_entries = usable_pages;
     assert!(
-        database_entries <= u32::MAX as usize,
+        maximum_pfn <= u32::MAX as usize,
         "mem/phys: PFN cache encoding supports at most {} pages",
         u32::MAX
     );
     let pagedb_pages = pages_for_len((size_of::<Page>() * database_entries) as u64);
+    let segment_pages =
+        pages_for_len((segment_count * size_of::<super::physseg::Segment>()) as u64);
     let l1 = pagedb_pages.div_ceil(512);
     let l2 = l1.div_ceil(512);
     let l3 = l2.div_ceil(512);
     let l4 = l3.div_ceil(512);
     let bootstrap_pages = l1 + l2 + l3 + l4 + 8;
-    let chunk_size = (pagedb_pages + bootstrap_pages) * PAGE_SIZE;
+    let chunk_size = (pagedb_pages + segment_pages + bootstrap_pages) * PAGE_SIZE;
 
     let mut pagedb_phys_base = None;
     let mut largest_usable = 0u64;
@@ -592,7 +738,7 @@ pub fn init() {
     // SAFETY: bootstrap allocation is single-threaded and bounded by the
     // reserved PFN database chunk.
     unsafe {
-        BOOTSTRAP_NEXT = pagedb_phys_end;
+        BOOTSTRAP_NEXT = pagedb_phys_end + segment_pages * PAGE_SIZE;
         BOOTSTRAP_END = bootstrap_end;
     }
 
@@ -607,17 +753,37 @@ pub fn init() {
             arch::paging::map_page(root, va, pa, flags)
                 .unwrap_or_else(|error| panic!("mem/phys: map PFNDB page {i}: {error:?}"));
         }
-        for index in 0..database_entries {
-            ptr::write(PAGEDB.add(index), Page::new());
+        // Segment descriptors live in the same permanently reserved bootstrap
+        // chunk. Build them before publishing the immutable lookup table.
+        let segment_pointer = mem::phys_to_virt(PhysAddr::new(pagedb_phys_end))
+            .as_mut_ptr::<super::physseg::Segment>();
+        let mut index = 0;
+        for entry in mmap {
+            if let Some((start, end)) = usable_page_range(entry) {
+                segment_pointer.add(index).write(super::physseg::Segment {
+                    start: (start / PAGE_SIZE) as usize,
+                    end: (end / PAGE_SIZE) as usize,
+                    first: 0,
+                });
+                index += 1;
+            }
         }
+        let segments = core::slice::from_raw_parts_mut(segment_pointer, segment_count);
+        assert_eq!(super::physseg::initialize(segments), database_entries);
+        for segment in segments.iter() {
+            for pfn in segment.start..segment.end {
+                let mut page = Page::new();
+                page.frame_number = pfn as u32;
+                ptr::write(PAGEDB.add(segment.first + pfn - segment.start), page);
+            }
+        }
+        SEGMENTS.call_once(|| segments);
     }
 
     let mut state = PmmState {
         free: LinkedList::new(FreePageAdapter::NEW),
         zero: LinkedList::new(FreePageAdapter::NEW),
-        active: LinkedList::new(ManagedPageAdapter::NEW),
-        inactive: LinkedList::new(ManagedPageAdapter::NEW),
-        unswappable: LinkedList::new(ManagedPageAdapter::NEW),
+        nfree: 0,
     };
     let mut used_pages = 0usize;
     let mut free_pages = 0usize;
@@ -629,7 +795,10 @@ pub fn init() {
         let mut pa = start;
         while pa < end {
             // SAFETY: every usable page is covered by the initialized PFN DB.
-            let page = unsafe { &*PAGEDB.add((pa / PAGE_SIZE) as usize) };
+            let index = super::physseg::lookup(SEGMENTS.get().unwrap(), (pa / PAGE_SIZE) as usize)
+                .expect("uvm: usable frame missing from physical segments");
+            // SAFETY: the initialized segment bounds the compact array index.
+            let page = unsafe { &*PAGEDB.add(index) };
             if pa >= pagedb_phys_base && pa < bootstrap_end {
                 page.status.store(
                     pack_status(
@@ -658,12 +827,13 @@ pub fn init() {
         }
     }
 
-    DATABASE_ENTRIES.store(database_entries, Ordering::Release);
+    MAX_PFN.store(maximum_pfn, Ordering::Release);
     TOTAL_PAGES.store(usable_pages, Ordering::Release);
     USED_PAGES.store(used_pages, Ordering::Release);
     FREE_PAGES.store(free_pages, Ordering::Release);
     ZERO_PAGES.store(0, Ordering::Release);
     MANAGED_PAGES.store(0, Ordering::Release);
+    state.nfree = free_pages;
     *PMM.lock() = Some(state);
     READY.store(true, Ordering::Release);
 
@@ -694,7 +864,7 @@ pub fn phys_to_page(pa: PhysAddr) -> Option<&'static Page> {
 }
 
 /// Allocates one physical page for `usage`.
-pub fn alloc_page(usage: PageUse, flags: PageAllocFlags) -> Option<&'static Page> {
+pub fn alloc_page(usage: PageUse, mut flags: PageAllocFlags) -> Option<&'static Page> {
     if !READY.load(Ordering::Acquire) {
         return None;
     }
@@ -706,8 +876,15 @@ pub fn alloc_page(usage: PageUse, flags: PageAllocFlags) -> Option<&'static Page
         "mem/phys: invalid dynamic page use {usage:?}"
     );
 
+    if crate::sys::sched::current_thread_opt().is_some_and(|thread| {
+        // SAFETY: the scheduler retains the executing thread; process identity
+        // is immutable for its lifetime. Kernel LWPs receive USERESERVE in UVM.
+        unsafe { &*thread }.is_kernel()
+    }) {
+        flags.insert(PageAllocFlags::USERESERVE);
+    }
     let want_zero = flags.contains(PageAllocFlags::ZERO);
-    let (page, was_zero) = take_page(want_zero)?;
+    let (page, was_zero) = take_page(want_zero, flags)?;
     FREE_PAGES.fetch_sub(1, Ordering::AcqRel);
     USED_PAGES.fetch_add(1, Ordering::AcqRel);
     if was_zero {
@@ -722,7 +899,12 @@ pub fn alloc_page(usage: PageUse, flags: PageAllocFlags) -> Option<&'static Page
 
 /// Allocates one zeroed physical page for `usage`.
 pub fn alloc_zeroed_page(usage: PageUse) -> Option<&'static Page> {
-    alloc_page(usage, PageAllocFlags::ZERO)
+    let reserve = if usage == PageUse::Managed {
+        PageAllocFlags::empty()
+    } else {
+        PageAllocFlags::USERESERVE
+    };
+    alloc_page(usage, PageAllocFlags::ZERO | reserve)
 }
 
 /// Allocates one zeroed page and returns its physical address.
@@ -786,7 +968,7 @@ pub fn alloc_contiguous(
     // to the shared lists first is what makes a long run findable.
     drain_page_caches();
 
-    let entries = DATABASE_ENTRIES.load(Ordering::Acquire);
+    let entries = MAX_PFN.load(Ordering::Acquire);
     let limit = ((max_address.saturating_add(1)) / PAGE_SIZE) as usize;
     let entries = entries.min(limit);
     if entries < count {
@@ -795,10 +977,22 @@ pub fn alloc_contiguous(
 
     let mut guard = PMM.lock();
     let state = guard.as_mut()?;
+    let minimum = if super::is_page_daemon() {
+        0
+    } else {
+        super::reserve::DAEMON_PAGES
+    };
+    if state.nfree < count.saturating_add(minimum) {
+        return None;
+    }
 
     let mut start = align_index(0, align);
     let mut claimed = None;
     while start + count <= entries {
+        start = align_index(super::physseg::next(SEGMENTS.get()?, start)?, align);
+        if start + count > entries {
+            break;
+        }
         let mut index = start;
         let mut run = 0usize;
         while run < count {
@@ -829,6 +1023,7 @@ pub fn alloc_contiguous(
                     zeroed += 1;
                 }
             }
+            state.nfree -= count;
             claimed = Some((start, zeroed));
             break;
         }
@@ -898,6 +1093,7 @@ fn drain_page_caches() {
             let Some(state) = guard.as_mut() else {
                 return;
             };
+            state.nfree += 1;
             if zeroed {
                 state.zero.push_back(page);
             } else {
@@ -944,6 +1140,7 @@ pub fn zero_free_pages(maximum: usize) -> usize {
             let Some(page) = state.free.pop_front() else {
                 break;
             };
+            state.nfree -= 1;
             pages[count] = Some(page);
             count += 1;
         }
@@ -958,6 +1155,7 @@ pub fn zero_free_pages(maximum: usize) -> usize {
         let mut guard = PMM.lock();
         let state = guard.as_mut().expect("mem/phys: not initialized");
         for page in pages[..count].iter().flatten() {
+            state.nfree += 1;
             state.zero.push_back(*page);
         }
         ZERO_PAGES.fetch_add(count, Ordering::AcqRel);
@@ -976,162 +1174,43 @@ pub fn stats() -> Option<PhysStats> {
     })
 }
 
-pub(crate) fn activate_managed(page: &'static Page, owner: &Arc<VmPage>) {
-    if page.queue() == PageQueue::Active {
-        return;
+pub(super) fn file_reclaim_possible() -> bool {
+    if FREE_PAGES.load(Ordering::Acquire) != 0 {
+        return true;
     }
-    let mut guard = PMM.lock();
-    let state = guard.as_mut().expect("mem/phys: not initialized");
-    debug_assert!(
-        page.owner
-            .lock()
-            .as_ref()
-            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
-        "mem/phys: queueing a frame for a page that does not own it"
-    );
-    match page.queue() {
-        PageQueue::None => {}
-        PageQueue::Active => return,
-        PageQueue::Inactive => {
-            // SAFETY: queue state and the PMM lock prove list membership.
-            unsafe {
-                state
-                    .inactive
-                    .cursor_mut_from_ptr(page as *const Page)
-                    .remove();
-            }
-        }
-        PageQueue::Unswappable => {
-            // SAFETY: queue state and the PMM lock prove list membership.
-            unsafe {
-                state
-                    .unswappable
-                    .cursor_mut_from_ptr(page as *const Page)
-                    .remove();
-            }
-        }
-    }
-    page.set_status_field(QUEUE_SHIFT, PageQueue::Active as u8);
-    state.active.push_back(page);
+    (0..TOTAL_PAGES.load(Ordering::Acquire)).any(|index| {
+        // SAFETY: the compact page array contains exactly TOTAL_PAGES entries
+        // and remains mapped for the kernel lifetime.
+        let page = unsafe { &*PAGEDB.add(index) };
+        page.owner_kind() == PageOwnerKind::File && page.wire_count() == 0 && page.loan_count() == 0
+    })
 }
 
-/// Parks an unchanged page that the configured swap tiers rejected.
-pub(crate) fn park_unswappable(page: &'static Page, owner: &Arc<VmPage>) {
-    let mut guard = PMM.lock();
-    let state = guard.as_mut().expect("mem/phys: not initialized");
-    if page.queue() != PageQueue::None {
-        return;
+pub(crate) fn activate_managed(page: &'static Page, _owner: &PageRef) {
+    if page.wire_count() == 0 {
+        super::policy::activate(page);
     }
-    debug_assert!(
-        page.owner
-            .lock()
-            .as_ref()
-            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner)),
-        "mem/phys: parking a frame for a page that does not own it"
-    );
-    page.set_status_field(QUEUE_SHIFT, PageQueue::Unswappable as u8);
-    state.unswappable.push_back(page);
+}
+
+pub(crate) fn enqueue_managed(page: &'static Page) {
+    super::policy::enqueue(page);
 }
 
 pub(crate) fn remove_managed(page: &'static Page) {
-    let mut guard = PMM.lock();
-    let state = guard.as_mut().expect("mem/phys: not initialized");
-    match page.queue() {
-        PageQueue::None => {}
-        PageQueue::Active => {
-            // SAFETY: queue state and the PMM lock prove list membership.
-            unsafe {
-                state
-                    .active
-                    .cursor_mut_from_ptr(page as *const Page)
-                    .remove();
-            }
-        }
-        PageQueue::Inactive => {
-            // SAFETY: queue state and the PMM lock prove list membership.
-            unsafe {
-                state
-                    .inactive
-                    .cursor_mut_from_ptr(page as *const Page)
-                    .remove();
-            }
-        }
-        PageQueue::Unswappable => {
-            // SAFETY: queue state and the PMM lock prove list membership.
-            unsafe {
-                state
-                    .unswappable
-                    .cursor_mut_from_ptr(page as *const Page)
-                    .remove();
-            }
-        }
-    }
-    page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
+    super::policy::dequeue(page);
 }
 
-pub(crate) fn age_active(maximum: usize) {
-    let mut guard = PMM.lock();
-    let state = guard.as_mut().expect("mem/phys: not initialized");
-    for _ in 0..maximum {
-        let Some(page) = state.active.pop_front() else {
-            break;
-        };
-        let _ = page.take_referenced();
-        page.set_status_field(QUEUE_SHIFT, PageQueue::Inactive as u8);
-        state.inactive.push_back(page);
-    }
+pub(crate) fn deactivate_managed(page: &'static Page) {
+    let _ = page.take_referenced();
+    super::policy::deactivate(page);
 }
 
-pub(crate) fn next_inactive_owner() -> Option<Arc<VmPage>> {
-    loop {
-        let (page, owner) = {
-            let mut guard = PMM.lock();
-            let state = guard.as_mut().expect("mem/phys: not initialized");
-            let page = state.inactive.pop_front()?;
-            page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
-            let owner = page.owner();
-            (page, owner)
-        };
-        let Some(owner) = owner else {
-            continue;
-        };
-        if page.take_referenced() {
-            activate_managed(page, &owner);
-            continue;
-        }
-        return Some(owner);
-    }
-}
-
-/// Detaches one parked page so its dirty bits or swap configuration can be
-/// reconsidered without putting it back into the normal reclaim rotation.
-pub(crate) fn next_unswappable_owner() -> Option<Arc<VmPage>> {
-    loop {
-        let owner = {
-            let mut guard = PMM.lock();
-            let state = guard.as_mut().expect("mem/phys: not initialized");
-            let page = state.unswappable.pop_front()?;
-            page.set_status_field(QUEUE_SHIFT, PageQueue::None as u8);
-            page.owner()
-        };
-        if let Some(owner) = owner {
-            return Some(owner);
-        }
-    }
-}
-
-pub(crate) fn managed_queues_empty() -> bool {
-    let guard = PMM.lock();
-    let state = guard.as_ref().expect("mem/phys: not initialized");
-    state.active.is_empty() && state.inactive.is_empty()
-}
-
-fn take_page(want_zero: bool) -> Option<(&'static Page, bool)> {
+fn take_page(want_zero: bool, flags: PageAllocFlags) -> Option<(&'static Page, bool)> {
     let cache_id = cache_id();
     if let Some(result) = pop_cache(cache_id, want_zero) {
         return Some(result);
     }
-    refill_cache(cache_id, want_zero);
+    refill_cache(cache_id, want_zero, flags);
     if let Some(result) = pop_cache(cache_id, want_zero) {
         return Some(result);
     }
@@ -1158,11 +1237,22 @@ fn pop_cache(cache_id: usize, want_zero: bool) -> Option<(&'static Page, bool)> 
     None
 }
 
-fn refill_cache(cache_id: usize, want_zero: bool) {
+fn refill_cache(cache_id: usize, want_zero: bool, flags: PageAllocFlags) {
+    let cpus = crate::sys::smp::cpu_count();
+    let daemon = super::is_page_daemon();
     let mut cache = PAGE_CACHES[cache_id].lock();
     let mut guard = PMM.lock();
     let state = guard.as_mut().expect("mem/phys: not initialized");
     for _ in 0..PAGE_CACHE_REFILL {
+        let access = super::reserve::access(
+            state.nfree,
+            cpus,
+            flags.contains(PageAllocFlags::USERESERVE),
+            daemon,
+        );
+        if access == super::reserve::Access::Denied {
+            return;
+        }
         let page = if want_zero {
             state
                 .zero
@@ -1179,12 +1269,19 @@ fn refill_cache(cache_id: usize, want_zero: bool) {
         let Some((page, zero)) = page else {
             return;
         };
+        state.nfree -= 1;
         if !cache.push(page.pfn() as u32, zero) {
+            state.nfree += 1;
             if zero {
                 state.zero.push_front(page);
             } else {
                 state.free.push_front(page);
             }
+            return;
+        }
+        // Near a reserve, UVM allocates just the requested page and does not
+        // speculatively fill the local free-page cache.
+        if access == super::reserve::Access::Single {
             return;
         }
     }
@@ -1243,6 +1340,7 @@ unsafe fn free_page_inner(page: &'static Page, zeroed: bool) {
     let mut guard = PMM.lock();
     let state = guard.as_mut().expect("mem/phys: not initialized");
     for pfn in spill[..count].iter().copied() {
+        state.nfree += 1;
         let page = page_by_index(pfn as usize).expect("mem/phys: invalid cached PFN");
         if zeroed {
             state.zero.push_back(page);
@@ -1252,11 +1350,10 @@ unsafe fn free_page_inner(page: &'static Page, zeroed: bool) {
     }
 }
 
-fn page_by_index(index: usize) -> Option<&'static Page> {
-    if index >= DATABASE_ENTRIES.load(Ordering::Acquire) {
-        return None;
-    }
-    // SAFETY: the PFN database is permanently mapped and `index` is bounded.
+fn page_by_index(pfn: usize) -> Option<&'static Page> {
+    let index = super::physseg::lookup(SEGMENTS.get()?, pfn)?;
+    // SAFETY: immutable physical segments bound this index to their assigned
+    // slice of the permanently mapped compact vm_page array.
     Some(unsafe { &*PAGEDB.add(index) })
 }
 
@@ -1322,16 +1419,6 @@ fn decode_page_use(value: u8) -> PageUse {
         4 => PageUse::PfnDatabase,
         5 => PageUse::Reserved,
         _ => panic!("mem/phys: invalid page use {value}"),
-    }
-}
-
-fn decode_page_queue(value: u8) -> PageQueue {
-    match value {
-        0 => PageQueue::None,
-        1 => PageQueue::Active,
-        2 => PageQueue::Inactive,
-        3 => PageQueue::Unswappable,
-        _ => panic!("mem/phys: invalid page queue {value}"),
     }
 }
 

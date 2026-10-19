@@ -10,35 +10,32 @@
 //! locks and the address-space lock strictly ordered: a caller holding a page
 //! backing lock must never fault, and a window is already faulted in.
 //!
-//! # Aliasing invariant
+//! # User memory
 //!
-//! These windows follow the kernel's user-memory convention: userspace may
-//! mutate a wired frame concurrently, so its direct-map alias is externally
-//! mutable memory. The `IoSink` borrow prevents competing kernel windows made
-//! through the same sink, while the page wire proves only that the frame stays
-//! resident. Code that needs strict Rust aliasing must copy through raw-pointer
-//! primitives rather than retain one of these slice views.
+//! User frames remain externally mutable while pinned. Windows expose copy
+//! operations, never Rust references to those bytes. Callers needing a slice
+//! ABI use bounded kernel storage and explicitly copy the transferred bytes.
+//! A writable pin also preserves the fork decision for its entire lifetime.
 
-use core::{
-    ops::{Deref, DerefMut},
-    slice,
+use core::ptr;
+
+use super::{
+    Error, PAGE_SIZE, Result, VirtAddr,
+    map::FaultAccess,
+    pmap::{UserPagePin, VmSpace},
 };
 
-use alloc::sync::Arc;
-
-use super::{Error, PAGE_SIZE, Result, VirtAddr, map::FaultAccess, page::VmPage, pmap::VmSpace};
-
 /// Wired, page-bounded HHDM alias shared by readable and writable guards.
-struct PinnedWindow {
-    page: Arc<VmPage>,
+struct PinnedWindow<'a> {
+    _pin: UserPagePin<'a>,
     pointer: *mut u8,
     length: usize,
 }
 
-impl PinnedWindow {
+impl<'a> PinnedWindow<'a> {
     /// Faults and wires one user page without allocating or copying payload data.
     fn resolve(
-        space: &VmSpace,
+        space: &'a VmSpace,
         address: VirtAddr,
         offset: usize,
         maximum: usize,
@@ -52,87 +49,119 @@ impl PinnedWindow {
         let remaining = (PAGE_SIZE - current.as_u64() % PAGE_SIZE) as usize;
         let (page, physical) = space.pin_user_page(current, access)?;
         Ok(Self {
-            page,
+            _pin: page,
             pointer: super::phys_to_virt(physical).as_mut_ptr(),
             length: maximum.min(remaining),
         })
     }
-
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: `resolve` produced this page-bounded direct-map alias and the
-        // retained wire keeps all bytes live. See the aliasing invariant above.
-        unsafe { slice::from_raw_parts(self.pointer, self.length) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: the retained wire keeps this page-bounded alias live; the
-        // guard's mutable borrow excludes another view through the same sink.
-        unsafe { slice::from_raw_parts_mut(self.pointer, self.length) }
-    }
 }
 
-impl Drop for PinnedWindow {
-    fn drop(&mut self) {
-        self.page.release_window();
-    }
-}
-
-enum Window<B> {
+enum Window<'a, B> {
     Kernel(B),
-    User(PinnedWindow),
+    User(PinnedWindow<'a>),
 }
 
-/// A writable window produced by [`IoSink::window`].
-///
-/// Dereferences to the window bytes. Dropping it releases the user-frame pin,
-/// so keep the guard alive for exactly as long as the memory is in use.
-pub struct SinkWindow<'a>(Window<&'a mut [u8]>);
+/// A writable, page-bounded transfer window. Dropping it releases its pin.
+/// User bytes are accessible only through copy operations.
+pub struct SinkWindow<'a>(Window<'a, &'a mut [u8]>);
 
 impl SinkWindow<'_> {
     fn empty() -> Self {
         Self(Window::Kernel(&mut []))
     }
-}
 
-impl Deref for SinkWindow<'_> {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
+    /// Returns the number of available bytes.
+    pub fn len(&self) -> usize {
         match &self.0 {
-            Window::Kernel(buffer) => buffer,
-            Window::User(window) => window.as_slice(),
+            Window::Kernel(buffer) => buffer.len(),
+            Window::User(window) => window.length,
         }
     }
-}
 
-impl DerefMut for SinkWindow<'_> {
-    fn deref_mut(&mut self) -> &mut [u8] {
+    /// Returns whether this window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copies a prefix into the window; untransferred bytes are untouched.
+    pub fn copy_from_slice(&mut self, source: &[u8]) {
+        assert!(source.len() <= self.len());
         match &mut self.0 {
-            Window::Kernel(buffer) => buffer,
-            Window::User(window) => window.as_mut_slice(),
+            Window::Kernel(buffer) => buffer[..source.len()].copy_from_slice(source),
+            Window::User(window) => {
+                // SAFETY: the pin retains a writable frame for this bounded
+                // transfer. No Rust reference to user memory is constructed.
+                unsafe { ptr::copy(source.as_ptr(), window.pointer, source.len()) };
+            }
+        }
+    }
+
+    /// Fills the entire window with `value`.
+    pub fn fill(&mut self, value: u8) {
+        match &mut self.0 {
+            Window::Kernel(buffer) => buffer.fill(value),
+            Window::User(window) => {
+                // SAFETY: the writable pin retains all `length` bytes.
+                unsafe { ptr::write_bytes(window.pointer, value, window.length) };
+            }
+        }
+    }
+
+    pub(super) fn read_page(&mut self, page: &super::PageRef, offset: usize) -> Result<()> {
+        match &mut self.0 {
+            Window::Kernel(buffer) => page.read(offset, buffer),
+            Window::User(window) => {
+                // SAFETY: the pin retains the complete destination window;
+                // read_raw handles overlap with the source page itself.
+                unsafe { page.read_raw(offset, window.pointer, window.length) }
+            }
         }
     }
 }
 
-/// A readable window produced by [`IoSource::window`].
-///
-/// Dereferences to the window bytes. Dropping it releases the user-frame pin,
-/// so keep the guard alive for exactly as long as the memory is in use.
-pub struct SourceWindow<'a>(Window<&'a [u8]>);
+/// A readable, page-bounded transfer window. Dropping it releases its pin.
+/// User bytes are accessible only through copy operations.
+pub struct SourceWindow<'a>(Window<'a, &'a [u8]>);
 
 impl SourceWindow<'_> {
     fn empty() -> Self {
         Self(Window::Kernel(&[]))
     }
-}
 
-impl Deref for SourceWindow<'_> {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
+    /// Returns the number of available bytes.
+    pub fn len(&self) -> usize {
         match &self.0 {
-            Window::Kernel(buffer) => buffer,
-            Window::User(window) => window.as_slice(),
+            Window::Kernel(buffer) => buffer.len(),
+            Window::User(window) => window.length,
+        }
+    }
+
+    /// Returns whether this window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copies a prefix of this window into a kernel buffer.
+    pub fn copy_to_slice(&self, destination: &mut [u8]) {
+        assert!(destination.len() <= self.len());
+        match &self.0 {
+            Window::Kernel(buffer) => destination.copy_from_slice(&buffer[..destination.len()]),
+            Window::User(window) => {
+                // SAFETY: the pin retains a readable frame for this bounded
+                // transfer. No Rust reference to user memory is constructed.
+                unsafe { ptr::copy(window.pointer, destination.as_mut_ptr(), destination.len()) };
+            }
+        }
+    }
+
+    pub(super) fn write_page(&self, page: &super::PageRef, offset: usize) -> Result<()> {
+        match &self.0 {
+            Window::Kernel(buffer) => page.write(offset, buffer),
+            Window::User(window) => {
+                // SAFETY: the pin retains the complete source window;
+                // write_raw handles overlap with the destination page itself.
+                unsafe { page.write_raw(offset, window.pointer, window.length) }
+            }
         }
     }
 }
@@ -167,7 +196,12 @@ impl<'a> UserRange<'a> {
         })
     }
 
-    fn window(&self, offset: usize, maximum: usize, access: FaultAccess) -> Result<PinnedWindow> {
+    fn window(
+        &self,
+        offset: usize,
+        maximum: usize,
+        access: FaultAccess,
+    ) -> Result<PinnedWindow<'_>> {
         PinnedWindow::resolve(self.space, self.address, offset, maximum, access)
     }
 }
@@ -253,6 +287,7 @@ impl<'a> IoSink<'a> {
 
     /// Copies `source` into the sink at `offset`.
     pub fn store(&mut self, offset: usize, source: &[u8]) -> Result<()> {
+        checked_subrange(self.len(), offset, source.len())?;
         let mut written = 0usize;
         while written < source.len() {
             let mut window = self.window(offset + written, source.len() - written)?;
@@ -268,6 +303,7 @@ impl<'a> IoSink<'a> {
 
     /// Zero-fills `length` bytes at `offset`.
     pub fn fill_zero(&mut self, offset: usize, length: usize) -> Result<()> {
+        checked_subrange(self.len(), offset, length)?;
         let mut filled = 0usize;
         while filled < length {
             let mut window = self.window(offset + filled, length - filled)?;
@@ -343,6 +379,7 @@ impl<'a> IoSource<'a> {
 
     /// Copies bytes from the source at `offset` into `destination`.
     pub fn load(&self, offset: usize, destination: &mut [u8]) -> Result<()> {
+        checked_subrange(self.len(), offset, destination.len())?;
         let mut read = 0usize;
         while read < destination.len() {
             let window = self.window(offset + read, destination.len() - read)?;
@@ -350,7 +387,7 @@ impl<'a> IoSource<'a> {
                 return Err(Error::InvalidAddress);
             }
             let count = window.len();
-            destination[read..read + count].copy_from_slice(&window);
+            window.copy_to_slice(&mut destination[read..read + count]);
             read += count;
         }
         Ok(())

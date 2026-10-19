@@ -251,7 +251,10 @@ pub(crate) fn map_memory_error(error: mem::Error) -> Errno {
         | mem::Error::NotMapped
         | mem::Error::Protection
         | mem::Error::AlreadyMapped => Errno::Fault,
-        mem::Error::SwapUnavailable | mem::Error::CorruptSwap | mem::Error::Io | mem::Error::Pmap => Errno::Io,
+        mem::Error::SwapUnavailable
+        | mem::Error::CorruptSwap
+        | mem::Error::Io
+        | mem::Error::Pmap => Errno::Io,
     }
 }
 

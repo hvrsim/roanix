@@ -20,39 +20,58 @@ use log::{debug, info};
 
 use crate::{
     arch,
-    sys::{clock, sched, smp, sync::Once},
+    sys::{
+        clock,
+        event::{Event, SequenceEvent},
+        sched, smp,
+        sync::{Mutex, Once},
+    },
 };
 
 pub mod addr;
 pub mod alloc;
+mod anon;
 mod error;
+mod fault;
+mod index;
 mod io;
 pub(crate) mod kstack;
 mod map;
+mod map_lock;
+mod metadata;
 mod object;
+mod owner;
 mod page;
 pub mod phys;
+mod physseg;
 mod pmap;
+pub(crate) mod policy;
+mod pool;
+mod reserve;
 pub mod swap;
 mod syscall;
 mod tlb;
-pub mod vmem;
+mod vmem;
 
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 pub(crate) use alloc::HEAP_BASE;
 pub use error::{Error, Result};
 pub use io::{IoSink, IoSource, SinkWindow, SourceWindow};
 pub use map::{
-    FaultAccess, ResolvedPage, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmBacking,
-    VmInheritance, VmMap, VmMapEntry, VmMapping, VmPlacement, VmProtection,
+    FaultAccess, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmBacking, VmInheritance, VmMap,
+    VmMapEntry, VmMapping, VmPlacement, VmProtection,
 };
 pub use object::{ObjectKind, PageAccount, PageCacheStats, VmObject, VmPager};
-pub use page::{PageInfo, PageLocation, VmPage};
+pub use page::{PageInfo, PageLocation, PageRef, PageWeak, VmPage};
 pub use pmap::{Pmap, VmSpace};
 pub use swap::{SwapBackend, SwapError, SwapStats};
 
 const PAGE_SCAN_BATCH: usize = 128;
 const PAGE_DAEMON_INTERVAL: Duration = Duration::from_millis(100);
+static DAEMON_WAKE: Event = Event::new();
+static PAGE_DAEMON_THREAD: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static MEMORY_AVAILABLE: SequenceEvent = SequenceEvent::new();
 
 bitflags! {
     /// Virtual memory mapping permissions and attributes used by low-level paging.
@@ -78,28 +97,17 @@ bitflags! {
 
 struct MemoryState {
     kernel_root: PhysAddr,
-    low_watermark: u64,
-    high_watermark: u64,
     next_page_id: AtomicU64,
     next_object_id: AtomicU64,
     reclaimed_pages: AtomicU64,
     faults: AtomicU64,
     promotions: AtomicU64,
-    reclaiming: AtomicBool,
+    reclaiming: Mutex<()>,
     daemon_started: AtomicBool,
-    zero_page: Once<Arc<VmPage>>,
 }
 
 struct MigrationPin {
     thread: Option<*mut crate::sys::thread::Thread>,
-}
-
-struct ReclaimGuard(&'static AtomicBool);
-
-impl Drop for ReclaimGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl MigrationPin {
@@ -127,7 +135,7 @@ impl Drop for MigrationPin {
 /// Global memory accounting snapshot.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct VmStats {
-    /// Resident object and anonymous pages, including the shared zero page.
+    /// Resident object and anonymous pages.
     pub resident_pages: u64,
     /// Pages successfully reclaimed to swap.
     pub reclaimed_pages: u64,
@@ -166,26 +174,21 @@ fn init_state() {
         return;
     }
     let physical = phys::stats().expect("mem: physical memory manager is not initialized");
-    let low_watermark = (physical.total_pages as u64 / 32).max(16);
-    let high_watermark = (physical.total_pages as u64 / 16)
-        .max(low_watermark + 16)
-        .min(physical.total_pages as u64);
+    let (low_watermark, high_watermark) =
+        reserve::watermarks(physical.total_pages, smp::cpu_count());
     let compressed_limit = (physical.total_pages as u64)
         .saturating_mul(PAGE_SIZE)
         .saturating_div(4);
 
     MEMORY.call_once(|| MemoryState {
         kernel_root: arch::paging::active_root(),
-        low_watermark,
-        high_watermark,
         next_page_id: AtomicU64::new(1),
         next_object_id: AtomicU64::new(1),
         reclaimed_pages: AtomicU64::new(0),
         faults: AtomicU64::new(0),
         promotions: AtomicU64::new(0),
-        reclaiming: AtomicBool::new(false),
+        reclaiming: Mutex::new(()),
         daemon_started: AtomicBool::new(false),
-        zero_page: Once::new(),
     });
     // Kernel-half tables must exist before any user root copies them, so that
     // later kernel mappings are shared rather than missed.
@@ -194,8 +197,6 @@ fn init_state() {
     unsafe { arch::paging::populate_kernel_tables(state().kernel_root) }
         .expect("mem: failed to reserve kernel page-table entries");
     swap::init(compressed_limit, physical.total_pages / 4);
-    let zero = VmPage::new_shared_zero().expect("mem: failed to allocate shared zero page");
-    state().zero_page.call_once(|| zero);
     register_cpu();
 
     info!(
@@ -235,27 +236,31 @@ pub fn stats() -> VmStats {
 
 /// Reclaims up to `target` resident pages synchronously.
 pub fn reclaim_now(target: usize) -> usize {
-    let reclaiming = &state().reclaiming;
-    if reclaiming
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let Some(_reclaim) = state().reclaiming.try_lock() else {
         return 0;
-    }
-    let _guard = ReclaimGuard(reclaiming);
+    };
+    reclaim_pages(target)
+}
+
+/// Scans under `MemoryState::reclaiming`, which serializes reclaim passes.
+fn reclaim_pages(target: usize) -> usize {
     let mut reclaimed = 0usize;
-    let mut attempts = 0usize;
-    while reclaimed < target && attempts < target.saturating_mul(4).max(PAGE_SCAN_BATCH) {
-        if phys::managed_queues_empty() {
-            // A backend change or hardware write may have made parked pages
-            // eligible again. Keep this bounded like the normal scan.
-            reconsider_unswappable(PAGE_SCAN_BATCH);
+    // One scan marker spans the whole pass, so a contended prefix cannot
+    // starve later candidates. Balance follows scan as in uvm_pdaemon; the
+    // synchronous reclaim API may repeat the daemon cycle once after aging.
+    for _ in 0..2 {
+        if reclaimed >= target {
+            break;
         }
-        phys::age_active(PAGE_SCAN_BATCH);
-        let progress = scan_inactive(PAGE_SCAN_BATCH, target - reclaimed);
+        let progress = policy::scan(usize::MAX, target - reclaimed);
         reclaimed += progress;
-        attempts += PAGE_SCAN_BATCH;
-        if progress == 0 && phys::managed_queues_empty() {
+        let shortage = if progress == 0 && !swap::has_capacity() && !swap::is_full() {
+            free_target().saturating_sub(phys::stats().map_or(0, |s| s.free_pages as u64)) as usize
+        } else {
+            0
+        };
+        policy::balance(usize::MAX, shortage);
+        if progress == 0 && policy::queues_empty() {
             break;
         }
     }
@@ -288,7 +293,10 @@ pub(crate) fn register_cpu() {
 /// Resolves a fault in the current thread's address space.
 pub fn handle_current_fault(address: VirtAddr, access: FaultAccess) -> Result<()> {
     let space = current_space().ok_or(Error::NotMapped)?;
-    space.fault(address, access)
+    space.fault(address, access).inspect_err(|error| {
+        debug!(target: "mem::fault", "root={:#x} address={:#x} access={access:?}: {error}",
+            space.pmap().root(), address);
+    })
 }
 
 /// Installs an address space on the current thread and activates its pmap.
@@ -323,6 +331,7 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
         // every address space contains the same permanent kernel mappings.
         return;
     };
+    let _preempt = smp::disable_preemption();
     let root = space.pmap().root();
     let active = arch::thiscpu().active_address_root.load(Ordering::Acquire);
     if active == root.as_u64() {
@@ -330,10 +339,11 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
         return;
     }
 
-    // The advertised root is published before the hardware switch and cleared
-    // after it, so it always covers the interval during which this CPU can
-    // hold translations for the space. Shootdown initiators rely on that to
-    // decide which CPUs must acknowledge an invalidation.
+    // Retain the outgoing root's advertised lifetime until the hardware
+    // switch completes. The incoming space is still owned by `space`.
+    arch::thiscpu()
+        .previous_address_root
+        .store(active, Ordering::Release);
     arch::thiscpu()
         .active_address_root
         .store(root.as_u64(), Ordering::Release);
@@ -343,6 +353,9 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
             .activate()
             .expect("mem: failed to activate scheduled address space");
     }
+    arch::thiscpu()
+        .previous_address_root
+        .store(0, Ordering::Release);
     // Entries published while this CPU ran another space must be applied
     // before user code observes the new one.
     tlb::poll();
@@ -351,9 +364,21 @@ pub(crate) fn activate_thread_space(space: Option<Arc<VmSpace>>) {
 /// Returns whether any CPU still has `root` installed.
 pub(crate) fn address_space_root_active(root: u64) -> bool {
     (0..smp::cpu_count()).any(|cpu_id| {
-        smp::core_local(cpu_id)
-            .is_some_and(|cpu| cpu.active_address_root.load(Ordering::Acquire) == root)
+        smp::core_local(cpu_id).is_some_and(|cpu| {
+            cpu.active_address_root.load(Ordering::Acquire) == root
+                || cpu.previous_address_root.load(Ordering::Acquire) == root
+        })
     })
+}
+
+pub(super) fn retire_address_space_root(root: PhysAddr) {
+    // Kernel threads may still borrow a root after its final owner drops it.
+    // No new user can activate it once the final pmap reference is gone.
+    while address_space_root_active(root.as_u64()) {
+        release_inactive_address_space_roots();
+        tlb::poll();
+        core::hint::spin_loop();
+    }
 }
 
 /// Requests CPUs running kernel-only threads to release borrowed user roots.
@@ -363,6 +388,12 @@ pub(crate) fn release_inactive_address_space_roots() {
 }
 
 fn release_inactive_address_space_root() {
+    // An IPI must not replace a root while its owner is publishing a switch.
+    // The reaper retries roots that remain active.
+    if arch::thiscpu().preempt_depth.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let _preempt = smp::disable_preemption();
     let cpu = arch::thiscpu();
     let active = cpu.active_address_root.load(Ordering::Acquire);
     if active == 0 || active == kernel_root().as_u64() {
@@ -386,48 +417,57 @@ pub(super) fn allocate_object_id() -> u64 {
     next_id(&state().next_object_id, "object")
 }
 
-pub(super) fn shared_zero_page() -> Arc<VmPage> {
-    state()
-        .zero_page
-        .get()
-        .cloned()
-        .expect("mem: shared zero page is not initialized")
+fn free_minimum() -> u64 {
+    reserve::watermarks(phys::stats().map_or(0, |s| s.total_pages), smp::cpu_count()).0
+}
+fn free_target() -> u64 {
+    reserve::watermarks(phys::stats().map_or(0, |s| s.total_pages), smp::cpu_count()).1
 }
 
-pub(super) fn is_shared_zero_page(page: &Arc<VmPage>) -> bool {
-    state()
-        .zero_page
-        .get()
-        .is_some_and(|zero| Arc::ptr_eq(page, zero))
+pub(super) fn replenish_reserve() {
+    if let Some(stats) = phys::stats()
+        && stats.free_pages as u64 <= free_minimum()
+    {
+        // A competing pass is work in progress, not failed reclamation.
+        // Wait before consuming its reserve and recheck after acquiring it.
+        // Callers must not hold a backing or map lock needed by reclamation.
+        let _reclaim = state().reclaiming.lock();
+        let free = phys::stats().map_or(0, |stats| stats.free_pages as u64);
+        if free <= free_minimum() {
+            let target = free_target().saturating_sub(free) as usize;
+            let _ = reclaim_pages(target.max(1));
+        }
+    }
 }
 
 pub(super) fn allocate_physical_page() -> Result<&'static phys::Page> {
-    if let Some(stats) = phys::stats()
-        && stats.free_pages as u64 <= state().low_watermark
-    {
-        let target = state()
-            .high_watermark
-            .saturating_sub(stats.free_pages as u64) as usize;
-        let _ = reclaim_now(target.max(1));
-    }
+    replenish_reserve();
     if let Some(page) = phys::alloc_zeroed_page(phys::PageUse::Managed) {
         return Ok(page);
     }
-    let _ = reclaim_now(PAGE_SCAN_BATCH);
-    phys::alloc_zeroed_page(phys::PageUse::Managed).ok_or(Error::OutOfMemory)
+    allocate_after_reclaim(PAGE_SCAN_BATCH)
 }
 
 /// Allocates the destination of a swap-in without first creating more swap.
 ///
 /// Normal faults refill the free-page high watermark before allocating. A
-/// page-in must instead consume the existing reserve first: reclaiming while
-/// the compressed tier is full can only make progress after this load releases
-/// its old slot.
+/// page-in first consumes available free storage without another reclaim
+/// pass. Its retained swap slot stays authoritative until the load completes;
+/// clean resident swap-backed pages can subsequently be evicted without I/O.
 pub(super) fn allocate_pagein_physical_page() -> Result<&'static phys::Page> {
     if let Some(page) = phys::alloc_zeroed_page(phys::PageUse::Managed) {
         return Ok(page);
     }
-    let _ = reclaim_now(1);
+    allocate_after_reclaim(1)
+}
+
+fn allocate_after_reclaim(target: usize) -> Result<&'static phys::Page> {
+    let _reclaim = state().reclaiming.lock();
+    // The previous owner may already have made enough progress.
+    if let Some(page) = phys::alloc_zeroed_page(phys::PageUse::Managed) {
+        return Ok(page);
+    }
+    let _ = reclaim_pages(target);
     phys::alloc_zeroed_page(phys::PageUse::Managed).ok_or(Error::OutOfMemory)
 }
 
@@ -517,67 +557,46 @@ pub fn virt_to_phys_hhdm(va: VirtAddr) -> Option<PhysAddr> {
     Some(PhysAddr::new(raw - off))
 }
 
+pub(super) fn is_page_daemon() -> bool {
+    sched::current_thread_opt()
+        .is_some_and(|thread| PAGE_DAEMON_THREAD.load(Ordering::Relaxed) == thread as usize)
+}
+
 fn page_daemon() -> ! {
+    PAGE_DAEMON_THREAD.store(sched::current_thread() as usize, Ordering::Release);
     loop {
-        clock::sleep(PAGE_DAEMON_INTERVAL);
-        reconsider_unswappable(32);
+        clock::wait_timeout(&DAEMON_WAKE, PAGE_DAEMON_INTERVAL);
+        DAEMON_WAKE.reset();
         let free = phys::stats().map_or(0, |stats| stats.free_pages as u64);
-        if free < state().high_watermark {
-            let target = state().high_watermark.saturating_sub(free) as usize;
+        if free < free_target() {
+            let target = free_target().saturating_sub(free) as usize;
             let _ = reclaim_now(target.max(1));
         } else {
-            phys::age_active(32);
+            policy::balance(32, 0);
             let _ = phys::zero_free_pages(8);
         }
+        MEMORY_AVAILABLE.notify();
     }
 }
 
-/// Samples parked pages for hardware writes and swap-tier changes.
-fn reconsider_unswappable(maximum: usize) {
-    let mut candidates: [Option<Arc<VmPage>>; PAGE_SCAN_BATCH] = core::array::from_fn(|_| None);
-    let mut count = 0usize;
-    while count < maximum.min(PAGE_SCAN_BATCH) {
-        let Some(page) = phys::next_unswappable_owner() else {
-            break;
-        };
-        candidates[count] = Some(page);
-        count += 1;
-    }
-    pmap::harvest_page_states(&candidates[..count]);
-    for page in candidates[..count].iter().flatten() {
-        page.reconsider_unswappable();
-    }
+pub(super) fn prepare_memory_wait() -> u64 {
+    MEMORY_AVAILABLE.observe()
 }
 
-fn scan_inactive(maximum: usize, target: usize) -> usize {
-    let mut candidates: [Option<Arc<VmPage>>; PAGE_SCAN_BATCH] = core::array::from_fn(|_| None);
-    let candidate_limit = maximum.min(PAGE_SCAN_BATCH);
-    let mut count = 0usize;
-    while count < candidate_limit {
-        let Some(page) = phys::next_inactive_owner() else {
-            break;
-        };
-        candidates[count] = Some(page);
-        count += 1;
+pub(super) fn wait_for_memory(ticket: u64) -> Result<()> {
+    if !state().daemon_started.load(Ordering::Acquire) {
+        return Err(Error::OutOfMemory);
     }
-    pmap::harvest_page_states(&candidates[..count]);
-
-    let mut reclaimed = 0usize;
-    for page in candidates[..count].iter().flatten() {
-        if page.take_referenced() {
-            page.reactivate();
-        } else if reclaimed < target {
-            if page.try_reclaim() {
-                reclaimed += 1;
-            }
-        } else {
-            page.reactivate();
-        }
+    if !swap::has_capacity() && !phys::file_reclaim_possible() {
+        return Err(Error::OutOfMemory);
     }
-    reclaimed
+    DAEMON_WAKE.signal();
+    MEMORY_AVAILABLE.wait(ticket);
+    Ok(())
 }
 
 pub(crate) fn activate_kernel_space() {
+    let _preempt = smp::disable_preemption();
     if arch::paging::active_root() != kernel_root() {
         // SAFETY: the root was captured from the bootloader-provided kernel
         // page table and remains live for the kernel lifetime.

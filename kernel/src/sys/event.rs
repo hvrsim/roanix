@@ -8,7 +8,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
 };
 
 use intrusive_collections::{LinkedList, LinkedListLink, UnsafeRef, intrusive_adapter};
@@ -26,6 +26,43 @@ const STATE_SIGNALED: u8 = 1 << 0;
 const STATE_QUEUED: u8 = 1 << 1;
 const NO_WINNER: usize = usize::MAX;
 const INLINE_WAITERS: usize = 8;
+
+/// Broadcast notifications retained as a generation across failed attempts.
+pub(crate) struct SequenceEvent {
+    generation: AtomicU64,
+    event: Event,
+}
+
+impl SequenceEvent {
+    pub(crate) const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            event: Event::new(),
+        }
+    }
+
+    pub(crate) fn observe(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn notify(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        // Pair with the post-registration fence: a notifier cannot miss the
+        // waiter while that waiter also misses the changed generation.
+        fence(Ordering::SeqCst);
+        self.event.wake_all();
+    }
+
+    pub(crate) fn wait(&self, ticket: u64) {
+        if self.observe() != ticket {
+            return;
+        }
+        self.event.wait_if(|| {
+            fence(Ordering::SeqCst);
+            self.observe() == ticket
+        });
+    }
+}
 
 /// A signallable event on which one or more threads can wait.
 ///
@@ -382,6 +419,10 @@ impl Event {
 
     /// Blocks the current thread until this event is signaled or woken.
     pub fn wait(&self) {
+        self.wait_if(|| true);
+    }
+
+    fn wait_if(&self, condition: impl FnOnce() -> bool) {
         assert_wait_context();
         if self.is_signaled() {
             return;
@@ -401,6 +442,7 @@ impl Event {
             core::slice::from_ref(&self),
             &registrations,
             group.as_ref().get_ref(),
+            condition,
         );
         assert_eq!(winner, 0, "event: single wait returned invalid winner");
     }
@@ -441,6 +483,7 @@ impl Event {
             events,
             registrations.as_ref().get_ref(),
             group.as_ref().get_ref(),
+            || true,
         )
     }
 
@@ -551,6 +594,7 @@ fn wait_with_registrations<R: Registrations + ?Sized>(
     events: &[&Event],
     registrations: &R,
     group: &WaitGroup,
+    condition: impl FnOnce() -> bool,
 ) -> usize {
     assert_eq!(
         events.len(),
@@ -574,6 +618,11 @@ fn wait_with_registrations<R: Registrations + ?Sized>(
             group.target().wake();
         }
         break;
+    }
+
+    if !condition() && group.try_claim(0) {
+        claimed_locally = true;
+        group.target().wake();
     }
 
     if !claimed_locally {

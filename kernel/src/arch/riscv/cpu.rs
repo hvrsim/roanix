@@ -467,6 +467,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
     }
 
     if frame.sstatus & SSTATUS_SPP == 0 {
+        let mut fault_error = None;
         let access = match frame.scause {
             SCAUSE_INSTRUCTION_PAGE_FAULT => Some(crate::mem::FaultAccess::Execute),
             SCAUSE_LOAD_PAGE_FAULT => Some(crate::mem::FaultAccess::Read),
@@ -481,6 +482,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
             if result.is_ok() {
                 return frame;
             }
+            fault_error = result.err();
         }
 
         if frame.scause & SCAUSE_INTERRUPT == 0 {
@@ -499,7 +501,7 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 _ => crate::proc::signal::SIGILL,
             };
             log::error!(
-                "riscv/trap: user trap ip=0x{:X} stval=0x{:X} cause=0x{:X} signal={}",
+                "riscv/trap: user trap ip=0x{:X} stval=0x{:X} cause=0x{:X} signal={} fault={fault_error:?}",
                 frame.ip,
                 frame.stval,
                 frame.scause,

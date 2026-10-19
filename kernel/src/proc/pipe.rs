@@ -137,8 +137,9 @@ impl PipeEnd {
             if available != 0 && (!atomic || available >= source.len()) {
                 let count = available.min(source.len());
                 let mut copied = 0usize;
+                let mut buffer = [0u8; 1024];
                 while copied < count {
-                    let window = match source.window(copied, count - copied) {
+                    let window = match source.window(copied, (count - copied).min(buffer.len())) {
                         Ok(window) => window,
                         Err(_) if copied != 0 => break,
                         Err(_) => return Err(PipeError::Fault),
@@ -146,8 +147,10 @@ impl PipeEnd {
                     if window.is_empty() {
                         break;
                     }
-                    state.buffer.extend(&*window);
-                    copied += window.len();
+                    let length = window.len();
+                    window.copy_to_slice(&mut buffer[..length]);
+                    state.buffer.extend(&buffer[..length]);
+                    copied += length;
                 }
                 if state.buffer.len() == PIPE_CAPACITY {
                     self.pipe.writable.reset();

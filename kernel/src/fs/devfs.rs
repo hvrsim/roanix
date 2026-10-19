@@ -103,8 +103,8 @@ impl DeviceNodeKind {
 
 /// Drives a contiguous-buffer read across every page window of `sink`.
 ///
-/// Device ABIs that require one flat buffer cannot see a segmented user range,
-/// so the transfer is issued once per page window. The first window keeps the
+/// Device ABIs receive bounded kernel buffers; user frames never become
+/// Rust slice references. Transfers stop at buffer and user-page boundaries. The first window keeps the
 /// caller's flags so blocking devices behave normally; later windows add
 /// `O_NONBLOCK` so a partially satisfied multi-page transfer never blocks
 /// waiting for data the device does not have.
@@ -119,6 +119,7 @@ where
 {
     let total = sink.len();
     let mut done = 0usize;
+    let mut buffer = [0u8; 1024];
     while done < total {
         let window_flags = if done == 0 {
             flags
@@ -126,7 +127,7 @@ where
             flags | crate::fs::OpenFlags::NONBLOCK.bits()
         };
         let mut window = sink
-            .window(done, total - done)
+            .window(done, (total - done).min(buffer.len()))
             .map_err(|_| Error::InvalidArgument)?;
         if window.is_empty() {
             break;
@@ -134,7 +135,7 @@ where
         let capacity = window.len();
         let count = match transfer(
             offset.saturating_add(done as u64),
-            &mut window,
+            &mut buffer[..capacity],
             window_flags,
         ) {
             Ok(count) => count,
@@ -144,6 +145,7 @@ where
         if count > capacity {
             return Err(Error::Io);
         }
+        window.copy_from_slice(&buffer[..count]);
         done += count;
         if count < capacity {
             break;
@@ -166,6 +168,7 @@ where
 {
     let total = source.len();
     let mut done = 0usize;
+    let mut buffer = [0u8; 1024];
     while done < total {
         let window_flags = if done == 0 {
             flags
@@ -173,13 +176,18 @@ where
             flags | crate::fs::OpenFlags::NONBLOCK.bits()
         };
         let window = source
-            .window(done, total - done)
+            .window(done, (total - done).min(buffer.len()))
             .map_err(|_| Error::InvalidArgument)?;
         if window.is_empty() {
             break;
         }
         let capacity = window.len();
-        let count = match transfer(offset.saturating_add(done as u64), &window, window_flags) {
+        window.copy_to_slice(&mut buffer[..capacity]);
+        let count = match transfer(
+            offset.saturating_add(done as u64),
+            &buffer[..capacity],
+            window_flags,
+        ) {
             Ok(count) => count,
             Err(_) if done != 0 => break,
             Err(error) => return Err(error),

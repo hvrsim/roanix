@@ -189,6 +189,9 @@ pub(crate) struct Thread {
     /// Saved trap frame restored when the thread is resumed.
     pub(crate) frame: *mut TrapFrame,
 
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fpu: crate::arch::cpu::FpuState,
+
     /// Parking handshake shared between the scheduler and wait sites.
     park_state: AtomicU8,
 
@@ -310,6 +313,10 @@ impl Thread {
     }
 
     /// Returns whether this thread is the per-CPU idle task.
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.process.is_none()
+    }
+
     pub(crate) fn is_idle(&self) -> bool {
         self.flags.contains(ThreadFlags::IDLE)
     }
@@ -564,6 +571,13 @@ impl Thread {
         frame >= stack_base && frame + size_of::<TrapFrame>() as u64 <= stack_top
     }
 
+    /// Checks the stack used by an architecture return path before it blocks.
+    #[cfg(debug_assertions)]
+    pub(crate) fn contains_stack_address(&self, address: usize) -> bool {
+        let top = self.stack_top.as_u64();
+        (top - KSTACK_SIZE as u64..top).contains(&(address as u64))
+    }
+
     /// Returns whether the low-end stack canary is still intact.
     ///
     /// The guard page below every kernel stack is the primary overflow
@@ -695,6 +709,8 @@ pub(crate) fn allocate_forked_user_thread(
     unsafe {
         crate::arch::cpu::init_forked_user_thread_frame(thread.frame, parent_frame);
     }
+    #[cfg(target_arch = "x86_64")]
+    thread.fpu.save();
     thread
 }
 
@@ -760,6 +776,8 @@ fn allocate_thread_record(
         stack,
         stack_top,
         frame,
+        #[cfg(target_arch = "x86_64")]
+        fpu: crate::arch::cpu::FpuState::new(),
         park_state: AtomicU8::new(PARK_STATE_IDLE),
         state_atomic: AtomicU8::new(state as u8),
         migration_pins: AtomicUsize::new(0),
@@ -786,6 +804,7 @@ pub(crate) unsafe fn free_thread(thread: *mut Thread) {
 /// Default idle loop that halts until the next interrupt arrives.
 pub(crate) extern "C" fn idle_task() -> ! {
     loop {
+        crate::mem::policy::idle();
         arch::wfi();
     }
 }

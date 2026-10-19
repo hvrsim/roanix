@@ -116,27 +116,31 @@ pub unsafe fn map_page(
         for level in (1..levels).rev() {
             let idx = table_index(v, level);
             debug_assert!(idx < ENTRIES_PER_TABLE);
-            let entry_ptr = pte_ptr(table, idx);
-            let pte = entry_ptr.read_volatile();
-
-            if pte & PTE_V != 0 {
-                if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-                    return Err(PagingError::HugePageConflict);
-                }
-                table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
-                continue;
+            let parent = table_entry(table, idx);
+            let mut pte = parent.load(Ordering::Acquire);
+            if pte & PTE_V == 0 {
+                let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
+                    .ok_or(PagingError::OutOfMemory)?;
+                let new = ((frame.as_u64() >> 12) << 10) | PTE_V;
+                pte = match parent.compare_exchange(pte, new, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => new,
+                    Err(installed) => {
+                        free_table_page(frame);
+                        installed
+                    }
+                };
+                sfence_vma(None);
             }
-
-            let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
-                .ok_or(PagingError::OutOfMemory)?;
-            entry_ptr.write_volatile(((frame.as_u64() >> 12) << 10) | PTE_V);
-            table = frame;
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                return Err(PagingError::HugePageConflict);
+            }
+            table = PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12);
         }
 
         let leaf_idx = table_index(v, 0);
         debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-        let leaf_ptr = pte_ptr(table, leaf_idx);
-        if leaf_ptr.read_volatile() & PTE_V != 0 {
+        let leaf_ptr = table_entry(table, leaf_idx);
+        if leaf_ptr.load(Ordering::Acquire) & PTE_V != 0 {
             return Err(PagingError::AlreadyMapped);
         }
 
@@ -165,7 +169,7 @@ pub unsafe fn map_page(
             bits |= PTE_G;
         }
 
-        leaf_ptr.write_volatile(((phys.as_u64() >> 12) << 10) | bits);
+        leaf_ptr.store(((phys.as_u64() >> 12) << 10) | bits, Ordering::Release);
         sfence_vma(Some(virt));
         Ok(())
     }
@@ -189,10 +193,14 @@ pub unsafe fn remap_page(
     // SAFETY: the caller guarantees exclusive page-table mutation.
     unsafe {
         let leaf = walk_to_leaf(root, virt)?;
-        if leaf.read_volatile() & PTE_V == 0 {
+        if leaf.load(Ordering::Acquire) & PTE_V == 0 {
             return Err(PagingError::NotMapped);
         }
-        leaf.write_volatile(((phys.as_u64() >> 12) << 10) | leaf_bits(flags));
+        let previous = leaf.swap(
+            ((phys.as_u64() >> 12) << 10) | leaf_bits(flags),
+            Ordering::AcqRel,
+        );
+        record_hardware_state(previous);
     }
     sfence_vma(Some(virt));
     Ok(())
@@ -211,7 +219,7 @@ pub unsafe fn take_accessed_dirty(root: PhysAddr, virt: VirtAddr) -> Result<(boo
     // SAFETY: the caller guarantees a stable, writable hierarchy.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let leaf = &*leaf_ptr.cast::<AtomicU64>();
+        let leaf = leaf_ptr;
         let value = leaf.load(Ordering::Acquire);
         if value & PTE_V == 0 || value & (PTE_R | PTE_W | PTE_X) == 0 {
             return Err(PagingError::NotMapped);
@@ -246,12 +254,13 @@ pub unsafe fn unmap_page(root: PhysAddr, virt: VirtAddr) -> Result<Option<PhysAd
     // exclusively writable during the removal.
     unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let pte = leaf_ptr.read_volatile();
+        let pte = leaf_ptr.load(Ordering::Acquire);
         if pte & PTE_V == 0 || pte & (PTE_R | PTE_W | PTE_X) == 0 {
             return Err(PagingError::NotMapped);
         }
 
-        leaf_ptr.write_volatile(0);
+        let pte = leaf_ptr.swap(0, Ordering::AcqRel);
+        record_hardware_state(pte);
         sfence_vma(Some(virt));
         Ok(Some(PhysAddr::new(((pte >> 10) & SATP_PPN_MASK) << 12)))
     }
@@ -288,12 +297,16 @@ pub unsafe fn protect_page(root: PhysAddr, virt: VirtAddr, flags: VmFlags) -> Re
     // SAFETY: the caller guarantees a stable, exclusively writable hierarchy.
     let frame = unsafe {
         let leaf_ptr = walk_to_leaf(root, virt)?;
-        let pte = leaf_ptr.read_volatile();
+        let pte = leaf_ptr.load(Ordering::Acquire);
         if pte & PTE_V == 0 {
             return Err(PagingError::NotMapped);
         }
         let ppn = (pte >> 10) & SATP_PPN_MASK;
-        leaf_ptr.write_volatile((ppn << 10) | leaf_bits(flags));
+        leaf_ptr
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |entry| {
+                Some((ppn << 10) | leaf_bits(flags) | (entry & (PTE_A | PTE_D)))
+            })
+            .expect("riscv/paging: unconditional leaf update failed");
         PhysAddr::new(ppn << 12)
     };
     sfence_vma(Some(virt));
@@ -313,13 +326,13 @@ pub unsafe fn populate_kernel_tables(root: PhysAddr) -> Result<()> {
     // exclusively mutated during early initialization.
     unsafe {
         for index in 256..ENTRIES_PER_TABLE {
-            let entry_ptr = pte_ptr(root, index);
-            if entry_ptr.read_volatile() & PTE_V != 0 {
+            let parent = table_entry(root, index);
+            if parent.load(Ordering::Acquire) & PTE_V != 0 {
                 continue;
             }
             let frame = phys::alloc_zeroed_phys(phys::PageUse::PageTable)
                 .ok_or(PagingError::OutOfMemory)?;
-            entry_ptr.write_volatile(((frame.as_u64() >> 12) << 10) | PTE_V);
+            parent.store(((frame.as_u64() >> 12) << 10) | PTE_V, Ordering::Release);
         }
     }
     Ok(())
@@ -336,8 +349,8 @@ pub unsafe fn create_user_root(kernel_root: PhysAddr) -> Result<PhysAddr> {
     // exclusively owned.
     unsafe {
         for index in 256..ENTRIES_PER_TABLE {
-            let entry = pte_ptr(kernel_root, index).read_volatile();
-            pte_ptr(root, index).write_volatile(entry);
+            let entry = table_entry(kernel_root, index).load(Ordering::Acquire);
+            table_entry(root, index).store(entry, Ordering::Release);
         }
     }
     Ok(root)
@@ -353,7 +366,7 @@ pub unsafe fn destroy_user_root(root: PhysAddr) {
     // SAFETY: the caller owns this inactive hierarchy.
     unsafe {
         for index in 0..256 {
-            let pte = pte_ptr(root, index).read_volatile();
+            let pte = table_entry(root, index).load(Ordering::Acquire);
             if pte & PTE_V == 0 {
                 continue;
             }
@@ -363,7 +376,7 @@ pub unsafe fn destroy_user_root(root: PhysAddr) {
                     levels - 1,
                 );
             }
-            pte_ptr(root, index).write_volatile(0);
+            table_entry(root, index).store(0, Ordering::Release);
         }
         free_table_page(root);
     }
@@ -387,7 +400,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
         for level in (0..levels).rev() {
             let idx = table_index(v, level);
             debug_assert!(idx < ENTRIES_PER_TABLE);
-            let pte = pte_ptr(table, idx).read_volatile();
+            let pte = table_entry(table, idx).load(Ordering::Acquire);
             if pte & PTE_V == 0 {
                 return None;
             }
@@ -447,8 +460,8 @@ fn table_index(virt: u64, level: usize) -> usize {
 ///
 /// # Safety
 ///
-/// `root` must own a valid hierarchy that stays mapped for the walk.
-unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
+/// `root` must own a hierarchy that remains mapped for the returned borrow.
+unsafe fn walk_to_leaf<'a>(root: PhysAddr, virt: VirtAddr) -> Result<&'a AtomicU64> {
     let levels = paging_levels(read_satp());
     let mut table = root;
     // SAFETY: the caller guarantees every valid table remains mapped.
@@ -456,7 +469,7 @@ unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
         for level in (1..levels).rev() {
             let idx = table_index(virt.as_u64(), level);
             debug_assert!(idx < ENTRIES_PER_TABLE);
-            let pte = pte_ptr(table, idx).read_volatile();
+            let pte = table_entry(table, idx).load(Ordering::Acquire);
             if pte & PTE_V == 0 {
                 return Err(PagingError::NotMapped);
             }
@@ -467,14 +480,25 @@ unsafe fn walk_to_leaf(root: PhysAddr, virt: VirtAddr) -> Result<*mut u64> {
         }
         let leaf_idx = table_index(virt.as_u64(), 0);
         debug_assert!(leaf_idx < ENTRIES_PER_TABLE);
-        Ok(pte_ptr(table, leaf_idx))
+        Ok(table_entry(table, leaf_idx))
     }
 }
 
-unsafe fn pte_ptr(table: PhysAddr, idx: usize) -> *mut u64 {
+unsafe fn table_entry<'a>(table: PhysAddr, idx: usize) -> &'a AtomicU64 {
     // SAFETY: callers guarantee `table` is mapped and `idx` is a valid
-    // page-table index.
-    unsafe { mem::phys_to_virt(table).as_mut_ptr::<u64>().add(idx) }
+    // page-table index, and the table outlives the returned borrow.
+    unsafe { &*mem::phys_to_virt(table).as_mut_ptr::<AtomicU64>().add(idx) }
+}
+
+fn record_hardware_state(entry: u64) {
+    if let Some(page) = phys::phys_to_page(PhysAddr::new(((entry >> 10) & SATP_PPN_MASK) << 12)) {
+        if entry & PTE_A != 0 {
+            page.mark_referenced();
+        }
+        if entry & PTE_D != 0 {
+            page.mark_dirty();
+        }
+    }
 }
 
 fn leaf_bits(flags: VmFlags) -> u64 {
@@ -508,7 +532,7 @@ unsafe fn destroy_table(table: PhysAddr, level: usize) {
     // SAFETY: the caller owns this inactive user hierarchy.
     unsafe {
         for index in 0..ENTRIES_PER_TABLE {
-            let pte = pte_ptr(table, index).read_volatile();
+            let pte = table_entry(table, index).load(Ordering::Acquire);
             if pte & PTE_V == 0 {
                 continue;
             }
@@ -518,7 +542,7 @@ unsafe fn destroy_table(table: PhysAddr, level: usize) {
                     level - 1,
                 );
             }
-            pte_ptr(table, index).write_volatile(0);
+            table_entry(table, index).store(0, Ordering::Release);
         }
         free_table_page(table);
     }

@@ -30,15 +30,17 @@ impl DeviceNodeOps for Special {
             Kind::Random => {
                 let length = sink.len();
                 let mut done = 0;
+                let mut buffer = [0u8; 256];
                 while done < length {
                     let mut window = sink
-                        .window(done, length - done)
+                        .window(done, (length - done).min(buffer.len()))
                         .map_err(|_| Error::InvalidArgument)?;
                     if window.is_empty() {
                         break;
                     }
                     let count = window.len();
-                    crate::sys::random::fill_bytes(&mut window);
+                    crate::sys::random::fill_bytes(&mut buffer[..count]);
+                    window.copy_from_slice(&buffer[..count]);
                     done += count;
                 }
                 Ok(done)
@@ -50,15 +52,17 @@ impl DeviceNodeOps for Special {
         if matches!(self.0, Kind::Random) {
             let length = source.len();
             let mut done = 0;
+            let mut buffer = [0u8; 256];
             while done < length {
                 let window = source
-                    .window(done, length - done)
+                    .window(done, (length - done).min(buffer.len()))
                     .map_err(|_| Error::InvalidArgument)?;
                 if window.is_empty() {
                     break;
                 }
                 let count = window.len();
-                crate::sys::random::mix_bytes(&window);
+                window.copy_to_slice(&mut buffer[..count]);
+                crate::sys::random::mix_bytes(&buffer[..count]);
                 done += count;
             }
             return Ok(done);

@@ -136,6 +136,8 @@ rtrap_entry:
     csrci sstatus, 0x2
     mv a0, sp
     call rsyscall_return
+    /* Signal delivery may block; use the selected thread's stack. */
+    mv sp, a0
     call rsignal_return
     mv sp, a0
     j .prepare_return
@@ -144,6 +146,8 @@ rtrap_entry:
 .handle_trap:
     mv a0, sp
     call rtrap
+    /* The outgoing thread may already be running on another hart. */
+    mv sp, a0
     call rsignal_return
     mv sp, a0
 

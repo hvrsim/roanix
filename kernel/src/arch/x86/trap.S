@@ -62,6 +62,8 @@ rsyscall_entry:
     mov %rax, 0(%rsp)
     mov %rsp, %rdi
     call rsyscall_return
+    /* Signal delivery may block; use the selected thread's stack. */
+    mov %rax, %rsp
     mov %rax, %rdi
     call rsignal_return
     mov %rax, %rsp
@@ -122,6 +124,8 @@ rtrap_entry:
     mov %rsp, %rdi
     xor %rbp, %rbp
     call rtrap
+    /* The outgoing thread may already be running on another CPU. */
+    mov %rax, %rsp
     mov %rax, %rdi
     call rsignal_return
     mov %rax, %rsp
