@@ -1132,14 +1132,18 @@ impl Scheduler {
         }
 
         let quantum_ns = cpu.quantum_for(current, &self.config);
-        let slice_deadline =
-            now_ns.saturating_add(quantum_ns.saturating_sub(current.slice_ns).max(1));
         let statclock_deadline = if cpu.next_statclock_ns == 0 {
             now_ns.saturating_add(SCHED_STAT_INTERVAL_NS)
         } else {
             cpu.next_statclock_ns
         };
-        statclock_deadline.min(slice_deadline)
+        clock::scheduler_deadline(
+            now_ns,
+            current.last_run_ns(),
+            current.slice_ns,
+            quantum_ns,
+            statclock_deadline,
+        )
     }
 
     fn current_deadline(&self, cpu_id: usize, now_ns: u64) -> u64 {

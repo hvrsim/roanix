@@ -1,9 +1,9 @@
+//! Monotonic timekeeping, CPU-local callouts, and tickless scheduler deadlines.
 //!
-//! # Kernel Timekeeping
-//!
-//! Architecture-independent timekeeping, deadline management, and per-CPU
-//! sleep queues.
-//!
+//! Each CPU arms its one-shot timer for the earliest scheduler or sleep deadline.
+//! Calendar buckets retain full nanosecond deadlines; bucket width never rounds
+//! expiration times. Queue changes and hardware writes hold the same IRQ lock.
+//! Wakeups run after releasing that lock to preserve scheduler lock ordering.
 
 use alloc::vec::Vec;
 use core::{
@@ -27,176 +27,20 @@ use crate::{
     },
 };
 
-static CLOCK_SETUP: Once<()> = Once::new();
-static CLOCKSOURCE: Once<RegisteredClockSource> = Once::new();
-static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
-/// Offset from the monotonic clock to the Unix epoch, or `0` when unknown.
-static REALTIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+// Timecounter conversion
 
 const CLOCK_SCALE_MAX_SHIFT: u32 = 48;
 const NSEC_PER_SEC: u128 = 1_000_000_000;
 
-/// Monotonic counter source used for timekeeping and delays.
-pub trait ClockSource: Sync {
-    /// Human-readable source name.
-    fn name(&self) -> &'static str;
-
-    /// Relative quality score. Higher is better.
-    fn rating(&self) -> u32;
-
-    /// Counter frequency in Hz.
-    fn frequency_hz(&self) -> u64;
-
-    /// Current raw counter value.
-    fn counter(&self) -> u64;
-
-    /// Number of significant bits in the raw counter.
-    ///
-    /// Kernel timekeeping assumes a counter that does not wrap within the
-    /// system's lifetime, so only 64-bit sources are accepted. Narrower
-    /// hardware must be wrapped in a source that widens the count before it is
-    /// registered.
-    fn counter_bits(&self) -> u32 {
-        64
-    }
-}
-
-/// One-shot local interrupt source used to deliver deadlines on the current CPU.
-pub trait EventTimer: Sync {
-    /// Human-readable timer name.
-    fn name(&self) -> &'static str;
-
-    /// Minimum armable delay in nanoseconds.
-    fn min_period_ns(&self) -> u64;
-
-    /// Maximum armable delay in nanoseconds.
-    fn max_period_ns(&self) -> u64;
-
-    /// Programs the next one-shot interrupt after `delay_ns`.
-    fn set_oneshot(&self, delay_ns: u64);
-
-    /// Stops timer delivery, if supported.
-    fn stop(&self);
-}
-
-/// Precomputed fixed-point conversion between nanoseconds and counter cycles.
+/// Fixed-point counter conversion using 128-bit intermediates and saturating results.
+/// The timekeeping multiplier is rounded to nearest; eventtimer conversion
+/// rounds upward so a requested delay never loses a counter cycle.
 #[derive(Copy, Clone)]
 pub(crate) struct ClockScale {
     ns_mult: u64,
     ns_shift: u32,
     cycles_mult: u64,
     cycles_shift: u32,
-}
-
-#[derive(Copy, Clone)]
-struct RegisteredClockSource {
-    source: &'static dyn ClockSource,
-    scale: ClockScale,
-    /// Raw counter value observed at registration.
-    ///
-    /// Subtracting it makes [`monotonic_ns`] start near zero at boot rather
-    /// than reporting whatever the hardware counter happened to hold.
-    epoch: u64,
-}
-
-/// Local timer state stored in [`crate::sys::smp::CoreLocal`].
-pub(crate) struct PerCpuClock {
-    state: IrqSpinLock<LocalClockState>,
-}
-
-impl PerCpuClock {
-    fn new() -> Self {
-        Self {
-            state: IrqSpinLock::new(LocalClockState::new()),
-        }
-    }
-}
-
-/// Intrusive sleep timer pinned on the sleeping thread's stack until expiry.
-struct Timer {
-    link: RBTreeLink,
-    deadline_ns: u64,
-    order: u64,
-    /// CPU whose timer tree owns this entry.
-    ///
-    /// A sleeper may resume on a different CPU, so removal has to go back to
-    /// the tree the timer was inserted into.
-    cpu_id: usize,
-    target: TimerTarget,
-}
-
-#[derive(Copy, Clone)]
-struct ExpiredTimer {
-    target: TimerTarget,
-}
-
-#[derive(Copy, Clone)]
-enum TimerTarget {
-    Event(NonNull<Event>),
-    Thread {
-        thread: NonNull<Thread>,
-        park_seq: u64,
-    },
-}
-
-// SAFETY: timers are only linked/unlinked while protected by the local timer
-// lock for their owning CPU, and every target remains live through removal.
-unsafe impl Send for Timer {}
-// SAFETY: timer fields are immutable while linked except under the local clock
-// lock, and target wakeup synchronization is handled by Event or the scheduler.
-unsafe impl Sync for Timer {}
-
-intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });
-
-impl<'a> KeyAdapter<'a> for TimerAdapter {
-    type Key = (u64, u64);
-
-    fn get_key(&self, timer: &'a Timer) -> Self::Key {
-        (timer.deadline_ns, timer.order)
-    }
-}
-
-struct LocalClockState {
-    next_order: u64,
-    next_scheduler_deadline_ns: u64,
-    next_timer_deadline_ns: u64,
-    armed_deadline_ns: u64,
-    timers: RBTree<TimerAdapter>,
-}
-
-impl Timer {
-    const fn new(deadline_ns: u64, cpu_id: usize, target: TimerTarget) -> Self {
-        Self {
-            link: RBTreeLink::new(),
-            deadline_ns,
-            order: 0,
-            cpu_id,
-            target,
-        }
-    }
-
-    fn for_event(deadline_ns: u64, cpu_id: usize, event: &Event) -> Self {
-        Self::new(
-            deadline_ns,
-            cpu_id,
-            TimerTarget::Event(NonNull::from(event)),
-        )
-    }
-
-    fn for_thread(deadline_ns: u64, cpu_id: usize, thread: *mut Thread, park_seq: u64) -> Self {
-        Self::new(
-            deadline_ns,
-            cpu_id,
-            TimerTarget::Thread {
-                thread: NonNull::new(thread).expect("clock: null sleep thread"),
-                park_seq,
-            },
-        )
-    }
-
-    fn is_linked(&self) -> bool {
-        self.link.is_linked()
-    }
 }
 
 impl ClockScale {
@@ -261,115 +105,377 @@ impl ClockScale {
     }
 }
 
+// Calendar callout queue
+
+const BUCKETS: usize = 256;
+const BUCKET_WIDTH_NS: u64 = 1_000_000;
+const EMPTY: usize = BUCKETS;
+
+intrusive_adapter!(TimerAdapter = UnsafeRef<Timer>: Timer { link: RBTreeLink });
+
+impl<'a> KeyAdapter<'a> for TimerAdapter {
+    type Key = (u64, u64);
+    fn get_key(&self, timer: &'a Timer) -> Self::Key {
+        (timer.deadline_ns, timer.order)
+    }
+}
+
+/// Exact calendar queue with ordered buckets and a tournament of bucket heads.
+///
+/// Lookup is O(1); mutations cost O(log m + log BUCKETS) for bucket occupancy m.
+/// Full deadlines distinguish calendar turns, and insertion order breaks ties.
+/// Fixed storage avoids allocation and redistribution under the IRQ lock.
+struct CalendarQueue {
+    buckets: [RBTree<TimerAdapter>; BUCKETS],
+    // Index 1 is the root; indices BUCKETS..2*BUCKETS are leaves.
+    // EMPTY marks a subtree without a timer; index 0 is unused.
+    winners: [usize; BUCKETS * 2],
+    // Valid only for nonempty buckets; keys are (deadline_ns, insertion_order).
+    heads: [(u64, u64); BUCKETS],
+    next_order: u64,
+}
+
+// SAFETY: queued timers stay pinned and live until removal; all link access
+// holds the owning CPU's clock lock. Targets are synchronized event/scheduler
+// wakeups, and migration-pinned waiters keep their storage live through dispatch.
+unsafe impl Send for CalendarQueue {}
+
+impl CalendarQueue {
+    fn new() -> Self {
+        Self {
+            buckets: core::array::from_fn(|_| RBTree::new(TimerAdapter::new())),
+            winners: [EMPTY; BUCKETS * 2],
+            heads: [(0, 0); BUCKETS],
+            next_order: 0,
+        }
+    }
+
+    fn bucket(deadline_ns: u64) -> usize {
+        (deadline_ns / BUCKET_WIDTH_NS) as usize & (BUCKETS - 1)
+    }
+
+    fn key(&self, bucket: usize) -> Option<(u64, u64)> {
+        if bucket == EMPTY {
+            return None;
+        }
+        Some(self.heads[bucket])
+    }
+
+    /// Refreshes one bucket head and its path to the tournament root.
+    fn update(&mut self, bucket: usize) {
+        let mut node = BUCKETS + bucket;
+        let head = self.buckets[bucket]
+            .front()
+            .get()
+            .map(|e| (e.deadline_ns, e.order));
+        if head == self.key(self.winners[node]) {
+            return;
+        }
+        self.winners[node] = if let Some(key) = head {
+            self.heads[bucket] = key;
+            bucket
+        } else {
+            EMPTY
+        };
+        while node > 1 {
+            node /= 2;
+            let a = self.winners[node * 2];
+            let b = self.winners[node * 2 + 1];
+            self.winners[node] = match (self.key(a), self.key(b)) {
+                (None, _) => b,
+                (_, None) => a,
+                (Some(ka), Some(kb)) => {
+                    if ka <= kb {
+                        a
+                    } else {
+                        b
+                    }
+                }
+            };
+        }
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.key(self.winners[1]).map(|key| key.0)
+    }
+
+    /// # Safety
+    /// `timer` must stay at this address and live until removed or popped.
+    /// Its deadline must not change while queued. All queue and link access
+    /// must be serialized by the owner CPU's clock lock.
+    unsafe fn insert(&mut self, timer: &mut Timer) {
+        assert!(!timer.link.is_linked(), "clock: callout already armed");
+        timer.order = self.next_order;
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .expect("clock: callout sequence exhausted");
+        let bucket = Self::bucket(timer.deadline_ns);
+        let changes_head = self
+            .key(self.winners[BUCKETS + bucket])
+            .is_none_or(|key| (timer.deadline_ns, timer.order) < key);
+        // SAFETY: caller guarantees stable storage through removal.
+        self.buckets[bucket].insert(unsafe { UnsafeRef::from_raw(timer) });
+        if changes_head {
+            self.update(bucket);
+        }
+    }
+
+    /// # Safety
+    /// A linked `timer` must belong to this queue, with access serialized by
+    /// the owner CPU lock. It must remain live throughout removal.
+    unsafe fn remove(&mut self, timer: &Timer) {
+        if !timer.link.is_linked() {
+            return;
+        }
+        let bucket = Self::bucket(timer.deadline_ns);
+        let changes_head =
+            self.key(self.winners[BUCKETS + bucket]) == Some((timer.deadline_ns, timer.order));
+        // SAFETY: caller guarantees this timer belongs to the locked queue.
+        unsafe { self.buckets[bucket].cursor_mut_from_ptr(timer).remove() }
+            .expect("clock: linked callout vanished");
+        if changes_head {
+            self.update(bucket);
+        }
+    }
+
+    fn pop_expired(&mut self, now_ns: u64) -> Option<TimerTarget> {
+        if self.next_deadline()? > now_ns {
+            return None;
+        }
+        let bucket = self.winners[1];
+        let timer = self.buckets[bucket]
+            .front_mut()
+            .remove()
+            .expect("clock: missing calendar head");
+        let target = timer.target;
+        self.update(bucket);
+        Some(target)
+    }
+}
+
+// Scheduler deadline arbitration
+
+/// A hardware write is distinct from leaving the currently armed timer alone.
+enum TimerUpdate {
+    Unchanged,
+    /// Programs a deadline, or stops delivery when no deadline remains.
+    Program(Option<u64>),
+}
+
+/// Scheduler, callout, and programmed deadlines protected by the CPU clock lock.
+#[derive(Default)]
+struct Deadlines {
+    scheduler: Option<u64>,
+    callout: Option<u64>,
+    armed: Option<u64>,
+}
+
+impl Deadlines {
+    fn set_scheduler(&mut self, deadline: u64) -> TimerUpdate {
+        self.scheduler = (deadline != 0).then_some(deadline);
+        self.changed()
+    }
+
+    fn set_callout(&mut self, deadline: Option<u64>) -> TimerUpdate {
+        self.callout = deadline;
+        self.changed()
+    }
+
+    fn next(&self) -> Option<u64> {
+        match (self.scheduler, self.callout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn changed(&mut self) -> TimerUpdate {
+        let next = self.next();
+        if next == self.armed {
+            return TimerUpdate::Unchanged;
+        }
+        self.armed = next;
+        TimerUpdate::Program(next)
+    }
+
+    fn finish_interrupt(&mut self, now: u64, callout: Option<u64>) -> Option<u64> {
+        self.callout = callout;
+        if self.scheduler.is_some_and(|deadline| deadline <= now) {
+            self.scheduler = None;
+        }
+        // Always program/stop after an IRQ, even if the logical deadline has
+        // not changed: hardware may have clamped a long delay or be level asserted.
+        self.armed = self.next();
+        self.armed
+    }
+}
+
+/// Computes a slice deadline anchored to the last runtime accounting point.
+/// Refresh IPIs must not grant extra runtime by restarting the remaining slice.
+/// An exhausted slice requests the earliest future interrupt; a due statclock
+/// deadline can still take precedence.
+pub(crate) fn scheduler_deadline(
+    now: u64,
+    last_run: u64,
+    consumed: u64,
+    quantum: u64,
+    statclock: u64,
+) -> u64 {
+    let slice = last_run.saturating_add(quantum.saturating_sub(consumed));
+    slice.max(now.saturating_add(1)).min(statclock)
+}
+
+static CLOCK_SETUP: Once<()> = Once::new();
+static CLOCKSOURCE: Once<RegisteredClockSource> = Once::new();
+static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
+/// Offset from the monotonic clock to the Unix epoch, or `0` when unknown.
+static REALTIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic counter source used for timekeeping and delays.
+pub trait ClockSource: Sync {
+    /// Human-readable source name.
+    fn name(&self) -> &'static str;
+
+    /// Relative quality score. Higher is better.
+    fn rating(&self) -> u32;
+
+    /// Counter frequency in Hz.
+    fn frequency_hz(&self) -> u64;
+
+    /// Current raw counter value.
+    fn counter(&self) -> u64;
+
+    /// Number of significant bits in the raw counter.
+    ///
+    /// Kernel timekeeping assumes a counter that does not wrap within the
+    /// system's lifetime, so only 64-bit sources are accepted. Narrower
+    /// hardware must be wrapped in a source that widens the count before it is
+    /// registered.
+    fn counter_bits(&self) -> u32 {
+        64
+    }
+}
+
+/// One-shot local interrupt source used to deliver deadlines on the current CPU.
+pub trait EventTimer: Sync {
+    /// Human-readable timer name.
+    fn name(&self) -> &'static str;
+
+    /// Minimum armable delay in nanoseconds.
+    fn min_period_ns(&self) -> u64;
+
+    /// Maximum armable delay in nanoseconds.
+    fn max_period_ns(&self) -> u64;
+
+    /// Programs the next one-shot interrupt after `delay_ns`.
+    fn set_oneshot(&self, delay_ns: u64);
+
+    /// Stops timer delivery, if supported.
+    fn stop(&self);
+}
+
+#[derive(Copy, Clone)]
+struct RegisteredClockSource {
+    source: &'static dyn ClockSource,
+    scale: ClockScale,
+    /// Raw counter value observed at registration.
+    ///
+    /// Subtracting it makes [`monotonic_ns`] start near zero at boot rather
+    /// than reporting whatever the hardware counter happened to hold.
+    epoch: u64,
+}
+
+/// Local timer state stored in [`crate::sys::smp::CoreLocal`].
+pub(crate) struct PerCpuClock {
+    state: IrqSpinLock<LocalClockState>,
+}
+
+impl PerCpuClock {
+    fn new() -> Self {
+        Self {
+            state: IrqSpinLock::new(LocalClockState::new()),
+        }
+    }
+}
+
+/// Stack-pinned callout owned by one CPU until expiry or cancellation.
+struct Timer {
+    link: RBTreeLink,
+    deadline_ns: u64,
+    order: u64,
+    cpu_id: usize,
+    target: TimerTarget,
+}
+
+#[derive(Copy, Clone)]
+enum TimerTarget {
+    Event(NonNull<Event>),
+    Thread {
+        thread: NonNull<Thread>,
+        park_seq: u64,
+    },
+}
+
+struct LocalClockState {
+    deadlines: Deadlines,
+    timers: CalendarQueue,
+}
+
+impl Timer {
+    const fn new(deadline_ns: u64, cpu_id: usize, target: TimerTarget) -> Self {
+        Self {
+            link: RBTreeLink::new(),
+            deadline_ns,
+            order: 0,
+            cpu_id,
+            target,
+        }
+    }
+
+    fn for_event(deadline_ns: u64, cpu_id: usize, event: &Event) -> Self {
+        Self::new(
+            deadline_ns,
+            cpu_id,
+            TimerTarget::Event(NonNull::from(event)),
+        )
+    }
+
+    fn for_thread(deadline_ns: u64, cpu_id: usize, thread: *mut Thread, park_seq: u64) -> Self {
+        Self::new(
+            deadline_ns,
+            cpu_id,
+            TimerTarget::Thread {
+                thread: NonNull::new(thread).expect("clock: null sleep thread"),
+                park_seq,
+            },
+        )
+    }
+}
+
 impl LocalClockState {
     fn new() -> Self {
         Self {
-            next_order: 0,
-            next_scheduler_deadline_ns: 0,
-            next_timer_deadline_ns: 0,
-            armed_deadline_ns: 0,
-            timers: RBTree::new(TimerAdapter::new()),
+            deadlines: Deadlines::default(),
+            timers: CalendarQueue::new(),
         }
     }
 
-    fn start(&mut self) -> Option<u64> {
-        self.refresh_programmed_deadline()
+    fn insert_timer(&mut self, timer: &mut Timer) -> TimerUpdate {
+        // SAFETY: caller pins the timer on its stack until cancellation, with
+        // migration disabled, and holds the owner CPU's clock lock.
+        unsafe { self.timers.insert(timer) };
+        self.deadlines.set_callout(self.timers.next_deadline())
     }
 
-    fn stop(&mut self) -> Option<u64> {
-        self.next_scheduler_deadline_ns = 0;
-        self.refresh_programmed_deadline()
+    fn take_expired(&mut self, now_ns: u64) -> Option<TimerTarget> {
+        self.timers.pop_expired(now_ns)
     }
 
-    fn insert_timer(&mut self, timer: &mut Timer) -> Option<u64> {
-        timer.order = self.next_order;
-        self.next_order = self.next_order.wrapping_add(1);
-        // SAFETY: the pinned timer outlives its tree membership and the local
-        // clock lock serializes all link manipulation.
-        self.timers
-            .insert(unsafe { UnsafeRef::from_raw(timer as *const Timer) });
-        self.refresh_timer_deadline();
-        self.refresh_programmed_deadline()
-    }
-
-    fn take_expired(&mut self, now_ns: u64) -> Option<ExpiredTimer> {
-        let expired = self.expired_front(now_ns)?;
-        // SAFETY: `expired_front` returned the currently linked front element
-        // while this tree is exclusively borrowed.
-        let timer = unsafe { self.timers.cursor_mut_from_ptr(expired).remove() }
-            .expect("clock: timer tree lost armed timer");
-        Some(ExpiredTimer {
-            target: timer.target,
-        })
-    }
-
-    fn remove_timer(&mut self, timer: &Timer) -> Option<u64> {
-        if !timer.link.is_linked() {
-            return None;
-        }
-        // SAFETY: the timer is linked in this exclusively borrowed tree and
-        // remains pinned for the duration of this operation.
-        unsafe {
-            self.timers
-                .cursor_mut_from_ptr(timer as *const Timer)
-                .remove()
-        }
-        .expect("clock: linked timer vanished");
-        self.refresh_timer_deadline();
-        self.refresh_programmed_deadline()
-    }
-
-    fn finish_interrupt(&mut self, now_ns: u64) -> Option<u64> {
-        self.refresh_timer_deadline();
-        if self.next_scheduler_deadline_ns != 0 && self.next_scheduler_deadline_ns <= now_ns {
-            self.next_scheduler_deadline_ns = 0;
-        }
-        // An expired level-triggered timer remains asserted until hardware is
-        // reprogrammed, including when there is no next deadline. Treating
-        // zero as already disarmed here skips timer.stop() and traps forever
-        // before a preemption-disabled thread can resume.
-        let next = self.combined_deadline();
-        self.armed_deadline_ns = next;
-        Some(next)
-    }
-
-    fn set_scheduler_deadline(&mut self, deadline_ns: u64) -> Option<u64> {
-        self.next_scheduler_deadline_ns = deadline_ns;
-        self.refresh_programmed_deadline()
-    }
-
-    fn expired_front(&self, now_ns: u64) -> Option<*const Timer> {
-        match self.timers.front().get() {
-            Some(timer) if timer.deadline_ns <= now_ns => Some(timer as *const Timer),
-            _ => None,
-        }
-    }
-
-    fn refresh_timer_deadline(&mut self) {
-        self.next_timer_deadline_ns = self
-            .timers
-            .front()
-            .get()
-            .map(|timer| timer.deadline_ns)
-            .unwrap_or(0);
-    }
-
-    fn combined_deadline(&self) -> u64 {
-        match (self.next_scheduler_deadline_ns, self.next_timer_deadline_ns) {
-            (0, 0) => 0,
-            (0, deadline) | (deadline, 0) => deadline,
-            (a, b) => a.min(b),
-        }
-    }
-
-    fn refresh_programmed_deadline(&mut self) -> Option<u64> {
-        let next = self.combined_deadline();
-        if next == self.armed_deadline_ns {
-            return None;
-        }
-
-        self.armed_deadline_ns = next;
-        Some(next)
+    fn remove_timer(&mut self, timer: &Timer) -> TimerUpdate {
+        // SAFETY: cancellation verifies the owner CPU and the stack frame stays
+        // pinned until this operation has completed under its clock lock.
+        unsafe { self.timers.remove(timer) };
+        self.deadlines.set_callout(self.timers.next_deadline())
     }
 }
 
@@ -418,12 +524,13 @@ pub fn register_event_timer(timer: &'static dyn EventTimer) {
 /// Starts local timer delivery on the current CPU.
 pub(crate) fn start_cpu() {
     CLOCK_SETUP.call_once(bootstrap_clocks);
-    with_local_clock(|local| (local.start(), ()));
+    // A fresh CPU has no deadlines; explicitly clear any firmware timer.
+    apply_deadline(None);
 }
 
-/// Stops local timer delivery on the current CPU.
+/// Clears scheduler delivery on this CPU while preserving armed callouts.
 pub fn stop() {
-    with_local_clock(|local| (local.stop(), ()));
+    with_local_clock(|local| local.deadlines.set_scheduler(0));
 }
 
 /// Busy-waits for the requested duration using the active local counter.
@@ -461,7 +568,7 @@ pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<
     // SAFETY: the scheduler keeps the current thread allocation live while it
     // is executing.
     let current_ref = unsafe { &*current };
-    // Pin so the timer stays associated with the CPU that owns its tree.
+    // Pin so the timer stays associated with the CPU that owns its queue.
     current_ref.pin_migration();
     arch::irqset(false);
 
@@ -473,13 +580,13 @@ pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<
         cpu_id,
         timeout_event.as_ref().get_ref(),
     ));
-    with_local_clock(|local| (local.insert_timer(timer.as_mut().get_mut()), ()));
+    with_local_clock(|local| local.insert_timer(timer.as_mut().get_mut()));
     arch::irqset(true);
 
     let winner = wait_with_timeout_event(events, timeout_event.as_ref().get_ref());
 
     // Always unlink: on the timeout path the timer already fired, but any
-    // other outcome leaves this stack-pinned node in the CPU's timer tree.
+    // other outcome leaves this stack-pinned node in the CPU's timer queue.
     remove_timer(timer.as_ref().get_ref());
     current_ref.unpin_migration();
 
@@ -550,20 +657,25 @@ pub fn set_realtime_offset(offset_ns: u64) {
 }
 
 /// Updates the current CPU's scheduler deadline and re-arms the local timer if
-/// needed.
+/// needed. A zero deadline clears scheduler delivery without cancelling callouts.
 pub fn set_scheduler_deadline(deadline_ns: u64) {
-    with_local_clock(|local| (local.set_scheduler_deadline(deadline_ns), ()));
+    with_local_clock(|local| local.deadlines.set_scheduler(deadline_ns));
 }
 
-/// Handles a local timer interrupt on the current CPU.
+/// Dispatches a bounded batch of expired callouts, then re-arms the local timer.
+/// Must run on the owning CPU with interrupts disabled. Migration-pinned waiters
+/// cannot resume and destroy their targets before dispatch finishes.
 pub fn handle_local_timer_interrupt() {
     let now_ns = monotonic_ns();
 
-    while let Some(expired) = {
-        let mut local = local_clock().lock();
-        local.take_expired(now_ns)
-    } {
-        match expired.target {
+    // Bound hard-interrupt work during timeout storms. Remaining overdue
+    // callouts re-arm at the hardware minimum, allowing scheduler progress.
+    const DISPATCH_BUDGET: usize = 64;
+    for _ in 0..DISPATCH_BUDGET {
+        let Some(expired) = local_clock().lock().take_expired(now_ns) else {
+            break;
+        };
+        match expired {
             TimerTarget::Event(event) => {
                 // SAFETY: the non-null pointer references the pinned timeout
                 // event, which remains alive until this signal completes.
@@ -577,42 +689,21 @@ pub fn handle_local_timer_interrupt() {
         }
     }
 
-    with_local_clock(|local| (local.finish_interrupt(now_ns), ()));
+    with_local_clock(|local| {
+        let next = local
+            .deadlines
+            .finish_interrupt(now_ns, local.timers.next_deadline());
+        TimerUpdate::Program(next)
+    });
 }
 
 /// Runs `f` against the local clock state and programs any resulting deadline
-/// before releasing the lock.
-///
-/// Programming the hardware inside the critical section keeps
-/// `armed_deadline_ns` and the timer register in agreement. Releasing the lock
-/// first would re-enable interrupts and let a timer IRQ reprogram the hardware
-/// in between, leaving the two permanently out of sync.
-fn with_local_clock<R>(f: impl FnOnce(&mut LocalClockState) -> (Option<u64>, R)) -> R {
+/// before releasing the IRQ lock, keeping cached and hardware deadlines in sync.
+fn with_local_clock(f: impl FnOnce(&mut LocalClockState) -> TimerUpdate) {
     let mut local = local_clock().lock();
-    let (arm, result) = f(&mut local);
-    if let Some(deadline) = arm {
+    if let TimerUpdate::Program(deadline) = f(&mut local) {
         apply_deadline(deadline);
     }
-    result
-}
-
-/// Runs `f` against a specific CPU's clock state.
-///
-/// Only the owning CPU may program its own timer hardware, so a remote update
-/// records the new deadline and relies on that CPU re-arming on its next trap.
-fn with_clock_for_cpu<R>(
-    cpu_id: usize,
-    f: impl FnOnce(&mut LocalClockState) -> (Option<u64>, R),
-) -> R {
-    let local_cpu = arch::thiscpu_opt().map(|cpu| cpu.id);
-    let mut local = clock_for_cpu(cpu_id).lock();
-    let (arm, result) = f(&mut local);
-    if let Some(deadline) = arm
-        && local_cpu == Some(cpu_id)
-    {
-        apply_deadline(deadline);
-    }
-    result
 }
 
 fn delay_ns(ns: u64) {
@@ -648,7 +739,7 @@ fn sleep_ns(ns: u64) {
     // is executing.
     let current_ref = unsafe { &*current };
     // Pin so the sleeper resumes on the CPU that owns its timer, keeping the
-    // removal below on the same tree the insertion used.
+    // removal below on the same queue the insertion used.
     current_ref.pin_migration();
     let park_seq = current_ref.prepare_park();
     let cpu_id = arch::thiscpu().id;
@@ -660,24 +751,29 @@ fn sleep_ns(ns: u64) {
         park_seq,
     ));
 
-    with_local_clock(|local| (local.insert_timer(timer.as_mut().get_mut()), ()));
+    with_local_clock(|local| local.insert_timer(timer.as_mut().get_mut()));
 
     sched::park_current(current, park_seq);
 
     // The timer normally fires and removes itself, but any other wake path
-    // would leave this stack-pinned node linked in the CPU's timer tree and
+    // would leave this stack-pinned node linked in the CPU's timer queue and
     // dangling as soon as this frame returns.
     remove_timer(timer.as_ref().get_ref());
     current_ref.unpin_migration();
 }
 
-/// Unlinks `timer` from the tree it was inserted into, if still linked.
+/// Unlinks `timer` from the queue it was inserted into, if still linked.
 fn remove_timer(timer: &Timer) {
-    if !timer.is_linked() {
-        return;
-    }
-
-    with_clock_for_cpu(timer.cpu_id, |local| (local.remove_timer(timer), ()));
+    // Migration stays pinned until cancellation completes. Taking the lock
+    // also disables IRQs, so a local dispatch cannot outlive this stack frame.
+    with_local_clock(|local| {
+        assert_eq!(
+            timer.cpu_id,
+            arch::thiscpu().id,
+            "clock: migrated armed callout"
+        );
+        local.remove_timer(timer)
+    });
 }
 
 fn bootstrap_clocks() {
@@ -712,12 +808,12 @@ fn clock_for_cpu(cpu_id: usize) -> &'static IrqSpinLock<LocalClockState> {
         .state
 }
 
-fn apply_deadline(deadline_ns: u64) {
+fn apply_deadline(deadline_ns: Option<u64>) {
     let timer = event_timer();
-    if deadline_ns == 0 {
+    let Some(deadline_ns) = deadline_ns else {
         timer.stop();
         return;
-    }
+    };
 
     let now_ns = monotonic_ns();
     let min_ns = timer.min_period_ns();
@@ -738,9 +834,7 @@ fn format_frequency(freq_hz: u64) -> (u64, u64, &'static str) {
 }
 
 fn duration_to_ns(duration: Duration) -> u64 {
-    let ns = (duration.as_secs() as u128 * 1_000_000_000u128)
-        .saturating_add(duration.subsec_nanos() as u128);
-    ns.min(u64::MAX as u128) as u64
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[inline]
