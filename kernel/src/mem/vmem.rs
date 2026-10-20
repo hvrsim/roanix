@@ -1,3 +1,10 @@
+//! Virtual-address arena allocation using boundary tags and size classes.
+//!
+//! The arena tracks free and allocated ranges without supplying their physical
+//! backing. It supports fixed, aligned, best-fit, and randomized placement, splits
+//! and coalesces adjacent ranges, and reserves tag storage before committing
+//! changes so metadata allocation failure leaves the arena unchanged.
+
 use core::{cell::Cell, ops::Bound, ptr::NonNull};
 
 use super::{

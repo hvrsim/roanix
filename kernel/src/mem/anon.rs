@@ -1,34 +1,12 @@
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-//! UVM amap/anon ownership and partial-reference accounting.
+//! Anonymous page ownership for private mappings and copy-on-write faults.
 //!
-//! Reference: NetBSD 99a671f895b7, sys/uvm/uvm_amap.c (amap_alloc1,
-//! amap_copy, amap_ref/unref, amap_pp_establish/adjref, amap_wiperange).
-//! Related amaps share the owner lock while they share anons. Only slots
-//! count as anon owners; temporary fault snapshots retain weak anon identities.
+//! Mapping slices track which anonymous slots they cover and share an owner lock
+//! while their pages remain shared. Partial-reference accounting releases unused
+//! slots when possible. Temporary fault snapshots retain weak identities so that
+//! observing a page does not create another copy-on-write owner.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
+
 use super::{
     Error, Result,
     metadata::NoSleep,
@@ -74,7 +52,7 @@ impl Slot {
     }
 }
 
-/// vm_aref: one logical reference to a page range, distinct from the Arc
+/// One logical reference to a page range, distinct from the Arc
 /// that keeps the amap allocation alive during an unlocked fault.
 pub(super) struct MapRef {
     map: Arc<AnonymousMap, NoSleep>,
@@ -92,7 +70,7 @@ impl MapRef {
     pub(super) fn is_exclusive(&self) -> bool {
         self.map.state.read().references == 1
     }
-    /// amap_extend: the sole aref may extend into unused slots, activate
+    /// An exclusive reference may extend into unused slots, activate
     /// preallocated slots, or replace the three arrays. Never join two amaps.
     pub(super) fn extend(&mut self, added: u64, backwards: bool) -> Result<()> {
         let added = usize::try_from(added).map_err(|_| Error::OutOfMemory)?;
@@ -150,7 +128,7 @@ impl MapRef {
             }
             return Ok(());
         }
-        // UVM forbids growing a fresh allocation beyond UVM_AMAP_LARGE.
+        // Keep fresh allocations below the large-map threshold.
         if need >= LARGE_PAGES as usize {
             return Err(Error::OutOfMemory);
         }
@@ -175,7 +153,7 @@ impl MapRef {
         while let Some(index) = state.used.pop() {
             let slot = state.slots[index as usize]
                 .take()
-                .expect("uvm: missing used anon");
+                .expect("mem: missing used anon");
             replacement.insert(index as usize + shift, slot);
         }
         if backwards {
@@ -190,7 +168,7 @@ impl MapRef {
         Ok(())
     }
 
-    /// Adds a partial reference (amap_ref); clipping does not copy any slots.
+    /// Adds a partial reference; clipping does not copy any slots.
     pub(super) fn clipped(&self, offset: u64, count: u64) -> Self {
         let offset = usize::try_from(offset).expect("mem: amap offset overflow");
         let count = usize::try_from(count).expect("mem: amap length overflow");
@@ -317,7 +295,7 @@ impl AmapState {
         }
         self.slots[index] = Some(slot);
     }
-    /// amap_unadd: swap the last used index into the removed index's place.
+    /// Swap the last used index into the removed index's place.
     fn remove(&mut self, index: usize) {
         if self.slots[index].is_none() {
             return;
@@ -329,7 +307,7 @@ impl AmapState {
         }
         self.slots[index] = None;
     }
-    /// amap_wiperange chooses the cheaper of slot and used-index traversal.
+    /// Choose the cheaper of slot and used-index traversal.
     fn wipe(&mut self, start: usize, length: usize) {
         let end = start + length;
         if length < self.used.len() {
@@ -363,7 +341,7 @@ impl AmapState {
                 );
                 PartialReferences::Counts(counts)
             }
-            // UVM's PPREF_NONE fallback: retaining unused slots is preferable
+            // If partial-reference storage is unavailable, retaining unused slots is preferable
             // to making an otherwise valid fork/clip fail for ppref storage.
             Err(_) => PartialReferences::Disabled,
         };

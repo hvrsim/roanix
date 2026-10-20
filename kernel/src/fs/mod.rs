@@ -2,12 +2,15 @@
 
 extern crate alloc;
 
+mod cache;
 pub mod devfs;
 pub mod error;
 pub mod ext4;
 pub mod fat32;
 pub mod file;
 mod io;
+pub(crate) mod namecache;
+mod namespace;
 pub mod partition;
 pub mod path;
 mod syscall;

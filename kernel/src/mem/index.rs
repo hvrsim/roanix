@@ -1,3 +1,12 @@
+//! Ordered, intrusive indexes for memory-management metadata.
+//!
+//! Nodes come from typed pools and can be reserved before entering critical
+//! sections. Publication, rekeying, and range detachment reuse those nodes so
+//! structural changes need not allocate through the general kernel heap.
+//! External owner locks protect indexes that are shared between threads.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
+
 use core::{cell::UnsafeCell, ops::RangeBounds};
 
 use intrusive_collections::{
@@ -106,7 +115,7 @@ impl<T> Index<T> {
             .tree
             .find_mut(&old)
             .remove()
-            .expect("uvm: rekey missing entry");
+            .expect("mem: rekey missing entry");
         node.key = new;
         self.tree.insert(node);
     }
@@ -232,7 +241,7 @@ impl<T> Index<T> {
         let mut removed = Self::new(self.pool);
         let mut cursor = self.tree.lower_bound_mut(Bound::Included(&start));
         while cursor.get().is_some_and(|node| node.key < end) {
-            let node = cursor.remove().expect("uvm: missing detached entry");
+            let node = cursor.remove().expect("mem: missing detached entry");
             removed.tree.insert(node);
             removed.len += 1;
         }

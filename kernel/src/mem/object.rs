@@ -1,19 +1,15 @@
 //! Memory objects and the unified filesystem page cache.
 //!
-//! A vnode has one `VmObject`, shared by descriptor I/O and every mapping.
-//! Anonymous/tmpfs missing indexes are sparse zeros. Disk-backed objects load
-//! missing indexes through a pager, and clean file frames can be discarded
-//! and read again instead of occupying swap.
+//! A vnode's object is shared by buffered I/O and file mappings. Anonymous and
+//! tmpfs holes read as zeros; immutable file objects load missing pages through
+//! a pager and can discard clean frames instead of writing them to swap.
 //!
-//! # Synchronization invariants
+//! The owner lock protects both the page index and backing state. Transfers
+//! release it before user faults, allocation, or pager I/O. Truncation gates new
+//! faults while invalidating translations and sanitizing bytes around the new
+//! end of the object. Page-account commitments follow index membership.
 //!
-//! * Filesystems serialize writes that change logical length with truncation.
-//! * The index and page state use the same owner lock. Transfers release it
-//!   before resolving user windows, allocating physical frames, or doing I/O.
-//! * Truncation deliberately holds the index lock as a fault gate until old
-//!   PTEs are removed and bytes newly outside/inside EOF are sanitized.
-//! * Object accounting is charged once when an index is inserted and released
-//!   once when that index is removed or the object is destroyed.
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use crate::mem::PageRef;
 use alloc::sync::Arc;
@@ -141,7 +137,7 @@ impl PageAccount {
 
 /// Object-page membership survives an unlocked pager operation through a
 /// weak handle. Clean file eviction removes the index entry under the same
-/// owner capability that protects the frame (uvm_pagefree).
+/// owner capability that protects the frame.
 pub(super) struct ObjectPages(Owned<Index<PageRef>>);
 impl ObjectPages {
     fn new() -> Arc<Self> {
@@ -506,7 +502,7 @@ impl VmObject {
 
     /// Removes pages beyond `size` and sanitizes a retained tail. Page-in is
     /// performed without the object lock; EOF and identity are revalidated
-    /// before any PTE or index change (uvm_vnp_setsize/PG_BUSY protocol).
+    /// before any page-table or index change, using the page busy protocol.
     pub fn truncate(&self, size: u64) -> Result<u64> {
         if self.pager.is_some() {
             return Err(Error::Protection);
@@ -643,7 +639,7 @@ impl VmObject {
         let page = VmPage::new_zero_in(
             index,
             // tmpfs exposes a vnode view of its underlying anonymous object;
-            // those swap-backed pages count as aobj pages in UVM's clock.
+            // those swap-backed pages belong to the anonymous replacement class.
             if self.kind == ObjectKind::Vnode && self.pager.is_none() {
                 super::phys::PageOwnerKind::Anonymous
             } else {

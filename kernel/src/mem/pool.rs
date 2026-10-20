@@ -1,3 +1,10 @@
+//! Typed metadata pools backed directly by physical pages.
+//!
+//! Sharded page lists and per-CPU slot caches provide fallible allocation without
+//! depending on the general heap. Owning handles destroy values before recycling
+//! their slots and support intrusive-collection pointer conversion. Draining
+//! releases unused cached storage while retaining pages that contain live values.
+
 use core::{
     marker::PhantomData,
     mem::{align_of, size_of},

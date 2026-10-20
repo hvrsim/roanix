@@ -1,22 +1,9 @@
+//! Guarded kernel-thread stacks in a dedicated virtual arena.
 //!
-//! # Guarded kernel stacks
-//!
-//! Kernel thread stacks are carved out of a dedicated virtual arena instead of
-//! the general heap so every stack can be preceded by a permanently unmapped
-//! guard page. A stack overflow then faults on the guard page immediately
-//! rather than silently corrupting neighbouring heap objects.
-//!
-//! Each slot is laid out as:
-//!
-//! ```text
-//! | guard page (unmapped) | stack pages ... | <- stack top
-//! ```
-//!
-//! The arena occupies a single top-level page-table entry. Memory
-//! initialization pre-populates every kernel-half top-level entry before the
-//! first user address space is created, so later slot mappings are shared
-//! automatically without a permanent sentinel stack.
-//!
+//! Each stack occupies a fixed slot preceded by an unmapped guard page, allowing
+//! stack overflow to fault before reaching adjacent allocations. Kernel page-table
+//! branches are prepared during initialization so later stack mappings are visible
+//! in every address space without a permanently mapped sentinel stack.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

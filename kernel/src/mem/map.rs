@@ -1,31 +1,12 @@
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * from: Id: uvm_fault.c,v 1.1.2.23 1998/02/06 05:29:05 chs Exp
- */
-
-//! Virtual address maps, anonymous overlays, and copy-on-write resolution.
+//! Virtual address ranges, mapping attributes, and anonymous overlays.
+//!
+//! The map indexes entries by their starting address and tracks backing-object
+//! and anonymous-slice ownership across insertion, clipping, merging, and unmap.
+//! Private mappings share pages until a write fault requires copy-on-write
+//! promotion. Reservations prepare metadata before structural changes, and map
+//! timestamps let fault handlers detect stale snapshots.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use alloc::sync::Arc;
 use bitflags::bitflags;
@@ -140,9 +121,9 @@ pub enum VmAdvice {
     Sequential,
 }
 
-/// The first fault uses the exact uvmadvice range, clipped to its entry.
+/// The first fault uses the advice window clipped to its mapping entry.
 /// Subsequent retries are narrow. Sequential backpages are deactivated and
-/// excluded from neighbor mapping (uvm_fault_check).
+/// excluded from neighbor mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FaultWindow {
     pub(super) start: u64,
@@ -448,7 +429,7 @@ impl VmMap {
     pub fn unmap(&mut self, start: VirtAddr, length: u64) -> Result<DetachedEntries> {
         let start = start.as_u64();
         let end = checked_end(start, length)?;
-        // uvm_unmap_remove clips only the two boundary entries, then chains
+        // Clip only the two boundary entries, then chain
         // the original nodes for deferred destruction. Allocating a change
         // record per entry can make freeing a large map fail under pressure.
         self.clip_at(start)?;
@@ -540,8 +521,8 @@ impl VmMap {
         if !entry.needs_copy {
             return Ok(());
         }
-        // amap_copy: lazily create only the chunk containing the fault for
-        // a large entry without an amap (UVM_AMAP_LARGE / UVM_AMAP_CHUNK).
+        // Lazily create only the chunk containing the fault for
+        // a large entry without an anonymous map.
         if entry.amap.is_none() && (entry.end - entry.start) / PAGE_SIZE >= anon::LARGE_PAGES {
             let chunk_bytes = anon::CHUNK_PAGES * PAGE_SIZE;
             let start = (address.as_u64() / chunk_bytes * chunk_bytes).max(entry.start);
@@ -668,7 +649,7 @@ impl VmMap {
         Ok(start)
     }
 
-    /// uvm_map_enter: backmerge first, then optional forward merge. Only a
+    /// Merge backwards first, then optionally forwards. Only a
     /// sole aref may extend; two populated amaps are never joined.
     fn merge_new(&mut self, entry: &VmMapEntry) -> bool {
         debug_assert!(entry.amap.is_none());
@@ -690,7 +671,7 @@ impl VmMap {
             let previous = self
                 .entries
                 .get_mut(&key)
-                .expect("uvm: missing backmerge entry");
+                .expect("mem: missing backmerge entry");
             if let Some(amap) = &mut previous.amap
                 && amap
                     .extend((entry.end - entry.start) / PAGE_SIZE, false)
@@ -724,7 +705,7 @@ impl VmMap {
         let next = self
             .entries
             .get_mut(&entry.end)
-            .expect("uvm: missing forward merge entry");
+            .expect("mem: missing forward merge entry");
         if let Some(amap) = &mut next.amap
             && amap
                 .extend((entry.end - entry.start) / PAGE_SIZE, true)
@@ -742,7 +723,7 @@ impl VmMap {
     }
 
     fn merge_following(&mut self, key: u64) {
-        let left = self.entries.get(&key).expect("uvm: missing merge entry");
+        let left = self.entries.get(&key).expect("mem: missing merge entry");
         let end = left.end;
         let Some(right) = self.entries.get(&end) else {
             return;
@@ -762,10 +743,10 @@ impl VmMap {
             if self
                 .entries
                 .get_mut(&key)
-                .expect("uvm: merge left")
+                .expect("mem: merge left")
                 .amap
                 .as_mut()
-                .expect("uvm: merge amap")
+                .expect("mem: merge amap")
                 .extend((right_end - end) / PAGE_SIZE, false)
                 .is_err()
             {
@@ -775,10 +756,10 @@ impl VmMap {
             && self
                 .entries
                 .get_mut(&end)
-                .expect("uvm: merge right")
+                .expect("mem: merge right")
                 .amap
                 .as_mut()
-                .expect("uvm: merge amap")
+                .expect("mem: merge amap")
                 .extend((end - key) / PAGE_SIZE, true)
                 .is_err()
         {
@@ -787,11 +768,11 @@ impl VmMap {
         let mut right = self
             .entries
             .remove(&end)
-            .expect("uvm: missing merged entry");
+            .expect("mem: missing merged entry");
         let left = self
             .entries
             .get_mut(&key)
-            .expect("uvm: missing merge survivor");
+            .expect("mem: missing merge survivor");
         left.end = right_end;
         if left.amap.is_none() {
             left.amap = right.amap.take();
@@ -826,7 +807,7 @@ impl VmMap {
         Ok(())
     }
 
-    /// uvm_map_clip_start/end: allocate only the extra boundary entry;
+    /// Allocate only the extra boundary entry when splitting a mapping;
     /// existing interior nodes survive protection/advice and move on unmap.
     fn clip_at(&mut self, boundary: u64) -> Result<()> {
         let Some((&key, entry)) = self.entries.range(..boundary).next_back() else {

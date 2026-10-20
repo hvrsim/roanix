@@ -1,8 +1,9 @@
+//! The kernel's global allocator and its page-backed heap.
 //!
-//! # Kernel Heap Allocator
-//!
-//! Fast page-backed heap allocator used as the kernel's global allocator.
-//!
+//! Small allocations use sharded size-class slabs and per-CPU magazines; large
+//! allocations reserve virtual ranges and map whole physical pages. Cache drains
+//! and deferred page retirement release unused storage without recycling a frame
+//! before the required translation invalidations have completed.
 
 use core::{
     alloc::{GlobalAlloc, Layout},

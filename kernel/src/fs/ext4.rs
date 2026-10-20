@@ -8,7 +8,6 @@
 
 use alloc::{
     boxed::Box,
-    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -16,15 +15,15 @@ use core::any::Any;
 
 use crate::{
     dev::block::{BlockClaim, BlockDevice},
-    mem::{self, IoSink, IoSource, VmObject},
-    sys::sync::{Mutex, Once},
+    mem::{IoSink, IoSource, VmObject},
+    sys::sync::Once,
 };
 
 use super::{
     Error, Result,
     vnode::{
         CreateKind, DirEntry, FileSystem, FilesystemId, NodeId, SetAttr, StatFs, Vnode, VnodeAttr,
-        VnodeKey, VnodeKind, VnodeOps, VnodeWeak,
+        VnodeCache, VnodeKey, VnodeKind, VnodeOps,
     },
 };
 
@@ -98,21 +97,15 @@ struct Inode {
     inline_symlink: Option<Box<[u8]>>,
 }
 
-#[derive(Clone)]
-struct DirectoryRecord {
-    name: Arc<[u8]>,
-    inode: u64,
-}
-
 /// One mounted ext4 volume.
 pub struct Ext4 {
     id: FilesystemId,
     claim: BlockClaim,
     geometry: Geometry,
     root: Once<Vnode>,
-    cache: Mutex<BTreeMap<u64, VnodeWeak>>,
+    cache: VnodeCache,
     metadata: Arc<VmObject>,
-    objects: Mutex<BTreeMap<u64, Arc<VmObject>>>,
+    objects: super::cache::ObjectCache,
 }
 
 struct Ext4Node {
@@ -136,8 +129,8 @@ impl Ext4 {
             claim,
             geometry,
             root: Once::new(),
-            cache: Mutex::new(BTreeMap::new()),
-            objects: Mutex::new(BTreeMap::new()),
+            cache: VnodeCache::new(),
+            objects: super::cache::ObjectCache::new(),
         });
         let inode = filesystem.read_inode(ROOT_INODE)?;
         if inode.kind != VnodeKind::Directory {
@@ -176,7 +169,7 @@ impl Ext4 {
         let mut bytes = zeroed(self.geometry.block_size as usize)?;
         self.metadata
             .read_at(self.block_offset(block)?, &mut bytes)
-            .map_err(ext4_memory_error)?;
+            .map_err(Error::from)?;
         Ok(bytes)
     }
 
@@ -199,7 +192,7 @@ impl Ext4 {
         let mut bytes = zeroed(self.geometry.inode_size.into())?;
         self.metadata
             .read_at(offset, &mut bytes)
-            .map_err(ext4_memory_error)?;
+            .map_err(Error::from)?;
 
         let mode = le16(&bytes, 0)?;
         let kind = mode_kind(mode)?;
@@ -304,29 +297,21 @@ impl Ext4 {
     }
 
     fn vnode(self: &Arc<Self>, number: u64, parent: &Vnode) -> Result<Vnode> {
-        if let Some(vnode) = self.cache.lock().get(&number).and_then(VnodeWeak::upgrade) {
-            return Ok(vnode);
-        }
-        let inode = self.read_inode(number)?;
-        let kind = inode.kind;
-        let vnode = Vnode::new(
-            VnodeKey {
-                filesystem: self.id,
-                node: NodeId::new(number),
-            },
-            kind,
-            Box::new(Ext4Node {
-                filesystem: Arc::downgrade(self),
-                inode,
-                parent: Some(parent.clone()),
-            }),
-        );
-        let mut cache = self.cache.lock();
-        if let Some(existing) = cache.get(&number).and_then(VnodeWeak::upgrade) {
-            return Ok(existing);
-        }
-        cache.insert(number, vnode.downgrade());
-        Ok(vnode)
+        self.cache.get_or_create(number, || {
+            let inode = self.read_inode(number)?;
+            Ok(Vnode::new(
+                VnodeKey {
+                    filesystem: self.id,
+                    node: NodeId::new(number),
+                },
+                inode.kind,
+                Box::new(Ext4Node {
+                    filesystem: Arc::downgrade(self),
+                    inode,
+                    parent: Some(parent.clone()),
+                }),
+            ))
+        })
     }
 
     fn extent_at<'a>(&self, extents: &'a [Extent], logical: u32) -> Option<&'a Extent> {
@@ -370,11 +355,11 @@ impl Ext4 {
                         .checked_add(within)
                         .ok_or(Error::Io)?;
                     if inode.kind == VnodeKind::Directory {
-                        let mut target = sink.slice(done, take).map_err(ext4_memory_error)?;
+                        let mut target = sink.slice(done, take).map_err(Error::from)?;
                         if self
                             .metadata
                             .read_into(disk_offset, &mut target)
-                            .map_err(ext4_memory_error)?
+                            .map_err(Error::from)?
                             != take
                         {
                             return Err(Error::Io);
@@ -383,7 +368,7 @@ impl Ext4 {
                         self.read_into_sink(disk_offset, sink, done, take)?;
                     }
                 } else {
-                    sink.fill_zero(done, take).map_err(ext4_memory_error)?;
+                    sink.fill_zero(done, take).map_err(Error::from)?;
                 }
                 done += take;
             } else {
@@ -394,7 +379,7 @@ impl Ext4 {
                 if take == 0 {
                     return Err(Error::Io);
                 }
-                sink.fill_zero(done, take).map_err(ext4_memory_error)?;
+                sink.fill_zero(done, take).map_err(Error::from)?;
                 done += take;
             }
         }
@@ -413,7 +398,7 @@ impl Ext4 {
         while copied < length {
             let mut window = sink
                 .window(sink_offset + copied, (length - copied).min(buffer.len()))
-                .map_err(ext4_memory_error)?;
+                .map_err(Error::from)?;
             if window.is_empty() {
                 return Err(Error::InvalidArgument);
             }
@@ -429,22 +414,32 @@ impl Ext4 {
         Ok(())
     }
 
-    fn directory(&self, inode: &Inode) -> Result<Vec<DirectoryRecord>> {
+    /// Walk borrowed names in disk order. A false visitor result stops I/O.
+    fn visit_directory(
+        &self,
+        inode: &Inode,
+        start: u64,
+        mut visit: impl FnMut(&[u8], u64, Option<VnodeKind>, u64) -> Result<bool>,
+    ) -> Result<()> {
         if inode.kind != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
+        if start >= inode.size {
+            return Ok(());
+        }
         let block_size = self.geometry.block_size as usize;
-        let mut output = Vec::new();
-        let mut offset = 0u64;
+        let mut bytes = zeroed(block_size)?;
+        // Cookies are byte offsets. Resume at the containing block rather
+        // than scanning the directory prefix on every getdents batch.
+        let mut offset = start / block_size as u64 * block_size as u64;
         while offset < inode.size {
             let length = block_size.min(usize::try_from(inode.size - offset).unwrap_or(usize::MAX));
-            let mut bytes = zeroed(length)?;
-            if self.read_data(inode, offset, &mut IoSink::kernel(&mut bytes))? != length {
+            if self.read_data(inode, offset, &mut IoSink::kernel(&mut bytes[..length]))? != length {
                 return Err(Error::Io);
             }
             let mut position = 0usize;
             while position < length {
-                let record = bytes.get(position..).ok_or(Error::Io)?;
+                let record = bytes[..length].get(position..).ok_or(Error::Io)?;
                 let number = u64::from(le32(record, 0)?);
                 let record_length = usize::from(le16(record, 4)?);
                 let name_length = usize::from(*record.get(6).ok_or(Error::Io)?);
@@ -463,19 +458,32 @@ impl Ext4 {
                     if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
                         return Err(Error::Io);
                     }
-                    if name != b"." && name != b".." {
-                        output.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                        output.push(DirectoryRecord {
-                            name: Arc::from(name),
-                            inode: number,
-                        });
+                    let entry_offset = offset + position as u64;
+                    if entry_offset >= start && name != b"." && name != b".." {
+                        let kind = match record[7] {
+                            0 => None,
+                            1 => Some(VnodeKind::Regular),
+                            2 => Some(VnodeKind::Directory),
+                            3 => Some(VnodeKind::CharacterDevice),
+                            4 => Some(VnodeKind::BlockDevice),
+                            5 => Some(VnodeKind::Fifo),
+                            6 => Some(VnodeKind::Socket),
+                            7 => Some(VnodeKind::Symlink),
+                            _ => return Err(Error::Io),
+                        };
+                        let next = entry_offset
+                            .checked_add(record_length as u64)
+                            .ok_or(Error::Io)?;
+                        if !visit(name, number, kind, next)? {
+                            return Ok(());
+                        }
                     }
                 }
                 position += record_length;
             }
             offset = offset.checked_add(length as u64).ok_or(Error::Io)?;
         }
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -552,19 +560,15 @@ impl VnodeOps for Ext4Node {
 
     fn lookup(&self, directory: &Vnode, name: &[u8]) -> Result<Vnode> {
         self.require_directory()?;
-        if name == b"." {
-            return Ok(directory.clone());
-        }
-        if name == b".." {
-            return self.parent(directory);
-        }
         let filesystem = self.filesystem()?;
-        let record = filesystem
-            .directory(&self.inode)?
-            .into_iter()
-            .find(|record| record.name.as_ref() == name)
-            .ok_or(Error::NotFound)?;
-        filesystem.vnode(record.inode, directory)
+        let mut found = None;
+        filesystem.visit_directory(&self.inode, 0, |candidate, number, _, _| {
+            if candidate == name {
+                found = Some(number);
+            }
+            Ok(found.is_none())
+        })?;
+        filesystem.vnode(found.ok_or(Error::NotFound)?, directory)
     }
 
     fn parent(&self, directory: &Vnode) -> Result<Vnode> {
@@ -600,16 +604,6 @@ impl VnodeOps for Ext4Node {
         Err(Error::ReadOnly)
     }
 
-    fn read_at(&self, vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
-        if self.inode.kind == VnodeKind::Directory {
-            return Err(Error::IsDirectory);
-        }
-        vnode
-            .memory_object()?
-            .read_into(offset, sink)
-            .map_err(ext4_memory_error)
-    }
-
     fn write_at(&self, _vnode: &Vnode, _offset: u64, _source: &IoSource<'_>) -> Result<usize> {
         Err(Error::ReadOnly)
     }
@@ -627,27 +621,23 @@ impl VnodeOps for Ext4Node {
             });
         }
         let filesystem = self.filesystem()?;
-        let mut objects = filesystem.objects.lock();
-        if let Some(object) = objects.get(&self.inode.number) {
-            return Ok(object.clone());
-        }
-        let bs = u64::from(filesystem.geometry.block_size);
-        let mut extents = Vec::new();
-        extents
-            .try_reserve_exact(self.inode.extents.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for extent in &self.inode.extents {
-            if extent.initialized {
-                extents.push(super::io::FileExtent {
-                    logical: u64::from(extent.logical) * bs,
-                    physical: extent.physical * bs,
-                    length: u64::from(extent.length) * bs,
-                });
+        filesystem.objects.get_or_create(self.inode.number, || {
+            let bs = u64::from(filesystem.geometry.block_size);
+            let mut extents = Vec::new();
+            extents
+                .try_reserve_exact(self.inode.extents.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            for extent in &self.inode.extents {
+                if extent.initialized {
+                    extents.push(super::io::FileExtent {
+                        logical: u64::from(extent.logical) * bs,
+                        physical: extent.physical * bs,
+                        length: u64::from(extent.length) * bs,
+                    });
+                }
             }
-        }
-        let object = super::io::ExtentPager::object(filesystem.device(), self.inode.size, extents)?;
-        objects.insert(self.inode.number, object.clone());
-        Ok(object)
+            super::io::ExtentPager::object(filesystem.device(), self.inode.size, extents)
+        })
     }
 
     fn readlink(&self, _vnode: &Vnode) -> Result<Box<[u8]>> {
@@ -700,22 +690,30 @@ impl VnodeOps for Ext4Node {
             next = DIRECTORY_CURSOR_BASE;
         }
         let filesystem = self.filesystem()?;
-        let records = filesystem.directory(&self.inode)?;
-        let start =
-            usize::try_from(next.saturating_sub(DIRECTORY_CURSOR_BASE)).unwrap_or(usize::MAX);
-        for (index, record) in records.iter().enumerate().skip(start) {
-            if result.len() == maximum {
-                break;
-            }
-            let vnode = filesystem.vnode(record.inode, directory)?;
-            next = DIRECTORY_CURSOR_BASE + index as u64 + 1;
+        if result.len() == maximum {
+            return Ok((result, next));
+        }
+        let start = next.saturating_sub(DIRECTORY_CURSOR_BASE);
+        filesystem.visit_directory(&self.inode, start, |name, number, kind, offset| {
+            // Typed ext4 entries already provide identity and type. Listing
+            // them need not read an inode or activate a vnode for each name.
+            let kind = match kind {
+                Some(kind) => kind,
+                None => filesystem.read_inode(number)?.kind,
+            };
+            result.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            next = offset.checked_add(DIRECTORY_CURSOR_BASE).ok_or(Error::Io)?;
             result.push(DirEntry {
-                name: record.name.clone(),
-                key: vnode.key(),
-                kind: vnode.kind(),
+                name: Arc::from(name),
+                key: VnodeKey {
+                    filesystem: filesystem.id,
+                    node: NodeId::new(number),
+                },
+                kind,
                 offset: next,
             });
-        }
+            Ok(result.len() < maximum)
+        })?;
         Ok((result, next))
     }
 
@@ -920,13 +918,4 @@ fn zeroed(length: usize) -> Result<Vec<u8>> {
         .map_err(|_| Error::OutOfMemory)?;
     bytes.resize(length, 0);
     Ok(bytes)
-}
-
-fn ext4_memory_error(error: mem::Error) -> Error {
-    match error {
-        mem::Error::OutOfMemory => Error::OutOfMemory,
-        mem::Error::LimitExceeded | mem::Error::SwapUnavailable => Error::NoSpace,
-        mem::Error::InvalidAddress => Error::FileTooLarge,
-        _ => Error::Io,
-    }
 }

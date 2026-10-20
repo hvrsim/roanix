@@ -1,4 +1,8 @@
-//! Memory subsystem operation errors.
+//! Errors shared by physical allocation and virtual-memory operations.
+//!
+//! These values distinguish invalid ranges and protections from resource limits,
+//! allocation failures, and backing-store errors. Callers translate them into
+//! subsystem-specific errors or userspace status codes at API boundaries.
 
 use core::fmt;
 

@@ -432,6 +432,7 @@ impl Devfs {
 
     /// Removes one empty, unopened node owned by a driver.
     pub fn remove_node(&self, owner: OwnerId, node: DevNodeId) -> Result<()> {
+        let _namespace_mutation = super::namespace::mutation();
         if node == self.root_id() {
             return Err(Error::PermissionDenied);
         }
@@ -439,6 +440,9 @@ impl Devfs {
         let record = state.records.get(&node).ok_or(Error::NotFound)?;
         if record.owner != owner {
             return Err(Error::PermissionDenied);
+        }
+        if record.vnode.is_covered() {
+            return Err(Error::Busy);
         }
         if !record.children.is_empty() {
             return Err(Error::NotEmpty);
@@ -483,8 +487,18 @@ impl Devfs {
     }
 
     pub(crate) fn force_remove_owner(&self, owner: OwnerId) -> Result<()> {
+        let _namespace_mutation = super::namespace::mutation();
         let mut state = self.state.lock();
         validate_no_foreign_children(&state, owner)?;
+        // Check every node before revoking any: partial revocation must not
+        // leave mounted directories behind when unloading a driver fails.
+        if state
+            .records
+            .values()
+            .any(|record| record.owner == owner && record.vnode.is_covered())
+        {
+            return Err(Error::Busy);
+        }
         for record in state
             .records
             .values()
@@ -505,6 +519,7 @@ impl Devfs {
         data: DevfsData,
     ) -> Result<DevNodeId> {
         path::validate_leaf_name(name)?;
+        let _namespace_mutation = super::namespace::mutation();
 
         let mut state = self.state.lock();
         // The parent is validated before an identifier is consumed so that a
@@ -517,6 +532,10 @@ impl Devfs {
             return Err(Error::AlreadyExists);
         }
 
+        // Registration bypasses Vnode::create, but participates in the same
+        // namecache sequence while the authoritative directory is locked.
+        let parent_vnode = parent_record.vnode.clone();
+        let _mutation = parent_vnode.mutate_name(name);
         let id = DevNodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
         if id.get() == 0 {
             return Err(Error::NoSpace);
@@ -834,18 +853,11 @@ impl VnodeOps for DevfsNode {
         Ok(())
     }
 
-    fn lookup(&self, directory: &Vnode, name: &[u8]) -> Result<Vnode> {
+    fn lookup(&self, _directory: &Vnode, name: &[u8]) -> Result<Vnode> {
         self.ensure_live()?;
         if self.kind != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
-        if name == b"." {
-            return Ok(directory.clone());
-        }
-        if name == b".." {
-            return self.parent(directory);
-        }
-        path::validate_leaf_name(name)?;
         let filesystem = self.filesystem()?;
         let state = filesystem.state.lock();
         let record = state.records.get(&self.id).ok_or(Error::NotFound)?;
@@ -1091,10 +1103,16 @@ fn node_operations(vnode: &Vnode) -> Result<&DevfsNode> {
 fn remove_record(state: &mut DevfsState, node: DevNodeId) -> Result<()> {
     let record = state.records.remove(&node).ok_or(Error::NotFound)?;
     if let Some(parent) = state.records.get_mut(&record.parent) {
-        if let Some(name) = parent.ordered.remove(&node) {
+        let name = parent.ordered.remove(&node).or_else(|| {
+            parent
+                .children
+                .iter()
+                .find(|(_, child)| **child == node)
+                .map(|(name, _)| name.clone())
+        });
+        if let Some(name) = name {
+            let _mutation = parent.vnode.mutate_name(&name);
             parent.children.remove(&name);
-        } else {
-            parent.children.retain(|_, child| *child != node);
         }
         if record.vnode.kind() == VnodeKind::Directory {
             let operations = node_operations(&parent.vnode)?;
@@ -1116,8 +1134,7 @@ fn validate_owner_removal(state: &DevfsState, owner: OwnerId) -> Result<()> {
         .values()
         .filter(|record| record.owner == owner)
         .try_for_each(|record| {
-            node_operations(&record.vnode)?
-                .is_idle()
+            (!record.vnode.is_covered() && node_operations(&record.vnode)?.is_idle())
                 .then_some(())
                 .ok_or(Error::Busy)
         })

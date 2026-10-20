@@ -7,7 +7,7 @@
 
 use alloc::{
     boxed::Box,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -16,7 +16,7 @@ use core::{any::Any, char};
 
 use crate::{
     dev::block::{BlockClaim, BlockDevice},
-    mem::{self, IoSink, VmObject, VmPager},
+    mem::{self, VmObject, VmPager},
     sys::sync::{Mutex, Once},
 };
 
@@ -24,7 +24,7 @@ use super::{
     Error, Result,
     vnode::{
         CreateKind, DirEntry, FileSystem, FilesystemId, NodeId, SetAttr, StatFs, Vnode, VnodeAttr,
-        VnodeKey, VnodeKind, VnodeOps, VnodeWeak,
+        VnodeCache, VnodeKey, VnodeKind, VnodeOps,
     },
 };
 
@@ -56,8 +56,8 @@ pub struct Fat32 {
     id: FilesystemId,
     volume: Arc<FatVolume>,
     root: Once<Vnode>,
-    cache: Mutex<BTreeMap<u64, VnodeWeak>>,
-    objects: Mutex<BTreeMap<u64, Arc<VmObject>>>,
+    cache: VnodeCache,
+    objects: super::cache::ObjectCache,
 }
 
 struct FatVolume {
@@ -82,9 +82,19 @@ struct Record {
     size: u64,
     attributes: u8,
     entry_offset: u64,
+    /// Logical byte position after the short entry, including its LFN slots.
+    next_offset: u64,
 }
 
 impl Record {
+    fn key(&self, filesystem: FilesystemId) -> VnodeKey {
+        // Division by a 32-byte slot leaves room for the two reserved IDs.
+        VnodeKey {
+            filesystem,
+            node: NodeId::new(self.entry_offset / 32 + 2),
+        }
+    }
+
     fn kind(&self) -> VnodeKind {
         if self.attributes & ATTR_DIRECTORY != 0 {
             VnodeKind::Directory
@@ -221,7 +231,7 @@ impl FatVolume {
         if self
             .metadata
             .read_at(offset, &mut bytes)
-            .map_err(fat_memory_error)?
+            .map_err(Error::from)?
             != 4
         {
             return Err(Error::Io);
@@ -272,8 +282,8 @@ impl Fat32 {
                 metadata: super::io::metadata_object(&device)?,
             }),
             root: Once::new(),
-            cache: Mutex::new(BTreeMap::new()),
-            objects: Mutex::new(BTreeMap::new()),
+            cache: VnodeCache::new(),
+            objects: super::cache::ObjectCache::new(),
         });
         filesystem
             .volume
@@ -297,33 +307,56 @@ impl Fat32 {
         Ok(filesystem)
     }
 
-    fn directory(&self, first_cluster: u32) -> Result<Vec<Record>> {
+    /// Decode one cluster at a time and stop as soon as the visitor is done.
+    fn visit_directory(
+        &self,
+        first_cluster: u32,
+        start: u64,
+        mut visit: impl FnMut(Record) -> Result<bool>,
+    ) -> Result<()> {
         self.volume.validate_cluster(first_cluster)?;
         let cluster_bytes = self.volume.geometry.bytes_per_cluster as usize;
         let mut cluster = first_cluster;
         let mut traversed = 0u32;
+        if !start.is_multiple_of(32) {
+            return Err(Error::InvalidArgument);
+        }
+        let skip = start / cluster_bytes as u64;
+        if skip >= u64::from(self.volume.geometry.cluster_count) {
+            return Ok(());
+        }
+        // Follow only FAT metadata over the prefix. Do not reread directory
+        // data or allocate/decode old names when resuming a listing.
+        for _ in 0..skip {
+            let Some(next) = self.volume.next_cluster(cluster)? else {
+                return Ok(());
+            };
+            cluster = next;
+            traversed += 1;
+        }
+        let mut logical = skip * cluster_bytes as u64;
+        let mut within = (start % cluster_bytes as u64) as usize / 32;
         let mut lfn = Vec::<[u8; 32]>::new();
-        let mut output = Vec::new();
+        let mut bytes = zeroed(cluster_bytes)?;
         loop {
             traversed = traversed.checked_add(1).ok_or(Error::Io)?;
             if traversed > self.volume.geometry.cluster_count {
                 return Err(Error::Io);
             }
             let absolute = self.volume.cluster_offset(cluster)?;
-            let mut bytes = zeroed(cluster_bytes)?;
             if self
                 .volume
                 .metadata
                 .read_at(absolute, &mut bytes)
-                .map_err(fat_memory_error)?
+                .map_err(Error::from)?
                 != bytes.len()
             {
                 return Err(Error::Io);
             }
             let (entries, _) = bytes.as_chunks::<32>();
-            for (index, entry) in entries.iter().enumerate() {
+            for (index, entry) in entries.iter().enumerate().skip(within) {
                 match entry[0] {
-                    0x00 => return Ok(output),
+                    0x00 => return Ok(()),
                     0xe5 => {
                         lfn.clear();
                         continue;
@@ -333,6 +366,12 @@ impl Fat32 {
                 if entry[11] == ATTR_LONG_NAME {
                     let mut part = [0u8; 32];
                     part.copy_from_slice(entry);
+                    // VFAT permits at most 20 slots (255 UTF-16 code units).
+                    // Discard malformed prefixes instead of growing without bound.
+                    if lfn.len() == 20 {
+                        lfn.clear();
+                    }
+                    lfn.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
                     lfn.push(part);
                     continue;
                 }
@@ -352,56 +391,41 @@ impl Fat32 {
                 if attributes & ATTR_DIRECTORY != 0 && first == 0 {
                     continue;
                 }
-                output.push(Record {
+                if !visit(Record {
                     name,
                     first_cluster: first,
                     size: u64::from(le32(entry, 28)),
                     attributes,
                     entry_offset: absolute + (index * 32) as u64,
-                });
+                    next_offset: logical + ((index + 1) * 32) as u64,
+                })? {
+                    return Ok(());
+                }
             }
             let Some(next) = self.volume.next_cluster(cluster)? else {
-                return Ok(output);
+                return Ok(());
             };
             cluster = next;
+            logical += cluster_bytes as u64;
+            within = 0;
         }
     }
 
     fn vnode(self: &Arc<Self>, record: &Record, parent: &Vnode) -> Result<Vnode> {
-        if let Some(vnode) = self
-            .cache
-            .lock()
-            .get(&record.entry_offset)
-            .and_then(VnodeWeak::upgrade)
-        {
-            return Ok(vnode);
-        }
-        let node_number = record
-            .entry_offset
-            .checked_div(32)
-            .and_then(|id| id.checked_add(2))
-            .ok_or(Error::Io)?;
-        let vnode = Vnode::new(
-            VnodeKey {
-                filesystem: self.id,
-                node: NodeId::new(node_number),
-            },
-            record.kind(),
-            Box::new(FatNode {
-                filesystem: Arc::downgrade(self),
-                kind: record.kind(),
-                first_cluster: record.first_cluster,
-                size: record.size,
-                entry_offset: Some(record.entry_offset),
-                parent: Some(parent.clone()),
-            }),
-        );
-        let mut cache = self.cache.lock();
-        if let Some(existing) = cache.get(&record.entry_offset).and_then(VnodeWeak::upgrade) {
-            return Ok(existing);
-        }
-        cache.insert(record.entry_offset, vnode.downgrade());
-        Ok(vnode)
+        self.cache.get_or_create(record.entry_offset, || {
+            Ok(Vnode::new(
+                record.key(self.id),
+                record.kind(),
+                Box::new(FatNode {
+                    filesystem: Arc::downgrade(self),
+                    kind: record.kind(),
+                    first_cluster: record.first_cluster,
+                    size: record.size,
+                    entry_offset: Some(record.entry_offset),
+                    parent: Some(parent.clone()),
+                }),
+            ))
+        })
     }
 }
 
@@ -482,19 +506,15 @@ impl VnodeOps for FatNode {
     }
 
     fn lookup(&self, directory: &Vnode, name: &[u8]) -> Result<Vnode> {
-        if name == b"." {
-            return Ok(directory.clone());
-        }
-        if name == b".." {
-            return self.parent(directory);
-        }
         let filesystem = self.filesystem()?;
-        let record = filesystem
-            .directory(self.directory_cluster()?)?
-            .into_iter()
-            .find(|record| names_equal(&record.name, name))
-            .ok_or(Error::NotFound)?;
-        filesystem.vnode(&record, directory)
+        let mut found = None;
+        filesystem.visit_directory(self.directory_cluster()?, 0, |record| {
+            if names_equal(&record.name, name) {
+                found = Some(record);
+            }
+            Ok(found.is_none())
+        })?;
+        filesystem.vnode(&found.ok_or(Error::NotFound)?, directory)
     }
 
     fn parent(&self, directory: &Vnode) -> Result<Vnode> {
@@ -529,16 +549,6 @@ impl VnodeOps for FatNode {
         Err(Error::ReadOnly)
     }
 
-    fn read_at(&self, vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
-        if self.kind == VnodeKind::Directory {
-            return Err(Error::IsDirectory);
-        }
-        vnode
-            .memory_object()?
-            .read_into(offset, sink)
-            .map_err(fat_memory_error)
-    }
-
     fn truncate(&self, _vnode: &Vnode, _size: u64) -> Result<()> {
         Err(Error::ReadOnly)
     }
@@ -550,21 +560,17 @@ impl VnodeOps for FatNode {
 
         let filesystem = self.filesystem()?;
         let key = self.entry_offset.ok_or(Error::Io)?;
-        let mut objects = filesystem.objects.lock();
-        if let Some(object) = objects.get(&key) {
-            return Ok(object.clone());
-        }
-        let object = VmObject::with_pager(
-            self.size,
-            Arc::new(FatPager {
-                volume: filesystem.volume.clone(),
-                first_cluster: self.first_cluster,
-                size: self.size,
-                chain: Mutex::new(ClusterChain::default()),
-            }),
-        );
-        objects.insert(key, object.clone());
-        Ok(object)
+        filesystem.objects.get_or_create(key, || {
+            Ok(VmObject::with_pager(
+                self.size,
+                Arc::new(FatPager {
+                    volume: filesystem.volume.clone(),
+                    first_cluster: self.first_cluster,
+                    size: self.size,
+                    chain: Mutex::new(ClusterChain::default()),
+                }),
+            ))
+        })
     }
 
     fn readdir(
@@ -598,36 +604,31 @@ impl VnodeOps for FatNode {
             next = DIRECTORY_CURSOR_BASE;
         }
         let filesystem = self.filesystem()?;
-        let records = filesystem.directory(self.directory_cluster()?)?;
-        let start =
-            usize::try_from(next.saturating_sub(DIRECTORY_CURSOR_BASE)).unwrap_or(usize::MAX);
-        for (index, record) in records.iter().enumerate().skip(start) {
-            if result.len() == maximum {
-                break;
-            }
-            let vnode = filesystem.vnode(record, directory)?;
-            next = DIRECTORY_CURSOR_BASE + index as u64 + 1;
+        if result.len() == maximum {
+            return Ok((result, next));
+        }
+        let start = next.saturating_sub(DIRECTORY_CURSOR_BASE);
+        filesystem.visit_directory(self.directory_cluster()?, start, |record| {
+            result.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            let key = record.key(filesystem.id);
+            let kind = record.kind();
+            next = record
+                .next_offset
+                .checked_add(DIRECTORY_CURSOR_BASE)
+                .ok_or(Error::Io)?;
             result.push(DirEntry {
-                name: record.name.clone(),
-                key: vnode.key(),
-                kind: vnode.kind(),
+                name: record.name,
+                key,
+                kind,
                 offset: next,
             });
-        }
+            Ok(result.len() < maximum)
+        })?;
         Ok((result, next))
     }
 
     fn fsync(&self, _vnode: &Vnode) -> Result<()> {
         self.filesystem()?.sync()
-    }
-}
-
-fn fat_memory_error(error: mem::Error) -> Error {
-    match error {
-        mem::Error::OutOfMemory => Error::OutOfMemory,
-        mem::Error::LimitExceeded | mem::Error::SwapUnavailable => Error::NoSpace,
-        mem::Error::InvalidAddress => Error::FileTooLarge,
-        _ => Error::Io,
     }
 }
 

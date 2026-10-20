@@ -1,9 +1,8 @@
+//! Typed physical and virtual addresses, page geometry, and alignment helpers.
 //!
-//! # Address Types
-//!
-//! Small typed wrappers and alignment helpers used throughout the memory
-//! subsystem.
-//!
+//! Physical and virtual address wrappers keep address domains distinct at call
+//! sites. The shared page-size and rounding helpers define the boundaries used
+//! by mappings, object offsets, and physical allocation.
 
 use core::{fmt, ptr};
 

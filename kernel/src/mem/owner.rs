@@ -1,6 +1,12 @@
-//! UVM page-owner locks: one lock can protect an object and its pages, or
-//! related amaps and their shared anons. This translates vmobjlock/am_lock/
-//! an_lock; it does not add a second lock to the page's backing state.
+//! Shared lock domains for related memory objects and page backing state.
+//!
+//! An allocated owner lock may protect an object with its pages or multiple
+//! anonymous maps that still share slots. Guard capabilities validate the lock's
+//! identity before exposing protected data, preventing a second unrelated lock
+//! from governing the same mutable backing state.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
+
 use alloc::sync::Arc;
 use core::{
     cell::UnsafeCell,
@@ -37,7 +43,7 @@ pub(super) struct OwnerWrite<'a> {
     _guard: WriteGuard<'a, ()>,
 }
 
-/// Data protected by a separately allocated UVM owner lock.
+/// Data protected by a separately allocated owner lock.
 pub(super) struct Owned<T> {
     owner: OwnerRef,
     value: UnsafeCell<T>,

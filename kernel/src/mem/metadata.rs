@@ -1,3 +1,10 @@
+//! Nonblocking allocation classes for small memory-management metadata.
+//!
+//! The allocator selects fixed, cache-line-aligned storage classes backed by
+//! typed pools. Unsupported sizes or alignments fail instead of entering the
+//! general heap or waiting for memory. Allocation and release use the same class,
+//! and draining returns unused pool storage to physical memory.
+
 use core::{
     alloc::{AllocError, Allocator, Layout},
     mem::MaybeUninit,

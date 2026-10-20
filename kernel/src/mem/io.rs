@@ -1,21 +1,10 @@
-//! Direction-typed I/O buffers that avoid kernel bounce allocations.
+//! Typed transfers between pageable user buffers and kernel memory.
 //!
-//! A transfer target is either kernel memory or a range in a user address
-//! space. User ranges are exposed through short-lived windows that alias the
-//! resident frame through the higher-half direct map, so a filesystem copies
-//! straight from its page cache into the user page and back.
-//!
-//! Windows never span a page boundary and are resolved without holding the
-//! address-space lock. Resolving before the copy is what keeps the page-cache
-//! locks and the address-space lock strictly ordered: a caller holding a page
-//! backing lock must never fault, and a window is already faulted in.
-//!
-//! # User memory
-//!
-//! User frames remain externally mutable while pinned. Windows expose copy
-//! operations, never Rust references to those bytes. Callers needing a slice
-//! ABI use bounded kernel storage and explicitly copy the transferred bytes.
-//! A writable pin also preserves the fork decision for its entire lifetime.
+//! User ranges are faulted and pinned through short-lived, page-bounded windows.
+//! Copies use direct-map aliases without allocating payload bounce buffers or
+//! exposing Rust references to externally mutable user bytes. Callers must resolve
+//! windows before taking page backing locks; writable pins preserve copy-on-write
+//! ownership for the duration of the transfer.
 
 use core::ptr;
 

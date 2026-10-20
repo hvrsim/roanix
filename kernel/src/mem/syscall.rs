@@ -1,4 +1,9 @@
-//! Virtual-memory syscall implementations.
+//! Userspace mapping, protection, and memory-advice entry points.
+//!
+//! The syscall layer validates flags, range arithmetic, descriptor access, and
+//! backing-object bounds before changing an address space. Shared file mappings
+//! use the vnode's existing memory object, while private mappings retain separate
+//! copy-on-write ownership. Errors are translated into userspace status codes.
 
 use crate::{
     fs::OpenFlags,

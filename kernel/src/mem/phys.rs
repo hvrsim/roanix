@@ -1,99 +1,11 @@
-/*-
- * Copyright (c) 2019, 2020 The NetBSD Foundation, Inc.
- * All rights reserved.
- *
- * This code is derived from software contributed to The NetBSD Foundation
- * by Andrew Doran.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
- * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
-
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * Copyright (c) 1991, 1993, The Regents of the University of California.
- *
- * All rights reserved.
- *
- * This code is derived from software contributed to Berkeley by
- * The Mach Operating System project at Carnegie-Mellon University.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- *	@(#)vm_page.c   8.3 (Berkeley) 3/21/94
- * from: Id: uvm_page.c,v 1.1.2.18 1998/02/06 05:24:42 chs Exp
- *
- *
- * Copyright (c) 1987, 1990 Carnegie-Mellon University.
- * All rights reserved.
- *
- * Permission to use, copy, modify and distribute this software and
- * its documentation is hereby granted, provided that both the copyright
- * notice and this permission notice appear in all copies of the
- * software, derivative works or modified versions, and any portions
- * thereof, and that both notices appear in supporting documentation.
- *
- * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
- * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND
- * FOR ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
- *
- * Carnegie Mellon requests users of this software to return to
- *
- *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
- *  School of Computer Science
- *  Carnegie Mellon University
- *  Pittsburgh PA 15213-3890
- *
- * any improvements or extensions that they make and grant Carnegie the
- * rights to redistribute these changes.
- */
-
+//! Physical-frame allocation, metadata, and lifecycle accounting.
 //!
-//! # Physical Memory Manager
+//! A compact page-frame database covers usable physical segments while excluding
+//! address holes. Free and zero queues, per-CPU caches, and reserve eligibility
+//! supply frames to kernel and pageable owners. Frame interlocks protect lifecycle
+//! state, mapping and wire counts, and deferred replacement-policy intents.
 //!
-//! PFN database, physical-page lifecycle, free/zero queues, per-CPU caches,
-//! and managed-page queues.
-//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use crate::mem::{PageRef, PageWeak};
 use alloc::sync::Arc;
@@ -131,7 +43,7 @@ bitflags! {
     pub struct PageAllocFlags: u8 {
         /// Return a page whose contents are all zero.
         const ZERO = 1 << 0;
-        /// Allow the caller to consume the kernel reserve (UVM_PGA_USERESERVE).
+        /// Allow the caller to consume the kernel reserve.
         const USERESERVE = 1 << 1;
     }
 }
@@ -230,7 +142,7 @@ pub enum PageQueue {
 /// fixed fraction of RAM. Separate free and replacement links permit deferred
 /// policy updates. The entry deliberately holds no owning collections: reverse mappings belong to the
 /// logical page. Each entry records its immutable physical frame number;
-/// UVM physical segments select its slice of the compact page array.
+/// Physical segments select its slice of the compact page array.
 #[repr(C, align(64))]
 pub struct Page {
     /// Physical allocator free-list membership (independent of pdqueue).
@@ -255,7 +167,7 @@ const OWNER_KIND_SHIFT: u32 = 24;
 const FIELD_MASK: u32 = 0xff;
 
 // Free and replacement queues need distinct links: a freed frame can still
-// have a deferred dequeue intent, exactly as in UVM's pageq/pdqueue layout.
+// have a deferred dequeue intent; their queue links are independent.
 const _: () = assert!(
     size_of::<Page>() <= 128 && size_of::<Page>().is_power_of_two(),
     "mem/phys: invalid frame database entry size"
@@ -796,7 +708,7 @@ pub fn init() {
         while pa < end {
             // SAFETY: every usable page is covered by the initialized PFN DB.
             let index = super::physseg::lookup(SEGMENTS.get().unwrap(), (pa / PAGE_SIZE) as usize)
-                .expect("uvm: usable frame missing from physical segments");
+                .expect("mem: usable frame missing from physical segments");
             // SAFETY: the initialized segment bounds the compact array index.
             let page = unsafe { &*PAGEDB.add(index) };
             if pa >= pagedb_phys_base && pa < bootstrap_end {
@@ -878,7 +790,7 @@ pub fn alloc_page(usage: PageUse, mut flags: PageAllocFlags) -> Option<&'static 
 
     if crate::sys::sched::current_thread_opt().is_some_and(|thread| {
         // SAFETY: the scheduler retains the executing thread; process identity
-        // is immutable for its lifetime. Kernel LWPs receive USERESERVE in UVM.
+        // is immutable for its lifetime. Kernel threads may use the kernel reserve.
         unsafe { &*thread }.is_kernel()
     }) {
         flags.insert(PageAllocFlags::USERESERVE);
@@ -1279,7 +1191,7 @@ fn refill_cache(cache_id: usize, want_zero: bool, flags: PageAllocFlags) {
             }
             return;
         }
-        // Near a reserve, UVM allocates just the requested page and does not
+        // Near a reserve, allocate just the requested page and do not
         // speculatively fill the local free-page cache.
         if access == super::reserve::Access::Single {
             return;

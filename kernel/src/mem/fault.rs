@@ -1,32 +1,11 @@
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * from: Id: uvm_fault.c,v 1.1.2.23 1998/02/06 05:29:05 chs Exp
- */
-
-//! Restartable faults: snapshot under the map lock, load without it, then
-//! revalidate map and slot ownership before publishing a translation.
+//! Restartable page-fault resolution and translation publication.
+//!
+//! A fault snapshots its mapping and backing identities under the map lock,
+//! resolves allocation or paging work without that lock, then revalidates the
+//! snapshot before installing a translation. Neighbor mappings are opportunistic:
+//! failure to populate them must not prevent resolving the requested page.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use crate::mem::PageRef;
 use alloc::sync::{Arc, Weak};
@@ -60,9 +39,9 @@ pub(super) struct PreparedFault {
 }
 
 impl FaultSnapshot {
-    /// uvm_fault_upper_lookup / uvm_fault_lower_lookup: enter only resident
+    /// Enter only resident anonymous or object-backed
     /// neighbors, under their owner lock, while the caller holds the map.
-    /// Neighbor allocation failures are deliberately ignored by UVM.
+    /// Ignore neighbor allocation failures so the center fault can proceed.
     pub(super) fn enter_neighbors(&self, pmap: &Pmap) {
         if let Some(amap) = self.anonymous.as_ref().and_then(Weak::upgrade) {
             amap.with_neighbors(

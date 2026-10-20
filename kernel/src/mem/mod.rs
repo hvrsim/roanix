@@ -1,9 +1,11 @@
+//! Memory subsystem initialization and shared kernel memory services.
 //!
-//! # Memory Subsystem
+//! This module connects physical allocation, address spaces, anonymous memory,
+//! file-backed objects, swapping, and translation invalidation. It establishes
+//! reclamation watermarks, runs the page daemon, coordinates memory waiters,
+//! and exposes address conversion and address-space activation helpers.
 //!
-//! Physical allocation, virtual mappings, anonymous memory, page caching,
-//! compressed swap, reclamation, address spaces, and TLB coordination.
-//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use ::alloc::sync::Arc;
 use core::{
@@ -246,7 +248,7 @@ pub fn reclaim_now(target: usize) -> usize {
 fn reclaim_pages(target: usize) -> usize {
     let mut reclaimed = 0usize;
     // One scan marker spans the whole pass, so a contended prefix cannot
-    // starve later candidates. Balance follows scan as in uvm_pdaemon; the
+    // starve later candidates. Balance follows each scan; the
     // synchronous reclaim API may repeat the daemon cycle once after aging.
     for _ in 0..2 {
         if reclaimed >= target {
@@ -569,6 +571,9 @@ fn page_daemon() -> ! {
         DAEMON_WAKE.reset();
         let free = phys::stats().map_or(0, |stats| stats.free_pages as u64);
         if free < free_target() {
+            // Drop optional VFS references from the daemon, never from an
+            // allocator retry that may already hold filesystem/object locks.
+            crate::fs::namecache::reclaim(32);
             let target = free_target().saturating_sub(free) as usize;
             let _ = reclaim_now(target.max(1));
         } else {

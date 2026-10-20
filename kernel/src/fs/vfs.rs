@@ -2,12 +2,12 @@
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Weak},
+    sync::Arc,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::sys::sync::{Mutex, Once};
+use crate::sys::sync::{Once, RwLock};
 
 use super::{
     error::{Error, Result},
@@ -21,8 +21,8 @@ static NAMESPACE: Once<Namespace> = Once::new();
 
 /// Number of filesystems mounted over a directory.
 ///
-/// Path traversal consults this before locking the namespace, so a namespace
-/// without submounts resolves every component lock-free.
+/// Mutation checks consult this before checking mount membership. Path walks
+/// use the finer per-vnode covered hint to skip the shared namespace lock.
 static COVERED_MOUNTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Stable identifier for one namespace mount.
@@ -34,7 +34,9 @@ struct Mount {
     filesystem: FileSystemRef,
     root: Vnode,
     covered: Option<Vnode>,
-    parent: Weak<Mount>,
+    // Children pin their parent. The namespace owns both; parents never own
+    // children, so this introduces no cycle and prevents detaching a subtree.
+    parent: Option<MountRef>,
 }
 
 type MountRef = Arc<Mount>;
@@ -45,7 +47,7 @@ struct NamespaceState {
 }
 
 struct Namespace {
-    state: Mutex<NamespaceState>,
+    state: RwLock<NamespaceState>,
 }
 
 #[derive(Clone)]
@@ -72,7 +74,7 @@ impl Mount {
             filesystem,
             root,
             covered: None,
-            parent: Weak::new(),
+            parent: None,
         }))
     }
 
@@ -89,7 +91,7 @@ impl Mount {
             filesystem,
             root,
             covered: Some(covered),
-            parent: Arc::downgrade(parent),
+            parent: Some(parent.clone()),
         }))
     }
 }
@@ -97,7 +99,7 @@ impl Mount {
 impl Namespace {
     fn new(filesystem: FileSystemRef) -> Result<Self> {
         Ok(Self {
-            state: Mutex::new(NamespaceState {
+            state: RwLock::new(NamespaceState {
                 root: Mount::root(filesystem)?,
                 mounted_at: BTreeMap::new(),
             }),
@@ -105,21 +107,21 @@ impl Namespace {
     }
 
     fn root(&self) -> MountRef {
-        self.state.lock().root.clone()
+        self.state.read().root.clone()
     }
 
-    fn mounted_at(&self, key: VnodeKey) -> Option<MountRef> {
-        if COVERED_MOUNTS.load(Ordering::Acquire) == 0 {
+    fn mounted_at(&self, vnode: &Vnode) -> Option<MountRef> {
+        if !vnode.is_covered() {
             return None;
         }
-        self.state.lock().mounted_at.get(&key).cloned()
+        self.state.read().mounted_at.get(&vnode.key()).cloned()
     }
 
     fn is_mount_point(&self, key: VnodeKey) -> bool {
         if COVERED_MOUNTS.load(Ordering::Acquire) == 0 {
             return false;
         }
-        self.state.lock().mounted_at.contains_key(&key)
+        self.state.read().mounted_at.contains_key(&key)
     }
 }
 
@@ -140,12 +142,26 @@ pub(crate) fn init_root(filesystem: FileSystemRef) -> Result<()> {
 /// is available. Callers must recreate any kernel filesystems they need below
 /// the new root after this operation succeeds.
 pub(crate) fn replace_root(filesystem: FileSystemRef) -> Result<()> {
+    let _topology = super::namespace::topology();
     let namespace = namespace()?;
     let root = Mount::root(filesystem)?;
-    let mut state = namespace.state.lock();
-    state.root = root;
-    state.mounted_at.clear();
+    let mut state = namespace.state.write();
+    let old_root = core::mem::replace(&mut state.root, root);
+    let old_mounts = core::mem::take(&mut state.mounted_at);
+    for mount in old_mounts.values() {
+        if let Some(covered) = &mount.covered {
+            covered.set_covered(false);
+        }
+    }
     COVERED_MOUNTS.store(0, Ordering::Release);
+    drop(state);
+    drop(_topology);
+    // Cache references and VM objects can run destructors; keep them out of
+    // the namespace lock, just like filesystem callbacks during traversal.
+    super::namecache::purge(old_root.filesystem.id());
+    for mount in old_mounts.values() {
+        super::namecache::purge(mount.filesystem.id());
+    }
     Ok(())
 }
 
@@ -193,6 +209,9 @@ pub(crate) fn open_at(
         return Err(Error::PermissionDenied);
     }
 
+    let mutation = flags
+        .contains(OpenFlags::CREATE)
+        .then(super::namespace::mutation);
     let follow_final = !flags.contains(OpenFlags::NOFOLLOW);
     let (anchor, created) = match resolve(Some(base), path, follow_final) {
         Ok(resolved) => {
@@ -231,7 +250,7 @@ pub(crate) fn open_at(
         }
         Err(error) => return Err(error),
     };
-    let vnode = anchor.vnode().clone();
+    let vnode = anchor.vnode();
 
     if flags.contains(OpenFlags::NOFOLLOW) && vnode.kind() == VnodeKind::Symlink {
         return Err(Error::SymlinkLoop);
@@ -245,14 +264,16 @@ pub(crate) fn open_at(
     // A file created by this call is accessible regardless of the mode it was
     // created with, matching the POSIX open description.
     if !created {
-        check_access(&vnode, flags)?;
+        check_access(vnode, flags)?;
     }
 
+    drop(mutation);
     OpenFile::new(anchor, flags)
 }
 
 /// Creates an empty regular file.
 pub fn create_file(path: &[u8], mode: u16) -> Result<Vnode> {
+    let _mutation = super::namespace::mutation();
     let root = root_anchor()?;
     let (directory, parent) = resolve_parent(Some(&root), path)?;
     if parent.trailing_slash {
@@ -269,14 +290,15 @@ pub fn create_dir(path: &[u8], mode: u16) -> Result<Vnode> {
     create_dir_at(&root, path, mode)
 }
 
-/// Creates an empty directory relative to a stable directory anchor.
 /// Creates an empty regular file directly below a stable directory anchor.
 pub(crate) fn create_file_at(base: &PathAnchor, name: &[u8], mode: u16) -> Result<Vnode> {
+    let _mutation = super::namespace::mutation();
     base.vnode().create(name, CreateKind::Regular, mode)
 }
 
 /// Creates an empty directory directly below a stable directory anchor.
 pub(crate) fn create_dir_at(base: &PathAnchor, path: &[u8], mode: u16) -> Result<Vnode> {
+    let _mutation = super::namespace::mutation();
     let (directory, parent) = resolve_parent(Some(base), path)?;
     directory
         .vnode
@@ -291,6 +313,7 @@ pub fn symlink(target: &[u8], path: &[u8]) -> Result<Vnode> {
 
 /// Creates a symbolic link relative to a stable directory anchor.
 pub(crate) fn symlink_at(target: &[u8], base: &PathAnchor, path: &[u8]) -> Result<Vnode> {
+    let _mutation = super::namespace::mutation();
     let (directory, parent) = resolve_parent(Some(base), path)?;
     // A symbolic link is not a directory, so a trailing separator cannot name
     // the object being created.
@@ -317,6 +340,7 @@ pub(crate) fn link_at(
     new_base: &PathAnchor,
     new_path: &[u8],
 ) -> Result<()> {
+    let _mutation = super::namespace::mutation();
     let target = resolve(Some(existing_base), existing, follow_existing)?;
     if target.vnode.kind() == VnodeKind::Directory {
         return Err(Error::PermissionDenied);
@@ -339,6 +363,7 @@ pub fn unlink(path: &[u8]) -> Result<()> {
 
 /// Removes a path relative to a stable directory anchor.
 pub(crate) fn unlink_at(base: &PathAnchor, path: &[u8], remove_directory: bool) -> Result<()> {
+    let _mutation = super::namespace::mutation();
     let namespace = namespace()?;
     let (directory, parent) = resolve_parent(Some(base), path)?;
     // The target is resolved only when a check needs it, so an ordinary removal
@@ -352,7 +377,8 @@ pub(crate) fn unlink_at(base: &PathAnchor, path: &[u8], remove_directory: bool) 
         }
         // The namespace lock guards only the mount table. Holding it across the
         // filesystem operation would serialise every removal in the system and
-        // invert the namespace/filesystem lock order.
+        // invert the namespace/filesystem lock order. The separate mutation
+        // gate excludes mount publication until this operation has finished.
         if namespace.is_mount_point(target.key()) {
             return Err(Error::Busy);
         }
@@ -379,6 +405,7 @@ pub(crate) fn rename_at(
     target_base: &PathAnchor,
     target: &[u8],
 ) -> Result<()> {
+    let _mutation = super::namespace::mutation();
     let namespace = namespace()?;
     let (source_directory, source_parent) = resolve_parent(Some(source_base), source)?;
     let (target_directory, target_parent) = resolve_parent(Some(target_base), target)?;
@@ -392,7 +419,11 @@ pub(crate) fn rename_at(
         || COVERED_MOUNTS.load(Ordering::Acquire) != 0
     {
         let source_vnode = source_directory.vnode.lookup(source_parent.name)?;
-        let target_vnode = target_directory.vnode.lookup(target_parent.name).ok();
+        let target_vnode = match target_directory.vnode.lookup(target_parent.name) {
+            Ok(vnode) => Some(vnode),
+            Err(Error::NotFound) => None,
+            Err(error) => return Err(error),
+        };
         if source_parent.trailing_slash && source_vnode.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
@@ -424,6 +455,7 @@ pub(crate) fn rename_at(
 
 /// Mounts a filesystem over an existing directory.
 pub fn mount(path: &[u8], filesystem: FileSystemRef) -> Result<MountId> {
+    let _topology = super::namespace::topology();
     let namespace = namespace()?;
     let (parent, split) = resolve_parent(None, path)?;
     let covered = parent.vnode.lookup(split.name)?;
@@ -431,22 +463,28 @@ pub fn mount(path: &[u8], filesystem: FileSystemRef) -> Result<MountId> {
         return Err(Error::NotDirectory);
     }
 
-    let mut state = namespace.state.lock();
+    // Prepare the filesystem before taking the table lock. The topology gate
+    // keeps both the parent mount and covered directory attached throughout.
+    let mount = Mount::child(filesystem, covered.clone(), &parent.mount)?;
+    let mut state = namespace.state.write();
     if state.mounted_at.contains_key(&covered.key()) {
         return Err(Error::Busy);
     }
-    let mount = Mount::child(filesystem, covered.clone(), &parent.mount)?;
     let id = mount.id;
     state.mounted_at.insert(covered.key(), mount);
+    // A walker seeing true must take the shared namespace lock and therefore
+    // observes the entry above. A false observation may precede this mount.
+    covered.set_covered(true);
     COVERED_MOUNTS.store(state.mounted_at.len(), Ordering::Release);
     Ok(id)
 }
 
 /// Detaches the filesystem mounted at `path`.
 pub fn unmount(path: &[u8]) -> Result<()> {
+    let _topology = super::namespace::topology();
     let namespace = namespace()?;
     let anchor = resolve(None, path, true)?;
-    let mut state = namespace.state.lock();
+    let mut state = namespace.state.write();
     // Only the root of a covering mount is a mount point; anything else is not
     // something that can be detached.
     if anchor.vnode.key() != anchor.mount.root.key() {
@@ -472,8 +510,13 @@ pub fn unmount(path: &[u8]) -> Result<()> {
     if Arc::strong_count(mount) > 2 {
         return Err(Error::Busy);
     }
-    state.mounted_at.remove(&key);
+    let detached = state.mounted_at.remove(&key);
+    covered.set_covered(false);
     COVERED_MOUNTS.store(state.mounted_at.len(), Ordering::Release);
+    drop(state);
+    drop(_topology);
+    super::namecache::purge(anchor.mount.filesystem.id());
+    drop(detached);
     Ok(())
 }
 
@@ -486,7 +529,7 @@ pub fn statfs(path: &[u8]) -> Result<StatFs> {
 pub fn sync_all() -> Result<()> {
     let namespace = namespace()?;
     let filesystems = {
-        let state = namespace.state.lock();
+        let state = namespace.state.read();
         let mut filesystems = Vec::new();
         filesystems
             .try_reserve(state.mounted_at.len().saturating_add(1))
@@ -557,8 +600,8 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
     // directory.
     let mut require_directory = parsed.trailing_slash;
     let follow_final = follow_final || parsed.trailing_slash;
-    // Only symbolic-link expansion needs owned components; an ordinary lookup
-    // never allocates.
+    // Only symbolic-link expansion needs owned path components; cache hits
+    // on ordinary paths do not allocate.
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut symlink_depth = 0usize;
 
@@ -572,6 +615,10 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
             },
         };
 
+        if current.vnode.kind() != VnodeKind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        check_search(&current.vnode)?;
         if component == b"." {
             continue;
         }
@@ -579,11 +626,6 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
             current = ascend(current)?;
             continue;
         }
-
-        if current.vnode.kind() != VnodeKind::Directory {
-            return Err(Error::NotDirectory);
-        }
-        check_search(&current.vnode)?;
         let parent = current.vnode.clone();
         let child = parent.lookup(component)?;
         let final_component = pending.is_empty() && components.peek().is_none();
@@ -617,7 +659,7 @@ fn resolve(base: Option<&PathAnchor>, path: &[u8], follow_final: bool) -> Result
         }
 
         current.vnode = child;
-        if let Some(mount) = namespace.mounted_at(current.vnode.key()) {
+        if let Some(mount) = namespace.mounted_at(&current.vnode) {
             current.vnode = mount.root.clone();
             current.mount = mount;
         }
@@ -634,7 +676,7 @@ fn ascend(mut current: PathAnchor) -> Result<PathAnchor> {
         let Some(covered) = current.mount.covered.as_ref() else {
             return Ok(current);
         };
-        let Some(parent_mount) = current.mount.parent.upgrade() else {
+        let Some(parent_mount) = current.mount.parent.clone() else {
             return Err(Error::Io);
         };
         current.vnode = covered.parent()?;

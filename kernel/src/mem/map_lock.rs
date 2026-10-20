@@ -1,68 +1,12 @@
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * Copyright (c) 1991, 1993, The Regents of the University of California.
- *
- * All rights reserved.
- *
- * This code is derived from software contributed to Berkeley by
- * The Mach Operating System project at Carnegie-Mellon University.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- *	@(#)vm_map.c    8.3 (Berkeley) 1/12/94
- * from: Id: uvm_map.c,v 1.1.2.27 1998/02/07 01:16:54 chs Exp
- *
- *
- * Copyright (c) 1987, 1990 Carnegie-Mellon University.
- * All rights reserved.
- *
- * Permission to use, copy, modify and distribute this software and
- * its documentation is hereby granted, provided that both the copyright
- * notice and this permission notice appear in all copies of the
- * software, derivative works or modified versions, and any portions
- * thereof, and that both notices appear in supporting documentation.
- *
- * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
- * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND
- * FOR ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
- *
- * Carnegie Mellon requests users of this software to return to
- *
- *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
- *  School of Computer Science
- *  Carnegie Mellon University
- *  Pittsburgh PA 15213-3890
- *
- * any improvements or extensions that they make and grant Carnegie the
- * rights to redistribute these changes.
- */
+//! Address-map locking with a temporary exclusive-operation owner.
+//!
+//! Readers may inspect a busy map. Other writers wait while the busy owner drops
+//! and reacquires map locks to finish an operation that spans unlocked work.
+//! The busy guard clears ownership and wakes waiting writers when released;
+//! recursive or mismatched busy ownership is rejected.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
-//! vm_map_lock / vm_map_busy / vm_map_unbusy (NetBSD uvm_map.c).
-//! Readers may enter a busy map. Writers acquire the rwlock and then check
-//! the busy owner; the busy owner can drop a read hold and regain a writer
-//! hold while every other writer waits on the map condition variable.
 use super::VmMap;
 use crate::sys::{
     event::SequenceEvent,
@@ -110,7 +54,7 @@ impl MapLock {
             self.changed.wait(ticket);
         }
     }
-    #[expect(dead_code, reason = "UVM nonblocking map-lock entry point")]
+    #[expect(dead_code, reason = "nonblocking map-lock entry point")]
     pub(super) fn try_write(&self) -> Option<MapWrite<'_>> {
         let mut entries = self.entries.try_write()?;
         if self.busy.try_lock()?.is_some() {
@@ -133,7 +77,7 @@ impl<'a> MapWrite<'a> {
     #[expect(dead_code, reason = "vm_map_busy API for pageable/wiring operations")]
     pub(super) fn busy(&self) -> MapBusy<'a> {
         let mut busy = self.lock.busy.lock();
-        assert!(busy.is_none(), "uvm: map already busy");
+        assert!(busy.is_none(), "mem: map already busy");
         let owner = current();
         *busy = Some(owner);
         MapBusy {
@@ -164,7 +108,7 @@ impl Drop for MapBusy<'_> {
         assert_eq!(
             self.owner,
             current(),
-            "uvm: busy map released by another LWP"
+            "mem: busy map released by another LWP"
         );
         let mut busy = self.lock.busy.lock();
         assert_eq!(*busy, Some(self.owner));

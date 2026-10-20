@@ -1,20 +1,9 @@
+//! Local and remote translation-cache invalidation.
 //!
-//! # TLB Shootdown
-//!
-//! Address-granular remote TLB invalidation shared by the kernel heap and the
-//! pageable virtual memory system.
-//!
-//! Invalidations are appended to a lock-free ring keyed by a monotonic
-//! sequence number. Each CPU records the highest sequence it has applied, so a
-//! responder replays only the entries it has not yet seen instead of
-//! discarding its whole TLB. When a CPU falls further behind than the ring can
-//! retain, the engine degrades to a single full flush for that CPU rather than
-//! stalling producers.
-//!
-//! Every entry carries the page-table root it belongs to. A CPU skips entries
-//! for address spaces it is not running, and initiators correspondingly wait
-//! only for the CPUs that could hold the translation.
-//!
+//! A sequence-numbered ring records address and page-table-root invalidations.
+//! Each CPU acknowledges the entries it has applied and skips roots it is not
+//! running. CPUs that fall behind the retained ring perform a full flush;
+//! initiators wait only for CPUs that could still hold the affected translation.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 

@@ -1,98 +1,13 @@
-/*-
- * Copyright (c) 2019, 2020 The NetBSD Foundation, Inc.
- * All rights reserved.
- *
- * This code is derived from software contributed to The NetBSD Foundation
- * by Andrew Doran.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
- * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+//! Clock-based page replacement with active and inactive queues.
+//!
+//! Per-CPU pending arrays batch policy intents using stable physical-page
+//! pointers. Scans acquire page owner, policy, and frame interlocks in that order,
+//! dropping policy before trying an owner lock and revalidating queue membership
+//! afterwards. Separate free-list and policy links allow deferred dequeue intents
+//! without corrupting physical allocation queues.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * Copyright (c) 1991, 1993, The Regents of the University of California.
- *
- * All rights reserved.
- *
- * This code is derived from software contributed to Berkeley by
- * The Mach Operating System project at Carnegie-Mellon University.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- *	@(#)vm_pageout.c        8.5 (Berkeley) 2/14/94
- * from: Id: uvm_pdaemon.c,v 1.1.2.32 1998/02/06 05:26:30 chs Exp
- *
- *
- * Copyright (c) 1987, 1990 Carnegie-Mellon University.
- * All rights reserved.
- *
- * Permission to use, copy, modify and distribute this software and
- * its documentation is hereby granted, provided that both the copyright
- * notice and this permission notice appear in all copies of the
- * software, derivative works or modified versions, and any portions
- * thereof, and that both notices appear in supporting documentation.
- *
- * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
- * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND
- * FOR ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
- *
- * Carnegie Mellon requests users of this software to return to
- *
- *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
- *  School of Computer Science
- *  Carnegie Mellon University
- *  Pittsburgh PA 15213-3890
- *
- * any improvements or extensions that they make and grant Carnegie the
- * rights to redistribute these changes.
- */
-
-//! NetBSD UVM clock policy (99a671f895b7, uvm_pdpolicy_clock.c).
-//! Lock order: page owner -> policy -> PFN interlock. A scan drops policy
-//! before trying the owner, then revalidates identity, intent and queue state.
-//! Per-CPU pending queues store PFN pointers, whose database lifetime is
-//! permanent. Free-list and policy links are independent.
 use super::{
     PageRef,
     phys::{Page, PageFlags, PageOwnerKind, PageQueue},
@@ -259,7 +174,7 @@ pub(super) fn queue(page: &Page) -> PageQueue {
     }
 }
 
-/// Caller holds the PFN interlock. uvm_pageunlock queues the pointer only
+/// Caller holds the frame interlock. Queue the pointer only
 /// after releasing that interlock; later intents coalesce until consumption.
 fn set_intent(page: &'static Page, intent: u32) -> bool {
     let flags = page.policy_flags.load(Ordering::Relaxed);
@@ -282,7 +197,7 @@ pub(super) fn wire(page: &'static Page, count: &AtomicU32) {
     let enqueue = {
         let _interlock = page.owner.lock();
         let previous = count.fetch_add(1, Ordering::AcqRel);
-        assert!(previous != u32::MAX, "uvm: wire count overflow");
+        assert!(previous != u32::MAX, "mem: wire count overflow");
         previous == 0 && set_intent(page, DEQUEUE)
     };
     if enqueue {
@@ -293,7 +208,7 @@ pub(super) fn unwire(page: &'static Page, count: &AtomicU32) {
     let enqueue = {
         let _interlock = page.owner.lock();
         let previous = count.fetch_sub(1, Ordering::AcqRel);
-        assert!(previous != 0, "uvm: wire count underflow");
+        assert!(previous != 0, "mem: wire count underflow");
         previous == 1 && set_intent(page, ACTIVATE)
     };
     if enqueue {
@@ -340,7 +255,7 @@ pub(super) fn enqueue(page: &'static Page) {
 
 fn drain(state: &mut ClockState, pending: &mut Pending, nonblocking: bool) {
     while pending.head != QUEUE_SIZE {
-        let page = pending.pages[pending.head].expect("uvm: missing pending page");
+        let page = pending.pages[pending.head].expect("mem: missing pending page");
         let interlock = if nonblocking {
             page.owner.try_lock()
         } else {
@@ -355,7 +270,7 @@ fn drain(state: &mut ClockState, pending: &mut Pending, nonblocking: bool) {
     }
 }
 /// Acquiring policy can sleep and migrate. Select the current CPU afterwards,
-/// then pin only while touching its pending array (uvmpdpol_flush).
+/// then pin only while touching its pending array.
 pub(super) fn flush() {
     let mut state = global().lock();
     let _preempt = smp::disable_preemption();
@@ -495,7 +410,7 @@ pub(super) fn balance(maximum: usize, mut swap_shortage: usize) {
         if deactivate {
             pmap::harvest_page_state_locked(&owner, &mut locked);
             page.take_referenced();
-            // uvmpdpol_balancequeue changes its own queues immediately. A
+            // Balancing updates its queues immediately. A
             // deferred intent would leave ninactive stale while deciding how
             // many more pages to age, and can scan the entire active list.
             let mut state = global().lock();
@@ -510,7 +425,7 @@ pub(super) fn balance(maximum: usize, mut swap_shortage: usize) {
     }
 }
 
-/// Select inactive victims using the reference min/max class protection.
+/// Select inactive victims using the configured minimum and maximum class shares.
 /// The owner stays held from revalidation through reclaim's PG_BUSY claim.
 pub(super) fn scan(maximum: usize, target: usize) -> usize {
     flush();
@@ -600,7 +515,7 @@ pub(super) fn scan(maximum: usize, target: usize) -> usize {
             freed += 1;
         } else if page.flags().contains(PageFlags::DIRTY) {
             dirty_reactivations += 1;
-            // UVMPD_NUMDIRTYREACTS bounds a fruitless dirty-page pass.
+            // Bound the number of dirty pages reconsidered without progress.
             if dirty_reactivations == 16 {
                 break;
             }

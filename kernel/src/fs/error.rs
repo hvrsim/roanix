@@ -83,3 +83,19 @@ impl fmt::Display for Error {
         })
     }
 }
+
+/// Preserve VM capacity failures at the filesystem boundary.
+impl From<crate::mem::Error> for Error {
+    fn from(error: crate::mem::Error) -> Self {
+        use crate::mem::Error as VmError;
+        match error {
+            VmError::OutOfMemory => Self::OutOfMemory,
+            VmError::LimitExceeded | VmError::SwapUnavailable => Self::NoSpace,
+            VmError::InvalidAddress => Self::FileTooLarge,
+            VmError::CorruptSwap | VmError::Io | VmError::Pmap => Self::Io,
+            VmError::AlreadyMapped | VmError::NotMapped | VmError::Protection => {
+                Self::InvalidArgument
+            }
+        }
+    }
+}

@@ -8,7 +8,7 @@ use alloc::{
 use core::{
     any::Any,
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use bitflags::bitflags;
@@ -295,8 +295,17 @@ pub trait VnodeOps: Any + Send + Sync {
     }
 
     /// Reads file data at an explicit byte offset.
-    fn read_at(&self, _vnode: &Vnode, _offset: u64, _sink: &mut IoSink<'_>) -> Result<usize> {
-        Err(Error::IsDirectory)
+    fn read_at(&self, vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
+        if vnode.kind() == VnodeKind::Directory {
+            return Err(Error::IsDirectory);
+        }
+        // Default buffered reads use exactly the object installed in mmap.
+        // Device and stream providers override this method; regular files only
+        // need to supply their pager through memory_object.
+        vnode
+            .memory_object()?
+            .read_into(offset, sink)
+            .map_err(Error::from)
     }
 
     /// Reads file data with the originating open flags.
@@ -426,6 +435,8 @@ struct VnodeInner {
     /// One VFS-owned cache identity for the active vnode. Provider callbacks
     /// run outside this lock so they may safely enter kernel memory services.
     memory_object: Mutex<Option<Arc<VmObject>>>,
+    names: super::namecache::Sequence,
+    covered: AtomicBool,
 }
 
 /// Filesystem-independent handle to one active node.
@@ -446,6 +457,8 @@ impl Vnode {
                 kind,
                 operations,
                 memory_object: Mutex::new(None),
+                names: super::namecache::Sequence::new(),
+                covered: AtomicBool::new(false),
             }),
         }
     }
@@ -458,6 +471,16 @@ impl Vnode {
     /// Returns the vnode type without invoking the filesystem.
     pub fn kind(&self) -> VnodeKind {
         self.inner.kind
+    }
+
+    /// Mount-table hint for the active vnode; namespace writers publish it
+    /// under their lock. False avoids touching the global table during walks.
+    pub(super) fn is_covered(&self) -> bool {
+        self.inner.covered.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_covered(&self, covered: bool) {
+        self.inner.covered.store(covered, Ordering::Release);
     }
 
     fn inotify_mask(&self, mask: u32) -> u32 {
@@ -473,11 +496,6 @@ impl Vnode {
         VnodeWeak {
             inner: Arc::downgrade(&self.inner),
         }
-    }
-
-    /// Returns the number of active strong references.
-    pub fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.inner)
     }
 
     /// Returns current vnode metadata.
@@ -505,7 +523,24 @@ impl Vnode {
 
     /// Looks up one direct child.
     pub(super) fn lookup(&self, name: &[u8]) -> Result<Self> {
-        self.inner.operations.lookup(self, name)
+        if self.kind() != VnodeKind::Directory {
+            return Err(Error::NotDirectory);
+        }
+        if name == b"." {
+            return Ok(self.clone());
+        }
+        if name == b".." {
+            return self.parent();
+        }
+        super::path::validate_leaf_name(name)?;
+        super::namecache::lookup(self, name, &self.inner.names, || {
+            self.inner.operations.lookup(self, name)
+        })
+    }
+
+    /// Gates namecache publication while a backend changes this directory.
+    pub(crate) fn mutate_name(&self, name: &[u8]) -> super::namecache::Mutation<'_> {
+        self.inner.names.write(self.key(), name)
     }
 
     /// Returns the logical parent directory.
@@ -515,7 +550,9 @@ impl Vnode {
 
     /// Creates a direct child.
     pub(super) fn create(&self, name: &[u8], kind: CreateKind, mode: u16) -> Result<Self> {
+        let mutation = self.mutate_name(name);
         let child = self.inner.operations.create(self, name, kind, mode)?;
+        drop(mutation);
         let mask = crate::proc::inotify::IN_CREATE
             | if child.kind() == VnodeKind::Directory {
                 crate::proc::inotify::IN_ISDIR
@@ -528,7 +565,9 @@ impl Vnode {
 
     /// Adds a hard link in this directory.
     pub(super) fn link(&self, name: &[u8], target: &Self) -> Result<()> {
+        let mutation = self.mutate_name(name);
         self.inner.operations.link(self, name, target)?;
+        drop(mutation);
         crate::proc::inotify::notify(self.key(), crate::proc::inotify::IN_CREATE, 0, Some(name));
         crate::proc::inotify::notify(target.key(), crate::proc::inotify::IN_ATTRIB, 0, None);
         Ok(())
@@ -541,7 +580,9 @@ impl Vnode {
         let target = crate::proc::inotify::is_watching()
             .then(|| self.lookup(name).ok())
             .flatten();
+        let mutation = self.mutate_name(name);
         self.inner.operations.unlink(self, name, remove_directory)?;
+        drop(mutation);
         let Some(target) = target else {
             return Ok(());
         };
@@ -578,9 +619,13 @@ impl Vnode {
         let replaced = watching
             .then(|| target_directory.lookup(target_name).ok())
             .flatten();
+        let source_mutation = self.mutate_name(source_name);
+        let target_mutation = target_directory.mutate_name(target_name);
         self.inner
             .operations
             .rename(self, source_name, target_directory, target_name)?;
+        drop(target_mutation);
+        drop(source_mutation);
         let Some(source) = source else {
             return Ok(());
         };
@@ -856,6 +901,21 @@ impl PartialEq for Vnode {
 }
 
 impl Eq for Vnode {}
+
+/// Active vnode identity index. Weak entries never pin a filesystem tree.
+pub(super) struct VnodeCache(super::cache::IdentityCache<VnodeInner>);
+
+impl VnodeCache {
+    pub const fn new() -> Self {
+        Self(super::cache::IdentityCache::new())
+    }
+
+    pub fn get_or_create(&self, key: u64, create: impl FnOnce() -> Result<Vnode>) -> Result<Vnode> {
+        self.0
+            .get_or_create(key, || Ok(create()?.inner))
+            .map(|inner| Vnode { inner })
+    }
+}
 
 /// Non-owning vnode reference used for parent links.
 #[derive(Clone, Default)]

@@ -17,7 +17,7 @@ use crate::{
     sys::{
         clock,
         smp::IrqSpinLock,
-        sync::{Mutex, Once},
+        sync::{Mutex, Once, RwLock},
     },
 };
 
@@ -78,7 +78,9 @@ struct TmpfsNode {
 }
 
 enum TmpfsData {
-    File(Mutex<TmpfsFile>),
+    // Shared reads may fault and copy concurrently. Length-changing writes,
+    // append and truncate remain exclusive to preserve their ordering.
+    File(RwLock<TmpfsFile>),
     Directory(TmpfsDirectory),
     Symlink(Arc<VmObject>),
 }
@@ -187,7 +189,7 @@ impl Tmpfs {
                 VnodeKind::Regular,
                 0,
                 1,
-                TmpfsData::File(Mutex::new(TmpfsFile {
+                TmpfsData::File(RwLock::new(TmpfsFile {
                     object: VmObject::with_page_account(
                         ObjectKind::Vnode,
                         self.page_account.clone(),
@@ -213,7 +215,7 @@ impl Tmpfs {
                     VmObject::with_page_account(ObjectKind::Vnode, self.page_account.clone());
                 let written = match object.write_at(0, &target) {
                     Ok(written) => written,
-                    Err(error) => return Err(mem_error(error)),
+                    Err(error) => return Err(Error::from(error)),
                 };
                 if written != target.len() {
                     return Err(Error::NoSpace);
@@ -287,7 +289,7 @@ impl TmpfsNode {
         }
     }
 
-    fn file(&self) -> Result<&Mutex<TmpfsFile>> {
+    fn file(&self) -> Result<&RwLock<TmpfsFile>> {
         match &self.data {
             TmpfsData::File(file) => Ok(file),
             TmpfsData::Directory(_) => Err(Error::IsDirectory),
@@ -320,7 +322,10 @@ impl TmpfsNode {
         offset
             .checked_add(source.len() as u64)
             .ok_or(Error::FileTooLarge)?;
-        let written = file.object.write_from(offset, source).map_err(mem_error)?;
+        let written = file
+            .object
+            .write_from(offset, source)
+            .map_err(Error::from)?;
         self.size
             .fetch_max(offset.saturating_add(written as u64), Ordering::AcqRel);
         self.touch_modified();
@@ -328,7 +333,7 @@ impl TmpfsNode {
     }
 
     fn truncate_locked(&self, file: &mut TmpfsFile, size: u64) -> Result<()> {
-        file.object.truncate(size).map_err(mem_error)?;
+        file.object.truncate(size).map_err(Error::from)?;
         self.size.store(size, Ordering::Release);
         self.touch_modified();
         Ok(())
@@ -444,15 +449,8 @@ impl VnodeOps for TmpfsNode {
         Ok(())
     }
 
-    fn lookup(&self, directory: &Vnode, name: &[u8]) -> Result<Vnode> {
+    fn lookup(&self, _directory: &Vnode, name: &[u8]) -> Result<Vnode> {
         let directory_data = self.directory()?;
-        if name == b"." {
-            return Ok(directory.clone());
-        }
-        if name == b".." {
-            return self.parent(directory);
-        }
-        path::validate_leaf_name(name)?;
         if self.links.load(Ordering::Acquire) == 0 {
             return Err(Error::NotFound);
         }
@@ -691,17 +689,17 @@ impl VnodeOps for TmpfsNode {
     }
 
     fn read_at(&self, _vnode: &Vnode, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
-        let file = self.file()?.lock();
+        let file = self.file()?.read();
         let size = self.size.load(Ordering::Acquire);
         if offset >= size || sink.is_empty() {
             return Ok(0);
         }
         let count = cmp::min(sink.len() as u64, size - offset) as usize;
-        let mut window = sink.slice(0, count).map_err(mem_error)?;
+        let mut window = sink.slice(0, count).map_err(Error::from)?;
         let read = file
             .object
             .read_into(offset, &mut window)
-            .map_err(mem_error)?;
+            .map_err(Error::from)?;
         drop(file);
         self.touch_accessed();
         Ok(read)
@@ -711,12 +709,12 @@ impl VnodeOps for TmpfsNode {
         if source.is_empty() {
             return Ok(0);
         }
-        let mut file = self.file()?.lock();
+        let mut file = self.file()?.write();
         self.write_locked(&mut file, offset, source)
     }
 
     fn append(&self, _vnode: &Vnode, source: &IoSource<'_>) -> Result<(usize, u64)> {
-        let mut file = self.file()?.lock();
+        let mut file = self.file()?.write();
         if source.is_empty() {
             return Ok((0, self.size.load(Ordering::Acquire)));
         }
@@ -726,12 +724,12 @@ impl VnodeOps for TmpfsNode {
     }
 
     fn truncate(&self, _vnode: &Vnode, size: u64) -> Result<()> {
-        let mut file = self.file()?.lock();
+        let mut file = self.file()?.write();
         self.truncate_locked(&mut file, size)
     }
 
     fn memory_object(&self, _vnode: &Vnode) -> Result<Arc<VmObject>> {
-        Ok(self.file()?.lock().object.clone())
+        Ok(self.file()?.read().object.clone())
     }
 
     fn readlink(&self, _vnode: &Vnode) -> Result<Box<[u8]>> {
@@ -740,7 +738,7 @@ impl VnodeOps for TmpfsNode {
                 let size = usize::try_from(self.size.load(Ordering::Acquire))
                     .map_err(|_| Error::FileTooLarge)?;
                 let mut target = alloc::vec![0; size];
-                let read = object.read_at(0, &mut target).map_err(mem_error)?;
+                let read = object.read_at(0, &mut target).map_err(Error::from)?;
                 if read != size {
                     return Err(Error::Io);
                 }
@@ -810,18 +808,6 @@ impl Drop for TmpfsNode {
     fn drop(&mut self) {
         if let Some(filesystem) = self.filesystem.upgrade() {
             filesystem.used_nodes.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
-fn mem_error(error: mem::Error) -> Error {
-    match error {
-        mem::Error::OutOfMemory => Error::OutOfMemory,
-        mem::Error::LimitExceeded | mem::Error::SwapUnavailable => Error::NoSpace,
-        mem::Error::InvalidAddress => Error::FileTooLarge,
-        mem::Error::CorruptSwap | mem::Error::Io | mem::Error::Pmap => Error::Io,
-        mem::Error::AlreadyMapped | mem::Error::NotMapped | mem::Error::Protection => {
-            Error::InvalidArgument
         }
     }
 }

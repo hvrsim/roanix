@@ -1,142 +1,12 @@
-/*
- * Copyright (c) 2008, 2010, 2016, 2017, 2019, 2020 The NetBSD Foundation, Inc.
- * All rights reserved.
- *
- * This code is derived from software contributed to The NetBSD Foundation
- * by Andrew Doran, and by Maxime Villard.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
- * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
-
-/*
- * Copyright (c) 2007 Manuel Bouyer.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-/*
- * Copyright (c) 2006 Mathieu Ropert <mro@adviseo.fr>
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
-
-/*
- * Copyright 2001 (c) Wasabi Systems, Inc.
- * All rights reserved.
- *
- * Written by Frank van der Linden for Wasabi Systems, Inc.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *      This product includes software developed for the NetBSD Project by
- *      Wasabi Systems, Inc.
- * 4. The name of Wasabi Systems, Inc. may not be used to endorse
- *    or promote products derived from this software without specific prior
- *    written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY WASABI SYSTEMS, INC. ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL WASABI SYSTEMS, INC
- * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
-
-/*
- * Copyright (c) 1997 Charles D. Cranor and Washington University.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-//! Machine-independent pmap ownership and address-space integration.
+//! Hardware translations, reverse mappings, and address-space integration.
 //!
-//! # Lock order
+//! Address-space operations acquire the map lock, anonymous index, object index,
+//! translation index, and page reverse list in that order when required. Faults
+//! release the map before allocation or I/O and revalidate before publication.
+//! Reverse-mapping walks try the translation lock and restart on contention,
+//! releasing the reverse list before waiting to preserve the normal lock order.
 //!
-//! Address-space operations acquire `VmSpace::map` (shared for faults), then
-//! the anonymous index, the object index, `PmapInner::mappings`, and the page's
-//! reverse list. Faults release the map before allocation or I/O and revalidate
-//! before entering a pinned page. Structural changes take the map exclusively.
-//! P->V operations use UVM's direct PV->pmap try-lock handoff; contention
-//! drops PV before waiting and restarting, preserving the V->P lock order.
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use crate::mem::PageRef;
 use alloc::sync::Arc;
@@ -239,7 +109,7 @@ impl ReverseMappings {
                 current = mapping.next.as_deref();
             }
             // A V->P operation removed the cursor. Restart the remaining PV
-            // list, as pmap_test_attrs does when the handoff races removal.
+            // list so iteration can continue after the lock handoff.
         }
         self.head.as_deref()
     }
@@ -338,7 +208,7 @@ impl Pmap {
         let page = pin.page();
         if protection.contains(VmProtection::EXECUTE) {
             let frame = super::phys::phys_to_page(pin.address())
-                .expect("uvm: executable pin lost its frame");
+                .expect("mem: executable pin lost its frame");
             page.note_executable(frame);
         }
         let mut mappings = self.inner.lock();
@@ -362,7 +232,7 @@ impl Pmap {
         let paddr = pin.acquire_mapping();
         if protection.contains(VmProtection::WRITE) {
             super::phys::phys_to_page(paddr)
-                .expect("uvm: mapping lost PFN")
+                .expect("mem: mapping lost PFN")
                 .mark_unknown();
         }
         let flags = pmap_flags(protection);
@@ -600,7 +470,7 @@ impl Drop for PmapInner {
     }
 }
 
-/// UVM pmap_pp_remove / pmap_test_attrs handoff: reference the pmap and
+/// Reference the translation map and
 /// try its lock with PV held, release PV, and if contended wait then restart.
 /// The Arc outlives both guards, so its final destructor never runs at IPL_VM.
 fn visit_reverse_mappings(
@@ -656,8 +526,8 @@ pub(super) fn remove_all_mappings(page: &PageRef) {
         // SAFETY: direct PV->pmap handoff retained the mapping identity and
         // this pmap lock exclusively owns its leaf and table hierarchy.
         unsafe { arch::paging::unmap_page(pmap.root, VirtAddr::new(address)) }
-            .expect("uvm: tracked PV mapping lacks a leaf");
-        mappings.remove(&address).expect("uvm: PV mapping vanished");
+            .expect("mem: tracked PV mapping lacks a leaf");
+        mappings.remove(&address).expect("mem: PV mapping vanished");
         page.remove_reverse_mapping(ptr::from_ref(pmap), address);
         let mut shootdown = Shootdown::for_root(pmap.root);
         shootdown.push(VirtAddr::new(address));
@@ -998,7 +868,7 @@ impl VmSpace {
 
 impl Drop for VmSpace {
     fn drop(&mut self) {
-        // UVM releases arefs only after pmap-level references are gone.
+        // Release anonymous references only after hardware mappings are gone.
         // The final VmSpace owner excludes user execution and new faults.
         self.pmap
             .remove(

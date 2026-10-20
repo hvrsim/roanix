@@ -1,33 +1,11 @@
-/*
- * Copyright (c) 1995, 1996, 1997, 2009 Matthew R. Green
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
- * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- * from: NetBSD: vm_swap.c,v 1.52 1997/12/02 13:47:37 pk Exp
- * from: Id: uvm_swap.c,v 1.1.2.42 1998/02/02 20:38:06 chuck Exp
- */
-
-//! Compressed front-swap and optional external swap backend.
+//! Compressed swap storage and an optional external backing store.
+//!
+//! Pages use compressed payloads or compact repeated-value representations when
+//! beneficial, with external storage available through a registered backend.
+//! Slot ownership, resident copies, and capacity accounting determine when backing
+//! can be reused or released; loading a page does not itself consume its slot.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -189,9 +167,9 @@ pub(super) fn has_capacity() -> bool {
             && (!state.free_slots.is_empty() || state.compressed.len() < state.maximum_slots))
 }
 
-/// uvm_swapisfull counts swap-only pages, excluding backing still held by
+/// Count swap-only pages, excluding backing still held by
 /// resident pages. Allocated slots can be exhausted while dropswap can still
-/// recover them. The reference discounts the final 1% for busy/contended slots.
+/// recover them. Leave a 1% margin for busy or contended slots.
 pub(super) fn is_full() -> bool {
     let Some(manager) = SWAP.get() else {
         return true;
@@ -221,7 +199,7 @@ pub(super) fn set_resident(handle: SwapHandle, resident: bool) {
     let bytes = entry
         .data
         .as_ref()
-        .expect("uvm: resident transition during swap I/O")
+        .expect("mem: resident transition during swap I/O")
         .len() as u64;
     entry.resident = resident;
     if resident {
@@ -364,7 +342,7 @@ pub(super) fn store(page: &[u8; PAGE_BYTES]) -> core::result::Result<SwapHandle,
     Ok(handle)
 }
 
-/// Restores a page without consuming its backing slot. UVM keeps resident
+/// Restore a page without consuming its backing slot. Keep resident
 /// swap backing until it becomes stale, is dropped under swap pressure, or
 /// its anon/object is destroyed. The page owner serializes slot users.
 pub(super) fn load(

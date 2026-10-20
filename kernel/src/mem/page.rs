@@ -1,4 +1,11 @@
-//! Logical memory pages backed by authoritative PFN database entries.
+//! Logical pages and their resident, zero, file, or swapped backing state.
+//!
+//! A page's owner lock coordinates backing transitions with its physical-frame
+//! database entry. Pins retain resident frames while callers copy bytes or
+//! publish mappings; busy state and wait notifications coordinate pager work.
+//! Reclamation checks ownership and mappings before releasing a frame.
+//!
+//! Third-party notices and provenance are in the repository-root `COPYING` file.
 
 use alloc::sync::Arc;
 use core::{
@@ -419,7 +426,7 @@ impl VmPage {
         Ok(())
     }
 
-    /// Zeroes a pinned resident range while its UVM owner lock is already held.
+    /// Zeroes a pinned resident range while its owner lock is already held.
     pub(super) fn zero_locked(
         self: &PageRef,
         offset: usize,
