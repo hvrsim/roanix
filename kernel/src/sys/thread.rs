@@ -136,6 +136,10 @@ pub(crate) struct Thread {
     /// losing a boost.
     pub(crate) boost_count: u32,
 
+    /// Debug ownership records; this raw lock never uses sleeping primitives.
+    #[cfg(debug_assertions)]
+    pub(crate) held_locks: IrqSpinLock<crate::sys::lockdep::HeldLocks>,
+
     /// User-visible priority computed from interactivity and nice value.
     pub(crate) user_priority: u8,
 
@@ -761,6 +765,8 @@ fn allocate_thread_record(
         ithread_base_priority: priority,
         lent_priority: u8::MAX,
         boost_count: 0,
+        #[cfg(debug_assertions)]
+        held_locks: IrqSpinLock::new(crate::sys::lockdep::HeldLocks::new()),
         user_priority: priority,
         nice: AtomicI8::new(nice.clamp(NICE_MIN, NICE_MAX)),
         cpu: AtomicUsize::new(cpu),

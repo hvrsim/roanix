@@ -553,16 +553,11 @@ pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
 /// Waits for any event or a timeout and returns the winning event index.
 pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<usize> {
     assert!(!events.is_empty(), "clock: timed wait requires an event");
+    super::parking::wait::assert_wait_context();
     let duration_ns = duration_to_ns(duration);
     if duration_ns == 0 {
         return events.iter().position(|event| event.is_signaled());
     }
-
-    assert!(
-        arch::irqstate() && !smp::in_interrupt_context(),
-        "clock: timed wait requires thread context with interrupts enabled"
-    );
-    smp::assert_blockable("clock: timed wait");
 
     let current = sched::current_thread();
     // SAFETY: the scheduler keeps the current thread allocation live while it
@@ -728,7 +723,7 @@ fn sleep_ns(ns: u64) {
         arch::irqstate() && !smp::in_interrupt_context(),
         "clock: sleep requires thread context with interrupts enabled"
     );
-    smp::assert_blockable("clock: sleep");
+    super::context::assert_sleepable("clock: sleep");
 
     // Keep timer setup on one CPU so the queue owner, measured timebase,
     // and programmed local deadline always match.

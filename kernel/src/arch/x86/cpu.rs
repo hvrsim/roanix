@@ -670,7 +670,11 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 17 => crate::proc::signal::SIGBUS,
                 _ => crate::proc::signal::SIGILL,
             };
+            // A synchronous user exception runs on its thread's stack.
+            // Queuing its signal may take sleeping locks, just like paging.
+            crate::arch::irqset(true);
             crate::proc::signal::send_current(signal);
+            crate::arch::irqset(false);
             return frame;
         }
         let (cpu_id, tid) = crate::arch::thiscpu_opt()

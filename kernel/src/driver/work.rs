@@ -11,7 +11,6 @@
 
 use alloc::{
     boxed::Box,
-    collections::VecDeque,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -19,14 +18,17 @@ use alloc::{
 use core::time::Duration;
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
 use crate::sys::{
     clock,
     event::Event,
+    executor::{SerialExecutor, SubmitError},
     sched,
+    smp::IrqSpinLock,
     sync::{Mutex, Once},
+    thread::Thread,
 };
 
 use super::{
@@ -46,14 +48,13 @@ struct Item {
     context: *mut c_void,
     argument: u64,
 }
-
-// SAFETY: the callback and context belong to the queue's owning module, which
-// cannot unload until the queue is drained and destroyed.
+// SAFETY: the queue's module remains live until all accepted work drains.
 unsafe impl Send for Item {}
-
-struct QueueState {
-    pending: VecDeque<Item>,
-    running: bool,
+impl Item {
+    fn run(self) {
+        // SAFETY: queue_work requires callback resources to outlive queue drain.
+        unsafe { (self.callback)(self.context, self.argument) };
+    }
 }
 
 /// A thread-backed queue of deferred callbacks.
@@ -62,11 +63,7 @@ pub struct WorkQueue {
     header: ObjHeader,
     name: Box<str>,
     owner: Option<Arc<Module>>,
-    state: Mutex<QueueState>,
-    wake: Event,
-    idle: Event,
-    stopping: AtomicBool,
-    finished: Event,
+    executor: SerialExecutor<()>,
     processed: AtomicU64,
 }
 
@@ -88,6 +85,8 @@ impl WorkQueue {
 #[repr(C)]
 pub struct Timer {
     header: ObjHeader,
+    control: IrqSpinLock<()>,
+    worker: AtomicPtr<Thread>,
     owner: Option<Arc<Module>>,
     callback: WorkFn,
     context: *mut c_void,
@@ -143,52 +142,15 @@ pub fn create_queue(owner: Option<&Arc<Module>>, name: &str) -> Result<Arc<WorkQ
         header,
         name: String::from(name).into_boxed_str(),
         owner: owner.cloned(),
-        state: Mutex::new(QueueState {
-            pending: VecDeque::new(),
-            running: false,
-        }),
-        wake: Event::new(),
-        idle: Event::new(),
-        stopping: AtomicBool::new(false),
-        finished: Event::new(),
+        executor: SerialExecutor::new((), MAX_PENDING),
         processed: AtomicU64::new(0),
     });
-    queue.header.register()?;
+    if let Err(error) = queue.header.register() {
+        queue.executor.shutdown();
+        return Err(error);
+    }
     registry.queues.lock().push(queue.clone());
 
-    let worker = queue.clone();
-    sched::run(move || {
-        loop {
-            worker.wake.wait();
-            worker.wake.reset();
-            loop {
-                let item = {
-                    let mut state = worker.state.lock();
-                    let item = state.pending.pop_front();
-                    state.running = item.is_some();
-                    item
-                };
-                let Some(item) = item else {
-                    break;
-                };
-                // SAFETY: the queue holds the callback alive, and its owning
-                // module cannot unload until the queue is destroyed.
-                unsafe { (item.callback)(item.context, item.argument) };
-                worker.processed.fetch_add(1, Ordering::Relaxed);
-            }
-            {
-                let mut state = worker.state.lock();
-                state.running = false;
-                if state.pending.is_empty() {
-                    worker.idle.signal();
-                }
-            }
-            if worker.stopping.load(Ordering::Acquire) {
-                break;
-            }
-        }
-        worker.finished.signal();
-    });
     Ok(queue)
 }
 
@@ -204,53 +166,48 @@ pub unsafe fn queue_work(
     context: *mut c_void,
     argument: u64,
 ) -> Result<()> {
-    {
-        let mut state = queue.state.lock();
-        // Checked under the same lock as the push: checking it outside let an
-        // item land in a queue whose flush had already observed emptiness,
-        // stranding the callback past worker exit.
-        if queue.stopping.load(Ordering::Acquire) {
-            return Err(Error::NoDevice);
-        }
-        if state.pending.len() >= MAX_PENDING {
-            return Err(Error::NoSpace);
-        }
-        state.pending.push_back(Item {
-            callback,
-            context,
-            argument,
-        });
-    }
-    queue.idle.reset();
-    queue.wake.signal();
-    Ok(())
+    let item = Item {
+        callback,
+        context,
+        argument,
+    };
+    let worker = queue.clone();
+    queue
+        .executor
+        .submit(move |_| {
+            item.run();
+            worker.processed.fetch_add(1, Ordering::Relaxed);
+        })
+        .map_err(submit_error)
 }
 
-/// Waits until a queue has no pending or running callbacks.
+fn submit_error(error: SubmitError) -> Error {
+    match error {
+        SubmitError::Closed => Error::NoDevice,
+        SubmitError::Full => Error::NoSpace,
+    }
+}
+
+/// Waits for work accepted before a queue barrier. Later work may still run.
+/// Calling from this queue's own callback is rejected.
 pub fn flush_queue(queue: &Arc<WorkQueue>) {
-    // One signal is enough to set the worker draining; re-signaling on every
-    // retry only interrupted a worker that was already making progress.
-    queue.wake.signal();
     loop {
-        {
-            let state = queue.state.lock();
-            if state.pending.is_empty() && !state.running {
+        match queue.executor.flush() {
+            Ok(()) => return,
+            Err(SubmitError::Full) => clock::sleep(Duration::from_micros(50)),
+            Err(SubmitError::Closed) => {
+                queue.executor.shutdown();
                 return;
             }
         }
-        queue.idle.wait();
     }
 }
 
-/// Destroys a work queue after its worker thread exits.
+/// Closes admission and joins all accepted work before releasing module code.
+/// Every concurrent destroy caller waits for completion.
 pub fn destroy_queue(queue: &Arc<WorkQueue>) -> Result<()> {
-    if queue.stopping.swap(true, Ordering::AcqRel) {
-        return Ok(());
-    }
     queue.header.set_state(super::obj::ObjState::Removing);
-    flush_queue(queue);
-    queue.wake.signal();
-    queue.finished.wait();
+    queue.executor.shutdown();
     if let Ok(registry) = registry() {
         registry
             .queues
@@ -281,6 +238,8 @@ pub unsafe fn create_timer(
         None,
     );
     let timer = Arc::new(Timer {
+        control: IrqSpinLock::new(()),
+        worker: AtomicPtr::new(core::ptr::null_mut()),
         header,
         owner: owner.cloned(),
         callback,
@@ -298,6 +257,9 @@ pub unsafe fn create_timer(
 
     let worker = timer.clone();
     sched::run(move || {
+        worker
+            .worker
+            .store(sched::current_thread(), Ordering::Release);
         loop {
             if worker.stopping.load(Ordering::Acquire) {
                 break;
@@ -324,6 +286,7 @@ pub unsafe fn create_timer(
             // cannot unload until the timer is destroyed.
             unsafe { (worker.callback)(worker.context, worker.argument) };
 
+            let _control = worker.control.lock();
             let period = worker.period_ns.load(Ordering::Acquire);
             if period != 0 && !worker.stopping.load(Ordering::Acquire) {
                 worker.deadline_ns.store(
@@ -333,6 +296,9 @@ pub unsafe fn create_timer(
                 worker.armed.store(true, Ordering::Release);
             }
         }
+        worker
+            .worker
+            .store(core::ptr::null_mut(), Ordering::Release);
         worker.finished.signal();
     });
     Ok(timer)
@@ -341,6 +307,7 @@ pub unsafe fn create_timer(
 /// Arms a timer to fire after `delay_ns`, repeating every `period_ns` when that
 /// is non-zero.
 pub fn arm_timer(timer: &Arc<Timer>, delay_ns: u64, period_ns: u64) -> Result<()> {
+    let control = timer.control.lock();
     if timer.stopping.load(Ordering::Acquire) {
         return Err(Error::NoDevice);
     }
@@ -350,25 +317,34 @@ pub fn arm_timer(timer: &Arc<Timer>, delay_ns: u64, period_ns: u64) -> Result<()
         Ordering::Release,
     );
     timer.armed.store(true, Ordering::Release);
+    drop(control);
     timer.wake.signal();
     Ok(())
 }
 
 /// Disarms a timer without destroying it.
 pub fn cancel_timer(timer: &Arc<Timer>) {
+    let control = timer.control.lock();
     timer.period_ns.store(0, Ordering::Release);
     timer.armed.store(false, Ordering::Release);
+    drop(control);
     timer.wake.signal();
 }
 
 /// Destroys a timer after its thread exits.
 pub fn destroy_timer(timer: &Arc<Timer>) -> Result<()> {
-    if timer.stopping.swap(true, Ordering::AcqRel) {
-        return Ok(());
-    }
+    crate::sys::context::assert_sleepable("timer: destroy");
+    assert_ne!(
+        timer.worker.load(Ordering::Acquire),
+        sched::current_thread(),
+        "timer: callback cannot destroy itself"
+    );
+    let control = timer.control.lock();
+    timer.stopping.store(true, Ordering::Release);
     timer.header.set_state(super::obj::ObjState::Removing);
     timer.armed.store(false, Ordering::Release);
     timer.period_ns.store(0, Ordering::Release);
+    drop(control);
     timer.wake.signal();
     timer.finished.wait();
     if let Ok(registry) = registry() {
@@ -438,7 +414,7 @@ pub fn list_queues() -> Result<Vec<QueueInfo>> {
         .map(|queue| QueueInfo {
             name: queue.name.to_string().into_boxed_str(),
             processed: queue.processed(),
-            pending: queue.state.lock().pending.len(),
+            pending: queue.executor.pending_count(),
         })
         .collect())
 }

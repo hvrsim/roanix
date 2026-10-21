@@ -33,8 +33,7 @@ use core::{
 use log::error;
 
 use crate::sys::{
-    event::Event,
-    sched,
+    service::Service,
     smp::IrqSpinLock,
     sync::{Mutex, Once},
 };
@@ -275,10 +274,8 @@ pub struct IrqAction {
     context: *mut c_void,
     owner: Option<Arc<Module>>,
     device: Option<Weak<Device>>,
-    wake: Event,
-    finished: Event,
-    stopping: AtomicBool,
-    threaded: AtomicBool,
+    service: Once<Service>,
+    pending: AtomicBool,
     calls: AtomicU64,
 }
 
@@ -669,23 +666,28 @@ pub unsafe fn request(
         context,
         owner: owner.cloned(),
         device: device.map(Arc::downgrade),
-        wake: Event::new(),
-        finished: Event::new(),
-        stopping: AtomicBool::new(false),
-        threaded: AtomicBool::new(false),
+        service: Once::new(),
+        pending: AtomicBool::new(false),
         calls: AtomicU64::new(0),
     });
+
+    {
+        let inner = record.inner.lock();
+        if !inner.actions.is_empty()
+            && (inner.flags & trigger::SHARED == 0 || flags & trigger::SHARED == 0)
+        {
+            return Err(Error::Busy);
+        }
+    }
+    if thread.is_some() {
+        start_thread(&action)?;
+    }
 
     // Build the replacement list outside the interrupt-safe lock: allocation
     // must not run with interrupts masked.
     let (domain, hwirq, unmask) = {
         let snapshot = {
             let inner = record.inner.lock();
-            if !inner.actions.is_empty()
-                && (inner.flags & trigger::SHARED == 0 || flags & trigger::SHARED == 0)
-            {
-                return Err(Error::Busy);
-            }
             inner.actions.clone()
         };
         let mut replacement = Vec::with_capacity(snapshot.len() + 1);
@@ -706,9 +708,6 @@ pub unsafe fn request(
         (domain, hwirq, should_unmask)
     };
 
-    if thread.is_some() {
-        start_thread(&action)?;
-    }
     if unmask && let Some(domain) = domain.as_ref() {
         domain.unmask(hwirq);
     }
@@ -717,25 +716,22 @@ pub unsafe fn request(
 
 fn start_thread(action: &Arc<IrqAction>) -> Result<()> {
     let worker = action.clone();
-    action.threaded.store(true, Ordering::Release);
-    sched::create_ithread(
-        move |_| {
-            loop {
-                worker.wake.wait();
-                worker.wake.reset();
-                if worker.stopping.load(Ordering::Acquire) {
-                    break;
-                }
-                if let Some(thread) = worker.thread {
-                    // SAFETY: the action holds the callback alive, and the
-                    // owning module cannot unload until this thread exits.
+    action.service.call_once(|| {
+        Service::interrupt(
+            move |_| {
+                // Shutdown's final drain must not invent an extra device callback.
+                if worker.pending.swap(false, Ordering::AcqRel)
+                    && let Some(thread) = worker.thread
+                {
+                    // SAFETY: release joins service before callback resources or
+                    // its owning module may be destroyed.
                     unsafe { thread(worker.context, worker.virq) };
                 }
-            }
-            worker.finished.signal();
-        },
-        0,
-    );
+                worker.pending.load(Ordering::Acquire)
+            },
+            7,
+        )
+    });
     Ok(())
 }
 
@@ -744,6 +740,9 @@ fn start_thread(action: &Arc<IrqAction>) -> Result<()> {
 /// The handler must not be released from its own threaded worker: the final
 /// wait observes that thread's exit and would deadlock against itself.
 pub fn release(action: &Arc<IrqAction>) -> Result<()> {
+    if let Some(service) = action.service.get() {
+        service.assert_not_current();
+    }
     let record = desc(action.virq).ok_or(Error::NotFound)?;
     let (domain, hwirq, mask) = {
         // Held only across the list read-modify-write it exists to serialize.
@@ -785,12 +784,8 @@ pub fn release(action: &Arc<IrqAction>) -> Result<()> {
         core::hint::spin_loop();
     }
 
-    if action.threaded.load(Ordering::Acquire) {
-        // The worker thread executes module code, so it must be observed to
-        // exit before the module may be unloaded.
-        action.stopping.store(true, Ordering::Release);
-        action.wake.signal();
-        action.finished.wait();
+    if let Some(service) = action.service.get() {
+        service.shutdown();
     }
     Ok(())
 }
@@ -912,13 +907,15 @@ pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
     };
 
     let mut outcome = DispatchOutcome::default();
-    loop {
+    // Do not drain an unlimited stream on the hard-interrupt stack. Drivers
+    // must quiet level sources; this also bounds a burst of distinct claims.
+    for _ in 0..64 {
         let mut hwirq = 0u64;
         // SAFETY: registration validated the callback and the output pointer
         // addresses local storage.
         let status = unsafe { claim(domain.ops.context, cpu, platform_id, &raw mut hwirq) };
         if status <= 0 {
-            break;
+            return outcome;
         }
         outcome.handled = true;
         if let Some(virq) = domain.lookup(hwirq) {
@@ -936,6 +933,7 @@ pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
             unsafe { complete(domain.ops.context, cpu, platform_id, hwirq) };
         }
     }
+    outcome.reschedule = true;
     outcome
 }
 
@@ -946,7 +944,6 @@ fn run(virq: u32) -> DispatchOutcome {
     record.count.fetch_add(1, Ordering::Relaxed);
 
     let mut result = DispatchOutcome::default();
-    let mut wake: Option<Arc<IrqAction>> = None;
     let mut claimed = false;
 
     // Take a counted reference to the handler list and release the lock before
@@ -979,19 +976,25 @@ fn run(virq: u32) -> DispatchOutcome {
         if status & outcome::WAKE_THREAD != 0 && action.thread.is_some() {
             // Requests coalesce: two pends raised between the worker's wake
             // and its next wait yield exactly one thread run.
-            wake = Some(action.clone());
+            action.pending.store(true, Ordering::Release);
         }
     }
-    drop(actions);
-    record.in_flight.fetch_sub(1, Ordering::Release);
 
     if let Some(domain) = domain {
         domain.eoi(hwirq);
     }
-    if let Some(action) = wake {
-        action.wake.signal();
-        result.reschedule = true;
+    // Wake every requesting action on shared lines, after controller EOI.
+    // A request arriving during service is retained by both pending states.
+    for action in actions.iter() {
+        if action.pending.load(Ordering::Acquire)
+            && let Some(service) = action.service.get()
+        {
+            service.request();
+            result.reschedule = true;
+        }
     }
+    drop(actions);
+    record.in_flight.fetch_sub(1, Ordering::Release);
     if !claimed {
         record.spurious.fetch_add(1, Ordering::Relaxed);
     }

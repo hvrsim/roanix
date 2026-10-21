@@ -7,7 +7,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use super::{Mutex, MutexGuard, assert_mutex_context};
+use super::{Mutex, MutexGuard, assert_lock_context};
 use crate::{arch, sys::event::Event};
 
 const WRITER: usize = 1 << (usize::BITS - 1);
@@ -59,7 +59,7 @@ impl<T> RwLock<T> {
 
     /// Acquires shared access without taking the writer mutex when uncontended.
     pub fn read(&self) -> ReadGuard<'_, T> {
-        assert_mutex_context();
+        assert_lock_context();
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if state & WRITER != 0 {

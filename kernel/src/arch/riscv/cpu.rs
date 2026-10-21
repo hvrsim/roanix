@@ -507,7 +507,11 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                 frame.scause,
                 signal
             );
+            // A synchronous user exception runs on its thread's stack.
+            // Queuing its signal may take sleeping locks, just like paging.
+            crate::arch::irqset(true);
             crate::proc::signal::send_current(signal);
+            crate::arch::irqset(false);
             return frame;
         }
     }

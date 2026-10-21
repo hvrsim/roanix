@@ -48,7 +48,6 @@ const PXA_CLOCK: u64 = 14_745_600;
 const WAKE_RX: u32 = 1;
 const WAKE_TX: u32 = 2;
 const WAKE_DRAIN: u32 = 4;
-const WAKE_SERVICED: u32 = 8;
 
 const fn console_ops() -> raw::ConsoleOps {
     raw::ConsoleOps {
@@ -136,6 +135,7 @@ struct Port {
     tty: Option<Tty>,
     ier: u8,
     required_ier: u8,
+    service_pending: bool,
     character_ns: u64,
     in_flight: usize,
     rx: Ring,
@@ -161,6 +161,7 @@ impl Port {
             tty: None,
             ier: 0,
             required_ier: 0,
+            service_pending: false,
             character_ns: 0,
             in_flight: 0,
             rx: Ring::new(),
@@ -186,6 +187,7 @@ impl Port {
         self.tty = None;
         self.ier = 0;
         self.required_ier = 0;
+        self.service_pending = false;
         self.character_ns = 0;
         self.in_flight = 0;
         self.rx = Ring::new();
@@ -224,7 +226,9 @@ impl Port {
         let value = value | self.required_ier;
         if self.ier != value {
             self.ier = value;
-            self.reg_write(IER, value);
+            if !self.service_pending {
+                self.reg_write(IER, value);
+            }
         }
     }
     fn configure(&mut self, framing: &raw::SerialFraming, clear: bool) -> bool {
@@ -266,7 +270,14 @@ impl Port {
         self.reg_write(IER, (divisor >> 8) as u8);
         self.reg_write(LCR, line);
         self.ier = ier;
-        self.reg_write(IER, ier);
+        self.reg_write(
+            IER,
+            if self.service_pending {
+                self.required_ier
+            } else {
+                ier
+            },
+        );
         self.reg_write(FCR, if clear { 7 } else { 1 });
         self.reg_write(MCR, 0x0b);
         true
@@ -308,41 +319,6 @@ impl Port {
             }
         } else {
             self.set_ier(self.ier | IER_TX);
-        }
-        wake
-    }
-    fn service(&mut self) -> u32 {
-        let mut wake = 0;
-        for _ in 0..64 {
-            let id = self.reg_read(IID);
-            if id == 0xff || id & 1 != 0 {
-                break;
-            }
-            wake |= WAKE_SERVICED;
-            match id & 0x0e {
-                4 | 12 => {
-                    let empty = self.rx.length == 0;
-                    if self.drain_rx() != 0 && empty {
-                        wake |= WAKE_RX;
-                    }
-                }
-                6 => {
-                    if self.reg_read(LSR) & LSR_DR != 0 {
-                        let empty = self.rx.length == 0;
-                        let byte = self.reg_read(DATA);
-                        self.rx.push(&mut self.rx_store, byte);
-                        self.drain_rx();
-                        if empty {
-                            wake |= WAKE_RX;
-                        }
-                    }
-                }
-                2 => wake |= self.fill_tx(),
-                0 => {
-                    self.reg_read(MSR);
-                }
-                _ => break,
-            }
         }
         wake
     }
@@ -551,18 +527,52 @@ fn fail_probe(index: usize, status: i32) -> i32 {
     status
 }
 
+// Hard delivery only identifies and quiets this UART. Do not mask a shared
+// controller line: another device may still need it while this port is serviced.
 unsafe extern "C" fn irq(context_pointer: *mut c_void, _virq: u32) -> u32 {
     let Some(lock) = context(context_pointer) else {
         return ddk::IRQ_NONE;
     };
-    let (wake, events) = {
-        let mut port = lock.lock_irqsave();
-        let wake = port.service();
-        (wake, (port.readable, port.writable, port.drained))
-    };
-    if wake == 0 {
+    let mut port = lock.lock_irqsave();
+    if !port.mapped || port.service_pending {
         return ddk::IRQ_NONE;
     }
+    let id = port.reg_read(IID);
+    if id == 0xff || id & 1 != 0 {
+        return ddk::IRQ_NONE;
+    }
+    port.service_pending = true;
+    port.reg_write(IER, port.required_ier);
+    ddk::IRQ_HANDLED | ddk::IRQ_WAKE_THREAD
+}
+
+unsafe extern "C" fn irq_service(context_pointer: *mut c_void, _virq: u32) {
+    let Some(lock) = context(context_pointer) else {
+        return;
+    };
+    let (wake, events) = {
+        let mut port = lock.lock_irqsave();
+        if !port.mapped {
+            return;
+        }
+        // Reading IIR in the hard handler can acknowledge a TX interrupt.
+        // Inspect RX/TX state directly rather than depending on that cause bit.
+        let empty = port.rx.length == 0;
+        let received = port.drain_rx();
+        let mut wake = if port.tx.length != 0 || port.ier & IER_TX != 0 {
+            port.fill_tx()
+        } else {
+            0
+        };
+        if received != 0 && empty {
+            wake |= WAKE_RX;
+        }
+        port.reg_read(LSR);
+        port.reg_read(MSR);
+        port.service_pending = false;
+        port.reg_write(IER, port.ier);
+        (wake, (port.readable, port.writable, port.drained))
+    };
     if wake & WAKE_RX != 0 {
         signal(events.0);
     }
@@ -571,11 +581,6 @@ unsafe extern "C" fn irq(context_pointer: *mut c_void, _virq: u32) -> u32 {
     }
     if wake & WAKE_DRAIN != 0 {
         signal(events.2);
-    }
-    if wake & !WAKE_SERVICED == 0 {
-        ddk::IRQ_HANDLED
-    } else {
-        ddk::IRQ_HANDLED | ddk::IRQ_RESCHEDULE
     }
 }
 unsafe extern "C" fn read(context_pointer: *mut c_void, out: *mut u8, length: usize) -> i64 {
@@ -803,8 +808,7 @@ fn name(index: u32, buffer: &mut [u8; 16]) -> &CStr {
     // terminator, all within its capacity.
     unsafe { CStr::from_bytes_with_nul_unchecked(&buffer[..=n]) }
 }
-// The probe path maps registers, programs the line, and publishes a
-// terminal; its steps share the port lock and ordering.
+// Probe reserves a port, performs sleepable setup, then publishes its IRQ and terminal.
 #[allow(clippy::too_many_lines)]
 unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_data: usize) -> i32 {
     // SAFETY: the driver core supplies a live device for the probe callback.
@@ -815,49 +819,51 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         return ddk::ENOSPC;
     };
     let lock = &PORTS[index];
+    // Probe owns the reserved slot. Query metadata and map registers before
+    // taking the raw lock: those framework operations may allocate or sleep.
+    let pxa = match_data == MATCH_PXA;
+    let clock = device
+        .integer(c"clock-frequency")
+        .ok()
+        .filter(|v| *v != 0)
+        .unwrap_or(if pxa { PXA_CLOCK } else { 1_843_200 }) as u32;
+    let memory = device.resource(ddk::RESOURCE_MEMORY, 0).ok();
+    let (mapping, io, shift, width) = if let Some(resource) = memory {
+        let shift = device
+            .integer(c"reg-shift")
+            .unwrap_or(if pxa { 2 } else { 0 }) as u32;
+        let width = device
+            .integer(c"reg-io-width")
+            .unwrap_or(if pxa { 4 } else { 1 }) as u32;
+        if shift > 8 || !matches!(width, 1 | 2 | 4) {
+            return fail_probe(index, ddk::EINVAL);
+        }
+        let mapping = match Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE) {
+            Ok(mapping) => mapping,
+            Err(error) => return fail_probe(index, error.status()),
+        };
+        (Some(mapping), 0, shift, width)
+    } else if let Ok(resource) = device.resource(ddk::RESOURCE_IO, 0) {
+        if resource.start > u64::from(u16::MAX) {
+            return fail_probe(index, ddk::ENOTSUP);
+        }
+        (None, resource.start as u16, 0, 1)
+    } else {
+        return fail_probe(index, ddk::ENOENT);
+    };
     {
         let mut port = lock.lock_irqsave();
         port.reset();
-        let pxa = match_data == MATCH_PXA;
+        port.memory = mapping.is_some();
+        port.mmio = mapping;
+        port.io = io;
+        port.shift = shift;
+        port.width = width;
+        port.clock = clock;
+        port.mapped = true;
         if pxa {
-            port.shift = 2;
-            port.width = 4;
             port.required_ier = IER_UUE;
             port.ier = IER_UUE;
-        }
-        port.clock = device
-            .integer(c"clock-frequency")
-            .ok()
-            .filter(|v| *v != 0)
-            .unwrap_or(if pxa { PXA_CLOCK } else { 1_843_200 }) as u32;
-        if let Ok(resource) = device.resource(ddk::RESOURCE_MEMORY, 0) {
-            port.memory = true;
-            port.shift = device.integer(c"reg-shift").unwrap_or(port.shift.into()) as u32;
-            port.width = device.integer(c"reg-io-width").unwrap_or(port.width.into()) as u32;
-            if port.shift > 8 || !matches!(port.width, 1 | 2 | 4) {
-                drop(port);
-                return fail_probe(index, ddk::EINVAL);
-            }
-            match Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE) {
-                Ok(map) => {
-                    port.mmio = Some(map);
-                    port.mapped = true;
-                }
-                Err(error) => {
-                    drop(port);
-                    return fail_probe(index, error.status());
-                }
-            }
-        } else if let Ok(resource) = device.resource(ddk::RESOURCE_IO, 0) {
-            if resource.start > u64::from(u16::MAX) {
-                drop(port);
-                return fail_probe(index, ddk::ENOTSUP);
-            }
-            port.io = resource.start as u16;
-            port.mapped = true;
-        } else {
-            drop(port);
-            return fail_probe(index, ddk::ENOENT);
         }
         let original = port.reg_read(SCR);
         port.reg_write(SCR, 0x5a);
@@ -898,7 +904,15 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         Err(error) => return fail_probe(index, error.status()),
     };
     let context = core::ptr::from_ref(lock) as *mut c_void;
-    let irq_receipt = match Irq::request(device, virq, c"uart", ddk::IRQ_SHARED, irq, context) {
+    let irq_receipt = match Irq::request_threaded(
+        device,
+        virq,
+        c"uart",
+        ddk::IRQ_SHARED,
+        irq,
+        irq_service,
+        context,
+    ) {
         Ok(value) => value,
         Err(error) => return fail_probe(index, error.status()),
     };
@@ -927,12 +941,11 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         port.ops.readable_event = port.readable.map_or(0, Event::id);
         port.ops.writable_event = port.writable.map_or(0, Event::id);
     }
-    let registration = {
-        let port = lock.lock_irqsave();
-        // SAFETY: this static port retains the operation table until terminal
-        // removal unregisters it.
-        unsafe { Tty::register(root, name(serial, &mut text), 0o660, 115_200, &port.ops) }
-    };
+    let operations = { lock.lock_irqsave().ops };
+    // SAFETY: registration copies the table. Callback context is this reserved
+    // static port and remains live until terminal removal completes.
+    let registration =
+        unsafe { Tty::register(root, name(serial, &mut text), 0o660, 115_200, &operations) };
     match registration {
         Ok(tty) => {
             lock.lock_irqsave().tty = Some(tty);
@@ -980,7 +993,8 @@ fn init(_: Module) -> Result<()> {
     Ok(())
 }
 fn exit(_: Module) {
-    if let Some(mut registration) = REGISTRATION.lock_irqsave().take() {
+    let registration = { REGISTRATION.lock_irqsave().take() };
+    if let Some(mut registration) = registration {
         let _ = registration.unregister();
     }
 }

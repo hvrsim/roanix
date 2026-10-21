@@ -110,6 +110,12 @@ pub struct CoreLocal {
     pub(crate) preempt_depth: AtomicUsize,
     pub(crate) preempt_pending: AtomicBool,
 
+    pub(crate) irq_guard_depth: AtomicUsize,
+    pub(crate) irq_guard_restore: AtomicBool,
+    pub(crate) irq_guard_started: AtomicU64,
+    pub(crate) irq_guard_max_ns: AtomicU64,
+    pub(crate) irq_guard_entries: AtomicU64,
+
     /// Timer state owned by this CPU.
     pub(crate) clock: Once<PerCpuClock>,
 
@@ -166,6 +172,11 @@ impl CoreLocal {
             spinlock_depth: AtomicUsize::new(0),
             preempt_depth: AtomicUsize::new(0),
             preempt_pending: AtomicBool::new(false),
+            irq_guard_depth: AtomicUsize::new(0),
+            irq_guard_restore: AtomicBool::new(false),
+            irq_guard_started: AtomicU64::new(0),
+            irq_guard_max_ns: AtomicU64::new(0),
+            irq_guard_entries: AtomicU64::new(0),
             clock: Once::new(),
             scheduler: Once::new(),
             sched_summary: CpuSummary::new(),
@@ -178,6 +189,7 @@ impl CoreLocal {
 /// RAII guard marking execution inside trap/interrupt context on the local CPU.
 pub struct InterruptContextGuard {
     active: bool,
+    _nosend: PhantomData<*mut ()>,
 }
 
 struct CpuRecord {
@@ -387,6 +399,7 @@ pub struct IrqSpinLockGuard<'a, T: ?Sized> {
     lock: &'a IrqSpinLock<T>,
     restore_irqs: bool,
     held: bool,
+    irq: Option<super::context::IrqGuard>,
     _nosend: PhantomData<*mut ()>,
 }
 
@@ -410,7 +423,7 @@ impl<T: ?Sized> IrqSpinLock<T> {
     #[inline]
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let restore_irqs = arch::irqstate();
-        arch::irqset(false);
+        let irq = super::context::IrqGuard::new();
         self.acquire();
         enter_spinlock();
 
@@ -418,6 +431,7 @@ impl<T: ?Sized> IrqSpinLock<T> {
             lock: self,
             restore_irqs,
             held: true,
+            irq: Some(irq),
             _nosend: PhantomData,
         }
     }
@@ -426,7 +440,7 @@ impl<T: ?Sized> IrqSpinLock<T> {
     #[inline]
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         let restore_irqs = arch::irqstate();
-        arch::irqset(false);
+        let irq = super::context::IrqGuard::new();
 
         if self.try_acquire() {
             enter_spinlock();
@@ -434,13 +448,12 @@ impl<T: ?Sized> IrqSpinLock<T> {
                 lock: self,
                 restore_irqs,
                 held: true,
+                irq: Some(irq),
                 _nosend: PhantomData,
             });
         }
 
-        if restore_irqs {
-            arch::irqset(true);
-        }
+        drop(irq);
         None
     }
 
@@ -536,9 +549,10 @@ impl<T: ?Sized> IrqSpinLockGuard<'_, T> {
     /// after the raw lock has been released.
     pub fn unlock_keep_irqs_disabled(mut self) -> bool {
         self.release();
-        let restore_irqs = self.restore_irqs;
-        self.restore_irqs = false;
-        restore_irqs
+        self.irq
+            .take()
+            .expect("smp: missing IRQ guard")
+            .leave_masked()
     }
 
     #[inline]
@@ -555,9 +569,7 @@ impl<T: ?Sized> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.release();
 
-        if self.restore_irqs {
-            arch::irqset(true);
-        }
+        drop(self.irq.take());
     }
 }
 
@@ -689,7 +701,10 @@ pub fn is_online(cpu_id: usize) -> bool {
 /// Marks the local CPU as executing inside trap/interrupt context.
 pub fn enter_interrupt_context() -> InterruptContextGuard {
     let Some(cpu) = arch::thiscpu_opt() else {
-        return InterruptContextGuard { active: false };
+        return InterruptContextGuard {
+            active: false,
+            _nosend: PhantomData,
+        };
     };
 
     assert!(
@@ -706,7 +721,10 @@ pub fn enter_interrupt_context() -> InterruptContextGuard {
     // SAFETY: interrupt entry runs with local interrupts disabled and the
     // assertions above rule out nested mutation.
     unsafe { arch::thiscpu_mut() }.interrupt_depth = 1;
-    InterruptContextGuard { active: true }
+    InterruptContextGuard {
+        active: true,
+        _nosend: PhantomData,
+    }
 }
 
 /// Returns whether the local CPU is currently handling a trap/interrupt.
@@ -737,11 +755,13 @@ fn leave_spinlock() {
 
 /// Pins execution to the current CPU while leaving interrupts deliverable.
 #[must_use]
-pub(crate) struct PreemptGuard {
+pub struct PreemptGuard {
     _nosend: PhantomData<*mut ()>,
 }
 
-pub(crate) fn disable_preemption() -> PreemptGuard {
+/// Prevents preemption and migration until the returned guard is dropped.
+/// Interrupts remain deliverable; blocking is forbidden while held.
+pub fn disable_preemption() -> PreemptGuard {
     let restore_irqs = arch::irqstate();
     arch::irqset(false);
     arch::thiscpu()
@@ -785,17 +805,17 @@ pub(crate) fn spinlock_depth() -> usize {
 /// Blocking requires interrupts to be deliverable, so no IRQ spinlock may be
 /// held and the CPU must not be inside a trap handler.
 #[inline]
-pub(crate) fn assert_blockable(context: &str) {
-    debug_assert!(
+pub fn assert_blockable(context: &str) {
+    assert!(
         arch::thiscpu_opt().is_none_or(|cpu| cpu.preempt_depth.load(Ordering::Relaxed) == 0),
         "{context}: blocked with preemption disabled"
     );
-    debug_assert!(
+    assert!(
         spinlock_depth() == 0,
         "{context}: blocked while holding {} IRQ spinlock(s)",
         spinlock_depth()
     );
-    debug_assert!(
+    assert!(
         !in_interrupt_context(),
         "{context}: blocked inside interrupt context"
     );

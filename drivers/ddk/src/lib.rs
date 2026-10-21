@@ -346,6 +346,7 @@ pub mod raw {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct ConsoleOps {
         pub size: u32,
         pub flags: u64,
@@ -465,6 +466,8 @@ pub const IRQ_DOMAIN_ROOT: u32 = 1 << 0;
 pub const IRQ_DOMAIN_DEFAULT: u32 = 1 << 2;
 pub const IRQ_NONE: u32 = 0;
 pub const IRQ_HANDLED: u32 = 1;
+/// Ask the kernel to run this action's registered service callback.
+pub const IRQ_WAKE_THREAD: u32 = 1 << 1;
 pub const IRQ_RESCHEDULE: u32 = 1 << 2;
 pub const LOG_ERROR: u32 = 1;
 pub const IFACE_MAY_SLEEP: u32 = 1 << 1;
@@ -1723,6 +1726,36 @@ impl Irq {
         handler: unsafe extern "C" fn(*mut c_void, u32) -> u32,
         context: *mut c_void,
     ) -> Result<Self> {
+        Self::request_with_thread(device, virq, name, flags, handler, None, context)
+    }
+
+    /// Registers a short hard handler and a sleepable, serialized service callback.
+    /// The hard handler quiets its source and returns `IRQ_WAKE_THREAD`. The service
+    /// callback drains authoritative state and rearms it. Both callbacks and their
+    /// context must stay live until release; service must not release itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_threaded(
+        device: Device,
+        virq: u32,
+        name: &CStr,
+        flags: u32,
+        handler: unsafe extern "C" fn(*mut c_void, u32) -> u32,
+        thread: unsafe extern "C" fn(*mut c_void, u32),
+        context: *mut c_void,
+    ) -> Result<Self> {
+        Self::request_with_thread(device, virq, name, flags, handler, Some(thread), context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_with_thread(
+        device: Device,
+        virq: u32,
+        name: &CStr,
+        flags: u32,
+        handler: unsafe extern "C" fn(*mut c_void, u32) -> u32,
+        thread: Option<unsafe extern "C" fn(*mut c_void, u32)>,
+        context: *mut c_void,
+    ) -> Result<Self> {
         let mut irq = ptr::null_mut();
         // SAFETY: handler and context remain valid until `release`.
         unsafe {
@@ -1733,7 +1766,7 @@ impl Irq {
                 name.as_ptr(),
                 flags,
                 Some(handler),
-                None,
+                thread,
                 context,
                 &raw mut irq,
             ))?;
@@ -1946,8 +1979,8 @@ unsafe impl Send for Tty {}
 
 impl Tty {
     /// # Safety
-    /// `operations` must remain immutable and valid for the terminal's
-    /// lifetime. Its context ownership stays with the caller.
+    /// Registration copies `operations`. Its callback code and context must
+    /// remain valid until the terminal is unregistered.
     pub unsafe fn register(
         parent: u64,
         name: &CStr,
