@@ -102,27 +102,24 @@ crate::syscall_handler! {
                 return Err(Errno::Access);
             }
             let vnode = file.vnode();
-            let file_size = vnode.getattr().map_err(map_fs_error)?.size;
-            let mapped_size = file_size
-                .checked_add(PAGE_SIZE - 1)
-                .map(|size| size & !(PAGE_SIZE - 1))
-                .ok_or(Errno::Overflow)?;
-            if (offset as u64)
-                .checked_add(size)
-                .is_none_or(|end| end > mapped_size)
-            {
-                // SIGBUS-on-access is not implemented yet, so reject ranges
-                // that could otherwise fabricate zero pages past EOF.
-                return Err(Errno::Invalid);
+            let device = matches!(vnode.kind(), crate::fs::VnodeKind::CharacterDevice
+                | crate::fs::VnodeKind::BlockDevice);
+            if device && (flags & MAP_SHARED == 0 || protection.contains(VmProtection::EXECUTE)) {
+                return Err(Errno::Access);
             }
-            let mut maximum = VmProtection::READ | VmProtection::EXECUTE;
+            let (object, object_offset) = file.mapping_object(offset as u64, size)
+                .map_err(map_fs_error)?;
+            let mut maximum = VmProtection::READ;
+            if !device {
+                maximum |= VmProtection::EXECUTE;
+            }
             if flags & MAP_PRIVATE != 0 || file.flags().contains(OpenFlags::WRITE) {
                 maximum |= VmProtection::WRITE;
             }
             (
                 VmBacking::Object {
-                    object: vnode.memory_object().map_err(map_fs_error)?,
-                    offset: offset as u64,
+                    object,
+                    offset: object_offset,
                     private: flags & MAP_PRIVATE != 0,
                 },
                 maximum,

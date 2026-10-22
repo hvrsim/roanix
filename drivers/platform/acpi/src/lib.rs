@@ -52,7 +52,7 @@ const EMPTY_OVERRIDE: InterruptOverride = InterruptOverride {
 
 struct State {
     overrides: [InterruptOverride; MAX_OVERRIDES],
-    devices: [Option<Device>; MAX_IOAPICS + MAX_LEGACY_UARTS],
+    devices: [Option<Device>; MAX_IOAPICS + MAX_LEGACY_UARTS + 1],
     count: usize,
     bus: Option<Bus>,
 }
@@ -61,7 +61,7 @@ impl State {
     const fn new() -> Self {
         Self {
             overrides: [EMPTY_OVERRIDE; MAX_OVERRIDES],
-            devices: [None; MAX_IOAPICS + MAX_LEGACY_UARTS],
+            devices: [None; MAX_IOAPICS + MAX_LEGACY_UARTS + 1],
             count: 0,
             bus: None,
         }
@@ -191,6 +191,18 @@ fn create_serial(state: &mut State, index: usize) -> Result<()> {
     state.remember(builder.publish()?)
 }
 
+fn create_keyboard(state: &mut State) -> Result<()> {
+    let mut builder = DeviceBuilder::new(c"keyboard@60")?;
+    let compatible = [c"pnp,PNP0303".as_ptr()];
+    let (gsi, flags) = resolve_isa(state, 1);
+    builder.set_bus(state.platform_bus()?)?;
+    builder.add_strings(c"compatible", &compatible)?;
+    builder.add_resource(RESOURCE_IO, 0, 0x60, 1, c"data")?;
+    builder.add_resource(RESOURCE_IO, 0, 0x64, 1, c"status")?;
+    builder.add_irq(&[gsi, flags])?;
+    state.remember(builder.publish()?)
+}
+
 fn map_table(physical: u64) -> Result<&'static [u8]> {
     let address = ddk::Mmio::direct(physical)?;
     // SAFETY: `mmio_direct` returns a valid boot direct-map address. The first
@@ -294,6 +306,7 @@ fn init(_module: Module) -> Result<()> {
     for index in 0..MAX_LEGACY_UARTS {
         create_serial(&mut state, index)?;
     }
+    create_keyboard(&mut state)?;
     Ok(())
 }
 

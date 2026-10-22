@@ -89,6 +89,7 @@ mod imports {
         fn cpu_platform_id(u32, *mut u64) -> i32;
         fn devfs_create(*const Module, u64, *const c_char, u32, u16, *const NodeOps, *mut u64) -> i32;
         fn devfs_mkdir(*const raw::Module, u64, *const c_char, u16, *mut u64) -> i32;
+        fn devfs_lookup(*const c_char, *mut u64) -> i32;
         fn devfs_remove(*const Module, u64) -> i32;
         fn devfs_root(*mut u64) -> i32;
         fn device_add(*mut raw::DeviceBuilder, *mut *const raw::Device) -> i32;
@@ -441,6 +442,7 @@ pub const ENOSPC: i32 = -8;
 pub const ENOMEM: i32 = -9;
 pub const EIO: i32 = -10;
 pub const EAGAIN: i32 = -11;
+pub const EDEFERRED: i32 = -14;
 pub const EINTR: i32 = -12;
 pub const ENODEV: i32 = -17;
 pub const ENOTTY: i32 = -19;
@@ -470,6 +472,8 @@ pub const IRQ_HANDLED: u32 = 1;
 pub const IRQ_WAKE_THREAD: u32 = 1 << 1;
 pub const IRQ_RESCHEDULE: u32 = 1 << 2;
 pub const LOG_ERROR: u32 = 1;
+pub const LOG_WARN: u32 = 2;
+pub const LOG_INFO: u32 = 3;
 pub const IFACE_MAY_SLEEP: u32 = 1 << 1;
 pub const IFACE_CONCURRENT: u32 = 1 << 2;
 pub const IFACE_SINGLETON: u32 = 1 << 3;
@@ -1350,6 +1354,11 @@ pub struct TicketLock<T> {
 unsafe impl<T: Send> Sync for TicketLock<T> {}
 
 impl<T> TicketLock<T> {
+    /// Exclusive access before publication or after all users have stopped.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     #[must_use]
     pub const fn new(value: T) -> Self {
         Self {
@@ -1908,6 +1917,16 @@ impl Drop for BlockRegistration {
 }
 
 impl Devfs {
+    /// Looks up a path relative to the devfs root, such as `input/event0`.
+    pub fn lookup(&self, path: &CStr) -> Result<u64> {
+        let mut node = 0;
+        // SAFETY: path and output storage remain live for this lookup.
+        unsafe {
+            result(imports::devfs_lookup(path.as_ptr(), &raw mut node))?;
+        }
+        Ok(node)
+    }
+
     pub fn current() -> Result<Self> {
         let _ = module()?;
         Ok(Self)

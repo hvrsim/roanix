@@ -394,6 +394,25 @@ pub trait VnodeOps: Any + Send + Sync {
         Err(Error::Unsupported)
     }
 
+    /// Resolves a file mapping, including device-specific mmap offsets.
+    fn mapping_object(
+        &self,
+        vnode: &Vnode,
+        _file_context: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Arc<VmObject>, u64)> {
+        let size = self.getattr(vnode)?.size;
+        let size = size
+            .checked_add(crate::mem::PAGE_SIZE - 1)
+            .ok_or(Error::InvalidArgument)?
+            & !(crate::mem::PAGE_SIZE - 1);
+        if offset.checked_add(length).is_none_or(|end| end > size) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((vnode.memory_object()?, offset))
+    }
+
     /// Reads a symbolic-link target.
     fn readlink(&self, _vnode: &Vnode) -> Result<Box<[u8]>> {
         Err(Error::InvalidArgument)
@@ -813,6 +832,18 @@ impl Vnode {
         }
         *cached = Some(object.clone());
         Ok(object)
+    }
+
+    /// Resolves backing storage for one open file's mapping request.
+    pub fn mapping_object(
+        &self,
+        file_context: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Arc<VmObject>, u64)> {
+        self.inner
+            .operations
+            .mapping_object(self, file_context, offset, length)
     }
 
     /// Reads a symbolic-link target.

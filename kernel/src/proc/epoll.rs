@@ -1,7 +1,7 @@
 //! epoll descriptor aggregation.
 
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -33,6 +33,11 @@ const EPOLL_UNSUPPORTED_FLAGS: u32 = EPOLLEXCLUSIVE | EPOLLWAKEUP;
 const EPOLL_EVENT_MASK: u32 = 0x07ff | EPOLLRDHUP;
 const EPOLL_WAIT_MAX: usize = 4096;
 const WAIT_INTERVAL_NS: u64 = 1_000_000;
+const MAX_NESTING: usize = 5;
+
+// Serialize graph changes so concurrent additions cannot form a cycle after
+// both callers have checked the old topology. Readiness never takes this lock.
+static TOPOLOGY: Mutex<Vec<Weak<Epoll>>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy)]
 struct UserEpollEvent {
@@ -45,6 +50,7 @@ struct Watch {
     events: u32,
     data: u64,
     last_ready: u32,
+    epochs: Vec<(usize, u64)>,
     disabled: bool,
 }
 
@@ -61,13 +67,17 @@ pub(crate) struct Epoll {
 
 impl Epoll {
     fn new(process: &Arc<Process>) -> Arc<Self> {
-        Arc::new(Self {
+        let epoll = Arc::new(Self {
             process: Arc::downgrade(process),
             state: Mutex::new(EpollState {
                 watches: BTreeMap::new(),
             }),
             changed: Event::new(),
-        })
+        });
+        let mut topology = TOPOLOGY.lock();
+        topology.retain(|entry| entry.strong_count() != 0);
+        topology.push(Arc::downgrade(&epoll));
+        epoll
     }
 
     fn control(
@@ -76,8 +86,17 @@ impl Epoll {
         descriptor: Descriptor,
         event: Option<UserEpollEvent>,
     ) -> Result<()> {
-        if matches!(descriptor, Descriptor::Epoll(_)) {
-            return Err(Errno::Invalid);
+        let topology = TOPOLOGY.lock();
+        if let Descriptor::Epoll(child) = &descriptor {
+            if core::ptr::eq(self, child.as_ref()) {
+                return Err(Errno::Invalid);
+            }
+            if operation == EPOLL_CTL_ADD && child.reaches(self) {
+                return Err(Errno::Loop);
+            }
+            if operation == EPOLL_CTL_ADD {
+                self.validate_nesting(child, &topology)?;
+            }
         }
         let key = descriptor.key();
         let mut state = self.state.lock();
@@ -95,6 +114,7 @@ impl Epoll {
                         events: event.events,
                         data: event.data,
                         last_ready: 0,
+                        epochs: Vec::new(),
                         disabled: false,
                     },
                 );
@@ -108,6 +128,7 @@ impl Epoll {
                 watch.events = event.events;
                 watch.data = event.data;
                 watch.last_ready = 0;
+                watch.epochs.clear();
                 watch.disabled = false;
                 Ok(())
             }
@@ -134,6 +155,14 @@ impl Epoll {
                 continue;
             }
             let requested = poll_mask(watch.events);
+            let epochs = if watch.events & EPOLLET != 0 {
+                notification_epochs(&watch.descriptor, requested)
+            } else {
+                Vec::new()
+            };
+            if epochs != watch.epochs {
+                watch.last_ready = 0;
+            }
             let ready = epoll_mask(watch.descriptor.poll(requested))
                 & (watch.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
             let report = if watch.events & EPOLLET != 0 {
@@ -142,6 +171,7 @@ impl Epoll {
                 ready
             };
             watch.last_ready = ready;
+            watch.epochs = epochs;
             if report == 0 {
                 continue;
             }
@@ -156,22 +186,109 @@ impl Epoll {
         output
     }
 
-    fn has_ready(&self) -> bool {
+    fn children(&self) -> Vec<Arc<Epoll>> {
+        self.state
+            .lock()
+            .watches
+            .values()
+            .filter_map(|watch| match &watch.descriptor {
+                Descriptor::Epoll(child) => Some(child.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reaches(&self, target: &Self) -> bool {
+        let mut pending = self.children();
+        let mut visited = BTreeSet::new();
+        while let Some(child) = pending.pop() {
+            if core::ptr::eq(child.as_ref(), target) {
+                return true;
+            }
+            if visited.insert(Arc::as_ptr(&child) as usize) {
+                pending.extend(child.children());
+            }
+        }
+        false
+    }
+
+    fn validate_nesting(&self, child: &Arc<Self>, topology: &[Weak<Self>]) -> Result<()> {
+        // Check ancestors too: adding a shallow subtree under an existing
+        // chain can exceed the limit. The cap also bounds recursive Arc drops.
+        let mut pending: Vec<_> = topology
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|entry| (entry, 1usize))
+            .collect();
+        let mut depths = BTreeMap::new();
+        while let Some((entry, depth)) = pending.pop() {
+            if depth > MAX_NESTING {
+                return Err(Errno::Loop);
+            }
+            let pointer = Arc::as_ptr(&entry) as usize;
+            if depths
+                .get(&pointer)
+                .is_some_and(|previous| *previous >= depth)
+            {
+                continue;
+            }
+            depths.insert(pointer, depth);
+            pending.extend(entry.children().into_iter().map(|child| (child, depth + 1)));
+            if core::ptr::eq(entry.as_ref(), self) {
+                pending.push((child.clone(), depth + 1));
+            }
+        }
+        Ok(())
+    }
+
+    fn ready_sources(&self, children: &mut Vec<Arc<Epoll>>) -> bool {
         let Some(process) = self.process.upgrade() else {
             return false;
         };
-        self.state.lock().watches.iter().any(|(key, watch)| {
+        self.state.lock().watches.iter_mut().any(|(key, watch)| {
             if watch.disabled || !process.contains_descriptor(*key) {
+                return false;
+            }
+            if watch.events & EPOLLET != 0
+                && notification_epochs(&watch.descriptor, poll_mask(watch.events)) != watch.epochs
+            {
+                watch.last_ready = 0;
+            }
+            if let Descriptor::Epoll(child) = &watch.descriptor {
+                if watch.events & u32::from(PollEvents::IN.bits()) != 0
+                    && (watch.events & EPOLLET == 0
+                        || watch.last_ready & u32::from(PollEvents::IN.bits()) == 0)
+                {
+                    children.push(child.clone());
+                }
                 return false;
             }
             let ready = epoll_mask(watch.descriptor.poll(poll_mask(watch.events)))
                 & (watch.events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
-            if watch.events & EPOLLET != 0 {
+            let report = if watch.events & EPOLLET != 0 {
                 ready & !watch.last_ready != 0
             } else {
                 ready != 0
-            }
+            };
+            watch.last_ready &= ready;
+            report
         })
+    }
+
+    fn has_ready(&self) -> bool {
+        // Traverse iteratively so userspace cannot exhaust the kernel stack by
+        // building a long chain. Never retain a child lock between iterations.
+        let mut pending = Vec::new();
+        if self.ready_sources(&mut pending) {
+            return true;
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(child) = pending.pop() {
+            if visited.insert(Arc::as_ptr(&child) as usize) && child.ready_sources(&mut pending) {
+                return true;
+            }
+        }
+        false
     }
 
     fn wait_descriptors(&self) -> Vec<(Descriptor, PollEvents)> {
@@ -196,6 +313,19 @@ impl Epoll {
             .collect()
     }
 
+    fn notification_sources(&self) -> Vec<(Descriptor, PollEvents)> {
+        let Some(process) = self.process.upgrade() else {
+            return Vec::new();
+        };
+        self.state
+            .lock()
+            .watches
+            .iter()
+            .filter(|(key, watch)| !watch.disabled && process.contains_descriptor(**key))
+            .map(|(_, watch)| (watch.descriptor.clone(), poll_mask(watch.events)))
+            .collect()
+    }
+
     pub(crate) fn poll(&self, requested: PollEvents) -> PollEvents {
         if requested.contains(PollEvents::IN) && self.has_ready() {
             PollEvents::IN
@@ -203,6 +333,37 @@ impl Epoll {
             PollEvents::empty()
         }
     }
+}
+
+// Readiness can become false and true entirely between two epoll calls.
+// Preserve endpoint notification epochs so an edge is not lost in that gap,
+// including when a parent only polls its child's epoll descriptor.
+fn notification_epochs(descriptor: &Descriptor, requested: PollEvents) -> Vec<(usize, u64)> {
+    let mut pending = alloc::vec![(descriptor.clone(), requested)];
+    let mut visited = BTreeSet::new();
+    let mut epochs = Vec::new();
+    while let Some((descriptor, requested)) = pending.pop() {
+        if let Descriptor::Epoll(child) = &descriptor {
+            if visited.insert(Arc::as_ptr(child) as usize) {
+                epochs.push((
+                    &child.changed as *const Event as usize,
+                    child.changed.generation(),
+                ));
+                pending.extend(child.notification_sources());
+            }
+        } else {
+            let mut events = Vec::new();
+            descriptor.poll_events(requested, &mut events);
+            epochs.extend(
+                events
+                    .into_iter()
+                    .map(|event| (event as *const Event as usize, event.generation())),
+            );
+        }
+    }
+    epochs.sort_unstable();
+    epochs.dedup();
+    epochs
 }
 
 crate::syscall_handler! {

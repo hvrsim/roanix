@@ -1,0 +1,45 @@
+#! /bin/sh
+
+version=1.8.12
+revision=1
+tarball_url="https://www.x.org/releases/individual/lib/libX11-${version}.tar.xz"
+tarball_blake2b="f4bdb69abb2add723ca84832ef35f239659228c1f5a3f53631f0d4d4afa7030512b9ba65479464f3efecca0e09d1f758e3b92b139dd5e716fac1b8caaf5bb98d"
+imagedeps="build-essential"
+
+configure() {
+    :
+}
+
+# Build only X.Org's locale and Compose data; no X server or Xlib is needed.
+preprocess() {
+    cpp -traditional -undef -nostdinc -P -DWCHAR32=1 < "$1" |
+        LC_ALL=C sed -e '/^[[:space:]]*XCOMM/s/XCOMM/#/' \
+            -e '/^[[:space:]]*XHASH/s/XHASH/#/' \
+            -e '/^$/d'
+}
+
+build() {
+    for name in locale.alias compose.dir; do
+        preprocess "${source_dir}/nls/${name}.pre" > "${name}.old"
+        # X.Org supplies both colon-free and legacy colon-separated entries.
+        LC_ALL=C sed -e '/^[^#][^\t ]*:/s/://' \
+            -e '/^[^#].*[\t ].*:/d' "${name}.old" > "${name}"
+        cat "${name}.old" >> "${name}"
+    done
+    for input in "${source_dir}"/nls/*/Compose.pre; do
+        locale=$(basename "$(dirname "${input}")")
+        mkdir -p "${locale}"
+        preprocess "${input}" > "${locale}/Compose"
+    done
+}
+
+package() {
+    target="${dest_dir}/usr/share/X11/locale"
+    mkdir -p "${target}" "${dest_dir}/usr/share/licenses/xcompose"
+    cp locale.alias compose.dir "${target}/"
+    for input in */Compose; do
+        mkdir -p "${target}/$(dirname "${input}")"
+        cp "${input}" "${target}/${input}"
+    done
+    cp "${source_dir}/COPYING" "${dest_dir}/usr/share/licenses/xcompose/"
+}

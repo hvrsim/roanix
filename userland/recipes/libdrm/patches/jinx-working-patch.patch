@@ -1,0 +1,84 @@
+diff --git libdrm-clean/include/drm/drm.h libdrm-workdir/include/drm/drm.h
+index 4e4f7c2..203cfc2 100644
+--- libdrm-clean/include/drm/drm.h
++++ libdrm-workdir/include/drm/drm.h
+@@ -35,7 +35,7 @@
+ #ifndef _DRM_H_
+ #define _DRM_H_
+ 
+-#if   defined(__linux__)
++#if defined(__linux__) || defined(__roanix__)
+ 
+ #include <linux/types.h>
+ #include <asm/ioctl.h>
+diff --git libdrm-clean/xf86drm.c libdrm-workdir/xf86drm.c
+index 6ca5626..6df5d9b 100644
+--- libdrm-clean/xf86drm.c
++++ libdrm-workdir/xf86drm.c
+@@ -3338,6 +3338,19 @@ static bool drmNodeIsDRM(int maj, int min)
+ 
+ drm_public int drmGetNodeTypeFromFd(int fd)
+ {
++#ifdef __roanix__
++    int type;
++
++    for (type = DRM_NODE_PRIMARY; type <= DRM_NODE_RENDER; type++) {
++        char *name = drmGetMinorNameForFD(fd, type);
++        if (name) {
++            free(name);
++            return type;
++        }
++    }
++    errno = ENODEV;
++    return -1;
++#else
+     struct stat sbuf;
+     int maj, min, type;
+ 
+@@ -3356,6 +3369,7 @@ drm_public int drmGetNodeTypeFromFd(int fd)
+     if (type == -1)
+         errno = ENODEV;
+     return type;
++#endif
+ }
+ 
+ drm_public int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags,
+@@ -3402,7 +3416,24 @@ drm_public int drmCloseBufferHandle(int fd, uint32_t handle)
+ 
+ static char *drmGetMinorNameForFD(int fd, int type)
+ {
+-#ifdef __linux__
++#if defined(__roanix__)
++    struct stat descriptor, candidate;
++    const char *pattern = drmGetDeviceName(type);
++    char path[PATH_MAX];
++    int minor;
++
++    if (!pattern || fstat(fd, &descriptor) || !S_ISCHR(descriptor.st_mode))
++        return NULL;
++
++    /* Roanix identifies vnodes by filesystem and inode. No sysfs dependency. */
++    for (minor = drmGetMinorBase(type); minor < drmGetMinorBase(type) + 64; minor++) {
++        snprintf(path, sizeof(path), pattern, DRM_DIR_NAME, minor);
++        if (!stat(path, &candidate) && S_ISCHR(candidate.st_mode) &&
++            candidate.st_dev == descriptor.st_dev && candidate.st_ino == descriptor.st_ino)
++            return strdup(path);
++    }
++    return NULL;
++#elif defined(__linux__)
+     DIR *sysdir;
+     struct dirent *ent;
+     struct stat sbuf;
+diff --git libdrm-clean/xf86drm.h libdrm-workdir/xf86drm.h
+index 6d91dfb..d10ba44 100644
+--- libdrm-clean/xf86drm.h
++++ libdrm-workdir/xf86drm.h
+@@ -47,7 +47,7 @@ extern "C" {
+ #define DRM_MAX_MINOR   64 /* deprecated */
+ #endif
+ 
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__roanix__)
+ 
+ #define DRM_IOCTL_NR(n)		_IOC_NR(n)
+ #define DRM_IOC_VOID		_IOC_NONE

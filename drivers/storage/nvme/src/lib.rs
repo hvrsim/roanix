@@ -42,6 +42,10 @@ const CSTS: usize = 0x1c;
 const AQA: usize = 0x24;
 const ASQ: usize = 0x28;
 const ACQ: usize = 0x30;
+#[cfg(target_arch = "riscv64")]
+const INTMS: usize = 0x0c;
+#[cfg(target_arch = "riscv64")]
+const INTMC: usize = 0x10;
 const DOORBELL_BASE: usize = 0x1000;
 const CC_ENABLE: u32 = 1;
 const CSTS_READY: u32 = 1;
@@ -203,9 +207,11 @@ impl QueuePair {
             if status & 1 == u16::from(self.phase) {
                 continue;
             }
-            if !self.event.wait_timeout(COMMAND_TIMEOUT_NS - elapsed)? {
-                return Err(Error::from_status(ddk::EIO));
-            }
+            #[cfg(target_arch = "riscv64")]
+            registers.write32(INTMC, 1);
+            // Recheck the completion before deciding that a timed wait failed:
+            // a completion and the deadline may become ready together.
+            self.event.wait_timeout(COMMAND_TIMEOUT_NS - elapsed)?;
         };
         if completion.cid != cid {
             return Err(Error::from_status(ddk::EIO));
@@ -217,6 +223,8 @@ impl QueuePair {
             self.phase = !self.phase;
         }
         registers.write32(self.cq_doorbell(stride), u32::from(self.cq_head));
+        #[cfg(target_arch = "riscv64")]
+        registers.write32(INTMC, 1);
         if completion.status >> 1 != 0 {
             return Err(Error::from_status(ddk::EIO));
         }
@@ -769,6 +777,11 @@ unsafe extern "C" fn interrupt(context: *mut c_void, virq: u32) -> u32 {
     // SAFETY: every IRQ receipt is released before the boxed controller and
     // its event slots are destroyed.
     let controller = unsafe { &*context.cast::<Controller>() };
+    // Quiet the level source before completing its PLIC claim. Consumers
+    // unmask after checking/acknowledging their queues, retriggering delivery
+    // when another queue completed while this interrupt was being handled.
+    #[cfg(target_arch = "riscv64")]
+    controller.registers.write32(INTMS, 1);
     let vector = controller
         .interrupt_virqs
         .iter()

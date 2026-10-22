@@ -1,0 +1,452 @@
+diff --git kmscon-clean/meson.build kmscon-workdir/meson.build
+index f34baa6..5ea7aa1 100644
+--- kmscon-clean/meson.build
++++ kmscon-workdir/meson.build
+@@ -52,7 +52,11 @@ systemdsystemunitdir = systemd_deps.get_variable(
+ #
+ xkbcommon_deps = dependency('xkbcommon', version: '>=0.5.0')
+ libtsm_deps = dependency('libtsm', version: '>=4.8.0', allow_fallback: true)
+-libudev_deps = dependency('libudev', version: '>=172')
++if host_machine.system() == 'roanix'
++    libudev_deps = declare_dependency()
++else
++    libudev_deps = dependency('libudev', version: '>=172')
++endif
+ dl_deps = dependency('dl')
+ threads_deps = dependency('threads')
+ zlib_deps = dependency('zlib')
+diff --git kmscon-clean/src/input/input.c kmscon-workdir/src/input/input.c
+index 328842c..76f8779 100644
+--- kmscon-clean/src/input/input.c
++++ kmscon-workdir/src/input/input.c
+@@ -54,6 +54,18 @@ static void input_free_dev(struct input_dev *dev);
+ 
+ static void notify_event(struct input_dev *dev, uint16_t type, uint16_t code, int32_t value)
+ {
++	if (type == EV_SYN && code == SYN_DROPPED) {
++		dev->dropped = true;
++		return;
++	}
++	if (dev->dropped) {
++		if (type == EV_SYN && code == SYN_REPORT) {
++			dev->dropped = false;
++			if (dev->capabilities & DEVICE_HAS_KEYS)
++				uxkb_dev_resync(dev);
++		}
++		return;
++	}
+ 	switch (type) {
+ 	case EV_KEY:
+ 		if (dev->capabilities & DEVICE_HAS_KEYS)
+diff --git kmscon-clean/src/input/input_internal.h kmscon-workdir/src/input/input_internal.h
+index 383754e..8bd2524 100644
+--- kmscon-clean/src/input/input_internal.h
++++ kmscon-workdir/src/input/input_internal.h
+@@ -88,6 +88,7 @@ struct input_dev {
+ 	struct input *input;
+ 
+ 	bool initialized;
++	bool dropped;
+ 
+ 	unsigned int capabilities;
+ 	int rfd;
+@@ -151,6 +152,7 @@ void uxkb_dev_destroy(struct input_dev *dev);
+ int uxkb_dev_process(struct input_dev *dev, uint16_t key_state, uint16_t code);
+ unsigned int uxkb_dev_get_mods(struct input_dev *dev);
+ void uxkb_dev_wake_up(struct input_dev *dev);
++void uxkb_dev_resync(struct input_dev *dev);
+ void uxkb_dev_set_leds(struct input_dev *dev, unsigned int scroll_lock, unsigned int num_lock,
+ 		       unsigned int caps_lock);
+ 
+diff --git kmscon-clean/src/input/input_uxkb.c kmscon-workdir/src/input/input_uxkb.c
+index b5a2967..da12236 100644
+--- kmscon-clean/src/input/input_uxkb.c
++++ kmscon-workdir/src/input/input_uxkb.c
+@@ -30,6 +30,7 @@
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/ioctl.h>
+ #include <unistd.h>
+ #include <xkbcommon/xkbcommon-compose.h>
+ #include <xkbcommon/xkbcommon.h>
+@@ -550,6 +551,34 @@ unsigned int uxkb_dev_get_mods(struct input_dev *dev)
+ 	return xkb_state_serialize_mods(dev->state, XKB_STATE_MODS_EFFECTIVE);
+ }
+ 
++void uxkb_dev_resync(struct input_dev *dev)
++{
++	unsigned char keys[(KEY_CNT + 7) / 8] = {0};
++	struct xkb_state *state;
++	xkb_mod_mask_t locked;
++	xkb_layout_index_t layout;
++
++	dev->repeating = false;
++	ev_timer_update(dev->repeat_timer, NULL);
++	if (dev->compose_state)
++		xkb_compose_state_reset(dev->compose_state);
++	state = xkb_state_new(dev->input->keymap);
++	if (!state)
++		return;
++	locked = xkb_state_serialize_mods(dev->state, XKB_STATE_MODS_LOCKED);
++	layout = xkb_state_serialize_layout(dev->state, XKB_STATE_LAYOUT_LOCKED);
++	/* Reconstruct state without replaying lost characters or hotkeys. */
++	if (ioctl(dev->rfd, EVIOCGKEY(sizeof(keys)), keys) >= 0)
++		for (unsigned int code = 0; code < KEY_CNT; code++)
++			if (keys[code / 8] & (1U << (code % 8)))
++				xkb_state_update_key(state, code + EVDEV_KEYCODE_OFFSET, XKB_KEY_DOWN);
++	xkb_state_update_mask(state,
++		xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED), 0, locked,
++		0, 0, layout);
++	xkb_state_unref(dev->state);
++	dev->state = state;
++}
++
+ void uxkb_dev_wake_up(struct input_dev *dev)
+ {
+ 	xkb_mod_mask_t locked_mods;
+diff --git kmscon-clean/src/terminal.c kmscon-workdir/src/terminal.c
+index dcfd8bc..9d13520 100644
+--- kmscon-clean/src/terminal.c
++++ kmscon-workdir/src/terminal.c
+@@ -1282,6 +1282,11 @@ static void terminal_close(struct kmscon_terminal *term)
+ 
+ void terminal_refresh_displays(struct kmscon_terminal *term)
+ {
++	struct screen *scr;
++	/* Other sessions share the display's back buffers. Invalidate both
++	 * buffers when restoring this terminal's cached screen contents. */
++	dlist_for_each_entry(scr, &term->screens, list)
++		display_set_need_redraw(scr->disp);
+ 	if (term->pointer.visible)
+ 		hw_cursor_show(term, term->pointer.x, term->pointer.y);
+ 	redraw_all(term);
+diff --git kmscon-clean/src/uterm/meson.build kmscon-workdir/src/uterm/meson.build
+index 322038e..e02007d 100644
+--- kmscon-clean/src/uterm/meson.build
++++ kmscon-workdir/src/uterm/meson.build
+@@ -2,12 +2,12 @@
+ # libuterm
+ # Provides API for VT switching, and monitoring devices (input and gpu)
+ #
+-uterm_srcs = [
+-    'monitor.c',
+-    'vt.c',
+-    'vt_fake.c',
+-    'vt_real.c',
+-]
++uterm_srcs = ['vt.c']
++if host_machine.system() == 'roanix'
++    uterm_srcs += ['monitor_roanix.c', 'vt_roanix.c']
++else
++    uterm_srcs += ['monitor.c', 'vt_fake.c', 'vt_real.c']
++endif
+ 
+ uterm_dep = [
+     libudev_deps,
+diff --git kmscon-workdir/src/uterm/monitor_roanix.c kmscon-workdir/src/uterm/monitor_roanix.c
+new file mode 100644
+index 0000000..c75d4ff
+--- /dev/null
++++ kmscon-workdir/src/uterm/monitor_roanix.c
+@@ -0,0 +1,179 @@
++/* SPDX-License-Identifier: MIT */
++/* Discover native device nodes, including devices added after seat startup. */
++#include <ctype.h>
++#include <dirent.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include "monitor.h"
++#include "shl/dlist.h"
++
++struct uterm_monitor_dev {
++	struct dlist list;
++	struct uterm_monitor *mon;
++	enum uterm_monitor_dev_type type;
++	char *node;
++	dev_t filesystem;
++	ino_t inode;
++	bool seen;
++	void *data;
++};
++
++struct uterm_monitor {
++	unsigned long ref;
++	struct ev_eloop *eloop;
++	struct ev_timer *timer;
++	struct uterm_monitor_cb cb;
++	struct dlist devices;
++	void *data;
++	bool scanning;
++};
++
++static void remove_device(struct uterm_monitor_dev *dev)
++{
++	dlist_unlink(&dev->list);
++	dev->mon->cb.free_dev(dev->mon->data, dev->type, dev->data);
++	free(dev->node);
++	free(dev);
++}
++
++static bool device_name(const char *name, const char *prefix)
++{
++	size_t length = strlen(prefix);
++	if (strncmp(name, prefix, length) || !name[length])
++		return false;
++	for (const char *p = name + length; *p; p++)
++		if (!isdigit((unsigned char)*p))
++			return false;
++	return true;
++}
++
++static void scan_directory(struct uterm_monitor *mon, const char *directory,
++			   const char *prefix, enum uterm_monitor_dev_type type)
++{
++	DIR *dir = opendir(directory);
++	struct dirent *entry;
++	if (!dir)
++		return;
++	while ((entry = readdir(dir))) {
++		struct uterm_monitor_dev *dev, *found = NULL;
++		struct stat status;
++		char *path;
++		if (!device_name(entry->d_name, prefix))
++			continue;
++		if (asprintf(&path, "%s/%s", directory, entry->d_name) < 0)
++			continue;
++		if (stat(path, &status) || !S_ISCHR(status.st_mode)) {
++			free(path);
++			continue;
++		}
++		dlist_for_each_entry(dev, &mon->devices, list) {
++			if (!strcmp(dev->node, path)) {
++				found = dev;
++				break;
++			}
++		}
++		if (found && (found->filesystem != status.st_dev || found->inode != status.st_ino)) {
++			remove_device(found);
++			found = NULL;
++		}
++		if (found) {
++			found->seen = true;
++			free(path);
++			continue;
++		}
++		dev = calloc(1, sizeof(*dev));
++		if (!dev) {
++			free(path);
++			continue;
++		}
++		dev->mon = mon;
++		dev->node = path;
++		dev->filesystem = status.st_dev;
++		dev->inode = status.st_ino;
++		dev->type = type;
++		dev->seen = true;
++		dlist_link_tail(&mon->devices, &dev->list);
++		mon->cb.new_dev(path, type, type == UTERM_MONITOR_DRM && !strcmp(entry->d_name, "card0")
++				? UTERM_MONITOR_PRIMARY : 0,
++				mon->data, dev);
++	}
++	closedir(dir);
++}
++
++static void scan(struct uterm_monitor *mon)
++{
++	struct uterm_monitor_dev *dev;
++	struct dlist *next;
++	dlist_for_each_entry(dev, &mon->devices, list)
++		dev->seen = false;
++	scan_directory(mon, "/dev/dri", "card", UTERM_MONITOR_DRM);
++	scan_directory(mon, "/dev/input", "event", UTERM_MONITOR_INPUT);
++	dlist_for_each_entry_safe(dev, next, &mon->devices, list)
++		if (!dev->seen)
++			remove_device(dev);
++}
++
++static void rescan(struct ev_timer *timer, uint64_t count, void *data)
++{
++	struct uterm_monitor *mon = data;
++	if (mon->scanning)
++		scan(mon);
++}
++
++int uterm_monitor_new(struct uterm_monitor **out, struct ev_eloop *eloop,
++		      struct uterm_monitor_cb *cb, void *data)
++{
++	struct uterm_monitor *mon = calloc(1, sizeof(*mon));
++	struct itimerspec interval = {.it_value.tv_sec = 1, .it_interval.tv_sec = 1};
++	int ret;
++	if (!mon)
++		return -ENOMEM;
++	mon->ref = 1;
++	mon->eloop = eloop;
++	mon->cb = *cb;
++	mon->data = data;
++	dlist_init(&mon->devices);
++	ret = ev_eloop_new_timer(eloop, &mon->timer, &interval, rescan, mon);
++	if (ret) {
++		free(mon);
++		return ret;
++	}
++	ev_eloop_ref(eloop);
++	*out = mon;
++	return 0;
++}
++
++void uterm_monitor_ref(struct uterm_monitor *mon)
++{
++	if (mon)
++		++mon->ref;
++}
++
++void uterm_monitor_unref(struct uterm_monitor *mon)
++{
++	struct uterm_monitor_dev *dev;
++	struct dlist *next;
++	if (!mon || --mon->ref)
++		return;
++	ev_eloop_rm_timer(mon->timer);
++	dlist_for_each_entry_safe(dev, next, &mon->devices, list)
++		remove_device(dev);
++	ev_eloop_unref(mon->eloop);
++	free(mon);
++}
++
++void uterm_monitor_scan(struct uterm_monitor *mon, const char *seat_name)
++{
++	if (!mon || strcmp(seat_name, "seat0"))
++		return;
++	mon->scanning = true;
++	scan(mon);
++}
++
++void uterm_monitor_set_dev_data(struct uterm_monitor_dev *dev, void *data)
++{
++	dev->data = data;
++}
+diff --git kmscon-clean/src/uterm/vt.c kmscon-workdir/src/uterm/vt.c
+index 67c4bcd..883cac8 100644
+--- kmscon-clean/src/uterm/vt.c
++++ kmscon-workdir/src/uterm/vt.c
+@@ -78,6 +78,9 @@ struct uterm_vt *uterm_vt_allocate(struct ev_eloop *eloop, bool libseat, struct
+ 	if (!eloop)
+ 		return NULL;
+ 
++#ifdef __roanix__
++	vt = uterm_vt_roanix_new(eloop, input);
++#else
+ 	if (libseat)
+ 		vt = uterm_vt_libseat_new(eloop, input, vt_name);
+ 
+@@ -86,6 +89,7 @@ struct uterm_vt *uterm_vt_allocate(struct ev_eloop *eloop, bool libseat, struct
+ 
+ 	if (!vt)
+ 		vt = uterm_vt_fake_new(eloop, input);
++#endif
+ 
+ 	if (!vt)
+ 		return NULL;
+diff --git kmscon-clean/src/uterm/vt_internal.h kmscon-workdir/src/uterm/vt_internal.h
+index 86932d3..4c1f2f6 100644
+--- kmscon-clean/src/uterm/vt_internal.h
++++ kmscon-workdir/src/uterm/vt_internal.h
+@@ -37,6 +37,10 @@ void vt_cb_activate(struct uterm_vt *vt);
+ int vt_cb_deactivate(struct uterm_vt *vt, bool force);
+ void vt_cb_hup(struct uterm_vt *vt);
+ 
++#ifdef __roanix__
++struct uterm_vt *uterm_vt_roanix_new(struct ev_eloop *eloop, struct input *input);
++#endif
++
+ struct uterm_vt *uterm_vt_real_new(struct ev_eloop *eloop, struct input *input,
+ 				   const char *vt_name);
+ struct uterm_vt *uterm_vt_fake_new(struct ev_eloop *eloop, struct input *input);
+diff --git kmscon-workdir/src/uterm/vt_roanix.c kmscon-workdir/src/uterm/vt_roanix.c
+new file mode 100644
+index 0000000..255cf0c
+--- /dev/null
++++ kmscon-workdir/src/uterm/vt_roanix.c
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: MIT */
++/* Roanix has a userspace seat; terminal sessions are managed by kmscon. */
++#include <stdlib.h>
++#include "vt_internal.h"
++
++static int activate(struct uterm_vt *vt)
++{
++	vt_cb_activate(vt);
++	return 0;
++}
++
++static int deactivate(struct uterm_vt *vt)
++{
++	return vt_cb_deactivate(vt, false);
++}
++
++static void destroy(struct uterm_vt *vt)
++{
++	vt_cb_deactivate(vt, true);
++	input_sleep(vt->input);
++}
++
++static const struct uterm_vt_ops ops = {
++	.activate = activate,
++	.deactivate = deactivate,
++	.destroy = destroy,
++};
++
++struct uterm_vt *uterm_vt_roanix_new(struct ev_eloop *eloop, struct input *input)
++{
++	struct uterm_vt *vt = calloc(1, sizeof(*vt));
++	if (!vt)
++		return NULL;
++	vt->eloop = eloop;
++	vt->input = input;
++	vt->ops = &ops;
++	input_wake_up(input);
++	return vt;
++}
+diff --git kmscon-clean/src/video/drm2d_video.c kmscon-workdir/src/video/drm2d_video.c
+index 8e86feb..5e5041e 100644
+--- kmscon-clean/src/video/drm2d_video.c
++++ kmscon-workdir/src/video/drm2d_video.c
+@@ -255,7 +255,7 @@ static void show_displays(struct video *video)
+ 	{
+ 		if (!display_is_online(disp))
+ 			continue;
+-		if (disp->dpms != DPMS_ON)
++		if (disp->dpms != DPMS_ON && disp->dpms != DPMS_UNKNOWN)
+ 			continue;
+ 
+ 		/* We use double-buffering so there might be no free back-buffer
+diff --git kmscon-clean/src/video/drm3d_video.c kmscon-workdir/src/video/drm3d_video.c
+index 0d84744..c5b64b8 100644
+--- kmscon-clean/src/video/drm3d_video.c
++++ kmscon-workdir/src/video/drm3d_video.c
+@@ -453,7 +453,7 @@ static void show_displays(struct video *video)
+ 	{
+ 		if (!display_is_online(disp))
+ 			continue;
+-		if (disp->dpms != DPMS_ON)
++		if (disp->dpms != DPMS_ON && disp->dpms != DPMS_UNKNOWN)
+ 			continue;
+ 
+ 		ret = drm3d_display_use(disp);
+diff --git kmscon-clean/src/video/drm_shared.c kmscon-workdir/src/video/drm_shared.c
+index e4fd870..114f2d6 100644
+--- kmscon-clean/src/video/drm_shared.c
++++ kmscon-workdir/src/video/drm_shared.c
+@@ -1058,7 +1058,7 @@ int drm_display_swap(struct display *disp, uint32_t fb)
+ 	struct drm_video *vdrm = disp->video->data;
+ 	int ret;
+ 
+-	if (disp->dpms != DPMS_ON)
++	if (disp->dpms != DPMS_ON && disp->dpms != DPMS_UNKNOWN)
+ 		return -EINVAL;
+ 
+ 	if ((disp->flags & DISPLAY_VSYNC))

@@ -806,19 +806,42 @@ pub(crate) fn spinlock_depth() -> usize {
 /// held and the CPU must not be inside a trap handler.
 #[inline]
 pub fn assert_blockable(context: &str) {
+    assert_context(context, false);
+}
+
+pub(crate) fn assert_sleepable(context: &str) {
+    assert_context(context, true);
+}
+
+fn assert_context(context: &str, sleepable: bool) {
+    // A preemptible caller may migrate after obtaining its CPU record. Keep
+    // sampling local so another thread's restrictions cannot trigger a panic.
+    let restore = arch::irqstate();
+    arch::irqset(false);
+    let preempt_depth =
+        arch::thiscpu_opt().map_or(0, |cpu| cpu.preempt_depth.load(Ordering::Relaxed));
+    let spin_depth = spinlock_depth();
+    let interrupt = !restore && in_interrupt_context();
+    let irq_guard_depth =
+        arch::thiscpu_opt().map_or(0, |cpu| cpu.irq_guard_depth.load(Ordering::Relaxed));
+    let scheduled = crate::sys::sched::current_thread_opt().is_some();
+    arch::irqset(restore);
     assert!(
-        arch::thiscpu_opt().is_none_or(|cpu| cpu.preempt_depth.load(Ordering::Relaxed) == 0),
+        preempt_depth == 0,
         "{context}: blocked with preemption disabled"
     );
     assert!(
-        spinlock_depth() == 0,
+        spin_depth == 0,
         "{context}: blocked while holding {} IRQ spinlock(s)",
-        spinlock_depth()
+        spin_depth
     );
-    assert!(
-        !in_interrupt_context(),
-        "{context}: blocked inside interrupt context"
-    );
+    assert!(!interrupt, "{context}: blocked inside interrupt context");
+    if sleepable {
+        assert!(irq_guard_depth == 0, "{context}: an IRQ guard is held");
+        if scheduled {
+            assert!(restore, "{context}: local IRQs are masked");
+        }
+    }
 }
 
 /// Queues `callback` for one or more CPUs and nudges them through the kernel's

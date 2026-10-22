@@ -21,6 +21,11 @@ is no general kernel symbol namespace.
 | `bus/pci/`         | `pci.ko`          | PCI/PCIe enumeration and configuration    |
 | `storage/nvme/`    | `storage-nvme.ko` | NVMe hardware driver                      |
 | `tty/uart8250/`    | `uart8250.ko`     | 8250/16550 serial hardware driver         |
+| `input/evdev/`     | —                | Shared evdev keyboard queues and ioctls   |
+| `input/i8042/`     | `i8042.ko`        | PC keyboard controller                   |
+| `usb/usb/`         | —                | USB host service ABI                     |
+| `usb/xhci/`        | `usb-xhci.ko`     | xHCI root ports, control and interrupt IN |
+| `usb/keyboard/`    | `usb-keyboard.ko` | USB HID boot keyboards                   |
 
 Enumerators publish devices on the kernel `platform` bus; drivers bind through
 match tables. Kernel policy and always-present services are deliberately not
@@ -65,3 +70,27 @@ After the controller and callback context are fully published, call
 `BlockRegistration::rescan()` once to discover GPT or MBR partitions. Dropping
 or explicitly unregistering the receipt withdraws the disk only when its nodes
 and mounted filesystems are idle.
+
+## USB keyboards
+
+`usb-xhci` claims PCI xHCI functions, owns their coherent command/event rings,
+and enumerates directly attached USB devices. It publishes USB interfaces on
+its `usb` bus and supplies a versioned `usb.host` service for control requests
+and interrupt IN transfers. x86 uses one MSI/MSI-X interrupter; RISC-V uses
+PLIC-routed INTx. Enumeration and waits run in worker context; the hard
+handler acknowledges and drains completion events without allocating.
+
+`usb-keyboard` binds HID boot keyboard interfaces, selects boot protocol, and
+translates modifier and six-key reports into Linux evdev keycodes. It shares
+the evdev implementation with i8042. Up to eight keyboard endpoints, including
+readers retaining disconnected devices, can coexist. Disconnection cancels
+pending reads before freeing controller DMA state. A descriptor kept open after
+unplug retains its static evdev endpoint until it can be reclaimed safely.
+
+The initial host service supports root-port keyboards. External hubs, bulk and
+isochronous transfers, HID report-protocol-only devices, and other USB classes
+are not implemented. These limits do not require changes in kmscon's input path.
+
+Modules may return `EDEFERRED` when a required bus is unavailable. The packaged
+module loader retries them after other modules have loaded, stopping if a pass
+makes no progress. Device-probe deferral remains a separate mechanism.

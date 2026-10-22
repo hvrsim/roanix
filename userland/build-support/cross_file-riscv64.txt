@@ -4,6 +4,7 @@ cpp = 'riscv64-roanix-g++'
 ar = 'riscv64-roanix-ar'
 nm = 'riscv64-roanix-nm'
 strip = 'riscv64-roanix-strip'
+pkg-config = 'riscv64-roanix-pkg-config'
 
 [host_machine]
 system = 'roanix'

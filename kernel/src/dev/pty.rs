@@ -222,9 +222,12 @@ impl DeviceNodeOps for Master {
             state.slave_seen = false;
             state.slave_opens = 0;
             state.locked = true;
-            state.to_master = queues.0;
-            state.to_slave = queues.1;
+            let old_master = core::mem::replace(&mut state.to_master, queues.0);
+            let old_slave = core::mem::replace(&mut state.to_slave, queues.1);
             slot.events.reset_for_open();
+            // Large buffers can use the VM allocator, which may sleep on free.
+            drop(state);
+            drop((old_master, old_slave));
             return Ok(index + 1);
         }
         Err(Error::NoSpace)

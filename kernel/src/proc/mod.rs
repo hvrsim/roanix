@@ -2,6 +2,7 @@
 
 mod elf;
 pub(crate) mod epoll;
+pub(crate) mod eventfd;
 pub(crate) mod inotify;
 mod pipe;
 pub(crate) mod signal;
@@ -33,6 +34,7 @@ use crate::{
 };
 
 pub(crate) use epoll::Epoll;
+pub(crate) use eventfd::EventFd;
 pub(crate) use inotify::Inotify;
 pub(crate) use pipe::{PipeEnd, PipeError};
 pub(crate) use signal::SignalFd;
@@ -66,6 +68,8 @@ pub enum Error {
     NoSuchProcess,
     /// The caller has no matching child process.
     NoChild,
+    /// A pending signal interrupted the operation.
+    Interrupted,
     /// The requested process operation is not permitted.
     PermissionDenied,
 }
@@ -94,6 +98,7 @@ impl fmt::Display for Error {
             Self::BadFileDescriptor => formatter.write_str("bad file descriptor"),
             Self::NoSuchProcess => formatter.write_str("process does not exist"),
             Self::NoChild => formatter.write_str("no matching child process"),
+            Self::Interrupted => formatter.write_str("process operation interrupted"),
             Self::PermissionDenied => formatter.write_str("process operation is not permitted"),
         }
     }
@@ -117,6 +122,8 @@ pub(crate) enum Descriptor {
     Inotify(Arc<Inotify>),
     /// Clock expiration counter.
     TimerFd(Arc<TimerFd>),
+    /// Userspace notification counter.
+    EventFd(Arc<EventFd>),
 }
 
 /// Stable identity of one open descriptor description.
@@ -153,6 +160,10 @@ impl Descriptor {
                 kind: 5,
                 pointer: Arc::as_ptr(value) as usize,
             },
+            Self::EventFd(value) => DescriptorKey {
+                kind: 6,
+                pointer: Arc::as_ptr(value) as usize,
+            },
         }
     }
 
@@ -164,6 +175,7 @@ impl Descriptor {
             Self::Epoll(epoll) => epoll.poll(requested),
             Self::Inotify(inotify) => inotify.poll(requested),
             Self::TimerFd(timer) => timer.poll(requested),
+            Self::EventFd(counter) => counter.poll(requested),
         }
     }
 
@@ -178,6 +190,7 @@ impl Descriptor {
             Self::SignalFd(signal_fd) => signal_fd.poll_events(requested, output),
             Self::Epoll(_) | Self::TimerFd(_) => false,
             Self::Inotify(inotify) => inotify.poll_events(requested, output),
+            Self::EventFd(counter) => counter.poll_events(requested, output),
         }
     }
 }
@@ -217,6 +230,7 @@ pub(crate) struct Process {
     active_threads: AtomicUsize,
     exited: AtomicBool,
     exit_status: AtomicI32,
+    wait_status: AtomicI32,
 }
 
 impl ProcessRegistry {
@@ -252,6 +266,7 @@ impl Process {
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
+            wait_status: AtomicI32::new(0),
         });
         let mut registry = process_registry().lock();
         registry.init = Arc::downgrade(&process);
@@ -278,6 +293,7 @@ impl Process {
             active_threads: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
+            wait_status: AtomicI32::new(0),
         });
         parent.children.lock().insert(pid, process.clone());
         process_registry()
@@ -732,6 +748,16 @@ impl Process {
             }
         }
     }
+
+    fn notify_wait_change(&self) {
+        let Some(parent) = self.parent.lock().upgrade() else {
+            return;
+        };
+        // Serialize with a waiter's scan/reset, but wake outside process locks.
+        drop(parent.children.lock());
+        parent.child_event.signal();
+        signal::send_kernel(&parent, signal::SIGCHLD);
+    }
 }
 
 fn process_registry() -> &'static Mutex<ProcessRegistry> {
@@ -850,7 +876,12 @@ pub(crate) fn exec_current(
 }
 
 /// Waits for and reaps one matching child process.
-pub(crate) fn wait_current(selector: isize, nohang: bool) -> Result<Option<(usize, i32)>> {
+pub(crate) fn wait_current(
+    selector: isize,
+    nohang: bool,
+    untraced: bool,
+    continued: bool,
+) -> Result<Option<(usize, i32)>> {
     if selector < -1 && selector == isize::MIN {
         return Err(Error::InvalidArgument);
     }
@@ -868,6 +899,15 @@ pub(crate) fn wait_current(selector: isize, nohang: bool) -> Result<Option<(usiz
                 if child.is_exited() {
                     exited = Some(*pid);
                     break;
+                }
+                let status = child.wait_status.load(Ordering::Acquire);
+                if ((untraced && status & 0xff == 0x7f) || (continued && status == 0xffff))
+                    && child
+                        .wait_status
+                        .compare_exchange(status, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    return Ok(Some((*pid, status)));
                 }
             }
             if !matching {
@@ -892,7 +932,10 @@ pub(crate) fn wait_current(selector: isize, nohang: bool) -> Result<Option<(usiz
             unregister_process(pid);
             return Ok(Some((pid, status)));
         }
-        parent.child_event.wait();
+        if parent.prepare_interrupt_wait() {
+            return Err(Error::Interrupted);
+        }
+        Event::wait_any(&[&parent.child_event, parent.interrupt_event()]);
     }
 }
 

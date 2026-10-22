@@ -26,6 +26,8 @@ USERLAND = ROOT / "userland"
 
 SYSTEM_PACKAGES = (
     "linux-headers",
+    "libdrm",
+    "kmscon",
     "bash",
     "coreutils",
     "python",
@@ -39,8 +41,8 @@ TARGETS = {
     "riscv64": "riscv64gc-unknown-none-elf",
 }
 DRIVERS = {
-    "x86_64": ("acpi", "ioapic", "pci", "nvme", "uart8250"),
-    "riscv64": ("fdt", "plic", "pci", "nvme", "uart8250"),
+    "x86_64": ("acpi", "ioapic", "pci", "nvme", "uart8250", "i8042", "usb-xhci", "usb-keyboard"),
+    "riscv64": ("fdt", "plic", "pci", "nvme", "uart8250", "usb-xhci", "usb-keyboard"),
 }
 
 # Pinned build tools and firmware.
@@ -618,7 +620,7 @@ class Build:
         ]
 
         if image.suffix == ".iso":
-            args += ["-cdrom", str(image)]
+            args += ["-cdrom", str(image), "-boot", "order=d"]
         else:
             args += ["-drive", f"file={image},format=raw"]
 

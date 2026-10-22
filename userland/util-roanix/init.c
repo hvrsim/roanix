@@ -169,28 +169,30 @@ static void detect_terminal_size(void) {
         publish_terminal_size(rows, columns);
 }
 
-static void run_shell(void) {
+static pid_t spawn_console(int graphical) {
     pid_t child = fork();
     if (child < 0) {
         perror("init: fork");
-        sleep(1);
-        return;
+        return -1;
     }
 
     if (child == 0) {
+        if (graphical) {
+            if (setsid() < 0) {
+                perror("init: graphical session");
+                _exit(1);
+            }
+            execl("/usr/bin/kmscon", "kmscon", "--no-reset-env", "--session-control",
+                  "--login", "--", "/usr/bin/bash", (char *)NULL);
+            perror("init: exec /usr/bin/kmscon");
+            _exit(127);
+        }
         execl("/usr/bin/bash", "bash", (char *)NULL);
         perror("init: exec /usr/bin/bash");
         _exit(127);
     }
 
-    for (;;) {
-        if (waitpid(child, NULL, 0) >= 0)
-            return;
-        if (errno != EINTR) {
-            perror("init: waitpid");
-            return;
-        }
-    }
+    return child;
 }
 
 int main(void) {
@@ -217,8 +219,30 @@ int main(void) {
     printf("Welcome to roanix!\n");
     fflush(stdout);
 
+    int graphical = access("/usr/bin/kmscon", X_OK) == 0
+        && access("/dev/dri/card0", R_OK | W_OK) == 0;
+    pid_t serial = -1, display = -1;
     for (;;) {
-        run_shell();
-        clear_terminal();
+        if (serial < 0)
+            serial = spawn_console(0);
+        if (graphical && display < 0)
+            display = spawn_console(1);
+        if (serial < 0 || (graphical && display < 0)) {
+            sleep(1);
+            continue;
+        }
+        int status;
+        pid_t child = waitpid(-1, &status, 0);
+        if (child == serial) {
+            serial = -1;
+            clear_terminal();
+        } else if (graphical && child == display) {
+            display = -1;
+            fprintf(stderr, "init: kmscon exited (status %d), restarting\n", status);
+            sleep(1);
+        } else if (child < 0 && errno != EINTR) {
+            perror("init: waitpid");
+            sleep(1);
+        }
     }
 }

@@ -14,10 +14,25 @@ name = "ddk"
 version = "0.1.0"
 
 [[package]]
+name = "evdev"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+]
+
+[[package]]
 name = "fdt"
 version = "0.1.0"
 dependencies = [
  "ddk",
+]
+
+[[package]]
+name = "i8042"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+ "evdev",
 ]
 
 [[package]]
@@ -53,4 +68,28 @@ name = "uart8250"
 version = "0.1.0"
 dependencies = [
  "ddk",
+]
+
+[[package]]
+name = "usb"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+]
+
+[[package]]
+name = "usb-keyboard"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+ "evdev",
+ "usb",
+]
+
+[[package]]
+name = "usb-xhci"
+version = "0.1.0"
+dependencies = [
+ "ddk",
+ "usb",
 ]

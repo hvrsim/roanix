@@ -290,6 +290,16 @@ impl OpenFile {
         self.vnode().terminal_state()
     }
 
+    /// Resolves backing storage for a mapping of this open file description.
+    pub fn mapping_object(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Arc<crate::mem::VmObject>, u64)> {
+        self.vnode()
+            .mapping_object(self.file_context, offset, length)
+    }
+
     /// Performs a device- or filesystem-specific control operation.
     pub fn ioctl(
         &self,

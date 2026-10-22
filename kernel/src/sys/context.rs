@@ -6,7 +6,7 @@
 
 use core::{marker::PhantomData, sync::atomic::Ordering};
 
-use super::{sched, smp};
+use super::smp;
 use crate::arch;
 
 pub use smp::{PreemptGuard, disable_preemption};
@@ -94,14 +94,7 @@ impl Drop for IrqGuard {
 /// Checks the complete thread-context contract, including uncontended paths.
 /// Early initialization may use uncontended locks before scheduling starts.
 pub fn assert_sleepable(operation: &str) {
-    smp::assert_blockable(operation);
-    assert!(
-        arch::thiscpu_opt().is_none_or(|cpu| cpu.irq_guard_depth.load(Ordering::Relaxed) == 0),
-        "{operation}: an IRQ guard is held"
-    );
-    if sched::current_thread_opt().is_some() {
-        assert!(arch::irqstate(), "{operation}: local IRQs are masked");
-    }
+    smp::assert_sleepable(operation);
 }
 
 /// Per-CPU IRQ restriction measurements. Durations are collected in debug builds.

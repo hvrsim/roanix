@@ -245,19 +245,36 @@ pub fn load_directory(path: &[u8]) -> Result<usize> {
         directory = &directory[..directory.len() - 1];
     }
     let mut loaded = 0usize;
-    for name in &names {
-        let mut full = directory.to_vec();
-        full.push(b'/');
-        full.extend_from_slice(name.as_bytes());
-        match load_file(&full) {
-            Ok(module) => {
-                debug!("loaded module {}", module.name());
-                loaded += 1;
+    while !names.is_empty() {
+        let previous = names.len();
+        names.retain(|name| {
+            let mut full = directory.to_vec();
+            full.push(b'/');
+            full.extend_from_slice(name.as_bytes());
+            match load_file(&full) {
+                Ok(module) => {
+                    debug!("loaded module {}", module.name());
+                    loaded += 1;
+                    false
+                }
+                Err(Error::AlreadyExists) => {
+                    debug!("module {name} was loaded during early boot; skipping packaged copy");
+                    false
+                }
+                Err(Error::Deferred) => true,
+                Err(failure) => {
+                    error!("failed to load module {name}: {failure:?}");
+                    false
+                }
             }
-            Err(Error::AlreadyExists) => {
-                debug!("module {name} was loaded during early boot; skipping packaged copy");
+        });
+        // Retry only explicitly deferred modules, and only while another
+        // module made progress publishing their prerequisites.
+        if names.len() == previous {
+            for name in &names {
+                error!("module {name} has unresolved prerequisites");
             }
-            Err(failure) => error!("failed to load module {name}: {failure:?}"),
+            break;
         }
     }
     super::super::core::probe::retrigger();

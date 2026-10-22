@@ -269,7 +269,8 @@ crate::syscall_handler! {
         }
         let selector = isize::try_from(selector).map_err(|_| Errno::Invalid)?;
         let Some((pid, encoded_status)) =
-            proc::wait_current(selector, flags & WNOHANG != 0).map_err(map_process_error)?
+            proc::wait_current(selector, flags & WNOHANG != 0,
+                flags & WUNTRACED != 0, flags & WCONTINUED != 0).map_err(map_process_error)?
         else {
             return Ok(0);
         };

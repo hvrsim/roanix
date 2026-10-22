@@ -362,8 +362,9 @@ impl SignalManager {
         SignalWait::Sleep
     }
 
-    fn enqueue(&self, info: SignalInfo) {
+    fn enqueue(&self, process: &Process, info: SignalInfo) {
         let mut wake_stopped = None;
+        let mut continued = false;
         {
             let mut state = self.state.lock();
             let signal = info.signal;
@@ -372,6 +373,10 @@ impl SignalManager {
                     .pending
                     .retain(|pending| !is_stop_signal(pending.signal));
                 wake_stopped = state.stopped.take();
+                if signal == SIGCONT && wake_stopped.is_some() {
+                    process.wait_status.store(0xffff, Ordering::Release);
+                    continued = true;
+                }
             } else if is_stop_signal(signal) {
                 state.pending.retain(|pending| pending.signal != SIGCONT);
             }
@@ -386,6 +391,9 @@ impl SignalManager {
                 self.pending_work.store(true, Ordering::Release);
                 self.event.signal();
             }
+        }
+        if continued {
+            process.notify_wait_change();
         }
         if let Some((thread, sequence)) = wake_stopped {
             let _ = sched::wake(thread as *mut crate::sys::thread::Thread, sequence);
@@ -457,8 +465,36 @@ impl SignalManager {
         false
     }
 
-    fn mark_stopped(&self, thread: *mut crate::sys::thread::Thread, sequence: u64) {
-        self.state.lock().stopped = Some((thread as usize, sequence));
+    fn mark_stopped(
+        &self,
+        process: &Process,
+        thread: *mut crate::sys::thread::Thread,
+        sequence: u64,
+        signal: u8,
+    ) {
+        let stopped = {
+            let mut state = self.state.lock();
+            if state
+                .pending
+                .iter()
+                .any(|info| matches!(info.signal, SIGCONT | SIGKILL))
+            {
+                false
+            } else {
+                state.stopped = Some((thread as usize, sequence));
+                process
+                    .wait_status
+                    .store((i32::from(signal) << 8) | 0x7f, Ordering::Release);
+                true
+            }
+        };
+        if stopped {
+            process.notify_wait_change();
+        } else {
+            // A continue/kill raced with taking the stop signal. Cancel the
+            // prepared park so delivery can process it without going to sleep.
+            let _ = sched::wake(thread, sequence);
+        }
     }
 }
 
@@ -570,13 +606,16 @@ pub(crate) fn kill(selector: i64, signal: i32) -> Result<()> {
         return Ok(());
     };
     for target in targets {
-        target.signals.enqueue(SignalInfo {
-            signal,
-            code: SI_USER,
-            sender_pid: current.pid() as u32,
-            sender_uid: 0,
-            synchronous: false,
-        });
+        target.signals.enqueue(
+            &target,
+            SignalInfo {
+                signal,
+                code: SI_USER,
+                sender_pid: current.pid() as u32,
+                sender_uid: 0,
+                synchronous: false,
+            },
+        );
     }
     Ok(())
 }
@@ -601,25 +640,31 @@ pub(crate) fn kill_thread(pid: usize, tid: usize, signal: i32) -> Result<()> {
     let Some(signal) = signal else {
         return Ok(());
     };
-    current.signals.enqueue(SignalInfo {
-        signal,
-        code: SI_TKILL,
-        sender_pid: current.pid() as u32,
-        sender_uid: 0,
-        synchronous: false,
-    });
+    current.signals.enqueue(
+        &current,
+        SignalInfo {
+            signal,
+            code: SI_TKILL,
+            sender_pid: current.pid() as u32,
+            sender_uid: 0,
+            synchronous: false,
+        },
+    );
     Ok(())
 }
 
 /// Queues a kernel-generated signal for one process.
 pub(crate) fn send_kernel(process: &Arc<Process>, signal: u8) {
-    process.signals.enqueue(SignalInfo {
-        signal,
-        code: SI_KERNEL,
-        sender_pid: 0,
-        sender_uid: 0,
-        synchronous: false,
-    });
+    process.signals.enqueue(
+        process,
+        SignalInfo {
+            signal,
+            code: SI_KERNEL,
+            sender_pid: 0,
+            sender_uid: 0,
+            synchronous: false,
+        },
+    );
 }
 
 /// Queues a kernel-generated signal for every live member of a process group.
@@ -642,13 +687,16 @@ pub(crate) fn send_kernel_process_group(group: usize, signal: u8) {
 /// Queues a synchronous kernel-generated signal for the current process.
 pub(crate) fn send_current(signal: u8) {
     if let Some(process) = super::current() {
-        process.signals.enqueue(SignalInfo {
-            signal,
-            code: SI_KERNEL,
-            sender_pid: 0,
-            sender_uid: 0,
-            synchronous: true,
-        });
+        process.signals.enqueue(
+            &process,
+            SignalInfo {
+                signal,
+                code: SI_KERNEL,
+                sender_pid: 0,
+                sender_uid: 0,
+                synchronous: true,
+            },
+        );
     }
 }
 
@@ -681,7 +729,9 @@ fn deliver_pending(frame: &mut TrapFrame) -> core::result::Result<(), u8> {
             // SAFETY: the current scheduler thread remains live while this
             // kernel continuation parks and is later resumed.
             let sequence = unsafe { &*thread }.prepare_park();
-            process.signals.mark_stopped(thread, sequence);
+            process
+                .signals
+                .mark_stopped(&process, thread, sequence, signal);
             sched::park_current(thread, sequence);
             continue;
         }

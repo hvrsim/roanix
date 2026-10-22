@@ -1,0 +1,25 @@
+[package]
+name = "usb-xhci"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+autolib = false
+
+[[bin]]
+name = "usb-xhci"
+path = "src/lib.rs"
+
+[dependencies]
+ddk = { path = "../../ddk" }
+usb = { path = "../usb" }
+
+[build-dependencies]
+ddk = { path = "../../ddk", features = ["module-build"] }
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -74,10 +74,10 @@ index 0000000..9e8955e
 +}
 diff --git mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
 new file mode 100644
-index 0000000..3209d9b
+index 0000000..f7de462
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1374 @@
+@@ -0,0 +1,1412 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -94,6 +94,7 @@ index 0000000..3209d9b
 +#include <sys/utsname.h>
 +#include <sys/wait.h>
 +#include <termios.h>
++#include <time.h>
 +#include <unistd.h>
 +
 +#include <bits/ensure.h>
@@ -782,6 +783,14 @@ index 0000000..3209d9b
 +    return error;
 +}
 +
++int Sysdeps<EventfdCreate>::operator()(unsigned int value, int flags, int *fd) {
++    long result = roanix_syscall2(ROANIX_SYS_EVENTFD_CREATE, value, flags);
++    int error = syscall_error(result);
++    if (!error)
++        *fd = static_cast<int>(result);
++    return error;
++}
++
 +int Sysdeps<EpollCtl>::operator()(
 +        int epoll_fd, int operation, int fd, struct epoll_event *event) {
 +    return syscall_error(roanix_syscall4(
@@ -867,11 +876,40 @@ index 0000000..3209d9b
 +}
 +
 +int Sysdeps<Sleep>::operator()(time_t *seconds, long *nanoseconds) {
++    if (*seconds < 0 || *nanoseconds < 0 || *nanoseconds >= 1000000000)
++        return EINVAL;
++    time_t started_seconds;
++    long started_nanoseconds;
++    bool timed = !Sysdeps<ClockGet>::operator()(CLOCK_MONOTONIC,
++        &started_seconds, &started_nanoseconds);
 +    int error = syscall_error(roanix_syscall2(
 +        ROANIX_SYS_CLOCK_SLEEP, *seconds, *nanoseconds));
 +    if (!error) {
 +        *seconds = 0;
 +        *nanoseconds = 0;
++    } else if (error == EINTR && timed) {
++        time_t now_seconds;
++        long now_nanoseconds;
++        if (!Sysdeps<ClockGet>::operator()(CLOCK_MONOTONIC, &now_seconds, &now_nanoseconds)) {
++            time_t elapsed_seconds = now_seconds - started_seconds;
++            long elapsed_nanoseconds = now_nanoseconds - started_nanoseconds;
++            if (elapsed_nanoseconds < 0) {
++                --elapsed_seconds;
++                elapsed_nanoseconds += 1000000000;
++            }
++            if (elapsed_seconds > *seconds
++                    || (elapsed_seconds == *seconds && elapsed_nanoseconds >= *nanoseconds)) {
++                *seconds = 0;
++                *nanoseconds = 0;
++            } else {
++                *seconds -= elapsed_seconds;
++                *nanoseconds -= elapsed_nanoseconds;
++                if (*nanoseconds < 0) {
++                    --*seconds;
++                    *nanoseconds += 1000000000;
++                }
++            }
++        }
 +    }
 +    return error;
 +}
@@ -1538,10 +1576,10 @@ index 0000000..375b4f1
 \ No newline at end of file
 diff --git mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
 new file mode 100644
-index 0000000..44482f7
+index 0000000..de1e002
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,144 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1613,6 +1651,7 @@ index 0000000..44482f7
 +    Renameat,
 +    Pipe,
 +    Poll,
++    EventfdCreate,
 +    EpollCreate,
 +    EpollCtl,
 +    EpollPwait,
@@ -1687,10 +1726,10 @@ index 0000000..44482f7
 +} // namespace mlibc
 diff --git mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
 new file mode 100644
-index 0000000..fd97218
+index 0000000..edf935f
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,248 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1778,7 +1817,8 @@ index 0000000..fd97218
 +    ROANIX_SYS_THREAD_KILL,
 +    ROANIX_SYS_THREAD_SET_NAME,
 +    ROANIX_SYS_THREAD_GET_NAME,
-+    ROANIX_SYS_FILE_MOUNT
++    ROANIX_SYS_FILE_MOUNT,
++    ROANIX_SYS_EVENTFD_CREATE
 +};
 +
 +/// Longest thread name the kernel stores, excluding the NUL terminator.
@@ -2124,7 +2164,7 @@ index 0000000..d7ccfd4
 +.section .note.GNU-stack,"",%progbits
 diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S
 new file mode 100644
-index 0000000..1baada4
+index 0000000..4b3fdcc
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crti.S
 @@ -0,0 +1,15 @@
@@ -2145,10 +2185,10 @@ index 0000000..1baada4
 +.section .note.GNU-stack,"",%progbits
 diff --git mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
 new file mode 100644
-index 0000000..76a4b87
+index 0000000..6029b17
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/riscv64/crt-src/crtn.S
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,11 @@
 +.section .init
 +    ld ra, 8(sp)
 +    addi sp, sp, 16

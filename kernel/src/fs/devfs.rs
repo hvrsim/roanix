@@ -12,7 +12,7 @@ use core::{
 };
 
 use crate::{
-    mem::{IoSink, IoSource},
+    mem::{IoSink, IoSource, VmObject},
     sys::{
         clock,
         event::Event,
@@ -205,6 +205,16 @@ where
 
 /// File operations implemented by a driver-owned device node.
 pub trait DeviceNodeOps: Send + Sync {
+    /// Resolves an mmap token belonging to this open file description.
+    fn mapping_object(
+        &self,
+        _file_context: usize,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<(Arc<VmObject>, u64)> {
+        Err(Error::Unsupported)
+    }
+
     /// Returns the initial byte offset for a new open file description.
     fn initial_offset(&self, _file_context: usize, _flags: u32) -> Result<u64> {
         Ok(0)
@@ -1055,6 +1065,18 @@ impl VnodeOps for DevfsNode {
                 operations.sync()
             }
         }
+    }
+
+    fn mapping_object(
+        &self,
+        _vnode: &Vnode,
+        file_context: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Arc<VmObject>, u64)> {
+        let _activity = self.begin_activity()?;
+        self.device_operations()?
+            .mapping_object(file_context, offset, length)
     }
 
     fn ioctl(

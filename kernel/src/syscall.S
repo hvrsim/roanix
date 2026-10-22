@@ -85,6 +85,7 @@ syscall_table:
     .quad syscall_thread_set_name
     .quad syscall_thread_get_name
     .quad syscall_file_mount
+    .quad syscall_eventfd_create
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

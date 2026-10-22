@@ -1,0 +1,21 @@
+#! /bin/sh
+
+version=4.8.0
+revision=1
+tarball_url="https://github.com/kmscon/libtsm/archive/refs/tags/v${version}.tar.gz"
+tarball_blake2b="ded6bf24b0a0ed16b8476c4c99670c69affd42e0ede106064f6653693822784f2f41c91ca4352a3f391d07250cb3815fbdcd599bbca0f7c9d88d803f05607313"
+hostdeps="gcc-host pkg-config"
+deps="sys-libs"
+
+configure() {
+    meson_configure -Dtests=false -Dgtktsm=false
+}
+
+build() {
+    ninja -j"${parallelism}"
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+    post_package_strip
+}

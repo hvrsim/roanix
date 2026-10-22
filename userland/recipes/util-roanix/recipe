@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=0.1
-revision=21
+revision=24
 source_dir="util-roanix"
 hostdeps="gcc-host binutils"
 deps="sys-libs"

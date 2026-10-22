@@ -403,7 +403,7 @@ crate::syscall_handler! {
             Descriptor::SignalFd(_) => {
                 write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
             }
-            Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) => {
+            Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) | Descriptor::EventFd(_) => {
                 write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
             }
         }
@@ -461,6 +461,9 @@ crate::syscall_handler! {
                         0
                     })
                 }
+                Descriptor::EventFd(counter) => {
+                    Ok(O_RDWR | if counter.is_nonblocking() { O_NONBLOCK } else { 0 })
+                }
             },
             F_SETFL => {
                 if argument & !(O_ACCMODE | O_APPEND | O_NONBLOCK) != 0 {
@@ -481,6 +484,7 @@ crate::syscall_handler! {
                     Descriptor::TimerFd(timer) => {
                         timer.set_nonblocking(argument & O_NONBLOCK != 0)
                     }
+                    Descriptor::EventFd(counter) => counter.set_nonblocking(argument & O_NONBLOCK != 0),
                 }
                 Ok(0)
             }
@@ -1079,19 +1083,26 @@ fn resolve_at_path(
         }
         Descriptor::SignalFd(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
         Descriptor::SignalFd(_) => Err(Errno::NotDirectory),
-        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_)
+        Descriptor::Epoll(_)
+        | Descriptor::Inotify(_)
+        | Descriptor::TimerFd(_)
+        | Descriptor::EventFd(_)
             if path.is_empty() && matches!(empty, EmptyPath::AllowAny) =>
         {
             Ok(AtPath::Anonymous)
         }
-        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_)
+        Descriptor::Epoll(_)
+        | Descriptor::Inotify(_)
+        | Descriptor::TimerFd(_)
+        | Descriptor::EventFd(_)
             if path.is_empty() =>
         {
             Err(Errno::BadFileDescriptor)
         }
-        Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) => {
-            Err(Errno::NotDirectory)
-        }
+        Descriptor::Epoll(_)
+        | Descriptor::Inotify(_)
+        | Descriptor::TimerFd(_)
+        | Descriptor::EventFd(_) => Err(Errno::NotDirectory),
     }
 }
 
@@ -1244,6 +1255,7 @@ fn descriptor_read(descriptor: &Descriptor, sink: &mut IoSink<'_>) -> Result<usi
         Descriptor::Epoll(_) => Err(Errno::BadFileDescriptor),
         Descriptor::Inotify(inotify) => inotify.read(sink),
         Descriptor::TimerFd(timer) => timer.read(sink),
+        Descriptor::EventFd(counter) => counter.read(sink),
     }
 }
 
@@ -1251,6 +1263,7 @@ fn descriptor_write(descriptor: &Descriptor, source: &IoSource<'_>) -> Result<us
     match descriptor {
         Descriptor::File(file) => file.write(source).map_err(map_fs_error),
         Descriptor::Pipe(pipe) => pipe.write(source).map_err(map_pipe_error),
+        Descriptor::EventFd(counter) => counter.write(source),
         Descriptor::SignalFd(_)
         | Descriptor::Epoll(_)
         | Descriptor::Inotify(_)

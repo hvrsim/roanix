@@ -128,7 +128,7 @@ impl Event {
         }
     }
 
-    fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.state.load(Ordering::Acquire) & GENERATION_MASK
     }
 }

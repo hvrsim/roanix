@@ -459,7 +459,9 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
                         frame
                     };
                 }
-                set_external_interrupts(false);
+                // A level source can disappear before the PLIC claim when
+                // another CPU acknowledges the device. A spurious delivery
+                // must not disable all subsequent external interrupts.
                 return frame;
             }
             _ => {}

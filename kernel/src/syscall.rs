@@ -237,6 +237,7 @@ pub(crate) fn map_process_error(error: proc::Error) -> Errno {
         proc::Error::BadFileDescriptor => Errno::BadFileDescriptor,
         proc::Error::NoSuchProcess => Errno::NoProcess,
         proc::Error::NoChild => Errno::NoChild,
+        proc::Error::Interrupted => Errno::Interrupted,
         proc::Error::PermissionDenied => Errno::Permission,
         proc::Error::InvalidArgument | proc::Error::InvalidElf(_) | proc::Error::UnsupportedElf => {
             Errno::Invalid

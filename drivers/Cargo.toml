@@ -7,6 +7,11 @@ members = [
     "irqchip/ioapic",
     "irqchip/plic",
     "tty/uart8250",
+    "input/i8042",
+    "input/evdev",
+    "usb/usb",
+    "usb/xhci",
+    "usb/keyboard",
     "storage/nvme",
 ]
 resolver = "3"

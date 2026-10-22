@@ -97,8 +97,20 @@ crate::syscall_handler! {
         if nanoseconds >= 1_000_000_000 {
             return Err(Errno::Invalid);
         }
-        clock::sleep(Duration::new(seconds, nanoseconds as u32));
-        Ok(0)
+        let duration = seconds.checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds)).ok_or(Errno::Overflow)?;
+        let deadline = clock::monotonic_ns().checked_add(duration).ok_or(Errno::Overflow)?;
+        let process = current_process()?;
+        loop {
+            let now = clock::monotonic_ns();
+            if now >= deadline {
+                return Ok(0);
+            }
+            if process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            clock::wait_timeout(process.interrupt_event(), Duration::from_nanos(deadline - now));
+        }
     }
 }
 

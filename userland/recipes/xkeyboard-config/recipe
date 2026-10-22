@@ -1,0 +1,18 @@
+#! /bin/sh
+
+version=2.44
+revision=1
+tarball_url="https://www.x.org/releases/individual/data/xkeyboard-config/xkeyboard-config-${version}.tar.xz"
+tarball_blake2b="6abb485ef5c9cb1292afaed22ac72026dc22c0a08c3bf04ca29f8dd61d68cbf06e511fe095628a0ab6dec7766374318c4b5bddeb2c4da8a8a692bbbbf4b4e83b"
+
+configure() {
+    meson_configure -Dnls=false
+}
+
+build() {
+    ninja -j"${parallelism}"
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+}

@@ -1,0 +1,28 @@
+#! /bin/sh
+
+version=1.8.1
+revision=2
+tarball_url="https://github.com/xkbcommon/libxkbcommon/archive/refs/tags/xkbcommon-${version}.tar.gz"
+tarball_blake2b="e990a37261e584b9f87348518f9036793896b7e55c490b90a05329a00c3589eb9ad1001ed7e125dc4b98b51f5e4f77de32779967407fd986697c0dc079e94142"
+hostdeps="gcc-host pkg-config"
+deps="sys-libs xkeyboard-config xcompose"
+
+configure() {
+    meson_configure \
+        -Denable-x11=false \
+        -Denable-wayland=false \
+        -Denable-tools=false \
+        -Denable-docs=false \
+        -Denable-xkbregistry=false \
+        -Denable-bash-completion=false \
+        -Dxkb-config-root=/usr/share/X11/xkb
+}
+
+build() {
+    ninja -j"${parallelism}"
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+    post_package_strip
+}
