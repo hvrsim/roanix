@@ -10,8 +10,12 @@ use core::time::Duration;
 use crate::{
     fs::PollEvents,
     mem::VirtAddr,
-    proc::{Descriptor, DescriptorKey, Process},
-    sys::{clock, event::Event, sync::Mutex},
+    proc::{Descriptor, DescriptorKey, Process, descriptor_life::DescriptorLife},
+    sys::{
+        clock,
+        event::{Event, EventListener},
+        sync::Mutex,
+    },
     syscall::{Errno, Result, current_process, map_memory_error, map_process_error},
 };
 
@@ -45,7 +49,14 @@ struct UserEpollEvent {
     data: u64,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct WatchKey {
+    fd: i32,
+    description: DescriptorKey,
+}
+
 struct Watch {
+    life: Arc<DescriptorLife>,
     descriptor: Descriptor,
     events: u32,
     data: u64,
@@ -55,22 +66,22 @@ struct Watch {
 }
 
 struct EpollState {
-    watches: BTreeMap<DescriptorKey, Watch>,
+    watches: BTreeMap<WatchKey, Watch>,
+    cursor: Option<WatchKey>,
 }
 
 /// One epoll open-file description.
 pub(crate) struct Epoll {
-    process: Weak<Process>,
     state: Mutex<EpollState>,
     changed: Event,
 }
 
 impl Epoll {
-    fn new(process: &Arc<Process>) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         let epoll = Arc::new(Self {
-            process: Arc::downgrade(process),
             state: Mutex::new(EpollState {
                 watches: BTreeMap::new(),
+                cursor: None,
             }),
             changed: Event::new(),
         });
@@ -83,7 +94,9 @@ impl Epoll {
     fn control(
         &self,
         operation: i32,
+        fd: i32,
         descriptor: Descriptor,
+        life: Arc<DescriptorLife>,
         event: Option<UserEpollEvent>,
     ) -> Result<()> {
         let topology = TOPOLOGY.lock();
@@ -98,8 +111,12 @@ impl Epoll {
                 self.validate_nesting(child, &topology)?;
             }
         }
-        let key = descriptor.key();
+        let key = WatchKey {
+            fd,
+            description: descriptor.key(),
+        };
         let mut state = self.state.lock();
+        state.watches.retain(|_, watch| watch.life.is_open());
         let result = match operation {
             EPOLL_CTL_ADD => {
                 let event = event.ok_or(Errno::Fault)?;
@@ -110,6 +127,7 @@ impl Epoll {
                 state.watches.insert(
                     key,
                     Watch {
+                        life,
                         descriptor,
                         events: event.events,
                         data: event.data,
@@ -141,17 +159,21 @@ impl Epoll {
     }
 
     fn collect_ready(&self, maximum: usize) -> Vec<UserEpollEvent> {
-        let Some(process) = self.process.upgrade() else {
-            return Vec::new();
-        };
         let mut state = self.state.lock();
-        state
-            .watches
-            .retain(|key, _| process.contains_descriptor(*key));
+        state.watches.retain(|_, watch| watch.life.is_open());
 
         let mut output = Vec::new();
-        for watch in state.watches.values_mut() {
-            if output.len() == maximum || watch.disabled {
+        let keys: Vec<_> = state.watches.keys().copied().collect();
+        let start = state
+            .cursor
+            .map_or(0, |cursor| keys.partition_point(|key| *key <= cursor));
+        let mut cursor = state.cursor;
+        for key in keys.iter().cycle().skip(start).take(keys.len()) {
+            if output.len() == maximum {
+                break;
+            }
+            let watch = state.watches.get_mut(key).expect("snapshot watch");
+            if watch.disabled {
                 continue;
             }
             let requested = poll_mask(watch.events);
@@ -175,6 +197,7 @@ impl Epoll {
             if report == 0 {
                 continue;
             }
+            cursor = Some(*key);
             output.push(UserEpollEvent {
                 events: report,
                 data: watch.data,
@@ -183,12 +206,16 @@ impl Epoll {
                 watch.disabled = true;
             }
         }
+        state.cursor = cursor;
         output
     }
 
     fn children(&self) -> Vec<Arc<Epoll>> {
-        self.state
-            .lock()
+        let mut state = self.state.lock();
+        // Retire dead graph edges before admitting new ones. Merely ignoring
+        // them during cycle detection could leave an Arc cycle in storage.
+        state.watches.retain(|_, watch| watch.life.is_open());
+        state
             .watches
             .values()
             .filter_map(|watch| match &watch.descriptor {
@@ -242,11 +269,8 @@ impl Epoll {
     }
 
     fn ready_sources(&self, children: &mut Vec<Arc<Epoll>>) -> bool {
-        let Some(process) = self.process.upgrade() else {
-            return false;
-        };
-        self.state.lock().watches.iter_mut().any(|(key, watch)| {
-            if watch.disabled || !process.contains_descriptor(*key) {
+        self.state.lock().watches.values_mut().any(|watch| {
+            if watch.disabled || !watch.life.is_open() {
                 return false;
             }
             if watch.events & EPOLLET != 0
@@ -291,14 +315,9 @@ impl Epoll {
         false
     }
 
-    fn wait_descriptors(&self) -> Vec<(Descriptor, PollEvents)> {
-        let Some(process) = self.process.upgrade() else {
-            return Vec::new();
-        };
+    fn wait_descriptors(&self) -> Vec<(Descriptor, PollEvents, Arc<DescriptorLife>)> {
         let mut state = self.state.lock();
-        state
-            .watches
-            .retain(|key, _| process.contains_descriptor(*key));
+        state.watches.retain(|_, watch| watch.life.is_open());
         self.changed.reset();
         state
             .watches
@@ -308,20 +327,18 @@ impl Epoll {
                 (
                     watch.descriptor.clone(),
                     poll_mask(watch.events) | PollEvents::ERR | PollEvents::HUP,
+                    watch.life.clone(),
                 )
             })
             .collect()
     }
 
     fn notification_sources(&self) -> Vec<(Descriptor, PollEvents)> {
-        let Some(process) = self.process.upgrade() else {
-            return Vec::new();
-        };
         self.state
             .lock()
             .watches
             .iter()
-            .filter(|(key, watch)| !watch.disabled && process.contains_descriptor(**key))
+            .filter(|(_, watch)| !watch.disabled && watch.life.is_open())
             .map(|(_, watch)| (watch.descriptor.clone(), poll_mask(watch.events)))
             .collect()
     }
@@ -357,7 +374,7 @@ fn notification_epochs(descriptor: &Descriptor, requested: PollEvents) -> Vec<(u
             epochs.extend(
                 events
                     .into_iter()
-                    .map(|event| (event as *const Event as usize, event.generation())),
+                    .map(|event| (&*event as *const Event as usize, event.generation())),
             );
         }
     }
@@ -372,7 +389,7 @@ crate::syscall_handler! {
             return Err(Errno::Invalid);
         }
         let process = current_process()?;
-        let epoll = Epoll::new(&process);
+        let epoll = Epoll::new();
         let fd = process
             .install_descriptor_value(
                 Descriptor::Epoll(epoll),
@@ -397,13 +414,13 @@ crate::syscall_handler! {
         else {
             return Err(Errno::Invalid);
         };
-        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+        let (descriptor, life) = process.watch_target(fd).ok_or(Errno::BadFileDescriptor)?;
         let event = if operation == EPOLL_CTL_DEL {
             None
         } else {
             Some(read_user_event(&process, event)?)
         };
-        epoll.control(operation, descriptor, event)?;
+        epoll.control(operation, fd, descriptor, life, event)?;
         Ok(0)
     }
 }
@@ -431,6 +448,17 @@ crate::syscall_handler! {
         });
 
         loop {
+            let descriptors = epoll.wait_descriptors();
+            let mut wait_events = alloc::vec![crate::sys::event::EventSource::from(&epoll.changed)];
+            let mut event_driven = true;
+            for (descriptor, requested, life) in &descriptors {
+                wait_events.push((&life.closed).into());
+                event_driven &= descriptor.poll_events(*requested, &mut wait_events);
+            }
+            wait_events.sort_unstable_by_key(|event| &**event as *const Event as usize);
+            wait_events.dedup_by_key(|event| &**event as *const Event as usize);
+
+            let listeners = wait_events.iter().map(|event| event.listen()).collect::<Vec<_>>();
             let ready = epoll.collect_ready(maximum);
             if !ready.is_empty() {
                 write_user_events(&process, events, &ready)?;
@@ -441,23 +469,15 @@ crate::syscall_handler! {
                 return Ok(0);
             }
 
-            let descriptors = epoll.wait_descriptors();
-            let mut wait_events = alloc::vec![&epoll.changed];
-            let mut event_driven = true;
-            for (descriptor, requested) in &descriptors {
-                event_driven &= descriptor.poll_events(*requested, &mut wait_events);
-            }
-            wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
-            wait_events.dedup_by_key(|event| *event as *const Event as usize);
 
             if event_driven {
                 if let Some(deadline) = deadline {
-                    let _ = clock::wait_any_timeout(
-                        &wait_events,
+                    let _ = clock::wait_listeners_timeout(
+                        &listeners,
                         Duration::from_nanos(deadline.saturating_sub(now).max(1)),
                     );
                 } else {
-                    Event::wait_any(&wait_events);
+                    EventListener::wait_any(&listeners);
                 }
             } else {
                 let sleep_ns = deadline

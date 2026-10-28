@@ -1,5 +1,6 @@
 //! Process ownership and executable startup.
 
+mod descriptor_life;
 mod elf;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
@@ -8,6 +9,9 @@ mod pipe;
 pub(crate) mod signal;
 pub(crate) mod syscall;
 pub(crate) mod timerfd;
+
+use crate::sys::event::EventSource;
+use descriptor_life::{DescriptorLife, OpenHandle};
 
 use alloc::{
     collections::BTreeMap,
@@ -182,13 +186,14 @@ impl Descriptor {
     pub(crate) fn poll_events<'a>(
         &'a self,
         requested: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         match self {
             Self::File(file) => file.poll_events(requested, output),
             Self::Pipe(pipe) => pipe.poll_events(requested, output),
             Self::SignalFd(signal_fd) => signal_fd.poll_events(requested, output),
-            Self::Epoll(_) | Self::TimerFd(_) => false,
+            Self::Epoll(_) => false,
+            Self::TimerFd(timer) => timer.poll_events(requested, output),
             Self::Inotify(inotify) => inotify.poll_events(requested, output),
             Self::EventFd(counter) => counter.poll_events(requested, output),
         }
@@ -197,6 +202,7 @@ impl Descriptor {
 
 #[derive(Clone)]
 struct DescriptorEntry {
+    handle: OpenHandle,
     descriptor: Descriptor,
     close_on_exec: bool,
 }
@@ -453,6 +459,7 @@ impl Process {
     pub(crate) fn install_file(&self, file: FileRef, close_on_exec: bool) -> Result<i32> {
         self.install_descriptor(
             DescriptorEntry {
+                handle: OpenHandle::new(),
                 descriptor: Descriptor::File(file),
                 close_on_exec,
             },
@@ -468,6 +475,7 @@ impl Process {
     ) -> Result<i32> {
         self.install_descriptor(
             DescriptorEntry {
+                handle: OpenHandle::new(),
                 descriptor,
                 close_on_exec,
             },
@@ -502,12 +510,12 @@ impl Process {
             .collect()
     }
 
-    /// Returns whether this process still owns a descriptor description.
-    pub(crate) fn contains_descriptor(&self, key: DescriptorKey) -> bool {
-        self.files.lock().iter().any(|slot| {
-            slot.as_ref()
-                .is_some_and(|entry| entry.descriptor.key() == key)
-        })
+    /// Resolves a watch without counting the observer as an open descriptor.
+    pub(crate) fn watch_target(&self, fd: i32) -> Option<(Descriptor, Arc<DescriptorLife>)> {
+        let index = usize::try_from(fd).ok()?;
+        let files = self.files.lock();
+        let entry = files.get(index)?.as_ref()?;
+        Some((entry.descriptor.clone(), entry.handle.life()))
     }
 
     /// Duplicates `fd` into the first slot at or above `minimum`.
@@ -517,14 +525,16 @@ impl Process {
         minimum: usize,
         close_on_exec: bool,
     ) -> Result<i32> {
-        let descriptor = self.descriptor(fd).ok_or(Error::BadFileDescriptor)?;
-        self.install_descriptor(
-            DescriptorEntry {
-                descriptor,
-                close_on_exec,
-            },
-            minimum,
-        )
+        let index = usize::try_from(fd).map_err(|_| Error::BadFileDescriptor)?;
+        let mut entry = self
+            .files
+            .lock()
+            .get(index)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or(Error::BadFileDescriptor)?;
+        entry.close_on_exec = close_on_exec;
+        self.install_descriptor(entry, minimum)
     }
 
     /// Duplicates `old_fd` onto `new_fd`.
@@ -540,10 +550,10 @@ impl Process {
             return Err(Error::TooManyFiles);
         }
         let mut files = self.files.lock();
-        let descriptor = files
+        let mut entry = files
             .get(old_index)
             .and_then(Option::as_ref)
-            .map(|entry| entry.descriptor.clone())
+            .cloned()
             .ok_or(Error::BadFileDescriptor)?;
         if old_index == new_index {
             return Ok(new_fd);
@@ -551,10 +561,8 @@ impl Process {
         if files.len() <= new_index {
             files.resize(new_index + 1, None);
         }
-        files[new_index] = Some(DescriptorEntry {
-            descriptor,
-            close_on_exec,
-        });
+        entry.close_on_exec = close_on_exec;
+        files[new_index] = Some(entry);
         Ok(new_fd)
     }
 

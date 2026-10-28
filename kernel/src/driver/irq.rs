@@ -1,16 +1,16 @@
 //! Interrupt routing and delivery.
 //!
 //! Interrupts are described by two layers. A *domain* is a controller's view of
-//! its own hardware interrupt numbers, and a *virtual interrupt* is the dense
-//! system-wide number the framework hands to drivers. Domains are registered by
+//! its own hardware interrupt numbers, and a *virtual interrupt* is an opaque
+//! system-wide identity the framework hands to drivers. Domains are registered by
 //! ordinary driver modules, so an I/O APIC, a PLIC, or a PCI message-signalled
 //! block is added without changing the framework.
 //!
-//! Delivery is designed for a short path. The architecture trap handler
-//! resolves a virtual interrupt with one array index, and the descriptor's
-//! handler list is guarded by an interrupt-safe spin lock that is essentially
-//! never contended. There is no map lookup and no global lock on the delivery
-//! path.
+//! Delivery retains a descriptor through a short IRQ-safe identity lookup and
+//! releases the table lock before invoking callbacks. Unmapping withdraws the
+//! identity and drains readers before destroying routing or storage. Retired
+//! identities are never reused, and storage grows with live mappings rather
+//! than the total number of mappings performed since boot.
 //!
 //! A handler that must do lengthy work returns [`outcome::WAKE_THREAD`] and the
 //! rest runs on a dedicated thread, which is what a storage or host-controller
@@ -27,7 +27,7 @@ use alloc::{
 };
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use log::error;
@@ -39,13 +39,18 @@ use crate::sys::{
 };
 
 use super::{
-    core::{device::Device, module::Module},
+    core::{
+        device::Device,
+        module::{self, Module},
+    },
     error::{self, Error, Result},
+    handle::HandleTable,
     obj::{ObjHeader, ObjKind, framework_object},
 };
 
-/// Largest number of virtual interrupts the system can route.
-pub const MAX_VIRQ: usize = 1024;
+/// Marks a hardware mapping whose readers and controller route are retiring.
+const RETIRING: u32 = u32::MAX;
+const CALLBACKS_CLOSED: u64 = 1 << 63;
 /// Largest hardware interrupt space one domain may declare.
 pub const MAX_HWIRQ: u32 = 4096;
 
@@ -163,11 +168,13 @@ pub struct DomainOps {
 pub struct IrqDomain {
     header: ObjHeader,
     name: Box<str>,
+    firmware_phandle: AtomicU32,
     owner: Option<Arc<Module>>,
     flags: u32,
     ops: DomainOps,
     hwirq_count: u32,
     map: Box<[AtomicU32]>,
+    calls: AtomicU64,
 }
 
 framework_object!(IrqDomain, IrqDomain);
@@ -179,7 +186,35 @@ unsafe impl Send for IrqDomain {}
 // requires the callbacks to tolerate concurrent invocation.
 unsafe impl Sync for IrqDomain {}
 
+struct DomainCall<'a> {
+    domain: &'a IrqDomain,
+    _owner: module::ModuleGuard,
+}
+
+impl Drop for DomainCall<'_> {
+    fn drop(&mut self) {
+        self.domain.calls.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl IrqDomain {
+    fn enter_call(&self, allow_unloading: bool) -> Result<DomainCall<'_>> {
+        let owner = module::pin_owner(self.owner(), allow_unloading)?;
+        self.calls
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |calls| {
+                if calls < CALLBACKS_CLOSED - 1 {
+                    Some(calls + 1)
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| Error::NoDevice)?;
+        Ok(DomainCall {
+            domain: self,
+            _owner: owner,
+        })
+    }
+
     /// Returns the domain name.
     pub fn name(&self) -> &str {
         &self.name
@@ -204,12 +239,13 @@ impl IrqDomain {
         let index = usize::try_from(hwirq).ok()?;
         let slot = self.map.get(index)?;
         match slot.load(Ordering::Acquire) {
-            0 => None,
+            0 | RETIRING => None,
             virq => Some(virq),
         }
     }
 
     fn translate(&self, cells: &[u32]) -> Result<(u64, u32)> {
+        let _call = self.enter_call(false)?;
         let Some(translate) = self.ops.translate else {
             let hwirq = cells.first().copied().unwrap_or(0);
             return Ok((u64::from(hwirq), 0));
@@ -232,6 +268,9 @@ impl IrqDomain {
     }
 
     fn mask(&self, hwirq: u64) {
+        let Ok(_call) = self.enter_call(false) else {
+            return;
+        };
         if let Some(mask) = self.ops.mask {
             // SAFETY: registration validated the callback.
             unsafe { mask(self.ops.context, hwirq) };
@@ -239,6 +278,9 @@ impl IrqDomain {
     }
 
     fn unmask(&self, hwirq: u64) {
+        let Ok(_call) = self.enter_call(false) else {
+            return;
+        };
         if let Some(unmask) = self.ops.unmask {
             // SAFETY: registration validated the callback.
             unsafe { unmask(self.ops.context, hwirq) };
@@ -246,6 +288,9 @@ impl IrqDomain {
     }
 
     fn eoi(&self, hwirq: u64) {
+        let Ok(_call) = self.enter_call(false) else {
+            return;
+        };
         if let Some(eoi) = self.ops.eoi {
             // SAFETY: registration validated the callback.
             unsafe { eoi(self.ops.context, hwirq) };
@@ -254,6 +299,7 @@ impl IrqDomain {
 
     /// Returns the message address and payload that raise `hwirq`.
     pub fn compose_message(&self, hwirq: u64) -> Result<(u64, u32)> {
+        let _call = self.enter_call(false)?;
         let compose = self.ops.compose_message.ok_or(Error::Unsupported)?;
         let mut address = 0u64;
         let mut data = 0u32;
@@ -269,6 +315,7 @@ impl IrqDomain {
 pub struct IrqAction {
     name: Box<str>,
     virq: u32,
+    flags: u32,
     handler: HandlerFn,
     thread: Option<ThreadFn>,
     context: *mut c_void,
@@ -277,6 +324,47 @@ pub struct IrqAction {
     service: Once<Service>,
     pending: AtomicBool,
     calls: AtomicU64,
+    provider: Mutex<Option<ActionProvider>>,
+}
+
+enum ActionProvider {
+    Dependency {
+        consumer: Arc<Module>,
+        provider: Arc<Module>,
+    },
+    Lease {
+        _lease: module::ModuleLease,
+    },
+}
+
+impl ActionProvider {
+    fn new(consumer: Option<&Arc<Module>>, provider: Option<&Arc<Module>>) -> Result<Option<Self>> {
+        let Some(provider) = provider else {
+            return Ok(None);
+        };
+        if let Some(consumer) = consumer {
+            if Arc::ptr_eq(consumer, provider) {
+                return Ok(None);
+            }
+            module::link(Some(consumer), Some(provider))?;
+            Ok(Some(Self::Dependency {
+                consumer: consumer.clone(),
+                provider: provider.clone(),
+            }))
+        } else {
+            Ok(Some(Self::Lease {
+                _lease: module::lease(provider)?,
+            }))
+        }
+    }
+}
+
+impl Drop for ActionProvider {
+    fn drop(&mut self) {
+        if let Self::Dependency { consumer, provider } = self {
+            module::unlink(Some(consumer), Some(provider));
+        }
+    }
 }
 
 // SAFETY: the handler, thread callback, and context outlive the action, which
@@ -312,11 +400,16 @@ struct DescBinding {
     /// take a counted reference to it and release the lock before running any
     /// driver code.
     actions: Arc<[Arc<IrqAction>]>,
+    device_users: usize,
 }
 
 struct IrqDesc {
     virq: u32,
     inner: IrqSpinLock<DescBinding>,
+    // Keep replaced arrays until their IRQ readers finish. Reclaiming on the
+    // next edit bounds retention by concurrent readers, without freeing an
+    // allocation from the hard-interrupt path.
+    retired_lists: Mutex<Vec<Arc<[Arc<IrqAction>]>>>,
     /// Number of dispatches currently executing handlers from this descriptor.
     ///
     /// Detaching a handler waits for this to drain, which is what guarantees no
@@ -327,7 +420,7 @@ struct IrqDesc {
 }
 
 struct Registry {
-    descs: Mutex<Vec<Arc<IrqDesc>>>,
+    descs: HandleTable<Arc<IrqDesc>>,
     domains: Mutex<Vec<Arc<IrqDomain>>>,
     vectors: Mutex<[bool; VECTOR_COUNT]>,
     /// Serialises handler-list edits.
@@ -339,22 +432,25 @@ struct Registry {
     registration: Mutex<()>,
 }
 
-/// Lock-free descriptor table indexed by virtual interrupt number.
-static DESCS: [AtomicPtr<IrqDesc>; MAX_VIRQ] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_VIRQ];
 /// Lock-free architecture vector table used by the x86 delivery path.
 static VECTOR_MAP: [AtomicU32; VECTOR_COUNT] = [const { AtomicU32::new(0) }; VECTOR_COUNT];
 /// Root controller consulted by architectures that report a generic external
 /// interrupt.
-static ROOT_DOMAIN: AtomicPtr<IrqDomain> = AtomicPtr::new(core::ptr::null_mut());
+static ROOT_DOMAIN: IrqSpinLock<Option<Arc<IrqDomain>>> = IrqSpinLock::new(None);
 /// Controller that decodes specifiers for devices without an explicit domain.
-static DEFAULT_DOMAIN: AtomicPtr<IrqDomain> = AtomicPtr::new(core::ptr::null_mut());
+static DEFAULT_DOMAIN: Mutex<Option<Arc<IrqDomain>>> = Mutex::new(None);
 static NEXT_VIRQ: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: Once<Registry> = Once::new();
 
+impl Drop for IrqDesc {
+    fn drop(&mut self) {
+        crate::sys::context::assert_sleepable("irq: descriptor destruction");
+    }
+}
+
 pub(crate) fn init() {
     REGISTRY.call_once(|| Registry {
-        descs: Mutex::new(Vec::new()),
+        descs: HandleTable::new(),
         domains: Mutex::new(Vec::new()),
         vectors: Mutex::new([false; VECTOR_COUNT]),
         registration: Mutex::new(()),
@@ -365,23 +461,18 @@ fn registry() -> Result<&'static Registry> {
     REGISTRY.get().ok_or(Error::NotInitialized)
 }
 
-fn desc(virq: u32) -> Option<&'static IrqDesc> {
-    let slot = DESCS.get(virq as usize)?;
-    let pointer = slot.load(Ordering::Acquire);
-    if pointer.is_null() {
-        return None;
-    }
-    // SAFETY: descriptors are allocated once, published here, and never freed,
-    // so a non-null slot always addresses a live descriptor.
-    Some(unsafe { &*pointer })
+fn desc(virq: u32) -> Option<Arc<IrqDesc>> {
+    // The table or retiring writer retains a strong reference until every
+    // reader has dropped its clone. No reader can free a descriptor in an IRQ.
+    registry().ok()?.descs.with(virq as usize, Arc::clone)
 }
 
-fn allocate_desc() -> Result<&'static IrqDesc> {
-    let registry = registry()?;
-    let virq = NEXT_VIRQ.fetch_add(1, Ordering::Relaxed);
-    if virq as usize >= MAX_VIRQ {
-        return Err(Error::NoSpace);
-    }
+fn allocate_desc() -> Result<Arc<IrqDesc>> {
+    let virq = NEXT_VIRQ
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            (next < RETIRING - 1).then_some(next + 1)
+        })
+        .map_err(|_| Error::NoSpace)?;
     let record = Arc::new(IrqDesc {
         virq,
         inner: IrqSpinLock::new(DescBinding {
@@ -390,23 +481,30 @@ fn allocate_desc() -> Result<&'static IrqDesc> {
             flags: 0,
             masked: true,
             actions: Arc::from([]),
+            device_users: 0,
         }),
+        retired_lists: Mutex::new(Vec::new()),
         in_flight: AtomicU64::new(0),
         count: AtomicU64::new(0),
         spurious: AtomicU64::new(0),
     });
-    // Descriptors are immortal by design: the delivery path reads them with a
-    // single atomic load and no lifetime bookkeeping. A failed mapping attempt
-    // therefore consumes one virtual interrupt number even when nothing binds
-    // to it - failure paths clear the domain map so nothing stale is reachable,
-    // and the 1024-number space is sized to make that acceptable. Reclaiming
-    // numbers would need generation-tagged handles; revisit only if a system
-    // ever exhausts the space.
-    let pointer = Arc::into_raw(record.clone()).cast_mut();
-    registry.descs.lock().push(record);
-    DESCS[virq as usize].store(pointer, Ordering::Release);
-    // SAFETY: the pointer was just published from a leaked reference.
-    Ok(unsafe { &*pointer })
+    registry()?.descs.insert(virq as usize, record.clone());
+    Ok(record)
+}
+
+fn drain_desc(record: Arc<IrqDesc>) {
+    // Withdrawal removed the only source of new clones. The retiring writer
+    // remains the final owner until IRQ and thread readers have all returned.
+    while Arc::strong_count(&record) != 1 {
+        core::hint::spin_loop();
+    }
+    drop(record);
+}
+
+fn retire_list(record: &IrqDesc, previous: Arc<[Arc<IrqAction>]>) {
+    let mut retired = record.retired_lists.lock();
+    retired.push(previous);
+    retired.retain(|list| Arc::strong_count(list) != 1);
 }
 
 /// Registers an interrupt controller domain.
@@ -414,7 +512,10 @@ fn allocate_desc() -> Result<&'static IrqDesc> {
 /// # Safety
 ///
 /// Every callback in `ops` must follow the domain ABI and stay executable until
-/// the domain is unregistered.
+/// the domain is unregistered. Mask, unmask, EOI, claim and complete run in IRQ
+/// context and must not block. Callbacks must tolerate concurrent invocation;
+/// they must not withdraw their own domain/current mapping, and setup must not
+/// recursively register or unregister IRQ mappings or handlers.
 pub unsafe fn register_domain(
     owner: Option<&Arc<Module>>,
     name: &str,
@@ -428,7 +529,9 @@ pub unsafe fn register_domain(
     if flags & domain_flags::ROOT != 0 && ops.claim.is_none() {
         return Err(Error::InvalidArgument);
     }
+    let _owner = module::pin_owner(owner, false)?;
     let registry = registry()?;
+    let registration = registry.registration.lock();
     let mut domains = registry.domains.lock();
     if domains.iter().any(|domain| &*domain.name == name) {
         return Err(Error::AlreadyExists);
@@ -445,55 +548,125 @@ pub unsafe fn register_domain(
     let domain = Arc::new(IrqDomain {
         header,
         name: String::from(name).into_boxed_str(),
+        firmware_phandle: AtomicU32::new(0),
         owner: owner.cloned(),
         flags,
         ops,
         hwirq_count,
         map: map.into_boxed_slice(),
+        calls: AtomicU64::new(0),
     });
     domain.header.register()?;
     domains.push(domain.clone());
     drop(domains);
 
-    if domain.is_root() && ROOT_DOMAIN.load(Ordering::Acquire).is_null() {
-        ROOT_DOMAIN.store(Arc::as_ptr(&domain).cast_mut(), Ordering::Release);
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::set_external_interrupts(true);
+    {
+        let mut root = ROOT_DOMAIN.lock();
+        if domain.is_root() && root.is_none() {
+            *root = Some(domain.clone());
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::set_external_interrupts(true);
+        }
     }
-    if flags & domain_flags::DEFAULT != 0 && DEFAULT_DOMAIN.load(Ordering::Acquire).is_null() {
-        DEFAULT_DOMAIN.store(Arc::as_ptr(&domain).cast_mut(), Ordering::Release);
+    if flags & domain_flags::DEFAULT != 0 {
+        let mut default = DEFAULT_DOMAIN.lock();
+        if default.is_none() {
+            *default = Some(domain.clone());
+        }
     }
+    drop(registration);
     super::core::probe::retrigger();
     Ok(domain)
 }
 
-/// Unregisters a domain once none of its interrupts are in use.
+/// Unregisters a domain once none of its interrupts are in use. Closes callback
+/// admission and drains earlier calls before returning. Call from thread
+/// context outside this domain's callbacks.
 pub fn unregister_domain(domain: &Arc<IrqDomain>) -> Result<()> {
+    unregister_domain_inner(domain, false)
+}
+
+fn force_unregister_domain(domain: &Arc<IrqDomain>) -> Result<()> {
+    unregister_domain_inner(domain, true)
+}
+
+fn unregister_domain_inner(domain: &Arc<IrqDomain>, retire_unused: bool) -> Result<()> {
+    let _pin = module::pin_owner(domain.owner(), true)?;
+    let registration = registry()?.registration.lock();
+    match domain.header.state() {
+        super::obj::ObjState::Dead => return Ok(()),
+        super::obj::ObjState::Removing => return Err(Error::Busy),
+        _ => {}
+    }
     for index in 0..domain.hwirq_count as usize {
-        if domain.map[index].load(Ordering::Acquire) != 0 {
+        let virq = domain.map[index].load(Ordering::Acquire);
+        if virq == 0 {
+            continue;
+        }
+        if !retire_unused || virq == RETIRING {
+            return Err(Error::Busy);
+        }
+        if let Some(record) = desc(virq)
+            && {
+                let inner = record.inner.lock();
+                !inner.actions.is_empty() || inner.device_users != 0
+            }
+        {
             return Err(Error::Busy);
         }
     }
-    force_unregister_domain(domain);
-    Ok(())
-}
-
-fn force_unregister_domain(domain: &Arc<IrqDomain>) {
+    domain.calls.fetch_or(CALLBACKS_CLOSED, Ordering::AcqRel);
     domain.header.set_state(super::obj::ObjState::Removing);
+    drop(registration);
+    // Callbacks may sleep or reenter other registration operations. Close their
+    // admission under the registry interlock, then drain without holding it.
+    while domain.calls.load(Ordering::Acquire) != CALLBACKS_CLOSED {
+        core::hint::spin_loop();
+    }
     for index in 0..domain.hwirq_count as usize {
-        let virq = domain.map[index].swap(0, Ordering::AcqRel);
+        let virq = domain.map[index].swap(RETIRING, Ordering::AcqRel);
         if virq != 0 {
             unbind_desc(virq);
+            if let Some(mask) = domain.ops.mask {
+                // SAFETY: callback admission is closed and drained; this writer
+                // retains controller context and executable backing until return.
+                unsafe { mask(domain.ops.context, index as u64) };
+            }
+            if let Some(teardown) = domain.ops.teardown {
+                // SAFETY: as above, with no mapping reader or action remaining.
+                unsafe { teardown(domain.ops.context, index as u64, virq) };
+            }
         }
+        domain.map[index].store(0, Ordering::Release);
     }
-    if ROOT_DOMAIN.load(Ordering::Acquire) == Arc::as_ptr(domain).cast_mut() {
-        ROOT_DOMAIN.store(core::ptr::null_mut(), Ordering::Release);
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::set_external_interrupts(false);
-    }
-    if DEFAULT_DOMAIN.load(Ordering::Acquire) == Arc::as_ptr(domain).cast_mut() {
-        DEFAULT_DOMAIN.store(core::ptr::null_mut(), Ordering::Release);
-    }
+    // Root dispatch borrows under this lock through claim and complete.
+    // Clearing the slot waits for a reader already executing controller code.
+    let previous = {
+        let mut root = ROOT_DOMAIN.lock();
+        if root
+            .as_ref()
+            .is_some_and(|entry| Arc::ptr_eq(entry, domain))
+        {
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::set_external_interrupts(false);
+            root.take()
+        } else {
+            None
+        }
+    };
+    drop(previous);
+    let previous = {
+        let mut default = DEFAULT_DOMAIN.lock();
+        if default
+            .as_ref()
+            .is_some_and(|entry| Arc::ptr_eq(entry, domain))
+        {
+            default.take()
+        } else {
+            None
+        }
+    };
+    drop(previous);
     if let Ok(registry) = registry() {
         registry
             .domains
@@ -501,31 +674,33 @@ fn force_unregister_domain(domain: &Arc<IrqDomain>) {
             .retain(|entry| !Arc::ptr_eq(entry, domain));
     }
     domain.header.poison();
+    Ok(())
 }
 
 fn unbind_desc(virq: u32) {
-    let Some(record) = desc(virq) else {
-        return;
-    };
-    let previous = {
-        let mut inner = record.inner.lock();
-        inner.domain = None;
-        inner.hwirq = 0;
-        inner.masked = true;
-        core::mem::replace(&mut inner.actions, Arc::from([]))
-    };
-    drop(previous);
+    if let Ok(registry) = registry()
+        && let Some(record) = registry.descs.remove(virq as usize)
+    {
+        drain_desc(record);
+    }
 }
 
 /// Maps a hardware interrupt into the virtual interrupt space.
 pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result<u32> {
+    let _call = domain.enter_call(false)?;
     let index = usize::try_from(hwirq).map_err(|_| Error::InvalidArgument)?;
     if index >= domain.hwirq_count as usize {
         return Err(Error::InvalidArgument);
     }
     let _registration = registry()?.registration.lock();
+    if domain.header.state() != super::obj::ObjState::Live {
+        return Err(Error::NoDevice);
+    }
     if let Some(existing) = domain.lookup(hwirq) {
         return Ok(existing);
+    }
+    if domain.map[index].load(Ordering::Acquire) == RETIRING {
+        return Err(Error::Busy);
     }
 
     let record = allocate_desc()?;
@@ -533,6 +708,9 @@ pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result
         .compare_exchange(0, record.virq, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        let virq = record.virq;
+        drop(record);
+        unbind_desc(virq);
         return domain.lookup(hwirq).ok_or(Error::Busy);
     }
 
@@ -549,8 +727,16 @@ pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result
         // published so the controller may reference it immediately.
         let status = unsafe { setup(domain.ops.context, hwirq, record.virq, flags) };
         if let Err(error) = error::from_status(status) {
+            domain.map[index].store(RETIRING, Ordering::Release);
+            let retired = registry()?
+                .descs
+                .remove(record.virq as usize)
+                .ok_or(Error::NotFound)?;
+            drop(record);
+            drop(_registration);
+            drain_desc(retired);
+            let _registration = registry()?.registration.lock();
             domain.map[index].store(0, Ordering::Release);
-            unbind_desc(record.virq);
             return Err(error);
         }
     }
@@ -559,20 +745,24 @@ pub fn create_mapping(domain: &Arc<IrqDomain>, hwirq: u64, flags: u32) -> Result
 
 /// Removes a hardware interrupt mapping after every handler has been released.
 pub fn destroy_mapping(domain: &Arc<IrqDomain>, hwirq: u64) -> Result<()> {
+    let _call = domain.enter_call(true)?;
     let index = usize::try_from(hwirq).map_err(|_| Error::InvalidArgument)?;
     if index >= domain.hwirq_count as usize {
         return Err(Error::InvalidArgument);
     }
+    let registration = registry()?.registration.lock();
     let virq = domain.map[index].load(Ordering::Acquire);
     if virq == 0 {
         return Err(Error::NotFound);
     }
+    if virq == RETIRING {
+        return Err(Error::Busy);
+    }
     let record = desc(virq).ok_or(Error::NotFound)?;
-    // Serializes against both a new mapping and a handler attachment.
-    let _registration = registry()?.registration.lock();
     {
         let inner = record.inner.lock();
         if !inner.actions.is_empty()
+            || inner.device_users != 0
             || inner
                 .domain
                 .as_ref()
@@ -582,61 +772,190 @@ pub fn destroy_mapping(domain: &Arc<IrqDomain>, hwirq: u64) -> Result<()> {
             return Err(Error::Busy);
         }
     }
-    domain.mask(hwirq);
-    while record.in_flight.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
+    if let Some(mask) = domain.ops.mask {
+        // SAFETY: the call guard retains executable code and controller context
+        // even when the owning module is performing orderly cleanup.
+        unsafe { mask(domain.ops.context, hwirq) };
     }
+    domain.map[index].store(RETIRING, Ordering::Release);
+    let retired = registry()?
+        .descs
+        .remove(virq as usize)
+        .ok_or(Error::NotFound)?;
+    drop(record);
+    // Readers may be completing a sleeping control callback or joining a
+    // threaded action. Let them acquire the registration mutex while draining.
+    // RETIRING prevents reuse of this hardware route until teardown completes.
+    drop(registration);
+    drain_desc(retired);
     if let Some(teardown) = domain.ops.teardown {
-        // SAFETY: registration keeps the callback executable until every
-        // mapping is removed and no dispatch remains in flight here.
+        // SAFETY: all descriptor readers and released threaded actions drained
+        // before controller routing or its vector resources can be destroyed.
         unsafe { teardown(domain.ops.context, hwirq, virq) };
     }
-    domain.map[index]
-        .compare_exchange(virq, 0, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::Busy)?;
-    unbind_desc(virq);
+    let _registration = registry()?.registration.lock();
+    domain.map[index].store(0, Ordering::Release);
     Ok(())
+}
+
+/// Associates a registered controller with its firmware identity. Called by
+/// the controller's probe after initialization, before consumers can map it.
+pub fn set_domain_device(domain: &Arc<IrqDomain>, device: &Arc<Device>) -> Result<()> {
+    let phandle = device
+        .properties()
+        .get("phandle")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0 && *value != u32::MAX)
+        .ok_or(Error::InvalidArgument)?;
+    let _owner = module::pin_owner(domain.owner(), false)?;
+    if let Some(owner) = domain.owner()
+        && !device
+            .driver()
+            .and_then(|driver| driver.owner().cloned())
+            .is_some_and(|driver| Arc::ptr_eq(&driver, owner))
+    {
+        return Err(Error::PermissionDenied);
+    }
+    let _registration = registry()?.registration.lock();
+    if domain.header.state() != super::obj::ObjState::Live
+        || matches!(
+            device.state(),
+            super::core::device::state::REMOVING | super::core::device::state::DEAD
+        )
+    {
+        return Err(Error::NoDevice);
+    }
+    let domains = registry()?.domains.lock();
+    if domains.iter().any(|other| {
+        !Arc::ptr_eq(other, domain) && other.firmware_phandle.load(Ordering::Acquire) == phandle
+    }) {
+        return Err(Error::AlreadyExists);
+    }
+    let result = match domain.firmware_phandle.compare_exchange(
+        0,
+        phandle,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(current) if current == phandle => Ok(()),
+        Err(_) => Err(Error::Busy),
+    };
+    drop(domains);
+    drop(_registration);
+    if result.is_ok() {
+        super::core::probe::retrigger();
+    }
+    result
+}
+
+fn firmware_domain(phandle: u32) -> Option<Arc<IrqDomain>> {
+    registry()
+        .ok()?
+        .domains
+        .lock()
+        .iter()
+        .find(|domain| {
+            domain.header.state() == super::obj::ObjState::Live
+                && domain.firmware_phandle.load(Ordering::Acquire) == phandle
+        })
+        .cloned()
 }
 
 /// Resolves the `index`-th firmware interrupt of `device` to a virtual
 /// interrupt.
 pub fn device_virq(device: &Arc<Device>, index: usize) -> Result<u32> {
     let entry = device.irqs().get(index).ok_or(Error::NotFound)?;
-    if let Some(virq) = entry.virq() {
+    let mut resolution = entry.resolution();
+    if matches!(
+        device.state(),
+        super::core::device::state::REMOVING | super::core::device::state::DEAD
+    ) {
+        return Err(Error::NoDevice);
+    }
+    if let Some(virq) = entry.virq()
+        && desc(virq).is_some()
+    {
         return Ok(virq);
     }
-    let domain = entry
-        .domain()
-        .or_else(inherited_domain)
-        .ok_or(Error::Deferred)?;
+    let domain = if let Some(domain) = resolution.clone() {
+        domain
+    } else if let Some(phandle) = entry.firmware_parent() {
+        firmware_domain(phandle).ok_or(Error::Deferred)?
+    } else {
+        inherited_domain().ok_or(Error::Deferred)?
+    };
+    let _call = domain.enter_call(false)?;
     let (hwirq, flags) = domain.translate(entry.cells())?;
     let virq = create_mapping(&domain, hwirq, flags)?;
-    entry.set_domain(domain);
+    let _registration = registry()?.registration.lock();
+    let record = desc(virq).ok_or(Error::NoDevice)?;
+    if domain.header.state() != super::obj::ObjState::Live {
+        return Err(Error::NoDevice);
+    }
+    {
+        let mut inner = record.inner.lock();
+        inner.device_users = inner.device_users.checked_add(1).ok_or(Error::Busy)?;
+    }
+    *resolution = Some(domain.clone());
     entry.set_virq(virq);
     Ok(virq)
+}
+
+// A firmware resolution is borrowed for one device binding. Keep shared lines
+// until the last binding releases its resolution, including probing consumers
+// that have resolved a line but have not attached an action yet.
+pub(crate) fn release_device_mappings(device: &Arc<Device>) {
+    for entry in device.irqs() {
+        let virq = {
+            let mut resolution = entry.resolution();
+            let virq = entry.virq();
+            entry.set_virq(0);
+            if !entry.has_explicit_domain() {
+                *resolution = None;
+            }
+            virq
+        };
+        let Some(virq) = virq else {
+            continue;
+        };
+        let retire = {
+            let Ok(registry) = registry() else {
+                continue;
+            };
+            let _registration = registry.registration.lock();
+            let Some(record) = desc(virq) else {
+                continue;
+            };
+            let mut inner = record.inner.lock();
+            inner.device_users = inner
+                .device_users
+                .checked_sub(1)
+                .expect("firmware IRQ resolution underflow");
+            if inner.device_users == 0 && inner.actions.is_empty() {
+                inner.domain.clone().map(|domain| (domain, inner.hwirq))
+            } else {
+                None
+            }
+        };
+        if let Some((domain, hwirq)) = retire {
+            // A new binding may acquire the line before this call. Its user
+            // count makes removal return Busy and leaves its route intact.
+            if let Err(error) = destroy_mapping(&domain, hwirq)
+                && !matches!(error, Error::Busy | Error::NotFound | Error::NoDevice)
+            {
+                error!("failed to retire firmware virq {virq}: {error:?}");
+            }
+        }
+    }
 }
 
 /// Returns the domain that decodes specifiers for a device with no explicit
 /// controller.
 fn inherited_domain() -> Option<Arc<IrqDomain>> {
-    let mut pointer = DEFAULT_DOMAIN.load(Ordering::Acquire);
-    if pointer.is_null() {
-        pointer = ROOT_DOMAIN.load(Ordering::Acquire);
-    }
-    if pointer.is_null() {
-        return None;
-    }
-    // SAFETY: the root pointer is only published while the domain is
-    // registered, and unregistration clears it before dropping the domain.
-    let domain = unsafe { &*pointer };
-    registry().ok().and_then(|registry| {
-        registry
-            .domains
-            .lock()
-            .iter()
-            .find(|entry| core::ptr::eq(Arc::as_ptr(entry), domain))
-            .cloned()
-    })
+    let default = { DEFAULT_DOMAIN.lock().clone() };
+    default.or_else(|| ROOT_DOMAIN.lock().clone())
 }
 
 /// Attaches a handler to a virtual interrupt.
@@ -656,11 +975,18 @@ pub unsafe fn request(
     thread: Option<ThreadFn>,
     context: *mut c_void,
 ) -> Result<Arc<IrqAction>> {
-    let record = desc(virq).ok_or(Error::NotFound)?;
+    let _owner = module::pin_owner(owner, false)?;
     let _registration = registry()?.registration.lock();
+    let record = desc(virq).ok_or(Error::NotFound)?;
+    let domain = record.inner.lock().domain.clone().ok_or(Error::NotFound)?;
+    let _provider = module::pin_owner(domain.owner(), false)?;
+    if domain.header.state() != super::obj::ObjState::Live {
+        return Err(Error::NoDevice);
+    }
     let action = Arc::new(IrqAction {
         name: String::from(name).into_boxed_str(),
         virq,
+        flags,
         handler,
         thread,
         context,
@@ -669,12 +995,17 @@ pub unsafe fn request(
         service: Once::new(),
         pending: AtomicBool::new(false),
         calls: AtomicU64::new(0),
+        provider: Mutex::new(ActionProvider::new(owner, domain.owner())?),
     });
 
     {
         let inner = record.inner.lock();
         if !inner.actions.is_empty()
-            && (inner.flags & trigger::SHARED == 0 || flags & trigger::SHARED == 0)
+            && (flags & trigger::SHARED == 0
+                || inner
+                    .actions
+                    .iter()
+                    .any(|action| action.flags & trigger::SHARED == 0))
         {
             return Err(Error::Busy);
         }
@@ -704,7 +1035,7 @@ pub unsafe fn request(
         let domain = inner.domain.clone();
         let hwirq = inner.hwirq;
         drop(inner);
-        drop(previous);
+        retire_list(&record, previous);
         (domain, hwirq, should_unmask)
     };
 
@@ -722,6 +1053,7 @@ fn start_thread(action: &Arc<IrqAction>) -> Result<()> {
                 // Shutdown's final drain must not invent an extra device callback.
                 if worker.pending.swap(false, Ordering::AcqRel)
                     && let Some(thread) = worker.thread
+                    && let Ok(_pin) = module::pin_owner(worker.owner.as_ref(), false)
                 {
                     // SAFETY: release joins service before callback resources or
                     // its owning module may be destroyed.
@@ -743,13 +1075,13 @@ pub fn release(action: &Arc<IrqAction>) -> Result<()> {
     if let Some(service) = action.service.get() {
         service.assert_not_current();
     }
-    let record = desc(action.virq).ok_or(Error::NotFound)?;
-    let (domain, hwirq, mask) = {
+    let (record, domain, hwirq, mask) = {
         // Held only across the list read-modify-write it exists to serialize.
         // The drain loop below can spin for as long as a dispatch is running,
         // and holding the global mutex through it stalled every unrelated
         // request and release in the system.
         let _registration = registry()?.registration.lock();
+        let record = desc(action.virq).ok_or(Error::NotFound)?;
         let snapshot = {
             let inner = record.inner.lock();
             inner.actions.clone()
@@ -769,8 +1101,8 @@ pub fn release(action: &Arc<IrqAction>) -> Result<()> {
         let domain = inner.domain.clone();
         let hwirq = inner.hwirq;
         drop(inner);
-        drop(previous);
-        (domain, hwirq, empty)
+        retire_list(&record, previous);
+        (record, domain, hwirq, empty)
     };
 
     if mask && let Some(domain) = domain.as_ref() {
@@ -787,6 +1119,10 @@ pub fn release(action: &Arc<IrqAction>) -> Result<()> {
     if let Some(service) = action.service.get() {
         service.shutdown();
     }
+    // Release the provider dependency only after both hard and threaded
+    // callbacks have drained. A retained receipt is no longer an active user.
+    let provider = { action.provider.lock().take() };
+    drop(provider);
     Ok(())
 }
 
@@ -832,6 +1168,7 @@ pub fn set_affinity(virq: u32, cpu: u32) -> Result<()> {
         (inner.domain.clone(), inner.hwirq)
     };
     let domain = domain.ok_or(Error::NotFound)?;
+    let _call = domain.enter_call(false)?;
     let set_affinity = domain.ops.set_affinity.ok_or(Error::Unsupported)?;
     // SAFETY: registration validated the callback.
     error::from_status(unsafe { set_affinity(domain.ops.context, hwirq, cpu) })
@@ -895,13 +1232,13 @@ pub(crate) fn dispatch_vector(vector: u8) -> DispatchOutcome {
 /// Dispatches a generic external interrupt. This is the RISC-V delivery path.
 #[cfg(target_arch = "riscv64")]
 pub(crate) fn dispatch_external(cpu: u32, platform_id: u64) -> DispatchOutcome {
-    let pointer = ROOT_DOMAIN.load(Ordering::Acquire);
-    if pointer.is_null() {
+    let root = ROOT_DOMAIN.lock();
+    let Some(domain) = root.as_ref() else {
         return DispatchOutcome::default();
-    }
-    // SAFETY: the root pointer is published only while its domain is
-    // registered and is cleared before the domain is dropped.
-    let domain = unsafe { &*pointer };
+    };
+    let Ok(_call) = domain.enter_call(false) else {
+        return DispatchOutcome::default();
+    };
     let Some(claim) = domain.ops.claim else {
         return DispatchOutcome::default();
     };
@@ -962,6 +1299,9 @@ fn run(virq: u32) -> DispatchOutcome {
     // device.
     result.handled = !actions.is_empty();
     for action in actions.iter() {
+        let Ok(_pin) = module::pin_owner(action.owner.as_ref(), false) else {
+            continue;
+        };
         action.calls.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the action is published in this list, and detaching one waits
         // for the in-flight count to drain before returning, so the callback
@@ -1009,6 +1349,7 @@ pub(crate) fn release_device_interrupts(device: &Arc<Device>) {
             .and_then(Weak::upgrade)
             .is_some_and(|owner| Arc::ptr_eq(&owner, device))
     });
+    release_device_mappings(device);
 }
 
 pub(crate) fn release_device_module_interrupts(device: &Arc<Device>, module: &Arc<Module>) {
@@ -1024,18 +1365,52 @@ pub(crate) fn release_device_module_interrupts(device: &Arc<Device>, module: &Ar
             .is_some_and(|owner| Arc::ptr_eq(owner, module));
         device_matches && module_matches
     });
+    release_device_mappings(device);
 }
 
-pub(crate) fn remove_module_interrupts(module: &Arc<Module>) {
+pub(crate) fn check_module_domain_users(module: &Arc<Module>) -> Result<()> {
+    let registry = registry()?;
+    let _registration = registry.registration.lock();
+    let domains = registry.domains.lock();
+    for domain in domains.iter().filter(|domain| {
+        domain
+            .owner()
+            .is_some_and(|owner| Arc::ptr_eq(owner, module))
+    }) {
+        if domain.calls.load(Ordering::Acquire) & !CALLBACKS_CLOSED != 0 {
+            return Err(Error::Busy);
+        }
+        for slot in &domain.map {
+            let virq = slot.load(Ordering::Acquire);
+            if virq == RETIRING {
+                return Err(Error::Busy);
+            }
+            if let Some(record) = desc(virq) {
+                let inner = record.inner.lock();
+                if inner.device_users != 0
+                    || inner.actions.iter().any(|action| {
+                        action
+                            .owner
+                            .as_ref()
+                            .is_none_or(|owner| !Arc::ptr_eq(owner, module))
+                    })
+                {
+                    return Err(Error::Busy);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_module_interrupts(module: &Arc<Module>) -> Result<()> {
     for_each_action(|action| {
         action
             .owner
             .as_ref()
             .is_some_and(|owner| Arc::ptr_eq(owner, module))
     });
-    let Ok(registry) = registry() else {
-        return;
-    };
+    let registry = registry()?;
     let owned: Vec<Arc<IrqDomain>> = registry
         .domains
         .lock()
@@ -1049,13 +1424,17 @@ pub(crate) fn remove_module_interrupts(module: &Arc<Module>) {
         .cloned()
         .collect();
     for domain in owned {
-        force_unregister_domain(&domain);
+        force_unregister_domain(&domain)?;
     }
+    Ok(())
 }
 
 fn for_each_action<F: Fn(&Arc<IrqAction>) -> bool>(select: F) {
-    let limit = NEXT_VIRQ.load(Ordering::Acquire).min(MAX_VIRQ as u32);
-    for virq in 1..limit {
+    let Ok(registry) = registry() else {
+        return;
+    };
+    for id in registry.descs.keys() {
+        let virq = id as u32;
         let Some(record) = desc(virq) else {
             continue;
         };
@@ -1068,6 +1447,7 @@ fn for_each_action<F: Fn(&Arc<IrqAction>) -> bool>(select: F) {
                 .cloned()
                 .collect()
         };
+        drop(record);
         for action in matching {
             if let Err(error) = release(&action) {
                 error!(
@@ -1098,27 +1478,24 @@ pub struct IrqInfo {
 
 /// Returns a snapshot of every mapped interrupt.
 pub fn list() -> Vec<IrqInfo> {
-    let limit = NEXT_VIRQ.load(Ordering::Acquire).min(MAX_VIRQ as u32);
     let mut entries = Vec::new();
-    for virq in 1..limit {
+    let Ok(registry) = registry() else {
+        return entries;
+    };
+    for id in registry.descs.keys() {
+        let virq = id as u32;
         let Some(record) = desc(virq) else {
             continue;
         };
         let (domain, hwirq, actions) = {
             let inner = record.inner.lock();
-            (
-                inner
-                    .domain
-                    .as_ref()
-                    .map(|domain| domain.name.to_string().into_boxed_str()),
-                inner.hwirq,
-                inner
-                    .actions
-                    .iter()
-                    .map(|action| action.name.to_string().into_boxed_str())
-                    .collect(),
-            )
+            (inner.domain.clone(), inner.hwirq, inner.actions.clone())
         };
+        let domain = domain.map(|domain| domain.name.to_string().into_boxed_str());
+        let actions = actions
+            .iter()
+            .map(|action| action.name.to_string().into_boxed_str())
+            .collect();
         if domain.is_none() {
             continue;
         }

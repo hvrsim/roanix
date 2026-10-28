@@ -1,5 +1,7 @@
 //! Kernel-owned `/dev/ptmx` and `/dev/pts/*` pseudo terminals.
 
+use crate::sys::event::EventSource;
+
 use alloc::{collections::VecDeque, string::ToString, sync::Arc, vec::Vec};
 
 use crate::{
@@ -309,17 +311,17 @@ impl DeviceNodeOps for Master {
         &'a self,
         file_context: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         let Ok(slot) = slot_for_context(file_context) else {
             return false;
         };
         if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) {
-            output.push(&slot.events.master_readable);
-            output.push(&slot.events.master_state);
+            output.push((&slot.events.master_readable).into());
+            output.push((&slot.events.master_state).into());
         }
         if events.intersects(PollEvents::OUT | PollEvents::WRNORM) {
-            output.push(&slot.events.slave_writable);
+            output.push((&slot.events.slave_writable).into());
         }
         true
     }

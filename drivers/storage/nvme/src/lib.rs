@@ -21,20 +21,20 @@ extern crate alloc;
 mod lease;
 use lease::{Guard as QueueGuard, Lease};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     ffi::{CStr, c_void},
     mem::size_of,
     ptr, slice,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
-#[cfg(target_arch = "x86_64")]
-use ddk::InterfaceBinding;
 use ddk::{
     BlockRegistration, Bus, Device, Dma, DriverRegistration, Error, Event, Irq, Mmio, Module,
-    RESOURCE_MEMORY, Result, TicketLock, raw,
+    OwnedEvent, Result, TicketLock, raw,
 };
+#[cfg(target_arch = "x86_64")]
+use ddk::{Mutex, TypedInterface, pci::MsiOps as PciMsiOps};
 
 const CAP: usize = 0x00;
 const CC: usize = 0x14;
@@ -52,7 +52,6 @@ const CSTS_READY: u32 = 1;
 const CSTS_FATAL: u32 = 1 << 1;
 
 const ADMIN_CREATE_SQ: u8 = 0x01;
-const ADMIN_DELETE_CQ: u8 = 0x04;
 const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
 const ADMIN_SET_FEATURES: u8 = 0x09;
@@ -67,17 +66,6 @@ const IO_DEPTH: u16 = 256;
 const DATA_BYTES: usize = 128 * 1024;
 const COMMAND_TIMEOUT_NS: u64 = 5_000_000_000;
 const MAX_CPUS: u32 = 64;
-
-#[cfg(target_arch = "x86_64")]
-#[repr(C)]
-struct PciMsiOps {
-    size: u32,
-    enable: Option<
-        unsafe extern "C" fn(*mut c_void, *const raw::Device, u32, *mut u32, *mut u32) -> i32,
-    >,
-    unmask: Option<unsafe extern "C" fn(*mut c_void, *const raw::Device) -> i32>,
-    disable: Option<unsafe extern "C" fn(*mut c_void, *const raw::Device)>,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -119,7 +107,7 @@ struct QueuePair {
     cq_head: u16,
     phase: bool,
     next_cid: u16,
-    event: Event,
+    event: OwnedEvent,
     failed: bool,
 }
 
@@ -138,7 +126,7 @@ impl QueuePair {
             PAGE_SIZE,
             ddk::DMA_ZERO,
         )?;
-        let event = Event::create()?;
+        let event = OwnedEvent::create()?;
         Ok(Self {
             submission,
             completion,
@@ -175,7 +163,7 @@ impl QueuePair {
             );
         }
         self.sq_tail = (self.sq_tail + 1) % self.depth;
-        fence(Ordering::Release);
+        ddk::device_barrier();
         registers.write32(self.sq_doorbell(stride), u32::from(self.sq_tail));
 
         let started = ddk::monotonic_ns();
@@ -193,7 +181,7 @@ impl QueuePair {
             // a Rust reference to asynchronously-mutated memory.
             let status = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).status)) };
             if status & 1 == u16::from(self.phase) {
-                fence(Ordering::Acquire);
+                ddk::device_barrier();
                 // SAFETY: the matching phase publishes the entire completion.
                 break unsafe { ptr::read_volatile(entry) };
             }
@@ -237,12 +225,6 @@ impl QueuePair {
 
     fn cq_doorbell(&self, stride: usize) -> usize {
         DOORBELL_BASE + (usize::from(self.id) * 2 + 1) * stride
-    }
-}
-
-impl Drop for QueuePair {
-    fn drop(&mut self) {
-        let _ = self.event.destroy();
     }
 }
 
@@ -389,17 +371,44 @@ struct Namespace {
     controller: usize,
     nsid: u32,
     block_size: usize,
-    block: Option<BlockRegistration>,
+    block_count: u64,
+    block: TicketLock<Option<BlockRegistration>>,
+}
+
+struct RegisterWindow(Mmio);
+
+impl core::ops::Deref for RegisterWindow {
+    type Target = Mmio;
+    fn deref(&self) -> &Mmio {
+        &self.0
+    }
+}
+
+// SAFETY: NVMe uses volatile register accesses. Queues own distinct doorbells,
+// and IRQ masking uses INTMS while consumers acknowledge through INTMC. Other
+// controller configuration is serialized by startup/removal admission.
+unsafe impl Sync for RegisterWindow {}
+
+// Interrupts only borrow this separately shared allocation, never an
+// exclusively borrowed Controller while startup is still discovering queues.
+struct InterruptState {
+    #[cfg(target_arch = "riscv64")]
+    registers: Arc<RegisterWindow>,
+    event_ids: [AtomicUsize; MAX_CPUS as usize + 1],
+    event_vectors: [AtomicU32; MAX_CPUS as usize + 1],
+    interrupt_virqs: [AtomicU32; MAX_CPUS as usize + 1],
+    event_count: AtomicU32,
 }
 
 struct Controller {
     device: Device,
-    registers: Mmio,
+    registers: Arc<RegisterWindow>,
     doorbell_stride: usize,
     timeout_ns: u64,
     maximum_entries: u16,
     maximum_io_queues: u16,
     admin: Lease<QueuePair>,
+    identify_buffer: Option<Dma>,
     io: Vec<Lease<IoQueue>>,
     // Boxing is intentional: the block ABI stores stable namespace context
     // pointers while this vector is allowed to grow during discovery.
@@ -407,13 +416,8 @@ struct Controller {
     namespaces: Vec<Box<Namespace>>,
     max_transfer: usize,
     interrupts: Vec<Irq>,
-    event_ids: [AtomicUsize; MAX_CPUS as usize + 1],
-    event_vectors: [AtomicU32; MAX_CPUS as usize + 1],
-    interrupt_virqs: [AtomicU32; MAX_CPUS as usize + 1],
-    event_count: AtomicU32,
+    irq_state: Arc<InterruptState>,
     vector_count: u16,
-    #[cfg(target_arch = "riscv64")]
-    legacy_virq: AtomicU32,
     #[cfg(target_arch = "x86_64")]
     msi_active: bool,
 }
@@ -425,6 +429,7 @@ unsafe impl Sync for Controller {}
 
 impl Controller {
     fn create(device: Device, registers: Mmio) -> Result<Box<Self>> {
+        let registers = Arc::new(RegisterWindow(registers));
         let capabilities = registers.read64(CAP);
         if capabilities & (1u64 << 37) == 0 {
             return Err(Error::from_status(ddk::ENOTSUP));
@@ -451,10 +456,11 @@ impl Controller {
         }
 
         let current = registers.read32(CC);
-        if current & CC_ENABLE != 0 {
-            registers.write32(CC, current & !CC_ENABLE);
-            wait_ready(&registers, false, timeout_ns)?;
-        }
+        registers.write32(CC, current & !CC_ENABLE);
+        ddk::device_barrier();
+        // Firmware may have cleared EN while shutdown is still pending. Do not
+        // replace its queue registers until RDY confirms DMA has stopped.
+        wait_ready(&registers, false, timeout_ns)?;
         let admin = QueuePair::new(device, 0, ADMIN_DEPTH, maximum_entries)?;
         registers.write32(
             AQA,
@@ -462,33 +468,40 @@ impl Controller {
         );
         registers.write64(ASQ, admin.submission.device_address());
         registers.write64(ACQ, admin.completion.device_address());
-        // NVM command set, round-robin arbitration, 4 KiB pages, 64-byte SQEs,
-        // and 16-byte CQEs.
-        registers.write32(CC, CC_ENABLE | (6 << 16) | (4 << 20));
-        wait_ready(&registers, true, timeout_ns)?;
-
-        Ok(Box::new(Self {
+        // Establish the rollback owner before enabling any device access.
+        let controller = Box::new(Self {
             device,
-            registers,
+            registers: registers.clone(),
             doorbell_stride,
             timeout_ns,
             maximum_entries,
             maximum_io_queues,
             admin: Lease::new(admin)?,
+            identify_buffer: None,
             io: Vec::new(),
             namespaces: Vec::new(),
             max_transfer: DATA_BYTES,
             interrupts: Vec::new(),
-            event_ids: [const { AtomicUsize::new(0) }; MAX_CPUS as usize + 1],
-            event_vectors: [const { AtomicU32::new(0) }; MAX_CPUS as usize + 1],
-            interrupt_virqs: [const { AtomicU32::new(0) }; MAX_CPUS as usize + 1],
-            event_count: AtomicU32::new(0),
+            irq_state: Arc::new(InterruptState {
+                #[cfg(target_arch = "riscv64")]
+                registers: registers.clone(),
+                event_ids: [const { AtomicUsize::new(0) }; MAX_CPUS as usize + 1],
+                event_vectors: [const { AtomicU32::new(0) }; MAX_CPUS as usize + 1],
+                interrupt_virqs: [const { AtomicU32::new(0) }; MAX_CPUS as usize + 1],
+                event_count: AtomicU32::new(0),
+            }),
             vector_count: 1,
-            #[cfg(target_arch = "riscv64")]
-            legacy_virq: AtomicU32::new(0),
             #[cfg(target_arch = "x86_64")]
             msi_active: false,
-        }))
+        });
+        // NVM command set, round-robin arbitration, 4 KiB pages, 64-byte SQEs,
+        // and 16-byte CQEs. Drop quiesces the device on every later failure.
+        ddk::device_barrier();
+        controller
+            .registers
+            .write32(CC, CC_ENABLE | (6 << 16) | (4 << 20));
+        wait_ready(&controller.registers, true, timeout_ns)?;
+        Ok(controller)
     }
 
     fn request_interrupts(&mut self, virqs: &[u32]) -> Result<()> {
@@ -496,28 +509,19 @@ impl Controller {
             return Err(Error::from_status(ddk::ENOTSUP));
         }
         self.vector_count = virqs.len().min(usize::from(u16::MAX)) as u16;
-        self.event_ids[0].store(self.admin.take()?.event.id(), Ordering::Release);
-        self.event_count.store(1, Ordering::Release);
-        #[cfg(target_arch = "riscv64")]
-        {
-            self.legacy_virq.store(virqs[0], Ordering::Release);
-        }
-        let context = ptr::from_mut(self).cast::<c_void>();
+        self.irq_state.event_ids[0].store(self.admin.take()?.event.id(), Ordering::Release);
+        self.irq_state.event_count.store(1, Ordering::Release);
+        let context = Arc::as_ptr(&self.irq_state).cast_mut().cast::<c_void>();
         for (index, virq) in virqs.iter().enumerate() {
-            self.interrupt_virqs[index].store(*virq, Ordering::Release);
+            self.irq_state.interrupt_virqs[index].store(*virq, Ordering::Release);
             let flags = if cfg!(target_arch = "riscv64") {
                 ddk::IRQ_SHARED
             } else {
                 0
             };
-            self.interrupts.push(Irq::request(
-                self.device,
-                *virq,
-                c"nvme",
-                flags,
-                interrupt,
-                context,
-            )?);
+            self.interrupts.push(unsafe {
+                Irq::request(self.device, *virq, c"nvme", flags, interrupt, context)
+            }?);
         }
         Ok(())
     }
@@ -539,9 +543,18 @@ impl Controller {
         Ok(())
     }
 
-    fn configure(&mut self, controller_id: u32) -> Result<()> {
-        let identify = Dma::allocate(Some(self.device), PAGE_SIZE, PAGE_SIZE, ddk::DMA_ZERO)?;
-        self.identify(0, 1, &identify)?;
+    fn configure(&mut self) -> Result<()> {
+        self.identify_buffer = Some(Dma::allocate(
+            Some(self.device),
+            PAGE_SIZE,
+            PAGE_SIZE,
+            ddk::DMA_ZERO,
+        )?);
+        let identify = self
+            .identify_buffer
+            .as_ref()
+            .expect("owned Identify buffer");
+        self.identify(0, 1, identify)?;
         // SAFETY: Identify Controller completed successfully into all 4096
         // bytes of this coherent allocation.
         let controller_data = unsafe { slice::from_raw_parts(identify.as_ptr(), PAGE_SIZE) };
@@ -555,7 +568,11 @@ impl Controller {
         self.create_io_queues()?;
         let controller_pointer = ptr::from_ref(self) as usize;
         for nsid in 1..=namespace_count {
-            self.identify(nsid, 0, &identify)?;
+            let identify = self
+                .identify_buffer
+                .as_ref()
+                .expect("owned Identify buffer");
+            self.identify(nsid, 0, identify)?;
             // SAFETY: Identify Namespace repopulated the complete buffer.
             let data = unsafe { slice::from_raw_parts(identify.as_ptr(), PAGE_SIZE) };
             let blocks = le64(&data[..8]);
@@ -579,33 +596,9 @@ impl Controller {
                 controller: controller_pointer,
                 nsid,
                 block_size,
-                block: None,
-            }));
-            let namespace = self
-                .namespaces
-                .last_mut()
-                .expect("namespace was just pushed");
-            let mut name_storage = [0u8; 32];
-            let operations = raw::BlockOps {
-                size: raw::BLOCK_OPS_SIZE,
-                flags: 0,
-                context: (&raw mut **namespace).cast(),
-                logical_block_size: block_size as u32,
-                max_transfer_blocks: (self.max_transfer / block_size) as u32,
                 block_count: blocks,
-                read: Some(block_read),
-                write: Some(block_write),
-                flush: Some(block_flush),
-                discard: None,
-            };
-            // SAFETY: callbacks are static and the boxed namespace plus its
-            // controller outlive the registration. The table itself is copied.
-            namespace.block = Some(unsafe {
-                BlockRegistration::register(
-                    namespace_name(controller_id, nsid, &mut name_storage),
-                    &operations,
-                )?
-            });
+                block: TicketLock::new(None),
+            }));
         }
         if self.namespaces.is_empty() {
             return Err(Error::from_status(ddk::ENODEV));
@@ -625,7 +618,13 @@ impl Controller {
         let completion_count = ((result >> 16) as u16).saturating_add(1);
         let count = wanted.min(submission_count).min(completion_count).max(1);
         for id in 1..=count {
-            let queue = IoQueue::new(self.device, id, self.maximum_entries)?;
+            // Publish ownership before any command can name this queue's DMA.
+            self.io.push(Lease::new(IoQueue::new(
+                self.device,
+                id,
+                self.maximum_entries,
+            )?)?);
+            let queue = self.io.last().expect("owned I/O queue").take()?;
             let vector = if self.vector_count <= 1 {
                 0
             } else {
@@ -640,35 +639,29 @@ impl Controller {
                 cdw11: 1 | (1 << 1) | (u32::from(vector) << 16),
                 ..Command::default()
             })?;
-            self.event_ids[usize::from(id)].store(queue.pair.event.id(), Ordering::Release);
-            self.event_vectors[usize::from(id)].store(u32::from(vector), Ordering::Release);
-            self.event_count.store(u32::from(id) + 1, Ordering::Release);
-            if let Err(error) = self.admin_command(Command {
+            self.irq_state.event_ids[usize::from(id)]
+                .store(queue.pair.event.id(), Ordering::Release);
+            self.irq_state.event_vectors[usize::from(id)]
+                .store(u32::from(vector), Ordering::Release);
+            self.irq_state
+                .event_count
+                .store(u32::from(id) + 1, Ordering::Release);
+            self.admin_command(Command {
                 cdw0: u32::from(ADMIN_CREATE_SQ),
                 prp1: queue.pair.submission.device_address(),
                 cdw10: u32::from(id) | (u32::from(queue.pair.depth - 1) << 16),
                 cdw11: 1 | (u32::from(id) << 16),
                 ..Command::default()
-            }) {
-                let _ = self.admin_command(Command {
-                    cdw0: u32::from(ADMIN_DELETE_CQ),
-                    cdw10: u32::from(id),
-                    ..Command::default()
-                });
-                self.event_ids[usize::from(id)].store(0, Ordering::Release);
-                self.event_count.store(u32::from(id), Ordering::Release);
-                return Err(error);
-            }
-            self.io.push(Lease::new(queue)?);
+            })?;
         }
         Ok(())
     }
 
     fn queue(&self) -> Result<QueueGuard<'_, IoQueue>> {
         let first = ddk::cpu_current() as usize % self.io.len();
-        let mut events = [self.io[0].ready; MAX_CPUS as usize];
+        let mut events = [self.io[0].ready.event(); MAX_CPUS as usize];
         for (event, queue) in events.iter_mut().zip(&self.io) {
-            *event = queue.ready;
+            *event = queue.ready.event();
         }
         loop {
             for step in 0..self.io.len() {
@@ -724,11 +717,41 @@ impl Controller {
         )
     }
 
-    fn remove_blocks(&mut self) -> Result<()> {
-        for namespace in self.namespaces.iter_mut().rev() {
-            if let Some(mut registration) = namespace.block.take() {
+    fn publish_blocks(&self, controller_id: u32) -> Result<()> {
+        for namespace in &self.namespaces {
+            let mut name_storage = [0u8; 32];
+            let operations = raw::BlockOps {
+                size: raw::BLOCK_OPS_SIZE,
+                flags: 0,
+                context: ptr::from_ref(namespace.as_ref()).cast_mut().cast(),
+                logical_block_size: namespace.block_size as u32,
+                max_transfer_blocks: (self.max_transfer / namespace.block_size) as u32,
+                block_count: namespace.block_count,
+                read: Some(block_read),
+                write: Some(block_write),
+                flush: Some(block_flush),
+                discard: None,
+            };
+            // SAFETY: discovery is complete and all callback-visible state is
+            // immutable or synchronized. The box remains bound until every
+            // successful registration has been withdrawn.
+            let registration = unsafe {
+                BlockRegistration::register(
+                    namespace_name(controller_id, namespace.nsid, &mut name_storage),
+                    &operations,
+                )?
+            };
+            *namespace.block.lock_irqsave() = Some(registration);
+        }
+        Ok(())
+    }
+
+    fn remove_blocks(&self) -> Result<()> {
+        for namespace in self.namespaces.iter().rev() {
+            let registration = { namespace.block.lock_irqsave().take() };
+            if let Some(mut registration) = registration {
                 if let Err(error) = registration.unregister() {
-                    namespace.block = Some(registration);
+                    *namespace.block.lock_irqsave() = Some(registration);
                     return Err(error);
                 }
             }
@@ -736,29 +759,33 @@ impl Controller {
         Ok(())
     }
 
-    fn scan_blocks(&self) -> Result<()> {
+    fn scan_blocks(&self) {
         for namespace in &self.namespaces {
-            namespace
-                .block
-                .as_ref()
-                .ok_or(Error::from_status(ddk::ENODEV))?
-                .rescan()?;
+            let registration = { namespace.block.lock_irqsave().take() };
+            if let Some(registration) = registration {
+                if registration.rescan().is_err() {
+                    ddk::log(
+                        ddk::LOG_WARN,
+                        c"namespace partition rescan failed; retaining live disk",
+                    );
+                }
+                *namespace.block.lock_irqsave() = Some(registration);
+            }
         }
-        Ok(())
     }
 
-    fn disable(&self) {
+    fn disable(&self) -> Result<()> {
         let command = self.registers.read32(CC);
-        if command & CC_ENABLE != 0 {
-            self.registers.write32(CC, command & !CC_ENABLE);
-            let _ = wait_ready(&self.registers, false, self.timeout_ns);
-        }
+        self.registers.write32(CC, command & !CC_ENABLE);
+        ddk::device_barrier();
+        // Even when EN was already clear, an earlier disable may still be pending.
+        wait_ready(&self.registers, false, self.timeout_ns)
     }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        self.disable();
+        assert!(self.disable().is_ok(), "NVMe failed to halt DMA");
         for interrupt in &mut self.interrupts {
             let _ = interrupt.release();
         }
@@ -774,9 +801,9 @@ unsafe extern "C" fn interrupt(context: *mut c_void, virq: u32) -> u32 {
     if context.is_null() {
         return ddk::IRQ_NONE;
     }
-    // SAFETY: every IRQ receipt is released before the boxed controller and
-    // its event slots are destroyed.
-    let controller = unsafe { &*context.cast::<Controller>() };
+    // SAFETY: IRQ receipts are drained before the retained InterruptState is
+    // released; startup mutates only the separate Controller allocation.
+    let controller = unsafe { &*context.cast::<InterruptState>() };
     // Quiet the level source before completing its PLIC claim. Consumers
     // unmask after checking/acknowledging their queues, retriggering delivery
     // when another queue completed while this interrupt was being handled.
@@ -806,7 +833,7 @@ fn wait_ready(registers: &Mmio, ready: bool, timeout_ns: u64) -> Result<()> {
     let started = ddk::monotonic_ns();
     loop {
         let status = registers.read32(CSTS);
-        if status & CSTS_FATAL != 0 {
+        if ready && status & CSTS_FATAL != 0 {
             return Err(Error::from_status(ddk::EIO));
         }
         if (status & CSTS_READY != 0) == ready {
@@ -941,18 +968,13 @@ static MSI_REJECTED: AtomicU32 = AtomicU32::new(0);
 static ATTACHED_CONTROLLERS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(target_arch = "x86_64")]
-static MSI_BINDING: TicketLock<Option<InterfaceBinding>> = TicketLock::new(None);
+static MSI_BINDING: Mutex<Option<TypedInterface<PciMsiOps>>> = Mutex::new(None);
 
 #[cfg(target_arch = "x86_64")]
 fn with_msi<T>(call: impl FnOnce(&PciMsiOps, *mut c_void) -> Result<T>) -> Result<T> {
     let binding = MSI_BINDING.lock();
     let binding = binding.as_ref().ok_or(Error::from_status(ddk::ENOTSUP))?;
-    // SAFETY: the binding keeps the provider and its immutable v1 operation
-    // table live for the duration of this call.
-    let operations = unsafe { &*binding.operations().cast::<PciMsiOps>() };
-    if operations.size < size_of::<PciMsiOps>() as u32 {
-        return Err(Error::from_status(ddk::ENOTSUP));
-    }
+    let operations = binding.ops();
     call(operations, binding.context())
 }
 
@@ -1021,6 +1043,11 @@ unsafe extern "C" fn probe(
         return ddk::EINVAL;
     };
     let result = (|| -> Result<()> {
+        let resource = ddk::pci::memory_bar(device, 0)?;
+        if resource.length < DOORBELL_BASE as u64 + 8 {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let registers = Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE)?;
         #[cfg(target_arch = "x86_64")]
         let virqs = match pci_msi_enable(device) {
             Ok(virqs) => virqs,
@@ -1044,11 +1071,6 @@ unsafe extern "C" fn probe(
                 return Err(error);
             }
         };
-        let resource = device.resource(RESOURCE_MEMORY, 0)?;
-        if resource.length < DOORBELL_BASE as u64 + 8 {
-            return Err(Error::from_status(ddk::EINVAL));
-        }
-        let registers = Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE)?;
         let mut controller = match Controller::create(device, registers) {
             Ok(controller) => controller,
             Err(error) => {
@@ -1065,29 +1087,32 @@ unsafe extern "C" fn probe(
         #[cfg(target_arch = "x86_64")]
         pci_msi_unmask(device)?;
         let controller_id = NEXT_CONTROLLER.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = controller.configure(controller_id) {
-            if controller.remove_blocks().is_err() {
-                // A concurrently mounted device still owns this context. Leaking
-                // is safer than invalidating its callbacks; the module lease
-                // held by that endpoint also prevents code unload.
-                let _ = Box::leak(controller);
-            }
-            return Err(error);
-        }
+        controller.configure()?;
         let pointer = Box::into_raw(controller);
-        // SAFETY: the box now remains owned through this device-private pointer
-        // until the matching remove callback reconstructs it.
+        // SAFETY: ownership transfers before any namespace is published.
         if let Err(error) = unsafe { device.set_data(pointer.cast()) } {
-            // SAFETY: set_data failed, so ownership was not transferred.
-            let mut controller = unsafe { Box::from_raw(pointer) };
-            if controller.remove_blocks().is_err() {
-                let _ = Box::leak(controller);
-            }
+            // SAFETY: no block callback can reach this allocation yet.
+            drop(unsafe { Box::from_raw(pointer) });
             return Err(error);
         }
-        // SAFETY: device data now owns the controller at its final address, so
-        // partition scanning may re-enter the immutable block callbacks.
-        unsafe { &*pointer }.scan_blocks()?;
+        // SAFETY: the binding now owns a fully configured controller.
+        let controller = unsafe { &*pointer };
+        if let Err(error) = controller.publish_blocks(controller_id) {
+            if controller.remove_blocks().is_ok() {
+                // SAFETY: all published contexts have been withdrawn.
+                let _ = unsafe { device.set_data(ptr::null_mut()) };
+                drop(unsafe { Box::from_raw(pointer) });
+                return Err(error);
+            }
+            // An external user acquired a published disk during startup. Keep
+            // its recoverable binding, IRQs and controller instead of leaking
+            // the only context pointer on a failed probe.
+            ddk::log(
+                ddk::LOG_WARN,
+                c"namespace publication incomplete; retaining active controller",
+            );
+        }
+        controller.scan_blocks();
         #[cfg(target_arch = "x86_64")]
         ATTACHED_CONTROLLERS.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -1095,22 +1120,22 @@ unsafe extern "C" fn probe(
     result.map_or_else(Error::status, |()| ddk::OK)
 }
 
-unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) {
+unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) -> i32 {
     // SAFETY: the driver core supplies the same live device used for probe.
     let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
-        return;
+        return ddk::OK;
     };
     // SAFETY: only this driver stores a pointer in its bound device.
     let controller = unsafe { device.data() }.cast::<Controller>();
     if controller.is_null() {
-        return;
+        return ddk::OK;
     }
     // SAFETY: probe transferred a unique box and device removal serializes this
     // callback against another remove. Keep ownership in device data until all
     // externally reachable namespace contexts have been revoked.
-    let controller_ref = unsafe { &mut *controller };
-    if controller_ref.remove_blocks().is_err() {
-        return;
+    let controller_ref = unsafe { &*controller };
+    if let Err(error) = controller_ref.remove_blocks() {
+        return error.status();
     }
     // SAFETY: clearing prevents any later callback from claiming this box.
     let _ = unsafe { device.set_data(ptr::null_mut()) };
@@ -1118,6 +1143,7 @@ unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) 
     ATTACHED_CONTROLLERS.fetch_sub(1, Ordering::AcqRel);
     // SAFETY: every node is gone, so no callback can retain a context pointer.
     drop(unsafe { Box::from_raw(controller) });
+    ddk::OK
 }
 
 unsafe extern "C" fn shutdown(_context: *mut c_void, pointer: *const raw::Device) {
@@ -1129,7 +1155,10 @@ unsafe extern "C" fn shutdown(_context: *mut c_void, pointer: *const raw::Device
     let controller = unsafe { device.data() }.cast::<Controller>();
     if !controller.is_null() {
         // SAFETY: shutdown is serialized against removal by the driver core.
-        unsafe { &*controller }.disable();
+        assert!(
+            unsafe { &*controller }.disable().is_ok(),
+            "NVMe failed to shut down"
+        );
     }
 }
 
@@ -1154,9 +1183,10 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     matches: MATCHES.as_ptr(),
     match_count: MATCHES.len(),
     probe: Some(probe),
-    remove: Some(remove),
+    remove: None,
     shutdown: Some(shutdown),
     context: ptr::null_mut(),
+    try_remove: Some(remove),
 });
 
 static REGISTRATION: TicketLock<Option<DriverRegistration>> = TicketLock::new(None);
@@ -1166,26 +1196,12 @@ fn init_inner() -> Result<()> {
     {
         MSI_REJECTED.store(0, Ordering::Release);
         ATTACHED_CONTROLLERS.store(0, Ordering::Release);
-        let binding = InterfaceBinding::bind(c"pci.msi", 1).inspect_err(|_error| {
+        let binding = PciMsiOps::bind().inspect_err(|_error| {
             ddk::log(
                 ddk::LOG_ERROR,
                 c"NVMe cannot load on x86_64 without the PCI MSI-X/MSI service",
             );
         })?;
-        // SAFETY: the binding owns a provider reference and the table size is
-        // checked again at every use.
-        let operations = unsafe { &*binding.operations().cast::<PciMsiOps>() };
-        if operations.size < size_of::<PciMsiOps>() as u32
-            || operations.enable.is_none()
-            || operations.unmask.is_none()
-            || operations.disable.is_none()
-        {
-            ddk::log(
-                ddk::LOG_ERROR,
-                c"NVMe cannot load: PCI MSI-X/MSI service is incomplete",
-            );
-            return Err(Error::from_status(ddk::ENOTSUP));
-        }
         *MSI_BINDING.lock() = Some(binding);
     }
     let bus = Bus::find(c"pci")?;
@@ -1222,7 +1238,7 @@ fn init(module: Module) -> Result<()> {
 }
 
 fn exit(_module: Module) {
-    if let Some(mut registration) = REGISTRATION.lock_irqsave().take() {
+    if let Some(mut registration) = { REGISTRATION.lock_irqsave().take() } {
         let _ = registration.unregister();
     }
     #[cfg(target_arch = "x86_64")]

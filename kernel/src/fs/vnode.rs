@@ -1,5 +1,7 @@
 //! Filesystem-independent vnode and filesystem contracts.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
@@ -15,7 +17,7 @@ use bitflags::bitflags;
 
 use crate::{
     mem::{IoSink, IoSource, ObjectKind, VmObject},
-    sys::{event::Event, sync::Mutex},
+    sys::sync::Mutex,
 };
 
 use super::error::{Error, Result};
@@ -365,7 +367,7 @@ pub trait VnodeOps: Any + Send + Sync {
         _vnode: &Vnode,
         _file_context: usize,
         _events: PollEvents,
-        _output: &mut Vec<&'a Event>,
+        _output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         false
     }
@@ -776,7 +778,7 @@ impl Vnode {
         &'a self,
         file_context: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         self.inner
             .operations

@@ -81,7 +81,6 @@ const EMPTY_ROUTE: Route = Route {
 
 struct State {
     chips: [Chip; MAX_CHIPS],
-    chip_count: usize,
     routes: [Route; MAX_GSI],
 }
 
@@ -89,13 +88,12 @@ impl State {
     const fn new() -> Self {
         Self {
             chips: [const { Chip::new() }; MAX_CHIPS],
-            chip_count: 0,
             routes: [EMPTY_ROUTE; MAX_GSI],
         }
     }
 
     fn chip_index(&self, hwirq: u64) -> Option<usize> {
-        self.chips[..self.chip_count].iter().position(|chip| {
+        self.chips.iter().position(|chip| {
             chip.present
                 && hwirq >= chip.gsi_base.into()
                 && hwirq - u64::from(chip.gsi_base) < chip.redirections.into()
@@ -128,9 +126,10 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     matches: MATCHES.as_ptr(),
     match_count: MATCHES.len(),
     probe: Some(probe),
-    remove: Some(remove),
+    remove: None,
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: Some(remove),
 });
 
 unsafe extern "C" fn translate(
@@ -181,7 +180,7 @@ unsafe extern "C" fn setup(_context: *mut c_void, hwirq: u64, virq: u32, flags: 
     let mut state = STATE.lock_irqsave();
     let Some(index) = state.chip_index(hwirq) else {
         drop(state);
-        ddk::irq_free_vector(vector);
+        let _ = ddk::irq_free_vector(vector);
         return ddk::ENOENT;
     };
     let chip = &state.chips[index];
@@ -217,7 +216,7 @@ unsafe extern "C" fn teardown(_context: *mut c_void, hwirq: u64, _virq: u32) {
         state.routes[hwirq as usize].active = false;
         route.vector
     };
-    ddk::irq_free_vector(vector);
+    let _ = ddk::irq_free_vector(vector);
 }
 
 fn set_mask(hwirq: u64, masked: bool) {
@@ -288,19 +287,6 @@ static DOMAIN_DEF: raw::IrqDomainDef = raw::IrqDomainDef {
     context: ptr::null_mut(),
 };
 
-fn ensure_domain() -> Result<()> {
-    let mut domain = DOMAIN.lock_irqsave();
-    if domain.is_none() {
-        *domain = Some(IrqDomain::register(
-            c"ioapic",
-            ddk::IRQ_DOMAIN_DEFAULT,
-            MAX_GSI as u32,
-            &DOMAIN_DEF,
-        )?);
-    }
-    Ok(())
-}
-
 unsafe extern "C" fn probe(
     _context: *mut c_void,
     pointer: *const raw::Device,
@@ -319,58 +305,58 @@ unsafe extern "C" fn probe(
         Ok(_) => return ddk::EINVAL,
         Err(error) => return error.status(),
     };
-    let index = {
-        let mut state = STATE.lock_irqsave();
-        if state.chip_count == MAX_CHIPS {
-            return ddk::ENOSPC;
-        }
-        let index = state.chip_count;
-        state.chip_count += 1;
-        index
-    };
     let window = match Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE) {
         Ok(window) => window,
         Err(error) => return error.status(),
     };
+    // Validate and initialize the unpublished chip before taking the IRQ lock.
+    let mut chip = Chip {
+        window: Some(window),
+        gsi_base,
+        redirections: 0,
+        present: true,
+    };
+    let redirections = ((chip.read(REG_VERSION) >> 16) & 0xff) + 1;
+    if redirections > MAX_REDIRECTIONS
+        || u64::from(gsi_base) + u64::from(redirections) > MAX_GSI as u64
     {
-        let mut state = STATE.lock_irqsave();
-        let chip = &mut state.chips[index];
-        chip.window = Some(window);
-        let version = chip.read(REG_VERSION);
-        let redirections = ((version >> 16) & 0xff) + 1;
-        if redirections > MAX_REDIRECTIONS
-            || u64::from(gsi_base) + u64::from(redirections) > MAX_GSI as u64
-        {
-            chip.window = None;
-            return ddk::EINVAL;
-        }
-        chip.gsi_base = gsi_base;
-        chip.redirections = redirections;
-        for line in 0..redirections {
-            chip.write_redirection(line, REDIRECTION_MASKED, 0);
-        }
-        chip.present = true;
-        // SAFETY: this static chip's address remains stable until module exit.
-        if let Err(error) = unsafe { device.set_data(core::ptr::from_mut(chip).cast()) } {
-            chip.present = false;
-            chip.window = None;
-            return error.status();
-        }
+        return ddk::EINVAL;
     }
-    if let Err(error) = ensure_domain() {
+    chip.redirections = redirections;
+    for line in 0..redirections {
+        chip.write_redirection(line, REDIRECTION_MASKED, 0);
+    }
+    let (index, pointer) = {
         let mut state = STATE.lock_irqsave();
-        let chip = &mut state.chips[index];
-        chip.present = false;
-        chip.window = None;
+        let Some((index, slot)) = state
+            .chips
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.window.is_none())
+        else {
+            return ddk::ENOSPC;
+        };
+        *slot = chip;
+        (index, core::ptr::from_mut(slot))
+    };
+    // SAFETY: the reserved chip slot has a permanent address and is cleared by remove.
+    if let Err(error) = unsafe { device.set_data(pointer.cast()) } {
+        let mapping = {
+            let mut state = STATE.lock_irqsave();
+            let chip = &mut state.chips[index];
+            chip.present = false;
+            chip.window.take()
+        };
+        drop(mapping);
         return error.status();
     }
     ddk::OK
 }
 
-unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) {
+unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) -> i32 {
     // SAFETY: removal callback receives the same live device handle used at probe.
     let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
-        return;
+        return ddk::OK;
     };
     // SAFETY: probe stored only a pointer to a static `Chip`; it is validated
     // against the state array below before use.
@@ -383,23 +369,46 @@ unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) 
         || (chip_pointer as usize) >= end
         || !(chip_pointer as usize - first).is_multiple_of(core::mem::size_of::<Chip>())
     {
-        return;
+        return ddk::OK;
     }
     let index = (chip_pointer as usize - first) / core::mem::size_of::<Chip>();
+    let chip = &state.chips[index];
+    if state.routes.iter().enumerate().any(|(gsi, route)| {
+        route.active
+            && gsi as u64 >= u64::from(chip.gsi_base)
+            && (gsi as u64) < u64::from(chip.gsi_base) + u64::from(chip.redirections)
+    }) {
+        return ddk::EBUSY;
+    }
     let chip = &mut state.chips[index];
     if chip.present {
         for line in 0..chip.redirections {
             chip.write_redirection(line, REDIRECTION_MASKED, 0);
         }
         chip.present = false;
-        chip.window = None;
     }
-    // SAFETY: clear the opaque pointer before the static slot may be reused.
+    let mapping = chip.window.take();
+    drop(state);
+    // SAFETY: this exclusively removing device cannot receive new callbacks.
+    // Context lookup is a thread-only service, outside the IRQ state guard.
     let _ = unsafe { device.set_data(ptr::null_mut()) };
+    drop(mapping);
+    ddk::OK
 }
 
 fn init(_module: Module) -> Result<()> {
     let bus = Bus::find(c"platform")?;
+    // SAFETY: callbacks are static, synchronize STATE with IRQ guards, and
+    // chip removal refuses active mappings before releasing MMIO.
+    let domain = unsafe {
+        IrqDomain::register(
+            c"ioapic",
+            ddk::IRQ_DOMAIN_DEFAULT,
+            MAX_GSI as u32,
+            &DOMAIN_DEF,
+        )
+    }?;
+    *DOMAIN.lock_irqsave() = Some(domain);
     let definition = {
         let mut driver = DRIVER.lock_irqsave();
         driver.bus = bus.as_raw();
@@ -415,10 +424,10 @@ fn init(_module: Module) -> Result<()> {
 }
 
 fn exit(_module: Module) {
-    if let Some(mut registration) = REGISTRATION.lock_irqsave().take() {
+    if let Some(mut registration) = { REGISTRATION.lock_irqsave().take() } {
         let _ = registration.unregister();
     }
-    if let Some(mut domain) = DOMAIN.lock_irqsave().take() {
+    if let Some(mut domain) = { DOMAIN.lock_irqsave().take() } {
         let _ = domain.unregister();
     }
 }

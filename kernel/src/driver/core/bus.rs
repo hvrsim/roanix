@@ -170,6 +170,7 @@ fn registry() -> Result<&'static Registry> {
 /// Every callback in `ops` must follow the bus ABI and stay executable until
 /// the bus is unregistered.
 pub unsafe fn register(owner: Option<&Arc<Module>>, name: &str, ops: BusOps) -> Result<Arc<Bus>> {
+    let _owner = module::pin_owner(owner, false)?;
     if name.is_empty() || name.len() > MAX_NAME {
         return Err(Error::InvalidArgument);
     }
@@ -241,10 +242,8 @@ pub fn find(name: &str) -> Result<Arc<Bus>> {
         .ok_or(Error::NotFound)
 }
 
-pub(super) fn remove_module_buses(module: &Arc<Module>) {
-    let Ok(registry) = registry() else {
-        return;
-    };
+pub(super) fn remove_module_buses(module: &Arc<Module>) -> Result<()> {
+    let registry = registry()?;
     let owned: Vec<Arc<Bus>> = registry
         .buses
         .lock()
@@ -257,8 +256,9 @@ pub(super) fn remove_module_buses(module: &Arc<Module>) {
         .cloned()
         .collect();
     for bus in owned {
-        force_unregister(&bus);
+        unregister(&bus)?;
     }
+    Ok(())
 }
 
 /// Pins the module owning `bus` across a bus callback.

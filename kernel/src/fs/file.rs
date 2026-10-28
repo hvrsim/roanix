@@ -1,5 +1,7 @@
 //! Open file descriptions and shared seek offsets.
 
+use crate::sys::event::EventSource;
+
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -7,7 +9,7 @@ use bitflags::bitflags;
 
 use crate::{
     mem::{IoSink, IoSource},
-    sys::{event::Event, sync::Mutex},
+    sys::sync::Mutex,
 };
 
 use super::{
@@ -274,7 +276,11 @@ impl OpenFile {
     }
 
     /// Appends events that can wake a readiness rescan.
-    pub fn poll_events<'a>(&'a self, mut events: PollEvents, output: &mut Vec<&'a Event>) -> bool {
+    pub fn poll_events<'a>(
+        &'a self,
+        mut events: PollEvents,
+        output: &mut Vec<EventSource<'a>>,
+    ) -> bool {
         let flags = self.flags();
         if !flags.contains(OpenFlags::READ) {
             events.remove(PollEvents::IN | PollEvents::RDNORM);

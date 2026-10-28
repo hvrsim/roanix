@@ -16,10 +16,13 @@
 //! ACPI platform enumeration. This is intentionally limited to the MADT
 //! records consumed by the previous C driver.
 
+extern crate alloc;
+use alloc::vec::Vec;
 use core::{ffi::CStr, slice};
 
 use ddk::{
-    Bus, Device, DeviceBuilder, Error, Module, RESOURCE_IO, RESOURCE_MEMORY, Result, TicketLock,
+    Bus, DeviceBuilder, DeviceRegistration, Error, Module, Mutex, RESOURCE_IO, RESOURCE_MEMORY,
+    Result,
 };
 
 const RSDP_V1_SIZE: usize = 20;
@@ -52,8 +55,7 @@ const EMPTY_OVERRIDE: InterruptOverride = InterruptOverride {
 
 struct State {
     overrides: [InterruptOverride; MAX_OVERRIDES],
-    devices: [Option<Device>; MAX_IOAPICS + MAX_LEGACY_UARTS + 1],
-    count: usize,
+    devices: Vec<DeviceRegistration>,
     bus: Option<Bus>,
 }
 
@@ -61,19 +63,9 @@ impl State {
     const fn new() -> Self {
         Self {
             overrides: [EMPTY_OVERRIDE; MAX_OVERRIDES],
-            devices: [None; MAX_IOAPICS + MAX_LEGACY_UARTS + 1],
-            count: 0,
+            devices: Vec::new(),
             bus: None,
         }
-    }
-
-    fn remember(&mut self, device: Device) -> Result<()> {
-        if self.count == self.devices.len() {
-            return Err(Error::from_status(ddk::ENOSPC));
-        }
-        self.devices[self.count] = Some(device);
-        self.count += 1;
-        Ok(())
     }
 
     fn platform_bus(&self) -> Result<Bus> {
@@ -81,7 +73,7 @@ impl State {
     }
 }
 
-static STATE: TicketLock<State> = TicketLock::new(State::new());
+static STATE: Mutex<State> = Mutex::new(State::new());
 
 fn le16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes([bytes[0], bytes[1]])
@@ -167,20 +159,21 @@ fn resolve_isa(state: &State, isa: u32) -> (u32, u32) {
 fn create_ioapic(state: &mut State, id: u8, address: u64, gsi_base: u32) -> Result<()> {
     let mut name = [0u8; 32];
     let mut builder = DeviceBuilder::new(hex_name(b"ioapic@", address as u32, &mut name))?;
-    let compatible = [c"intel,ioapic".as_ptr()];
+    let compatible = [c"intel,ioapic"];
     builder.set_bus(state.platform_bus()?)?;
     builder.add_strings(c"compatible", &compatible)?;
     builder.add_u32(c"acpi.id", id.into())?;
     builder.add_u32(c"gsi-base", gsi_base)?;
     builder.add_resource(RESOURCE_MEMORY, 0, address, 0x20, c"regs")?;
-    state.remember(builder.publish()?)
+    state.devices.push(builder.publish()?);
+    Ok(())
 }
 
 fn create_serial(state: &mut State, index: usize) -> Result<()> {
     let mut name = [0u8; 32];
     let mut builder =
         DeviceBuilder::new(hex_name(b"serial@", LEGACY_PORTS[index].into(), &mut name))?;
-    let compatible = [c"pnp,16550a".as_ptr(), c"ns16550a".as_ptr()];
+    let compatible = [c"pnp,16550a", c"ns16550a"];
     let (gsi, flags) = resolve_isa(state, LEGACY_IRQS[index]);
     builder.set_bus(state.platform_bus()?)?;
     builder.add_strings(c"compatible", &compatible)?;
@@ -188,19 +181,21 @@ fn create_serial(state: &mut State, index: usize) -> Result<()> {
     builder.add_u32(c"clock-frequency", 1_843_200)?;
     builder.add_resource(RESOURCE_IO, 0, LEGACY_PORTS[index].into(), 8, c"regs")?;
     builder.add_irq(&[gsi, flags])?;
-    state.remember(builder.publish()?)
+    state.devices.push(builder.publish()?);
+    Ok(())
 }
 
 fn create_keyboard(state: &mut State) -> Result<()> {
     let mut builder = DeviceBuilder::new(c"keyboard@60")?;
-    let compatible = [c"pnp,PNP0303".as_ptr()];
+    let compatible = [c"pnp,PNP0303"];
     let (gsi, flags) = resolve_isa(state, 1);
     builder.set_bus(state.platform_bus()?)?;
     builder.add_strings(c"compatible", &compatible)?;
     builder.add_resource(RESOURCE_IO, 0, 0x60, 1, c"data")?;
     builder.add_resource(RESOURCE_IO, 0, 0x64, 1, c"status")?;
     builder.add_irq(&[gsi, flags])?;
-    state.remember(builder.publish()?)
+    state.devices.push(builder.publish()?);
+    Ok(())
 }
 
 fn map_table(physical: u64) -> Result<&'static [u8]> {
@@ -299,7 +294,7 @@ fn init(_module: Module) -> Result<()> {
         return Err(Error::from_status(ddk::EINVAL));
     }
 
-    let mut state = STATE.lock_irqsave();
+    let mut state = STATE.lock();
     *state = State::new();
     state.bus = Some(Bus::find(c"platform")?);
     walk_tables(&mut state, root, wide)?;
@@ -310,15 +305,18 @@ fn init(_module: Module) -> Result<()> {
     Ok(())
 }
 
-fn exit(_module: Module) {
-    let devices = {
-        let mut state = STATE.lock_irqsave();
-        let devices = state.devices;
-        *state = State::new();
-        devices
-    };
-    for device in devices.into_iter().flatten().rev() {
-        let _ = device.remove();
+fn exit(_: Module) {
+    let mut devices = { core::mem::take(&mut STATE.lock().devices) };
+    while let Some(mut device) = devices.pop() {
+        if device.remove().is_err() {
+            devices.push(device);
+            STATE.lock().devices.append(&mut devices);
+            ddk::log(
+                ddk::LOG_ERROR,
+                c"firmware device removal refused; retaining publication receipts",
+            );
+            return;
+        }
     }
 }
 

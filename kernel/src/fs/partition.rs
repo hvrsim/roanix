@@ -8,7 +8,7 @@
 use alloc::{format, sync::Arc, vec::Vec};
 
 use crate::{
-    dev::block::{self, BlockBackend, BlockDevice},
+    dev::block::{self, BlockDevice},
     driver::error::{Error, Result},
 };
 
@@ -26,48 +26,6 @@ struct Partition {
     blocks: u64,
 }
 
-struct PartitionBackend {
-    parent: Arc<BlockDevice>,
-    first: u64,
-    blocks: u64,
-}
-
-impl PartitionBackend {
-    fn map(&self, lba: u64, blocks: u32) -> Result<u64> {
-        let end = lba
-            .checked_add(u64::from(blocks))
-            .ok_or(Error::InvalidArgument)?;
-        if end > self.blocks {
-            return Err(Error::InvalidArgument);
-        }
-        self.first.checked_add(lba).ok_or(Error::InvalidArgument)
-    }
-}
-
-impl BlockBackend for PartitionBackend {
-    fn read_blocks(&self, lba: u64, blocks: u32, buffer: &mut [u8]) -> Result<()> {
-        self.parent
-            .read_blocks(self.map(lba, blocks)?, blocks, buffer)
-    }
-
-    fn write_blocks(&self, lba: u64, blocks: u32, buffer: &[u8]) -> Result<()> {
-        self.parent
-            .write_blocks(self.map(lba, blocks)?, blocks, buffer)
-    }
-
-    fn flush(&self) -> Result<()> {
-        self.parent.flush()
-    }
-
-    fn discard(&self, lba: u64, blocks: u32) -> Result<()> {
-        self.parent.discard(self.map(lba, blocks)?, blocks)
-    }
-
-    fn writable(&self) -> bool {
-        self.parent.writable()
-    }
-}
-
 /// Scans a newly registered whole disk. Corrupt or absent tables leave the
 /// disk usable and are reported without failing hardware probe.
 pub fn scan(device: &Arc<BlockDevice>) {
@@ -75,12 +33,12 @@ pub fn scan(device: &Arc<BlockDevice>) {
         Ok(partitions) => {
             for partition in partitions {
                 let name = format!("{}p{}", device.name(), partition.number);
-                let backend = Arc::new(PartitionBackend {
-                    parent: device.clone(),
-                    first: partition.first,
-                    blocks: partition.blocks,
-                });
-                match block::register_child(&name, device.clone(), backend, partition.blocks) {
+                match block::register_partition(
+                    &name,
+                    device.clone(),
+                    partition.first,
+                    partition.blocks,
+                ) {
                     Ok(child) => {
                         log::info!(
                             target: "partition",

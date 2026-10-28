@@ -28,7 +28,10 @@ use crate::{
     sys::sync::{Mutex, Once},
 };
 
-use super::node::{self, DevNodeId};
+use super::{
+    block_ranges::WriteRanges,
+    node::{self, DevNodeId},
+};
 
 const IO_BATCH_BYTES: usize = 128 * 1024;
 
@@ -151,10 +154,15 @@ pub struct BlockDevice {
     parent: Option<Arc<BlockDevice>>,
     children: Mutex<Vec<Weak<BlockDevice>>>,
     backend: Arc<dyn BlockBackend>,
+    backend_start: u64,
+    write_ranges: Arc<WriteRanges>,
     logical_block_size: u32,
     max_transfer_blocks: u32,
     block_count: u64,
     devfs_node: Mutex<Option<DevNodeId>>,
+    // Shared by a whole disk and its partitions. Claim admission, child
+    // publication and removal must all observe the same lifecycle interlock.
+    lifecycle: Arc<Mutex<()>>,
     claims: AtomicU64,
     scanned: AtomicU32,
 }
@@ -201,9 +209,15 @@ impl BlockDevice {
 
     pub fn read_blocks(&self, lba: u64, blocks: u32, buffer: &mut [u8]) -> Result<()> {
         self.check_transfer(lba, blocks, buffer.len())?;
-        self.transfer_chunks(lba, blocks, buffer, |backend, at, count, bytes| {
-            backend.read_blocks(at, count, bytes)
-        })
+        if blocks == 0 {
+            return Ok(());
+        }
+        self.transfer_chunks(
+            self.backend_start + lba,
+            blocks,
+            buffer,
+            |backend, at, count, bytes| backend.read_blocks(at, count, bytes),
+        )
     }
 
     fn transfer_chunks<F>(
@@ -239,8 +253,19 @@ impl BlockDevice {
         Ok(())
     }
 
-    pub fn write_blocks(&self, mut lba: u64, mut blocks: u32, buffer: &[u8]) -> Result<()> {
+    pub fn write_blocks(&self, lba: u64, blocks: u32, buffer: &[u8]) -> Result<()> {
         self.check_transfer(lba, blocks, buffer.len())?;
+        if blocks == 0 {
+            return Ok(());
+        }
+        let first = self.backend_start + lba;
+        let _range = self.write_ranges.lock(first..first + u64::from(blocks));
+        self.write_blocks_locked(lba, blocks, buffer)
+    }
+
+    // Caller owns the complete affected range, including bounce-buffer sectors.
+    fn write_blocks_locked(&self, lba: u64, mut blocks: u32, buffer: &[u8]) -> Result<()> {
+        let mut lba = self.backend_start + lba;
         let limit = if self.max_transfer_blocks == 0 {
             u32::MAX
         } else {
@@ -261,15 +286,21 @@ impl BlockDevice {
     }
 
     pub fn flush(&self) -> Result<()> {
+        let _range = self.write_ranges.lock(0..u64::MAX);
         self.backend.flush()
     }
 
-    pub fn discard(&self, mut lba: u64, mut blocks: u32) -> Result<()> {
+    pub fn discard(&self, lba: u64, mut blocks: u32) -> Result<()> {
         self.check_transfer(
             lba,
             blocks,
             blocks as usize * self.logical_block_size as usize,
         )?;
+        if blocks == 0 {
+            return Ok(());
+        }
+        let mut lba = self.backend_start + lba;
+        let _range = self.write_ranges.lock(lba..lba + u64::from(blocks));
         let limit = if self.max_transfer_blocks == 0 {
             u32::MAX
         } else {
@@ -405,8 +436,11 @@ impl BlockDevice {
         let bs = self.logical_block_size as usize;
         let first = offset / bs as u64;
         let leading = offset as usize % bs;
+        let range_start = self.backend_start + first;
+        let range_end = self.backend_start + end.div_ceil(bs as u64);
+        let _range = self.write_ranges.lock(range_start..range_end);
         if leading == 0 && buffer.len().is_multiple_of(bs) {
-            self.write_blocks(first, (buffer.len() / bs) as u32, buffer)?;
+            self.write_blocks_locked(first, (buffer.len() / bs) as u32, buffer)?;
             return Ok(buffer.len());
         }
         let mut bounce = block_buffer(bs)?;
@@ -416,13 +450,13 @@ impl BlockDevice {
             self.read_blocks(lba, 1, &mut bounce)?;
             let take = buffer.len().min(bs - leading);
             bounce[leading..leading + take].copy_from_slice(&buffer[..take]);
-            self.write_blocks(lba, 1, &bounce)?;
+            self.write_blocks_locked(lba, 1, &bounce)?;
             done += take;
             lba += 1;
         }
         let middle = (buffer.len() - done) / bs * bs;
         if middle != 0 {
-            self.write_blocks(lba, (middle / bs) as u32, &buffer[done..done + middle])?;
+            self.write_blocks_locked(lba, (middle / bs) as u32, &buffer[done..done + middle])?;
             done += middle;
             lba += (middle / bs) as u64;
         }
@@ -430,21 +464,22 @@ impl BlockDevice {
             self.read_blocks(lba, 1, &mut bounce)?;
             let tail = buffer.len() - done;
             bounce[..tail].copy_from_slice(&buffer[done..]);
-            self.write_blocks(lba, 1, &bounce)?;
+            self.write_blocks_locked(lba, 1, &bounce)?;
         }
         Ok(buffer.len())
     }
 
     pub fn claim(self: &Arc<Self>) -> Result<BlockClaim> {
         let _pin = module::pin_owner(self.owner.as_ref(), false)?;
-        if !self.header.is_live() {
+        let _lifecycle = self.lifecycle.lock();
+        if self.header.state() != ObjState::Live {
             return Err(Error::NoDevice);
         }
-        self.claims.fetch_add(1, Ordering::AcqRel);
-        if !self.header.is_live() {
-            self.claims.fetch_sub(1, Ordering::AcqRel);
-            return Err(Error::NoDevice);
-        }
+        self.claims
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |claims| {
+                claims.checked_add(1)
+            })
+            .map_err(|_| Error::Busy)?;
         Ok(BlockClaim(self.clone()))
     }
 }
@@ -563,24 +598,41 @@ pub fn register_module(owner: Arc<Module>, name: &str, ops: BlockOps) -> Result<
         Some(owner.clone()),
         None,
         Arc::new(ModuleBackend { owner, ops }),
+        0,
         block_size,
         max_transfer,
         count,
     )
 }
 
-/// Registers a derived block address space such as a partition.
-pub fn register_child(
+/// Registers a linear partition sharing its parent's backend and write ranges.
+pub fn register_partition(
     name: &str,
     parent: Arc<BlockDevice>,
-    backend: Arc<dyn BlockBackend>,
+    first: u64,
     block_count: u64,
 ) -> Result<Arc<BlockDevice>> {
+    let _lifecycle = parent.lifecycle.lock();
+    if parent.header.state() != ObjState::Live {
+        return Err(Error::NoDevice);
+    }
+    if block_count == 0
+        || first
+            .checked_add(block_count)
+            .is_none_or(|end| end > parent.block_count)
+    {
+        return Err(Error::InvalidArgument);
+    }
+    let backend_start = parent
+        .backend_start
+        .checked_add(first)
+        .ok_or(Error::InvalidArgument)?;
     register(
         name,
         parent.owner.clone(),
         Some(parent.clone()),
-        backend,
+        parent.backend.clone(),
+        backend_start,
         parent.logical_block_size,
         parent.max_transfer_blocks,
         block_count,
@@ -593,6 +645,7 @@ fn register(
     owner: Option<Arc<Module>>,
     parent: Option<Arc<BlockDevice>>,
     backend: Arc<dyn BlockBackend>,
+    backend_start: u64,
     logical_block_size: u32,
     max_transfer_blocks: u32,
     block_count: u64,
@@ -616,10 +669,19 @@ fn register(
         parent: parent.clone(),
         children: Mutex::new(Vec::new()),
         backend,
+        backend_start,
+        write_ranges: parent.as_ref().map_or_else(
+            || Arc::new(WriteRanges::new()),
+            |parent| parent.write_ranges.clone(),
+        ),
         logical_block_size,
         max_transfer_blocks,
         block_count,
         devfs_node: Mutex::new(None),
+        lifecycle: parent.as_ref().map_or_else(
+            || Arc::new(Mutex::new(())),
+            |parent| parent.lifecycle.clone(),
+        ),
         claims: AtomicU64::new(0),
         scanned: AtomicU32::new(0),
     });
@@ -677,6 +739,14 @@ pub fn find(name: &str) -> Result<Arc<BlockDevice>> {
 
 /// Removes a device and all unclaimed partition children.
 pub fn unregister(device: &Arc<BlockDevice>) -> Result<()> {
+    let _lifecycle = device.lifecycle.lock();
+    unregister_locked(device)
+}
+
+fn unregister_locked(device: &Arc<BlockDevice>) -> Result<()> {
+    if device.header.state() == ObjState::Dead {
+        return Ok(());
+    }
     if device.claims.load(Ordering::Acquire) != 0 {
         return Err(Error::Busy);
     }
@@ -693,10 +763,10 @@ pub fn unregister(device: &Arc<BlockDevice>) -> Result<()> {
         return Err(Error::Busy);
     }
     for child in children.into_iter().rev() {
-        unregister(&child)?;
+        unregister_locked(&child)?;
     }
     device.header.set_state(ObjState::Removing);
-    if let Some(node_id) = device.devfs_node.lock().take()
+    if let Some(node_id) = { device.devfs_node.lock().take() }
         && let Err(error) = node::remove(device.owner.as_ref(), node_id)
     {
         device.header.set_state(ObjState::Live);
@@ -733,8 +803,8 @@ pub fn try_remove_module_devices(module: &Arc<Module>) -> Result<()> {
 }
 
 /// Sweeps module-owned root devices after its exit callback.
-pub fn remove_module_devices(module: &Arc<Module>) {
-    let Ok(registry) = registry() else { return };
+pub fn remove_module_devices(module: &Arc<Module>) -> Result<()> {
+    let registry = registry()?;
     let roots: Vec<_> = registry
         .devices
         .lock()
@@ -749,8 +819,9 @@ pub fn remove_module_devices(module: &Arc<Module>) {
         .cloned()
         .collect();
     for device in roots {
-        let _ = unregister(&device);
+        unregister(&device)?;
     }
+    Ok(())
 }
 
 const _: () = assert!(size_of::<BlockOps>() == BLOCK_OPS_SIZE);

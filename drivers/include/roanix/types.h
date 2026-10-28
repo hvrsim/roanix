@@ -116,7 +116,7 @@ struct rdf_worker;
 
 /* Identifier of a node in the device filesystem. */
 typedef uint64_t rdf_devnode_t;
-/* Address of a kernel event object. */
+/* Opaque, revocable event identity; never a kernel address. */
 typedef uintptr_t rdf_event_t;
 
 #if defined(__GNUC__) || defined(__clang__)

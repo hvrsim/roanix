@@ -1,5 +1,7 @@
 //! Kernel-owned device filesystem.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
@@ -15,7 +17,6 @@ use crate::{
     mem::{IoSink, IoSource, VmObject},
     sys::{
         clock,
-        event::Event,
         sync::{Mutex, Once},
     },
 };
@@ -276,7 +277,7 @@ pub trait DeviceNodeOps: Send + Sync {
         &'a self,
         _file_context: usize,
         _events: PollEvents,
-        _output: &mut Vec<&'a Event>,
+        _output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         false
     }
@@ -974,7 +975,7 @@ impl VnodeOps for DevfsNode {
         _vnode: &Vnode,
         file_context: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         match &self.data {
             DevfsData::Directory => false,

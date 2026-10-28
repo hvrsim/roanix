@@ -6,7 +6,7 @@ use core::{
     ffi::{CStr, c_void},
     ptr, slice,
 };
-use ddk::{Devfs, Error, Event, Result, TicketLock, raw};
+use ddk::{Error, Event, OwnedEvent, Result, TicketLock, devfs, raw};
 
 const READERS: usize = 8;
 const QUEUE: usize = 256;
@@ -14,7 +14,7 @@ const RECORD: usize = 24;
 pub const KEY_BYTES: usize = 96;
 
 struct Reader {
-    event: Option<Event>,
+    event: Option<OwnedEvent>,
     head: usize,
     length: usize,
     records: [[u8; RECORD]; QUEUE],
@@ -36,7 +36,7 @@ impl Reader {
         }
         self.records[(self.head + self.length) % QUEUE] = record;
         self.length += 1;
-        if let Some(event) = self.event {
+        if let Some(event) = &self.event {
             let _ = event.signal();
         }
     }
@@ -82,8 +82,7 @@ impl Keyboard {
         if self.state.lock_irqsave().node.is_some() {
             self.unpublish()?;
         }
-        let fs = Devfs::current()?;
-        let directory = fs.lookup(c"input")?;
+        let directory = devfs::lookup(c"input")?;
         let mut ops = OPS;
         ops.context = ptr::from_ref(self).cast_mut().cast();
         {
@@ -106,7 +105,7 @@ impl Keyboard {
                     CStr::from_bytes_with_nul(&name).expect("event name")
                 };
                 // SAFETY: this static keyboard outlives the node and its callbacks.
-                match unsafe { fs.create_character(directory, name, 0o600, &ops) } {
+                match unsafe { devfs::create_character(directory, name, 0o600, &ops) } {
                     Err(error) if error.status() == ddk::EEXIST => None,
                     result => Some(result),
                 }
@@ -133,14 +132,14 @@ impl Keyboard {
             let mut state = self.state.lock_irqsave();
             state.online = false;
             for reader in &state.readers {
-                if let Some(event) = reader.event {
+                if let Some(event) = &reader.event {
                     let _ = event.signal();
                 }
             }
             state.node
         };
         if let Some(node) = node {
-            Devfs::current()?.remove(node)?;
+            devfs::remove(node)?;
             self.state.lock_irqsave().node = None;
         }
         Ok(())
@@ -201,10 +200,10 @@ fn keyboard<'a>(context: *mut c_void) -> &'a Keyboard {
     unsafe { &*context.cast::<Keyboard>() }
 }
 unsafe extern "C" fn open(context: *mut c_void, _: u32, out: *mut usize) -> i32 {
-    let event = match Event::create() {
+    let mut event = Some(match OwnedEvent::create() {
         Ok(event) => event,
         Err(error) => return error.status(),
-    };
+    });
     let index = {
         let mut state = keyboard(context).state.lock_irqsave();
         if !state.online {
@@ -217,7 +216,7 @@ unsafe extern "C" fn open(context: *mut c_void, _: u32, out: *mut usize) -> i32 
             let reader = &mut state.readers[index];
             reader.head = 0;
             reader.length = 0;
-            reader.event = Some(event);
+            reader.event = event.take();
             Ok(index)
         } else {
             Err(ddk::ENOSPC)
@@ -231,10 +230,7 @@ unsafe extern "C" fn open(context: *mut c_void, _: u32, out: *mut usize) -> i32 
             }
             ddk::OK
         }
-        Err(error) => {
-            let _ = event.destroy();
-            error
-        }
+        Err(error) => error,
     }
 }
 unsafe extern "C" fn close(context: *mut c_void, index: usize, _: u32) {
@@ -246,9 +242,7 @@ unsafe extern "C" fn close(context: *mut c_void, index: usize, _: u32) {
             .get_mut(index)
             .and_then(|r| r.event.take())
     };
-    if let Some(event) = event {
-        let _ = event.destroy();
-    }
+    drop(event);
 }
 unsafe extern "C" fn read(
     context: *mut c_void,
@@ -271,7 +265,7 @@ unsafe extern "C" fn read(
                 return i64::from(ddk::ENODEV);
             }
             let reader = &mut state.readers[index];
-            let Some(event) = reader.event else {
+            let Some(event) = reader.event.as_ref().map(OwnedEvent::event) else {
                 return i64::from(ddk::EINVAL);
             };
             let count = reader.length.min(length / RECORD);
@@ -326,7 +320,7 @@ unsafe extern "C" fn readable(context: *mut c_void, index: usize) -> usize {
         .lock_irqsave()
         .readers
         .get(index)
-        .and_then(|r| r.event)
+        .and_then(|r| r.event.as_ref().map(OwnedEvent::event))
         .map_or(0, Event::id)
 }
 unsafe extern "C" fn ioctl(

@@ -9,7 +9,7 @@
  *
  *     #include <roanix/driver.h>
  *
- *     static int32_t probe(void *ctx, struct rdf_device *dev, uintptr_t data)
+ *     static int32_t probe(void *ctx, const struct rdf_device *dev, uintptr_t data)
  *     {
  *         ...
  *         return RDF_OK;
@@ -19,7 +19,7 @@
  *         RDF_MATCH_COMPATIBLE("vendor,widget"),
  *     };
  *
- *     static int32_t init(struct rdf_module *self)
+ *     static int32_t init(const struct rdf_module *self)
  *     {
  *         static struct rdf_driver_def def = { ... };
  *         return rdf_driver_register(&def, NULL);
@@ -158,7 +158,7 @@ extern "C" {
 /* --- Module state ------------------------------------------------------- */
 
 /* This module's handle, installed before its initialization callback. */
-extern struct rdf_module *rdf_self __attribute__((visibility("hidden")));
+extern const struct rdf_module *rdf_self __attribute__((visibility("hidden")));
 
 /* --- Diagnostics and memory --------------------------------------------- */
 
@@ -327,8 +327,15 @@ static inline int32_t rdf_device_add_irq(struct rdf_device_builder *builder,
     return rdf_api_v2_device_add_irq(builder, domain, cells, count);
 }
 
+/* Adds a specifier with a controller that may register after publication. */
+static inline int32_t rdf_device_add_firmware_irq(struct rdf_device_builder *builder,
+    uint32_t phandle, const uint32_t *cells, size_t count)
+{
+    return rdf_api_v2_device_add_firmware_irq(builder, phandle, cells, count);
+}
+
 /* Publishes a described device. The builder is consumed either way. */
-static inline int32_t rdf_device_add(struct rdf_device_builder *builder, struct rdf_device **out)
+static inline int32_t rdf_device_add(struct rdf_device_builder *builder, const struct rdf_device **out)
 {
     return rdf_api_v2_device_add(builder, out);
 }
@@ -348,7 +355,7 @@ static inline int32_t rdf_device_remove(const struct rdf_device *device)
 /* --- Device inspection -------------------------------------------------- */
 
 /* Returns the root of the device tree. */
-static inline int32_t rdf_device_root(struct rdf_device **out)
+static inline int32_t rdf_device_root(const struct rdf_device **out)
 {
     return rdf_api_v2_device_root(out);
 }
@@ -360,7 +367,7 @@ static inline const char *rdf_device_name(const struct rdf_device *device)
 }
 
 /* Returns a device's parent, or NULL at the root. */
-static inline struct rdf_device *rdf_device_parent(const struct rdf_device *device)
+static inline const struct rdf_device *rdf_device_parent(const struct rdf_device *device)
 {
     return rdf_api_v2_device_parent(device);
 }
@@ -372,7 +379,7 @@ static inline size_t rdf_device_child_count(const struct rdf_device *device)
 }
 
 /* Returns one child of a device. */
-static inline struct rdf_device *rdf_device_child(const struct rdf_device *device, size_t index)
+static inline const struct rdf_device *rdf_device_child(const struct rdf_device *device, size_t index)
 {
     return rdf_api_v2_device_child(device, index);
 }
@@ -387,6 +394,13 @@ static inline void *rdf_device_data(const struct rdf_device *device)
 static inline void rdf_device_set_data(const struct rdf_device *device, void *value)
 {
     rdf_api_v2_device_set_data(device, value);
+}
+
+/* Stores data only if the device identity is still live; preserves caller
+ * ownership on failure. Use this when transferring an allocated context. */
+static inline int32_t rdf_device_set_data_checked(const struct rdf_device *device, void *value)
+{
+    return rdf_api_v2_device_set_data_checked(device, value);
 }
 
 /* Reads an integer property. */
@@ -560,7 +574,7 @@ static inline size_t rdf_iface_count(const char *name, uint32_t min_version)
 }
 
 /* Returns one global provider of a name. */
-static inline struct rdf_iface *rdf_iface_provider(const char *name, uint32_t min_version,
+static inline const struct rdf_iface *rdf_iface_provider(const char *name, uint32_t min_version,
                                                    size_t index)
 {
     return rdf_api_v2_iface_provider(name, min_version, index);
@@ -581,6 +595,13 @@ static inline int32_t rdf_irq_domain_register(const char *name, uint32_t flags,
                                               const struct rdf_irq_domain **out)
 {
     return rdf_api_v2_irq_domain_register(rdf_self, name, flags, hwirq_count, definition, out);
+}
+
+/* Publishes a fully initialized firmware controller; may retry consumers. */
+static inline int32_t rdf_irq_domain_set_device(const struct rdf_irq_domain *domain,
+    const struct rdf_device *device)
+{
+    return rdf_api_v2_irq_domain_set_device(domain, device);
 }
 
 /* Unregisters an interrupt controller domain. */
@@ -1143,15 +1164,15 @@ static inline uint32_t rdf_klog_set_console_level(uint32_t level)
  * ELF entry must be `rdf_module_entry`, which the supplied link flags arrange.
  */
 #define RDF_MODULE(module_name, module_description, module_init, module_exit)                  \
-    struct rdf_module *rdf_self __attribute__((visibility("hidden")));                         \
-    static int32_t rdf_module_start(struct rdf_module *self)                                   \
+    const struct rdf_module *rdf_self __attribute__((visibility("hidden")));                         \
+    static int32_t rdf_module_start(const struct rdf_module *self)                                   \
     {                                                                                          \
         rdf_self = self;                                                                       \
         return (module_init)(self);                                                            \
     }                                                                                          \
-    static void rdf_module_stop(struct rdf_module *self)                                       \
+    static void rdf_module_stop(const struct rdf_module *self)                                       \
     {                                                                                          \
-        void (*stop)(struct rdf_module *) = (module_exit);                                     \
+        void (*stop)(const struct rdf_module *) = (module_exit);                                     \
         if (stop != NULL)                                                                      \
             stop(self);                                                                        \
     }                                                                                          \

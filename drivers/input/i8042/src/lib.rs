@@ -145,7 +145,7 @@ fn attach(device: Device) -> Result<()> {
         return Err(Error::from_status(ddk::ENODEV));
     }
     let virq = ddk::irq_of_device(device, 0)?;
-    let irq = Irq::request(device, virq, c"i8042", 0, interrupt, ptr::null_mut())?;
+    let irq = unsafe { Irq::request(device, virq, c"i8042", 0, interrupt, ptr::null_mut()) }?;
     STATE.lock_irqsave().irq = Some(irq);
     let mut keys = [0; evdev::KEY_BYTES];
     for code in (1..=83)
@@ -212,6 +212,7 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     remove: Some(remove),
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: None,
 });
 fn init(_: Module) -> Result<()> {
     let bus = Bus::find(c"platform")?;

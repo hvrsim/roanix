@@ -11,6 +11,7 @@ name = "pci"
 path = "src/lib.rs"
 
 [dependencies]
+firmware_tree = { package = "fdt", path = "../../platform/fdt" }
 ddk = { path = "../../ddk" }
 
 [build-dependencies]

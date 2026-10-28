@@ -43,6 +43,8 @@ mod state {
     pub const UNLOADING: u32 = 3;
     /// The module has been torn down.
     pub const DEAD: u32 = 4;
+    /// Exit completed; framework cleanup must finish before releasing backing.
+    pub const RETIRED: u32 = 5;
 }
 
 /// Stable numeric identity used for dependency bookkeeping.
@@ -101,6 +103,7 @@ pub struct Module {
     state: AtomicU32,
     active: AtomicU64,
     leases: AtomicU64,
+    pub(crate) mutexes_closed: core::sync::atomic::AtomicBool,
     exit: Option<ExitFn>,
     edges: Mutex<Edges>,
     backing: Mutex<Option<Box<dyn ModuleBacking>>>,
@@ -131,13 +134,13 @@ impl Module {
 
     /// Returns whether the module is loaded and usable.
     pub fn is_live(&self) -> bool {
-        self.state.load(Ordering::Acquire) == state::LIVE
+        self.state.load(Ordering::SeqCst) == state::LIVE
     }
 
     /// Returns whether the module may still register objects.
     pub fn is_registering(&self) -> bool {
         matches!(
-            self.state.load(Ordering::Acquire),
+            self.state.load(Ordering::SeqCst),
             state::LOADING | state::LIVE
         )
     }
@@ -149,7 +152,7 @@ impl Module {
 
     /// Returns the number of long-lived consumers keeping this module resident.
     pub fn lease_count(&self) -> u64 {
-        self.leases.load(Ordering::Acquire)
+        self.leases.load(Ordering::SeqCst)
     }
 }
 
@@ -214,11 +217,14 @@ impl ModuleGuard {
 /// Cleanup paths pass `allow_unloading` so teardown can still run after the
 /// module has left the live state.
 pub fn pin(module: &Arc<Module>, allow_unloading: bool) -> Result<ModuleGuard> {
-    if !state_allows(module.state.load(Ordering::Acquire), allow_unloading) {
+    // State and activity are separate atomics. Their admission/withdrawal
+    // operations share an SC order so an entrant's recheck and the retiree's
+    // counter check cannot both miss the other side.
+    if !state_allows(module.state.load(Ordering::SeqCst), allow_unloading) {
         return Err(Error::NoDevice);
     }
-    module.active.fetch_add(1, Ordering::AcqRel);
-    if !state_allows(module.state.load(Ordering::Acquire), allow_unloading) {
+    module.active.fetch_add(1, Ordering::SeqCst);
+    if !state_allows(module.state.load(Ordering::SeqCst), allow_unloading) {
         let previous = module.active.fetch_sub(1, Ordering::Release);
         debug_assert!(previous != 0, "driver: module callback underflow");
         return Err(Error::NoDevice);
@@ -238,11 +244,11 @@ pub fn pin_owner(module: Option<&Arc<Module>>, allow_unloading: bool) -> Result<
 
 /// Acquires a long-lived lease on `module`.
 pub fn lease(module: &Arc<Module>) -> Result<ModuleLease> {
-    if !state_allows(module.state.load(Ordering::Acquire), false) {
+    if !state_allows(module.state.load(Ordering::SeqCst), false) {
         return Err(Error::NoDevice);
     }
-    module.leases.fetch_add(1, Ordering::AcqRel);
-    if !state_allows(module.state.load(Ordering::Acquire), false) {
+    module.leases.fetch_add(1, Ordering::SeqCst);
+    if !state_allows(module.state.load(Ordering::SeqCst), false) {
         let previous = module.leases.fetch_sub(1, Ordering::Release);
         debug_assert!(previous != 0, "driver: module lease underflow");
         return Err(Error::NoDevice);
@@ -263,7 +269,7 @@ pub fn lease_owner(module: Option<&Arc<Module>>) -> Result<ModuleLease> {
 fn state_allows(current: u32, allow_unloading: bool) -> bool {
     current == state::LIVE
         || current == state::LOADING
-        || (allow_unloading && current == state::UNLOADING)
+        || (allow_unloading && matches!(current, state::UNLOADING | state::RETIRED))
 }
 
 struct Registry {
@@ -314,6 +320,7 @@ pub unsafe fn load(definition: ModuleDefinition) -> Result<Arc<Module>> {
         state: AtomicU32::new(state::LOADING),
         active: AtomicU64::new(0),
         leases: AtomicU64::new(0),
+        mutexes_closed: core::sync::atomic::AtomicBool::new(false),
         exit: definition.exit,
         edges: Mutex::new(Edges {
             depends_on: BTreeMap::new(),
@@ -340,20 +347,31 @@ pub unsafe fn load(definition: ModuleDefinition) -> Result<Arc<Module>> {
     if status < 0 {
         {
             let _graph = registry.graph.lock();
-            module.state.store(state::UNLOADING, Ordering::Release);
+            module.state.store(state::UNLOADING, Ordering::SeqCst);
         }
         module
             .header
             .set_state(super::super::obj::ObjState::Removing);
-        teardown(&module);
+        if let Err(error) = teardown(&module) {
+            // Failed initialization may already have published a resource
+            // acquired by another thread. Keep its code and receipts resident
+            // so explicit unload can retry after those users release it.
+            module.header.set_state(super::super::obj::ObjState::Live);
+            module.state.store(state::LIVE, Ordering::SeqCst);
+            log::warn!(
+                "module {}: initialization failed; cleanup is busy: {error:?}",
+                module.name.as_str()
+            );
+            return Err(Error::from_status(status));
+        }
         drop_edges(&module);
-        module.state.store(state::DEAD, Ordering::Release);
+        module.state.store(state::DEAD, Ordering::SeqCst);
         module.header.poison();
         registry.modules.lock().remove(&id);
         return Err(Error::from_status(status));
     }
 
-    module.state.store(state::LIVE, Ordering::Release);
+    module.state.store(state::LIVE, Ordering::SeqCst);
     super::probe::retrigger();
     Ok(module)
 }
@@ -361,13 +379,25 @@ pub unsafe fn load(definition: ModuleDefinition) -> Result<Arc<Module>> {
 /// Unloads a module once nothing depends on it.
 pub fn unload(module: &Arc<Module>) -> Result<()> {
     let registry = registry()?;
-    if module.state.load(Ordering::Acquire) != state::LIVE {
+    if module
+        .state
+        .compare_exchange(
+            state::RETIRED,
+            state::UNLOADING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        return finish_unload(module, registry);
+    }
+    if module.state.load(Ordering::SeqCst) != state::LIVE {
         return Err(Error::Busy);
     }
     if !module.edges.lock().dependents.is_empty() {
         return Err(Error::Busy);
     }
-    if module.active.load(Ordering::Acquire) != 0 {
+    if module.active.load(Ordering::SeqCst) != 0 {
         return Err(Error::Busy);
     }
 
@@ -391,8 +421,8 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
                 .compare_exchange(
                     state::LIVE,
                     state::UNLOADING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
                 )
                 .is_err()
         {
@@ -400,16 +430,31 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
         }
     }
 
-    if module.active.load(Ordering::Acquire) != 0 || module.lease_count() != 0 {
-        module.state.store(state::LIVE, Ordering::Release);
+    if module.active.load(Ordering::SeqCst) != 0 || module.lease_count() != 0 {
+        module.state.store(state::LIVE, Ordering::SeqCst);
         return Err(Error::Busy);
     }
+    if let Err(error) = super::super::abi::mutexes::check_module(module) {
+        module.state.store(state::LIVE, Ordering::SeqCst);
+        return Err(error);
+    }
     if let Err(error) = crate::dev::node::try_remove_module_nodes(module) {
-        module.state.store(state::LIVE, Ordering::Release);
+        module.state.store(state::LIVE, Ordering::SeqCst);
         return Err(error);
     }
     if let Err(error) = crate::dev::block::try_remove_module_devices(module) {
-        module.state.store(state::LIVE, Ordering::Release);
+        module.state.store(state::LIVE, Ordering::SeqCst);
+        return Err(error);
+    }
+
+    // Checked driver removal can still refuse while the module is resident.
+    // Do this before exit or terminal withdrawal, so refusal is recoverable.
+    if let Err(error) = super::driver::detach_module_drivers(module)
+        .and_then(|()| super::super::irq::check_module_domain_users(module))
+        .and_then(|()| super::device::remove_module_devices(module))
+    {
+        module.state.store(state::LIVE, Ordering::SeqCst);
+        super::probe::retrigger();
         return Err(error);
     }
 
@@ -428,11 +473,25 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
     module
         .header
         .set_state(super::super::obj::ObjState::Removing);
-    // Sweep anything a missing or faulty exit callback left registered.
-    teardown(module);
+    finish_unload(module, registry)
+}
 
+/// Exit has completed. A failed sweep must retain backing and cleanup receipts
+/// without reopening ordinary callbacks or executing exit a second time.
+fn finish_unload(module: &Arc<Module>, registry: &Registry) -> Result<()> {
+    if let Err(error) = teardown(module) {
+        module.state.store(state::RETIRED, Ordering::SeqCst);
+        return Err(error);
+    }
+    // Close even cleanup callback admission before the last activity check.
+    // A racing pin either contributes to active or sees DEAD on its recheck
+    // and returns without invoking any code from the image.
+    module.state.store(state::DEAD, Ordering::SeqCst);
+    if module.active.load(Ordering::SeqCst) != 0 || module.lease_count() != 0 {
+        module.state.store(state::RETIRED, Ordering::SeqCst);
+        return Err(Error::Busy);
+    }
     drop_edges(module);
-    module.state.store(state::DEAD, Ordering::Release);
     module.header.poison();
     registry.modules.lock().remove(&module.id);
     *module.backing.lock() = None;
@@ -445,22 +504,31 @@ pub fn unload(module: &Arc<Module>) -> Result<()> {
 /// Teardown runs in dependency order: bound drivers are detached before the
 /// devices they own disappear, and published services are withdrawn last so
 /// consumers can still complete their own teardown.
-fn teardown(module: &Arc<Module>) {
-    super::driver::remove_module_drivers(module);
+fn teardown(module: &Arc<Module>) -> Result<()> {
+    if !module.edges.lock().dependents.is_empty()
+        || module.lease_count() != 0
+        || module.active.load(Ordering::SeqCst) != 0
+    {
+        return Err(Error::Busy);
+    }
+    super::super::abi::mutexes::check_module(module)?;
+    super::driver::remove_module_drivers(module)?;
     // Hardware remove callbacks get the first chance to withdraw their block
     // registrations while callback contexts are still intact. Sweep only
     // registrations a missing or faulty callback left behind.
-    crate::dev::block::remove_module_devices(module);
-    super::device::remove_module_devices(module);
+    super::device::remove_module_devices(module)?;
+    crate::dev::block::remove_module_devices(module)?;
     crate::dev::console::remove_module_terminals(module);
-    super::bus::remove_module_buses(module);
-    super::iface::remove_module_interfaces(module);
-    super::super::irq::remove_module_interrupts(module);
+    super::bus::remove_module_buses(module)?;
+    super::iface::remove_module_interfaces(module)?;
+    super::super::irq::remove_module_interrupts(module)?;
     super::super::work::remove_module_workers(module);
     super::super::io::dma::remove_module_buffers(module);
     super::super::io::mmio::remove_module_mappings(module);
     crate::dev::node::remove_module_nodes(module);
+    super::super::abi::mutexes::remove_module(module)?;
     super::super::abi::events::remove_module_events(module);
+    Ok(())
 }
 
 fn drop_edges(module: &Arc<Module>) {
@@ -621,7 +689,12 @@ pub fn unload_all() {
             .modules
             .lock()
             .values()
-            .filter(|module| module.is_live() && module.edges.lock().dependents.is_empty())
+            .filter(|module| {
+                matches!(
+                    module.state.load(Ordering::SeqCst),
+                    state::LIVE | state::RETIRED
+                ) && module.edges.lock().dependents.is_empty()
+            })
             .cloned()
             .collect();
         if candidates.is_empty() {
@@ -640,6 +713,6 @@ pub fn unload_all() {
     }
     let stuck = registry.modules.lock().len();
     if stuck != 0 {
-        error!("{stuck} module(s) could not be unloaded and remain live");
+        error!("{stuck} module(s) could not be unloaded and remain resident");
     }
 }

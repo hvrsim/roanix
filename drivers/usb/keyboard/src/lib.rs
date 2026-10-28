@@ -71,7 +71,7 @@ impl Drop for Keyboard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.host.cancel(self.device);
-        let worker = { self.worker.lock().take() };
+        let worker = { self.worker.lock_irqsave().take() };
         if let Some(mut worker) = worker {
             let _ = worker.join();
         }
@@ -175,11 +175,12 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
         let context = ptr::from_ref(&*keyboard).cast_mut().cast();
         // SAFETY: the box remains pinned until its worker is joined by Drop.
         let worker = unsafe { Worker::spawn(Some(worker), context) }?;
-        *keyboard.worker.lock() = Some(worker);
+        *keyboard.worker.lock_irqsave() = Some(worker);
         // SAFETY: remove recovers this unique allocation exactly once.
         unsafe {
-            device.set_data(Box::into_raw(keyboard).cast())?;
+            device.set_data(context)?;
         }
+        let _ = Box::into_raw(keyboard);
         ddk::log(ddk::LOG_INFO, c"USB HID keyboard attached");
         Ok(())
     })();
@@ -222,6 +223,7 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     remove: Some(remove),
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: None,
 });
 fn init(_: Module) -> Result<()> {
     let bus = Bus::find(c"usb").map_err(|error| {
@@ -232,18 +234,18 @@ fn init(_: Module) -> Result<()> {
         }
     })?;
     let definition = {
-        let mut driver = DRIVER.lock();
+        let mut driver = DRIVER.lock_irqsave();
         driver.bus = bus.as_raw();
         // SAFETY: this static table is initialized before registration.
         unsafe { &*ptr::from_ref(&*driver) }
     };
     // SAFETY: the definition and callback code remain static until unregister.
     let registration = unsafe { DriverRegistration::register(definition) }?;
-    *REGISTRATION.lock() = Some(registration);
+    *REGISTRATION.lock_irqsave() = Some(registration);
     Ok(())
 }
 fn exit(_: Module) {
-    let registration = { REGISTRATION.lock().take() };
+    let registration = { REGISTRATION.lock_irqsave().take() };
     if let Some(mut registration) = registration {
         let _ = registration.unregister();
     }

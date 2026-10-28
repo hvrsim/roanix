@@ -172,9 +172,10 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     matches: MATCHES.as_ptr(),
     match_count: MATCHES.len(),
     probe: Some(probe),
-    remove: Some(remove),
+    remove: None,
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: Some(remove),
 });
 
 unsafe extern "C" fn translate(
@@ -332,17 +333,32 @@ static DOMAIN_DEF: raw::IrqDomainDef = raw::IrqDomainDef {
     context: ptr::null_mut(),
 };
 
-fn install_domain(source_count: u32) -> Result<()> {
-    let mut domain = DOMAIN.lock_irqsave();
-    if domain.is_some() {
+fn install_domain(device: Device, source_count: u32) -> Result<()> {
+    if DOMAIN.lock_irqsave().is_some() {
         return Err(ddk::Error::from_status(ddk::EBUSY));
     }
-    *domain = Some(IrqDomain::register(
-        c"plic",
-        ddk::IRQ_DOMAIN_ROOT | ddk::IRQ_DOMAIN_DEFAULT,
-        source_count,
-        &DOMAIN_DEF,
-    )?);
+    // SAFETY: callbacks are static, synchronize STATE with IRQ guards, and
+    // successful domain withdrawal precedes releasing its mapping.
+    let mut domain = unsafe {
+        IrqDomain::register(
+            c"plic",
+            ddk::IRQ_DOMAIN_ROOT | ddk::IRQ_DOMAIN_DEFAULT,
+            source_count,
+            &DOMAIN_DEF,
+        )
+    }?;
+    if let Err(error) = domain.set_device(device) {
+        if domain.unregister().is_ok() {
+            return Err(error);
+        }
+        // Legacy/default-domain users may have arrived during registration.
+        // Keep their initialized controller and recoverable binding resident.
+        ddk::log(
+            ddk::LOG_ERROR,
+            c"PLIC firmware association failed; retaining active domain users",
+        );
+    }
+    *DOMAIN.lock_irqsave() = Some(domain);
     Ok(())
 }
 
@@ -440,16 +456,17 @@ unsafe extern "C" fn probe(
         state.present = true;
     }
 
-    if let Err(error) = install_domain((ndev + 1) as u32) {
+    // Transfer the callback context before publishing a controller that can
+    // synchronously admit legacy or firmware-qualified interrupt consumers.
+    // SAFETY: STATE is static and fully initialized before this transfer.
+    if let Err(error) = unsafe { device.set_data(core::ptr::from_ref(&STATE).cast_mut().cast()) } {
         let mapping = STATE.lock_irqsave().clear();
         drop(mapping);
         return error.status();
     }
-    // SAFETY: the static state lock remains allocated for the module lifetime.
-    if let Err(error) = unsafe { device.set_data(core::ptr::from_ref(&STATE).cast_mut().cast()) } {
-        if let Some(mut domain) = DOMAIN.lock_irqsave().take() {
-            let _ = domain.unregister();
-        }
+    if let Err(error) = install_domain(device, (ndev + 1) as u32) {
+        // SAFETY: no registered domain remains on an error return.
+        let _ = unsafe { device.set_data(core::ptr::null_mut()) };
         let mapping = STATE.lock_irqsave().clear();
         drop(mapping);
         return error.status();
@@ -457,14 +474,21 @@ unsafe extern "C" fn probe(
     ddk::OK
 }
 
-unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) {
+unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) -> i32 {
     // SAFETY: removal receives the same live device handle used for probe.
     let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
-        return;
+        return ddk::OK;
     };
     // SAFETY: probe stores only the address of the static state lock.
     if unsafe { device.data() } != core::ptr::from_ref(&STATE).cast_mut().cast() {
-        return;
+        return ddk::OK;
+    }
+    let domain = { DOMAIN.lock_irqsave().take() };
+    if let Some(mut domain) = domain {
+        if let Err(error) = domain.unregister() {
+            *DOMAIN.lock_irqsave() = Some(domain);
+            return error.status();
+        }
     }
     let mut state = STATE.lock_irqsave();
     for source in 1..state.source_count {
@@ -482,6 +506,7 @@ unsafe extern "C" fn remove(_context: *mut c_void, pointer: *const raw::Device) 
     // SAFETY: clear the opaque pointer before the controller can be reprobed.
     let _ = unsafe { device.set_data(ptr::null_mut()) };
     drop(mapping);
+    ddk::OK
 }
 
 fn init(_module: Module) -> Result<()> {
@@ -500,10 +525,10 @@ fn init(_module: Module) -> Result<()> {
 }
 
 fn exit(_module: Module) {
-    if let Some(mut registration) = REGISTRATION.lock_irqsave().take() {
+    if let Some(mut registration) = { REGISTRATION.lock_irqsave().take() } {
         let _ = registration.unregister();
     }
-    if let Some(mut domain) = DOMAIN.lock_irqsave().take() {
+    if let Some(mut domain) = { DOMAIN.lock_irqsave().take() } {
         let _ = domain.unregister();
     }
 }

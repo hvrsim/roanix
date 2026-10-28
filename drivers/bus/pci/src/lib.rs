@@ -12,7 +12,7 @@
 )]
 
 //! ECAM-only PCIe enumeration and MSI/MSI-X configuration.
-//! x86 requires ACPI MCFG. RISC-V supports QEMU `virt` ECAM and PLIC INTx.
+//! x86 requires ACPI MCFG. RISC-V uses FDT ECAM and controller-qualified INTx.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -25,8 +25,8 @@ use core::{
 #[cfg(target_arch = "riscv64")]
 use ddk::{Bus, DriverRegistration};
 use ddk::{
-    BusRegistration, Device, DeviceBuilder, Error, Mmio, Module, RESOURCE_MEMORY, Result,
-    TicketLock, raw,
+    BusRegistration, Device, DeviceBuilder, DeviceRegistration, Error, Mmio, Module, Mutex,
+    RESOURCE_MEMORY, Result, TicketLock, raw,
 };
 #[cfg(target_arch = "x86_64")]
 use ddk::{InterfacePublication, IrqDomain};
@@ -48,39 +48,26 @@ const CAPABILITIES: u16 = 0x34;
 const CAP_MSI: u8 = 0x05;
 #[cfg(target_arch = "x86_64")]
 const CAP_MSIX: u8 = 0x11;
-const QEMU_VIRT_MMIO_START: u64 = 0x4000_0000;
-const QEMU_VIRT_MMIO_END: u64 = 0x8000_0000;
 #[cfg(target_arch = "x86_64")]
 const MAX_MESSAGE_IDS: usize = 2048;
 
-#[repr(C)]
 #[cfg(target_arch = "x86_64")]
-pub struct PciMsiOps {
-    pub size: u32,
-    pub enable: Option<
-        unsafe extern "C" fn(*mut c_void, *const raw::Device, u32, *mut u32, *mut u32) -> i32,
-    >,
-    pub unmask: Option<unsafe extern "C" fn(*mut c_void, *const raw::Device) -> i32>,
-    pub disable: Option<unsafe extern "C" fn(*mut c_void, *const raw::Device)>,
-}
-#[derive(Clone, Copy)]
-struct Address {
-    segment: u16,
-    bus: u8,
-    device: u8,
-    function: u8,
-}
+use ddk::pci::MsiOps as PciMsiOps;
+use routing::{Address, Lookup as InterruptLookup};
 struct Ecam {
-    segment: u16,
-    start_bus: u8,
-    end_bus: u8,
+    config: config::ConfigRange,
+    parent: Option<Device>,
     window: Mmio,
+    space: AddressSpace,
 }
-#[derive(Clone, Copy, Default)]
-struct Bar {
-    base: u64,
-    size: u64,
-}
+mod bar;
+mod bridge;
+mod config;
+mod routing;
+mod windows;
+use bar::{Bar, Kind};
+use firmware_tree::InterruptRoute;
+use windows::AddressSpace;
 #[cfg(target_arch = "x86_64")]
 enum MsiMode {
     Msix { table: Mmio },
@@ -94,11 +81,11 @@ struct MsiState {
     virqs: Vec<u32>,
 }
 struct Function {
-    device: Device,
-    #[cfg(target_arch = "x86_64")]
+    host: Option<Device>,
+    device: Option<DeviceRegistration>,
     address: Address,
-    #[cfg(target_arch = "x86_64")]
     bars: [Bar; 6],
+    forwarding: Vec<bridge::Bridge>,
     #[cfg(target_arch = "x86_64")]
     msi: Option<MsiState>,
 }
@@ -112,7 +99,6 @@ struct State {
     publication: Option<InterfacePublication>,
     #[cfg(target_arch = "x86_64")]
     used_ids: [bool; MAX_MESSAGE_IDS],
-    next_mmio: u64,
     #[cfg(target_arch = "riscv64")]
     host_driver: Option<DriverRegistration>,
 }
@@ -128,23 +114,29 @@ impl State {
             publication: None,
             #[cfg(target_arch = "x86_64")]
             used_ids: [false; MAX_MESSAGE_IDS],
-            next_mmio: QEMU_VIRT_MMIO_START,
             #[cfg(target_arch = "riscv64")]
             host_driver: None,
         }
     }
     fn ecam(&self, a: Address) -> Option<(&Ecam, usize)> {
-        let e = self
-            .ecams
+        self.ecams
             .iter()
-            .find(|e| e.segment == a.segment && (e.start_bus..=e.end_bus).contains(&a.bus))?;
-        Some((
-            e,
-            (usize::from(a.bus - e.start_bus) << 20)
-                | (usize::from(a.device) << 15)
-                | (usize::from(a.function) << 12),
-        ))
+            .find_map(|ecam| ecam.config.offset(a).map(|offset| (ecam, offset)))
     }
+
+    fn bar_address(&self, function: &Function, bar: Bar) -> Option<u64> {
+        self.ecam(function.address)?
+            .0
+            .space
+            .translate(bar)
+            .filter(|_| {
+                function
+                    .forwarding
+                    .iter()
+                    .all(|bridge| bridge.forwards(bar))
+            })
+    }
+
     fn read32(&self, a: Address, o: u16) -> u32 {
         self.ecam(a)
             .map_or(u32::MAX, |(e, b)| e.window.read32(b + usize::from(o & !3)))
@@ -158,24 +150,13 @@ impl State {
         (self.read32(a, o) >> (u32::from(o & 2) * 8)) as u16
     }
     fn write16(&self, a: Address, o: u16, v: u16) {
-        let s = u32::from(o & 2) * 8;
-        let c = self.read32(a, o);
-        self.write32(a, o, (c & !(0xffff << s)) | (u32::from(v) << s));
+        // A dword read/modify/write would echo adjacent W1C status bits.
+        if let Some((e, base)) = self.ecam(a) {
+            e.window.write16(base + usize::from(o), v);
+        }
     }
     fn read8(&self, a: Address, o: u16) -> u8 {
         (self.read32(a, o) >> (u32::from(o & 3) * 8)) as u8
-    }
-    fn allocate_mmio(&mut self, size: u64) -> Option<u64> {
-        if !cfg!(target_arch = "riscv64") || size == 0 || !size.is_power_of_two() {
-            return None;
-        }
-        let start = self.next_mmio.checked_add(size - 1)? & !(size - 1);
-        let end = start.checked_add(size)?;
-        if end > QEMU_VIRT_MMIO_END {
-            return None;
-        }
-        self.next_mmio = end;
-        Some(start)
     }
     #[cfg(target_arch = "x86_64")]
     fn alloc_id(&mut self) -> Result<u64> {
@@ -197,7 +178,7 @@ impl State {
         }
     }
 }
-static STATE: TicketLock<State> = TicketLock::new(State::new());
+static STATE: Mutex<State> = Mutex::new(State::new());
 fn status(r: Result<()>) -> i32 {
     r.map_or_else(Error::status, |()| ddk::OK)
 }
@@ -209,11 +190,36 @@ unsafe extern "C" fn prepare(_: *mut c_void, p: *const raw::Device) -> i32 {
     status((|| {
         let a = device_address(d)?;
         let s = STATE.lock();
+        let function = s
+            .functions
+            .iter()
+            .find(|function| function.address == a)
+            .ok_or(Error::from_status(ddk::ENODEV))?;
+        let decode = function
+            .bars
+            .iter()
+            .filter(|bar| s.bar_address(function, **bar).is_some())
+            .fold(0, |flags, bar| {
+                flags
+                    | if bar.kind == Kind::Io {
+                        COMMAND_IO
+                    } else {
+                        COMMAND_MEMORY
+                    }
+            });
+        for bridge in function.forwarding.iter().rev() {
+            let command = s.read16(bridge.address, COMMAND);
+            s.write16(
+                bridge.address,
+                COMMAND,
+                command | decode | COMMAND_BUS_MASTER,
+            );
+        }
         let c = s.read16(a, COMMAND);
         s.write16(
             a,
             COMMAND,
-            (c | COMMAND_MEMORY | COMMAND_BUS_MASTER) & !COMMAND_INTERRUPT_DISABLE,
+            (c | decode | COMMAND_BUS_MASTER) & !COMMAND_INTERRUPT_DISABLE,
         );
         Ok(())
     })())
@@ -242,16 +248,18 @@ fn hex(v: u8) -> [u8; 2] {
     [D[usize::from(v >> 4)], D[usize::from(v & 15)]]
 }
 fn function_name(a: Address, o: &mut [u8; 24]) -> &CStr {
-    let b = hex(a.bus);
-    let d = hex(a.device);
+    let segment = a.segment.to_be_bytes();
     o[..4].copy_from_slice(b"pci@");
-    o[4..6].copy_from_slice(&b);
-    o[6] = b':';
-    o[7..9].copy_from_slice(&d);
-    o[9] = b'.';
-    o[10] = b'0' + a.function;
-    o[11] = 0;
-    cstr(&o[..12])
+    o[4..6].copy_from_slice(&hex(segment[0]));
+    o[6..8].copy_from_slice(&hex(segment[1]));
+    o[8] = b':';
+    o[9..11].copy_from_slice(&hex(a.bus));
+    o[11] = b':';
+    o[12..14].copy_from_slice(&hex(a.device));
+    o[14] = b'.';
+    o[15] = b'0' + a.function;
+    o[16] = 0;
+    cstr(&o[..17])
 }
 fn bar_name(i: usize, o: &mut [u8; 8]) -> &CStr {
     o[..3].copy_from_slice(b"bar");
@@ -259,93 +267,98 @@ fn bar_name(i: usize, o: &mut [u8; 8]) -> &CStr {
     o[4] = 0;
     cstr(&o[..5])
 }
-fn probe_bar(s: &mut State, a: Address, i: usize) -> Option<(Bar, u32, bool)> {
-    let o = BAR0 + i as u16 * 4;
-    let low = s.read32(a, o);
-    if low & 1 != 0 {
-        return None;
-    }
-    let wide = low & 6 == 4;
-    let high = wide.then(|| s.read32(a, o + 4));
-    s.write32(a, o, u32::MAX);
-    if wide {
-        s.write32(a, o + 4, u32::MAX);
-    }
-    let ml = s.read32(a, o);
-    let mh = wide.then(|| s.read32(a, o + 4));
-    if let Some(v) = high {
-        s.write32(a, o + 4, v);
-    }
-    s.write32(a, o, low);
-    let (mut base, mask) = if wide {
-        (
-            (u64::from(high?) << 32) | u64::from(low & !15),
-            (u64::from(mh?) << 32) | u64::from(ml & !15),
-        )
-    } else {
-        (
-            u64::from(low & !15),
-            u64::from(ml & !15) | 0xffff_ffff_0000_0000,
-        )
-    };
-    let size = (!mask).wrapping_add(1);
-    if size == 0 || !size.is_power_of_two() {
-        return None;
-    }
-    if base == 0 {
-        base = s.allocate_mmio(size)?;
-        s.write32(a, o, base as u32 | (low & 15));
-        if wide {
-            s.write32(a, o + 4, (base >> 32) as u32);
-        }
-    } else if cfg!(target_arch = "riscv64")
-        && (QEMU_VIRT_MMIO_START..QEMU_VIRT_MMIO_END).contains(&base)
-    {
-        s.next_mmio = s.next_mmio.max(base.saturating_add(size));
-    }
-    Some((Bar { base, size }, if low & 8 != 0 { 2 } else { 0 }, wide))
+struct Configuration<'a> {
+    state: &'a State,
+    address: Address,
 }
-fn publish_function(s: &mut State, parent: Option<Device>, a: Address) -> Result<()> {
+impl bar::Config for Configuration<'_> {
+    fn read(&self, index: usize) -> u32 {
+        self.state.read32(self.address, BAR0 + index as u16 * 4)
+    }
+    fn write(&mut self, index: usize, value: u32) {
+        self.state
+            .write32(self.address, BAR0 + index as u16 * 4, value);
+    }
+}
+impl bridge::Config for Configuration<'_> {
+    fn read32(&self, offset: u16) -> u32 {
+        self.state.read32(self.address, offset)
+    }
+    fn write32(&mut self, offset: u16, value: u32) {
+        self.state.write32(self.address, offset, value);
+    }
+    fn write16(&mut self, offset: u16, value: u16) {
+        self.state.write16(self.address, offset, value);
+    }
+}
+fn probe_bar(s: &State, a: Address, i: usize, count: usize) -> bar::Probe {
+    bar::probe(
+        &mut Configuration {
+            state: s,
+            address: a,
+        },
+        i,
+        count,
+    )
+}
+fn bar_key(a: Address, index: usize) -> u64 {
+    (u64::from(a.segment) << 24)
+        | (u64::from(a.bus) << 16)
+        | (u64::from(a.device) << 11)
+        | (u64::from(a.function) << 8)
+        | index as u64
+}
+
+#[cfg(target_arch = "riscv64")]
+fn firmware_error(error: firmware_tree::Error) -> Error {
+    Error::from_status(match error {
+        firmware_tree::Error::Malformed => ddk::EINVAL,
+        firmware_tree::Error::Unsupported => ddk::ENOTSUP,
+    })
+}
+
+fn publish_function(
+    parent: Option<Device>,
+    a: Address,
+    bars: [Bar; 6],
+    interrupt: Option<InterruptRoute>,
+) -> Result<()> {
+    let s = STATE.lock();
     let identity = s.read32(a, 0);
     if identity as u16 == u16::MAX {
         return Ok(());
     }
     let cr = s.read32(a, 8);
     let class = cr >> 8;
-    let h = s.read16(a, HEADER_TYPE) as u8 & 0x7f;
-    let count = if h == 0 {
-        6
-    } else if h == 1 {
-        2
+    let function = s
+        .functions
+        .iter()
+        .find(|function| function.address == a)
+        .ok_or(Error::from_status(ddk::ENODEV))?;
+    let physical = bars.map(|bar| s.bar_address(function, bar));
+    let parent = if let Some(bridge) = function.forwarding.first() {
+        Some(
+            s.functions
+                .iter()
+                .find(|function| function.address == bridge.address)
+                .and_then(|function| function.device.as_ref())
+                .ok_or(Error::from_status(ddk::ENODEV))?
+                .device()?,
+        )
     } else {
-        0
+        parent
     };
-    let saved = s.read16(a, COMMAND);
-    s.write16(a, COMMAND, saved & !(COMMAND_IO | COMMAND_MEMORY));
-    let mut bars = [Bar::default(); 6];
-    let mut flags = [0u32; 6];
-    let mut present = [false; 6];
-    let mut i = 0;
-    while i < count {
-        if let Some((bar, f, wide)) = probe_bar(s, a, i) {
-            bars[i] = bar;
-            flags[i] = f;
-            present[i] = true;
-            if wide {
-                i += 1;
-            }
-        }
-        i += 1;
-    }
-    s.write16(a, COMMAND, saved | COMMAND_MEMORY | COMMAND_BUS_MASTER);
+    let bus = s
+        .bus
+        .as_ref()
+        .ok_or(Error::from_status(ddk::EINVAL))?
+        .bus()?;
+    drop(s);
+    // Construction and publication can allocate and synchronously probe. Do
+    // not retain the configuration lock through either operation.
     let mut n = [0u8; 24];
     let mut b = DeviceBuilder::new(function_name(a, &mut n))?;
-    b.set_bus(
-        s.bus
-            .as_ref()
-            .ok_or(Error::from_status(ddk::EINVAL))?
-            .bus()?,
-    )?;
+    b.set_bus(bus)?;
     if let Some(p) = parent {
         b.set_parent(p)?;
     }
@@ -357,70 +370,245 @@ fn publish_function(s: &mut State, parent: Option<Device>, a: Address) -> Result
     b.add_u32(c"pci.device", u32::from(a.device))?;
     b.add_u32(c"pci.function", u32::from(a.function))?;
     b.add_u32(c"pci.revision", cr & 0xff)?;
-    #[cfg(target_arch = "riscv64")]
-    {
-        let pin = s.read8(a, 0x3d);
-        if (1..=4).contains(&pin) {
-            // QEMU virt's PCI interrupt-map swizzles INTA-D onto PLIC 32-35.
-            let irq = 32 + (u32::from(a.device) + u32::from(pin) - 1) % 4;
-            b.add_irq(&[irq])?;
-        }
+    if let Some(route) = interrupt {
+        b.add_firmware_irq(route.phandle, &route.cells)?;
     }
-    for i in 0..count {
-        if present[i] {
+    for i in 0..6 {
+        if let Some(cpu) = physical[i] {
             let mut rn = [0u8; 8];
             b.add_resource(
-                RESOURCE_MEMORY,
-                flags[i],
-                bars[i].base,
+                if bars[i].kind == Kind::Io {
+                    ddk::RESOURCE_IO
+                } else {
+                    RESOURCE_MEMORY
+                },
+                bars[i].flags(),
+                if bars[i].kind == Kind::Io {
+                    bars[i].base
+                } else {
+                    cpu
+                },
                 bars[i].size,
                 bar_name(i, &mut rn),
             )?;
         }
     }
-    let device = b.publish()?;
-    s.functions.push(Function {
-        device,
-        #[cfg(target_arch = "x86_64")]
-        address: a,
-        #[cfg(target_arch = "x86_64")]
-        bars,
-        #[cfg(target_arch = "x86_64")]
-        msi: None,
+    let unassigned = bars.iter().enumerate().fold(0u32, |mask, (index, bar)| {
+        mask | if bar.size != 0 && bar.base == 0 {
+            1 << index
+        } else {
+            0
+        }
     });
-    Ok(())
+    b.add_u32(c"pci.unassigned-bars", unassigned)?;
+    let unmapped = bars.iter().enumerate().fold(0u32, |mask, (index, bar)| {
+        mask | if bar.size != 0 && bar.base != 0 && physical[index].is_none() {
+            1 << index
+        } else {
+            0
+        }
+    });
+    b.add_u32(c"pci.unmapped-bars", unmapped)?;
+    match b.publish() {
+        Ok(device) => {
+            let mut s = STATE.lock();
+            let function = s
+                .functions
+                .iter_mut()
+                .find(|f| f.address == a)
+                .ok_or(Error::from_status(ddk::ENODEV))?;
+            function.device = Some(device);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
-fn enumerate(s: &mut State, parent: Option<Device>) -> Result<()> {
-    let ranges: Vec<_> = s
+fn same_parent(first: Option<Device>, second: Option<Device>) -> bool {
+    first.map(Device::as_raw) == second.map(Device::as_raw)
+}
+
+fn enumerate(
+    parent: Option<Device>,
+    route: impl Fn(Address, u8, Option<Address>) -> Result<InterruptLookup<InterruptRoute>>,
+) -> Result<()> {
+    let mut state = STATE.lock();
+    let ranges: Vec<_> = state
         .ecams
         .iter()
-        .map(|e| (e.segment, e.start_bus, e.end_bus))
+        .enumerate()
+        .filter(|(_, e)| same_parent(e.parent, parent))
+        .map(|(index, e)| (index, e.config))
         .collect();
-    for (segment, start, end) in ranges {
-        for bus in start..=end {
+    let mut discovered = Vec::new();
+    let mut bridges = Vec::new();
+    for (root, config) in ranges.iter().copied() {
+        for bus in config.start_bus..=config.end_bus {
             for device in 0..32 {
                 let first = Address {
-                    segment,
+                    segment: config.segment,
                     bus,
                     device,
                     function: 0,
                 };
-                if s.read16(first, 0) == u16::MAX {
+                if state.read16(first, 0) == u16::MAX {
                     continue;
                 }
-                let fs = if s.read16(first, HEADER_TYPE) & 0x80 != 0 {
+                let functions = if state.read8(first, HEADER_TYPE) & 0x80 != 0 {
                     8
                 } else {
                     1
                 };
-                for function in 0..fs {
-                    publish_function(s, parent, Address { function, ..first })?;
+                for function in 0..functions {
+                    let address = Address { function, ..first };
+                    if state.read16(address, 0) != u16::MAX
+                        && state.read8(address, HEADER_TYPE) & 0x7f == 1
+                    {
+                        bridges.push(
+                            bridge::Bridge::probe(
+                                address,
+                                &mut Configuration {
+                                    state: &state,
+                                    address,
+                                },
+                            )
+                            .map_err(|error| {
+                                Error::from_status(match error {
+                                    bridge::Error::Malformed => ddk::EINVAL,
+                                    bridge::Error::Unsupported => ddk::ENOTSUP,
+                                })
+                            })?,
+                        );
+                    }
+                    if state.read16(address, 0) == u16::MAX
+                        || state.functions.iter().any(|f| f.address == address)
+                    {
+                        continue;
+                    }
+                    let count = match state.read8(address, HEADER_TYPE) & 0x7f {
+                        0 => 6,
+                        1 => 2,
+                        _ => 0,
+                    };
+                    let saved = state.read16(address, COMMAND);
+                    state.write16(address, COMMAND, saved & !(COMMAND_IO | COMMAND_MEMORY));
+                    let mut bars = [Bar::default(); 6];
+                    let mut index = 0;
+                    while index < count {
+                        let found = probe_bar(&state, address, index, count);
+                        if let Some(bar) = found.bar {
+                            bars[index] = bar;
+                        }
+                        index += found.slots;
+                    }
+                    state.write16(address, COMMAND, saved);
+                    discovered.push((root, address, bars));
                 }
             }
         }
     }
+    bridge::validate(&bridges).map_err(|_| Error::from_status(ddk::EINVAL))?;
+    let paths: Vec<_> = discovered
+        .iter()
+        .map(|(root, address, _)| {
+            let root_bus =
+                cfg!(target_arch = "riscv64").then_some(state.ecams[*root].config.start_bus);
+            bridge::path(root_bus, *address, &bridges).map_err(|_| Error::from_status(ddk::EINVAL))
+        })
+        .collect::<Result<_>>()?;
+    let irq_bridges: Vec<_> = bridges
+        .iter()
+        .map(|bridge| (bridge.address, bridge.secondary))
+        .collect();
+    let interrupts: Vec<_> = discovered
+        .iter()
+        .map(|(root, address, _)| {
+            routing::resolve(
+                state.ecams[*root].config.start_bus,
+                *address,
+                state.read8(*address, 0x3d),
+                &irq_bridges,
+                &route,
+            )
+            .map_err(|error| match error {
+                routing::Error::InvalidTopology => Error::from_status(ddk::EINVAL),
+                routing::Error::Firmware(error) => error,
+            })
+        })
+        .collect::<Result<_>>()?;
+    // Reserve every firmware assignment before choosing any new address. A
+    // later BDF can otherwise own the range allocated to an earlier one.
+    let mut spaces: Vec<_> = state.ecams.iter().map(|e| e.space.clone()).collect();
+    for (root, address, bars) in &discovered {
+        for (index, bar) in bars.iter().copied().enumerate() {
+            if bar.size != 0 && bar.base != 0 {
+                spaces[*root]
+                    .reserve(bar_key(*address, index), bar)
+                    .map_err(|_| Error::from_status(ddk::EINVAL))?;
+            }
+        }
+    }
+    for (index, space) in spaces.iter().enumerate() {
+        if spaces[..index].iter().any(|other| space.conflicts(other)) {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+    }
+    for ((root, address, bars), path) in discovered.iter_mut().zip(&paths) {
+        for (index, bar) in bars.iter_mut().enumerate() {
+            if bar.size == 0 || bar.base != 0 {
+                continue;
+            }
+            if let Some(base) = spaces[*root].allocate_within(
+                bar_key(*address, index),
+                *bar,
+                &bridge::limits(path, *bar),
+            ) {
+                let saved = state.read16(*address, COMMAND);
+                state.write16(*address, COMMAND, saved & !(COMMAND_IO | COMMAND_MEMORY));
+                let offset = BAR0 + index as u16 * 4;
+                let flags =
+                    state.read32(*address, offset) & if bar.kind == Kind::Io { 3 } else { 15 };
+                state.write32(*address, offset, base as u32 | flags);
+                if bar.address_bits == 64 {
+                    state.write32(*address, offset + 4, (base >> 32) as u32);
+                }
+                state.write16(*address, COMMAND, saved);
+                bar.base = base;
+            }
+        }
+    }
+    for (ecam, space) in state.ecams.iter_mut().zip(spaces) {
+        ecam.space = space;
+    }
+    // Keep configuration/allocation receipts even if constructing or publishing
+    // one device fails. Consumer probes can also reenter PCI during publication.
+    let depths: Vec<_> = paths.iter().map(Vec::len).collect();
+    for ((_, address, bars), path) in discovered.iter().zip(paths) {
+        state.functions.push(Function {
+            host: parent,
+            device: None,
+            address: *address,
+            bars: *bars,
+            forwarding: path,
+            #[cfg(target_arch = "x86_64")]
+            msi: None,
+        });
+    }
+    drop(state);
+    let mut publications: Vec<_> = discovered.into_iter().zip(interrupts).zip(depths).collect();
+    // Parent receipts must exist before publishing children, including when
+    // one hierarchy spans several ACPI MCFG entries.
+    publications.sort_by_key(|(_, depth)| *depth);
+    for (((_, address, bars), interrupt), _) in publications {
+        if publish_function(parent, address, bars, interrupt).is_err() {
+            ddk::log(
+                ddk::LOG_ERROR,
+                c"PCI function publication failed; host retains configuration for removal",
+            );
+        }
+    }
     Ok(())
 }
+
 #[cfg(target_arch = "x86_64")]
 fn capabilities(s: &State, a: Address) -> (Option<u16>, Option<u16>) {
     if s.read16(a, STATUS) & STATUS_CAPABILITIES == 0 {
@@ -501,11 +689,12 @@ unsafe extern "C" fn msi_enable(
         if requested == 0 || out.is_null() || actual.is_null() {
             return Err(Error::from_status(ddk::EINVAL));
         }
+        let address = device_address(d)?;
         let mut s = STATE.lock();
         let i = s
             .functions
             .iter()
-            .position(|f| f.device.as_raw() == d.as_raw())
+            .position(|f| f.address == address)
             .ok_or(Error::from_status(ddk::ENODEV))?;
         if s.functions[i].msi.is_some() {
             return Err(Error::from_status(ddk::EBUSY));
@@ -522,7 +711,7 @@ unsafe extern "C" fn msi_enable(
                 .bars
                 .get(bir)
                 .copied()
-                .filter(|b| b.size != 0)
+                .filter(|b| b.size != 0 && b.base != 0 && b.kind == Kind::Memory)
                 .ok_or(Error::from_status(ddk::EINVAL))?;
             let bytes = count
                 .checked_mul(16)
@@ -533,9 +722,12 @@ unsafe extern "C" fn msi_enable(
             {
                 return Err(Error::from_status(ddk::EINVAL));
             }
-            s.write16(a, cap + 2, (ctl | 1 << 14) & !(1 << 15));
-            let table = Mmio::map(bar.base + offset, bytes, ddk::MMIO_DEVICE)?;
+            let cpu = s
+                .bar_address(&s.functions[i], bar)
+                .ok_or(Error::from_status(ddk::ENOTSUP))?;
+            let table = Mmio::map(cpu + offset, bytes, ddk::MMIO_DEVICE)?;
             let (ids, virqs, msgs) = map_messages(&mut s, count)?;
+            s.write16(a, cap + 2, (ctl | 1 << 14) & !(1 << 15));
             for (j, (addr, data)) in msgs.iter().copied().enumerate() {
                 let base = j * 16;
                 table.write32(base, addr as u32);
@@ -589,11 +781,12 @@ unsafe extern "C" fn msi_unmask(_: *mut c_void, p: *const raw::Device) -> i32 {
         return ddk::EINVAL;
     };
     status((|| {
+        let address = device_address(d)?;
         let s = STATE.lock();
         let f = s
             .functions
             .iter()
-            .find(|f| f.device.as_raw() == d.as_raw())
+            .find(|f| f.address == address)
             .ok_or(Error::from_status(ddk::ENODEV))?;
         let m = f.msi.as_ref().ok_or(Error::from_status(ddk::EINVAL))?;
         match &m.mode {
@@ -639,12 +832,11 @@ fn disable_index(s: &mut State, i: usize) {
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn msi_disable(_: *mut c_void, p: *const raw::Device) {
     if let Some(d) = unsafe { Device::from_raw(p) } {
+        let Ok(address) = device_address(d) else {
+            return;
+        };
         let mut s = STATE.lock();
-        if let Some(i) = s
-            .functions
-            .iter()
-            .position(|f| f.device.as_raw() == d.as_raw())
-        {
+        if let Some(i) = s.functions.iter().position(|f| f.address == address) {
             disable_index(&mut s, i);
         }
     }
@@ -656,21 +848,58 @@ static MSI_OPS: PciMsiOps = PciMsiOps {
     unmask: Some(msi_unmask),
     disable: Some(msi_disable),
 };
-fn remove_devices() {
-    let devices = {
-        let mut s = STATE.lock();
-        #[cfg(target_arch = "x86_64")]
-        for i in 0..s.functions.len() {
-            disable_index(&mut s, i);
+fn remove_devices(parent: Option<Device>) -> Result<()> {
+    let devices: Vec<_> = STATE
+        .lock()
+        .functions
+        .iter()
+        .filter(|f| parent.is_none() || same_parent(f.host, parent))
+        .filter_map(|f| f.device.as_ref().and_then(|entry| entry.device().ok()))
+        .collect();
+    for device in devices.into_iter().rev() {
+        match device.remove() {
+            Ok(()) => {}
+            // Parent removal may already have completed the claimed children.
+            Err(error) if error.status() == ddk::ENODEV => {}
+            Err(error) => return Err(error),
         }
-        mem::take(&mut s.functions)
-            .into_iter()
-            .map(|f| f.device)
-            .collect::<Vec<_>>()
-    };
-    for d in devices.into_iter().rev() {
-        let _ = d.remove();
+        let mut state = STATE.lock();
+        if let Some(index) = state.functions.iter().position(|f| {
+            f.device
+                .as_ref()
+                .and_then(|entry| entry.device().ok())
+                .is_some_and(|entry| entry.as_raw() == device.as_raw())
+        }) {
+            #[cfg(target_arch = "x86_64")]
+            disable_index(&mut state, index);
+            let function = state.functions.remove(index);
+            for ecam in &mut state.ecams {
+                if ecam.config.offset(function.address).is_some() {
+                    for bar in 0..6 {
+                        ecam.space.release(bar_key(function.address, bar));
+                    }
+                }
+            }
+        }
     }
+    // Unpublished records own BAR reservations as well; they are safe to
+    // retire once every published child has completed checked removal.
+    let mut state = STATE.lock();
+    while let Some(index) = state
+        .functions
+        .iter()
+        .position(|f| f.device.is_none() && (parent.is_none() || same_parent(f.host, parent)))
+    {
+        #[cfg(target_arch = "x86_64")]
+        disable_index(&mut state, index);
+        let function = state.functions.remove(index);
+        for ecam in &mut state.ecams {
+            for bar in 0..6 {
+                ecam.space.release(bar_key(function.address, bar));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -686,24 +915,35 @@ static ROUTES: TicketLock<[Option<Route>; MAX_MESSAGE_IDS]> =
 unsafe extern "C" fn message_setup(_: *mut c_void, h: u64, v: u32, _: u32) -> i32 {
     status((|| {
         let vector = ddk::irq_alloc_vector(v)?;
-        let mut routes = ROUTES.lock();
-        let Some(slot) = routes.get_mut(h as usize) else {
-            ddk::irq_free_vector(vector);
-            return Err(Error::from_status(ddk::EINVAL));
+        let installed = {
+            let mut routes = ROUTES.lock_irqsave();
+            if let Some(slot) = routes.get_mut(h as usize) {
+                *slot = Some(Route {
+                    vector,
+                    cpu: ddk::cpu_current(),
+                });
+                true
+            } else {
+                false
+            }
         };
-        *slot = Some(Route {
-            vector,
-            cpu: ddk::cpu_current(),
-        });
+        if !installed {
+            let _ = ddk::irq_free_vector(vector);
+            return Err(Error::from_status(ddk::EINVAL));
+        }
         Ok(())
     })())
 }
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn message_teardown(_: *mut c_void, h: u64, _: u32) {
-    if let Some(slot) = ROUTES.lock().get_mut(h as usize) {
-        if let Some(route) = slot.take() {
-            ddk::irq_free_vector(route.vector);
-        }
+    let route = {
+        ROUTES
+            .lock_irqsave()
+            .get_mut(h as usize)
+            .and_then(Option::take)
+    };
+    if let Some(route) = route {
+        let _ = ddk::irq_free_vector(route.vector);
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -712,7 +952,7 @@ unsafe extern "C" fn message_affinity(_: *mut c_void, h: u64, cpu: u32) -> i32 {
         if ddk::cpu_platform_id(cpu)? > u64::from(u8::MAX) {
             return Err(Error::from_status(ddk::ENOTSUP));
         }
-        let mut r = ROUTES.lock();
+        let mut r = ROUTES.lock_irqsave();
         r.get_mut(h as usize)
             .and_then(Option::as_mut)
             .ok_or(Error::from_status(ddk::ENOENT))?
@@ -732,7 +972,7 @@ unsafe extern "C" fn message_compose(
             return Err(Error::from_status(ddk::EINVAL));
         }
         let route = ROUTES
-            .lock()
+            .lock_irqsave()
             .get(h as usize)
             .copied()
             .flatten()
@@ -771,25 +1011,135 @@ unsafe extern "C" fn host_probe(_: *mut c_void, p: *const raw::Device, _: usize)
     };
     status((|| {
         let r = d.resource(RESOURCE_MEMORY, 0)?;
-        let buses = (r.length >> 20).clamp(1, 256);
-        let window = Mmio::map(r.start, r.length as usize, ddk::MMIO_DEVICE)?;
+        if r.length == 0 || !r.length.is_multiple_of(1 << 20) || r.length > (256 << 20) {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let buses = r.length >> 20;
+        let (start_bus, end_bus) = match d.property_len(c"bus-range") {
+            0 => (0, (buses - 1) as u8),
+            2 => {
+                let start = d.cell(c"bus-range", 0)?;
+                let end = d.cell(c"bus-range", 1)?;
+                if end > 255 || start > end || end - start + 1 > buses {
+                    return Err(Error::from_status(ddk::EINVAL));
+                }
+                (start as u8, end as u8)
+            }
+            _ => return Err(Error::from_status(ddk::EINVAL)),
+        };
+        let segment = match d.integer(c"linux,pci-domain") {
+            Ok(value) => u16::try_from(value).map_err(|_| Error::from_status(ddk::EINVAL))?,
+            Err(error) if error.status() == ddk::ENOENT => 0,
+            Err(error) => return Err(error),
+        };
+        let config = config::ConfigRange::new(r.start, r.length, segment, start_bus, end_bus)
+            .ok_or(Error::from_status(ddk::EINVAL))?;
+        let window = Mmio::map(config.physical, config.length, ddk::MMIO_DEVICE)?;
+        let cells = d.property_len(c"roanix,bus-ranges");
+        if !cells.is_multiple_of(5) {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let mut windows = Vec::new();
+        for row in (0..cells).step_by(5) {
+            let kind = match d.cell(c"roanix,bus-ranges", row)? {
+                value if value == u64::from(ddk::RESOURCE_MEMORY) => Kind::Memory,
+                value if value == u64::from(ddk::RESOURCE_IO) => Kind::Io,
+                _ => return Err(Error::from_status(ddk::EINVAL)),
+            };
+            windows.push(
+                windows::Window::new(
+                    kind,
+                    d.cell(c"roanix,bus-ranges", row + 1)? as u32,
+                    d.cell(c"roanix,bus-ranges", row + 2)?,
+                    d.cell(c"roanix,bus-ranges", row + 3)?,
+                    d.cell(c"roanix,bus-ranges", row + 4)?,
+                )
+                .map_err(|_| Error::from_status(ddk::EINVAL))?,
+            );
+        }
+        let space = if d.integer(c"roanix,ranges-identity").unwrap_or(0) != 0 {
+            AddressSpace::identity()
+        } else {
+            AddressSpace::new(windows).map_err(|_| Error::from_status(ddk::EINVAL))?
+        };
+        let mut blob = alloc::vec![0u8; 2 * 1024 * 1024];
+        let length = ddk::firmware_devicetree(&mut blob)?;
+        let tree = firmware_tree::Tree::parse(&blob[..length]).map_err(firmware_error)?;
+        let node = usize::try_from(d.integer(c"roanix,node-index")?)
+            .map_err(|_| Error::from_status(ddk::EINVAL))?;
+        if tree.nodes().get(node).is_none() {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
         let mut s = STATE.lock();
-        if !s.ecams.is_empty() {
-            return Err(Error::from_status(ddk::EBUSY));
+        if s.ecams
+            .iter()
+            .any(|ecam| ecam.config.conflicts(config) || ecam.space.conflicts(&space))
+        {
+            return Err(Error::from_status(ddk::EINVAL));
         }
         s.ecams.push(Ecam {
-            segment: 0,
-            start_bus: 0,
-            end_bus: (buses - 1) as u8,
+            config,
+            parent: Some(d),
             window,
+            space,
         });
-        enumerate(&mut s, Some(d))
+        drop(s);
+        if let Err(error) = enumerate(Some(d), |address, pin, bridge| {
+            let unit_address = |address: Address| {
+                (u32::from(address.bus) << 16)
+                    | (u32::from(address.device) << 11)
+                    | (u32::from(address.function) << 8)
+            };
+            let nexus = if let Some(bridge) = bridge {
+                let Some(index) = tree
+                    .pci_node(node, unit_address(bridge))
+                    .map_err(firmware_error)?
+                else {
+                    return Ok(InterruptLookup::Inherited);
+                };
+                if tree.nodes()[index].bytes(c"interrupt-map").is_none() {
+                    return Ok(InterruptLookup::Inherited);
+                }
+                index
+            } else {
+                node
+            };
+            tree.resolve_interrupt(nexus, &[unit_address(address), 0, 0], &[u32::from(pin)])
+                .map(InterruptLookup::Mapped)
+                .map_err(firmware_error)
+        }) {
+            let ecam = {
+                let mut state = STATE.lock();
+                state
+                    .ecams
+                    .iter()
+                    .position(|ecam| same_parent(ecam.parent, Some(d)))
+                    .map(|index| state.ecams.remove(index))
+            };
+            drop(ecam);
+            return Err(error);
+        }
+        Ok(())
     })())
 }
 #[cfg(target_arch = "riscv64")]
-unsafe extern "C" fn host_remove(_: *mut c_void, _: *const raw::Device) {
-    remove_devices();
-    STATE.lock().ecams.clear();
+unsafe extern "C" fn host_remove(_: *mut c_void, pointer: *const raw::Device) -> i32 {
+    let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
+        return ddk::EINVAL;
+    };
+    status((|| {
+        remove_devices(Some(device))?;
+        let ecam = {
+            let mut state = STATE.lock();
+            state
+                .ecams
+                .iter()
+                .position(|ecam| same_parent(ecam.parent, Some(device)))
+                .map(|index| state.ecams.remove(index))
+        };
+        drop(ecam);
+        Ok(())
+    })())
 }
 #[cfg(target_arch = "riscv64")]
 static HOST_MATCHES: [raw::Match; 1] = [raw::Match {
@@ -807,15 +1157,16 @@ static HOST_MATCHES: [raw::Match; 1] = [raw::Match {
 #[cfg(target_arch = "riscv64")]
 static HOST_DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     size: raw::DRIVER_DEF_SIZE,
-    name: c"qemu-virt-pcie".as_ptr(),
+    name: c"pci-ecam-host".as_ptr(),
     bus: ptr::null(),
     priority: 0,
     matches: HOST_MATCHES.as_ptr(),
     match_count: 1,
     probe: Some(host_probe),
-    remove: Some(host_remove),
+    remove: None,
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: Some(host_remove),
 });
 
 #[cfg(target_arch = "x86_64")]
@@ -872,20 +1223,24 @@ fn discover_mcfg(s: &mut State) -> Result<()> {
         if table.len() < 44 || &table[..4] != b"MCFG" {
             continue;
         }
+        if !(table.len() - 44).is_multiple_of(16) {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
         for entry in table[44..].chunks_exact(16) {
             let base = le64(entry);
             let segment = u16::from_le_bytes([entry[8], entry[9]]);
             let start = entry[10];
             let end = entry[11];
-            if base == 0 || end < start {
-                continue;
+            let config = config::ConfigRange::mcfg(base, segment, start, end)
+                .ok_or(Error::from_status(ddk::EINVAL))?;
+            if s.ecams.iter().any(|ecam| ecam.config.conflicts(config)) {
+                return Err(Error::from_status(ddk::EINVAL));
             }
-            let bytes = (usize::from(end - start) + 1) << 20;
             s.ecams.push(Ecam {
-                segment,
-                start_bus: start,
-                end_bus: end,
-                window: Mmio::map(base, bytes, ddk::MMIO_DEVICE)?,
+                config,
+                parent: None,
+                window: Mmio::map(config.physical, config.length, ddk::MMIO_DEVICE)?,
+                space: AddressSpace::identity(),
             });
         }
         break;
@@ -902,12 +1257,12 @@ fn init_inner() -> Result<()> {
     STATE.lock().bus = Some(bus);
     #[cfg(target_arch = "x86_64")]
     {
-        STATE.lock().domain = Some(IrqDomain::register(
-            c"x86-pci-msi",
-            0,
-            MAX_MESSAGE_IDS as u32,
-            &MESSAGE_DOMAIN,
-        )?);
+        // SAFETY: callbacks and ROUTES are static, with short synchronized
+        // controller operations. All message mappings retire before withdrawal.
+        let domain = unsafe {
+            IrqDomain::register(c"x86-pci-msi", 0, MAX_MESSAGE_IDS as u32, &MESSAGE_DOMAIN)
+        }?;
+        STATE.lock().domain = Some(domain);
         let mut s = STATE.lock();
         if let Err(e) = discover_mcfg(&mut s) {
             ddk::log(
@@ -916,13 +1271,20 @@ fn init_inner() -> Result<()> {
             );
             return Err(e);
         }
-        enumerate(&mut s, None)?;
+        drop(s);
+        enumerate(None, |_, _, bridge| {
+            Ok(if bridge.is_some() {
+                InterruptLookup::Inherited
+            } else {
+                InterruptLookup::Mapped(None)
+            })
+        })?;
     }
     #[cfg(target_arch = "riscv64")]
     {
         let platform = Bus::find(c"platform")?;
         let host_def = {
-            let mut d = HOST_DRIVER.lock();
+            let mut d = HOST_DRIVER.lock_irqsave();
             d.bus = platform.as_raw();
             let p = ptr::from_ref(&*d);
             unsafe { &*p }
@@ -953,21 +1315,23 @@ fn init(module: Module) -> Result<()> {
 }
 fn exit(_module: Module) {
     #[cfg(target_arch = "x86_64")]
-    if let Some(mut p) = STATE.lock().publication.take() {
+    if let Some(mut p) = { STATE.lock().publication.take() } {
         let _ = p.withdraw();
     }
     #[cfg(target_arch = "riscv64")]
-    if let Some(mut d) = STATE.lock().host_driver.take() {
+    if let Some(mut d) = { STATE.lock().host_driver.take() } {
         let _ = d.unregister();
     }
-    remove_devices();
+    if remove_devices(None).is_err() {
+        return;
+    }
     let (ecams, bus) = {
         let mut s = STATE.lock();
         (mem::take(&mut s.ecams), s.bus.take())
     };
     drop(ecams);
     #[cfg(target_arch = "x86_64")]
-    if let Some(mut d) = STATE.lock().domain.take() {
+    if let Some(mut d) = { STATE.lock().domain.take() } {
         let _ = d.unregister();
     }
     if let Some(mut bus) = bus {
@@ -976,7 +1340,7 @@ fn exit(_module: Module) {
 }
 ddk::module!(
     b"pci\0",
-    b"ECAM PCIe bus (mandatory MSI/MSI-X on x86_64, PLIC INTx on RISC-V)\0",
+    b"ECAM PCIe bus with MSI/MSI-X and PLIC INTx services\0",
     init,
     exit
 );

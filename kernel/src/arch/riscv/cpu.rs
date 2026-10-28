@@ -37,6 +37,7 @@ pub(crate) const SSTATUS_SIE: u64 = 1 << 1;
 const SSTATUS_SPIE: u64 = 1 << 5;
 const SSTATUS_SPP: u64 = 1 << 8;
 const SSTATUS_FS_INITIAL: u64 = 1 << 13;
+const SSTATUS_FS_CLEAN: u64 = 2 << 13;
 pub(crate) const SIE_SSIE: u64 = 1 << 1;
 pub(crate) const SIE_STIE: u64 = 1 << 5;
 const SIE_SEIE: u64 = 1 << 9;
@@ -88,7 +89,16 @@ pub struct TrapFrame {
     ip: u64,
     sstatus: u64,
     reserved: u64,
+    floating: [u64; 32],
+    fcsr: u64,
+    floating_reserved: u64,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == 560);
+    assert!(core::mem::offset_of!(TrapFrame, floating) == 288);
+    assert!(core::mem::offset_of!(TrapFrame, fcsr) == 544);
+};
 
 impl TrapFrame {
     pub(crate) fn syscall_argument(&self, index: usize) -> u64 {
@@ -129,7 +139,8 @@ impl TrapFrame {
     }
 
     pub(crate) fn restore_signal(&mut self, saved: &Self) -> bool {
-        if saved.sstatus & SSTATUS_SPP != 0
+        if saved.fcsr & !0xff != 0
+            || saved.sstatus & SSTATUS_SPP != 0
             || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX).contains(&saved.ip)
             || !(crate::mem::USER_ADDRESS_MIN..crate::mem::USER_ADDRESS_MAX)
                 .contains(&saved.prev_sp)
@@ -137,7 +148,9 @@ impl TrapFrame {
             return false;
         }
         *self = *saved;
-        self.sstatus = SSTATUS_SPIE | SSTATUS_FS_INITIAL;
+        // The frame contains an initialized saved context, not the initial
+        // zero context used for a new image.
+        self.sstatus = SSTATUS_SPIE | SSTATUS_FS_CLEAN;
         true
     }
 
@@ -199,6 +212,9 @@ pub unsafe fn init_kernel_thread_frame(
             ip: ip as u64,
             sstatus: SSTATUS_SPP | SSTATUS_SPIE,
             reserved: 0,
+            floating: [0; 32],
+            fcsr: 0,
+            floating_reserved: 0,
         };
     }
 }
@@ -250,6 +266,9 @@ pub unsafe fn init_user_thread_frame(frame: *mut TrapFrame, ip: u64, stack: u64)
             ip,
             sstatus: SSTATUS_SPIE | SSTATUS_FS_INITIAL,
             reserved: 0,
+            floating: [0; 32],
+            fcsr: 0,
+            floating_reserved: 0,
         };
     }
 }

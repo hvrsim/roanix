@@ -95,6 +95,7 @@ pub struct SerialFraming {
 struct Backend {
     ops: ConsoleOps,
     owner: Option<Arc<Module>>,
+    events: [Option<Arc<Event>>; 3],
 }
 
 // SAFETY: the operation table and context belong to the owning module, which
@@ -107,10 +108,6 @@ unsafe impl Sync for Backend {}
 impl Backend {
     fn pin(&self) -> FsResult<module::ModuleGuard> {
         module::pin_owner(self.owner.as_ref(), false).map_err(|_| FsError::Io)
-    }
-
-    fn event(pointer: usize) -> Option<&'static Event> {
-        crate::driver::abi::events::resolve(pointer)
     }
 }
 
@@ -246,15 +243,15 @@ impl ConsoleBackend for Backend {
     }
 
     fn readable_event(&self) -> Option<&Event> {
-        Self::event(self.ops.readable_event)
+        self.events[0].as_deref()
     }
 
     fn writable_event(&self) -> Option<&Event> {
-        Self::event(self.ops.writable_event)
+        self.events[1].as_deref()
     }
 
     fn hangup_event(&self) -> Option<&Event> {
-        Self::event(self.ops.hangup_event)
+        self.events[2].as_deref()
     }
 
     fn reset_on_last_close(&self) -> bool {
@@ -360,7 +357,10 @@ pub unsafe fn register(
     let state = state()?;
 
     let path = terminal_path(parent, name)?;
+    let events = [ops.readable_event, ops.writable_event, ops.hangup_event]
+        .map(crate::driver::abi::events::resolve);
     let backend = Arc::new(Backend {
+        events,
         ops,
         owner: owner.cloned(),
     });

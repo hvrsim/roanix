@@ -16,6 +16,9 @@ extern "C" {
 
 /* --- Barriers ----------------------------------------------------------- */
 
+/* These memory barriers order ordinary shared memory. They do not replace
+ * rdf_device_barrier() for DMA descriptor/doorbell or completion/payload pairs.
+ * Like the Rust DDK, these helpers assume coherent DMA mappings. */
 /* Orders all preceding memory accesses before all following ones. */
 static inline void rdf_mb(void)
 {
@@ -32,6 +35,19 @@ static inline void rdf_rmb(void)
 static inline void rdf_wmb(void)
 {
     __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+/* Orders coherent DMA memory and device register accesses together. Use before
+ * publishing a descriptor through a doorbell and after observing completion
+ * before reading its DMA payload. Register accessors below are volatile only;
+ * they do not insert this ordering or flush posted writes. */
+static inline void rdf_device_barrier(void)
+{
+#if defined(__riscv)
+    __asm__ volatile("fence iorw, iorw" : : : "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
 }
 
 /* --- Register access ---------------------------------------------------- */

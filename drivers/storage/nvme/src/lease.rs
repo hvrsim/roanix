@@ -2,23 +2,23 @@
 //! a queue. Completion waits and buffer access happen outside that lock.
 
 use core::ops::{Deref, DerefMut};
-use ddk::{Event, Result, TicketLock};
+use ddk::{OwnedEvent, Result, TicketLock};
 
 pub struct Lease<T> {
     value: TicketLock<Option<T>>,
-    pub ready: Event,
+    pub ready: OwnedEvent,
 }
 
 impl<T> Lease<T> {
     pub fn new(value: T) -> Result<Self> {
         Ok(Self {
             value: TicketLock::new(Some(value)),
-            ready: Event::create()?,
+            ready: OwnedEvent::create()?,
         })
     }
 
     pub fn try_take(&self) -> Result<Option<Guard<'_, T>>> {
-        let mut value = self.value.lock();
+        let mut value = self.value.lock_irqsave();
         // Reset and transfer ownership under the same lock used by return.
         // A later return cannot be lost between checking and waiting.
         self.ready.reset()?;
@@ -35,12 +35,6 @@ impl<T> Lease<T> {
             }
             self.ready.wait()?;
         }
-    }
-}
-
-impl<T> Drop for Lease<T> {
-    fn drop(&mut self) {
-        let _ = self.ready.destroy();
     }
 }
 
@@ -64,7 +58,7 @@ impl<T> DerefMut for Guard<'_, T> {
 
 impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
-        let mut slot = self.owner.value.lock();
+        let mut slot = self.owner.value.lock_irqsave();
         *slot = self.value.take();
         let _ = self.owner.ready.signal();
     }

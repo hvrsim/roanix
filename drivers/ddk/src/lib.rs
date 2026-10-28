@@ -18,6 +18,10 @@
 //! The remaining types are small ownership and synchronization wrappers used
 //! inside a Rust module; none are passed over a module boundary.
 
+mod mutex;
+pub use mutex::{Mutex, MutexGuard};
+pub mod pci;
+
 extern crate alloc;
 
 #[cfg(feature = "module-build")]
@@ -26,7 +30,7 @@ extern crate std;
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
-    ffi::{CStr, c_char, c_void},
+    ffi::{CStr, c_void},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::{self, NonNull},
@@ -95,6 +99,7 @@ mod imports {
         fn device_add(*mut raw::DeviceBuilder, *mut *const raw::Device) -> i32;
         fn device_add_cells(*mut raw::DeviceBuilder, *const c_char, *const u64, usize, u32) -> i32;
         fn device_add_int(*mut raw::DeviceBuilder, *const c_char, u64, u32) -> i32;
+        fn device_add_firmware_irq(*mut raw::DeviceBuilder, u32, *const u32, usize) -> i32;
         fn device_add_irq(*mut raw::DeviceBuilder, *const raw::IrqDomain, *const u32, usize) -> i32;
         fn device_add_resource(*mut raw::DeviceBuilder, u32, u32, u64, u64, *const c_char) -> i32;
         fn device_add_strings(*mut raw::DeviceBuilder, *const c_char, *const *const c_char, usize) -> i32;
@@ -106,12 +111,18 @@ mod imports {
         fn device_property_len(*const raw::Device, *const c_char) -> usize;
         fn device_remove(*const raw::Device) -> i32;
         fn device_resource(*const raw::Device, u32, usize, *mut u64, *mut u64, *mut u32) -> i32;
+        fn device_resource_named(*const raw::Device, u32, *const c_char, *mut u64, *mut u64, *mut u32) -> i32;
         fn device_set_bus(*mut raw::DeviceBuilder, *const raw::Bus) -> i32;
-        fn device_set_data(*const raw::Device, *mut c_void);
+        fn device_set_data_checked(*const raw::Device, *mut c_void) -> i32;
         fn device_set_dma_mask(*mut raw::DeviceBuilder, u64) -> i32;
         fn device_set_parent(*mut raw::DeviceBuilder, *const raw::Device) -> i32;
         fn driver_register(*const raw::Module, *const raw::DriverDef, *mut *const raw::Driver) -> i32;
         fn driver_unregister(*const raw::Driver) -> i32;
+        fn mutex_create(*const raw::Module, *mut usize) -> i32;
+        fn mutex_lock(usize) -> i32;
+        fn mutex_try_lock(usize) -> i32;
+        fn mutex_unlock(usize) -> i32;
+        fn mutex_destroy(usize) -> i32;
         fn event_create(*const raw::Module, *mut usize) -> i32;
         fn event_destroy(usize) -> i32;
         fn event_reset(usize) -> i32;
@@ -126,14 +137,15 @@ mod imports {
         fn firmware_devicetree(*mut u8, usize, *mut usize) -> i32;
         fn iface_publish(*const raw::Module, *const raw::Device, *const c_char, u32, u32, *const c_void, usize, *mut c_void, *mut *const raw::Interface) -> i32;
         fn iface_withdraw(*const raw::Interface) -> i32;
-        fn iface_bind(*const raw::Module, *const raw::Device, u32, *const c_char, u32, *mut *mut raw::InterfaceBinding, *mut *mut c_void, *mut *mut c_void) -> i32;
+        fn iface_bind_global(*const raw::Module, *const c_char, u32, u32, *mut *mut raw::InterfaceBinding, *mut raw::InterfaceBindingInfo) -> i32;
         fn iface_unbind(*mut raw::InterfaceBinding);
         fn irq_alloc_vector(u32, *mut u32) -> i32;
         fn irq_domain_register(*const raw::Module, *const c_char, u32, u32, *const raw::IrqDomainDef, *mut *const raw::IrqDomain) -> i32;
+        fn irq_domain_set_device(*const raw::IrqDomain, *const raw::Device) -> i32;
         fn irq_domain_unregister(*const raw::IrqDomain) -> i32;
         fn irq_map(*const raw::IrqDomain, u64, u32, *mut u32) -> i32;
         fn irq_unmap(*const raw::IrqDomain, u64) -> i32;
-        fn irq_free_vector(u32);
+        fn irq_free_vector(u32) -> i32;
         fn irq_set_affinity(u32, u32) -> i32;
         fn irq_compose_message(*const raw::IrqDomain, u64, *mut u64, *mut u32) -> i32;
         fn irq_of_device(*const raw::Device, usize, *mut u32) -> i32;
@@ -150,8 +162,8 @@ mod imports {
         fn time_sleep(u64);
         fn tty_register(*const raw::Module, u64, *const c_char, u16, u32, *const raw::ConsoleOps, *mut *mut raw::Tty) -> i32;
         fn tty_unregister(*mut raw::Tty) -> i32;
-        fn worker_join(*mut c_void) -> i32;
-        fn worker_spawn(*const Module, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void, *mut *mut c_void) -> i32;
+        fn worker_join(*mut raw::Worker) -> i32;
+        fn worker_spawn(*const Module, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void, *mut *mut raw::Worker) -> i32;
     }
 }
 
@@ -167,7 +179,7 @@ pub mod raw {
     pub const NODE_OPS_SIZE: u32 = 120;
     pub const CONSOLE_OPS_SIZE: u32 = 160;
     pub const BUS_DEF_SIZE: u32 = 48;
-    pub const DRIVER_DEF_SIZE: u32 = 80;
+    pub const DRIVER_DEF_SIZE: u32 = 88;
     pub const IRQ_DOMAIN_DEF_SIZE: u32 = 96;
     pub const BLOCK_OPS_SIZE: u32 = 64;
 
@@ -195,6 +207,16 @@ pub mod raw {
     );
 
     pub type WorkerEntry = Option<unsafe extern "C" fn(*mut c_void)>;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct InterfaceBindingInfo {
+        pub ops: *const c_void,
+        pub context: *mut c_void,
+        pub ops_size: usize,
+        pub version: u32,
+        pub flags: u32,
+    }
 
     #[repr(C)]
     pub struct Mmio {
@@ -237,6 +259,7 @@ pub mod raw {
         pub remove: Option<unsafe extern "C" fn(*mut c_void, *const Device)>,
         pub shutdown: Option<unsafe extern "C" fn(*mut c_void, *const Device)>,
         pub context: *mut c_void,
+        pub try_remove: Option<unsafe extern "C" fn(*mut c_void, *const Device) -> i32>,
     }
 
     #[repr(C)]
@@ -379,8 +402,8 @@ pub mod raw {
         pub flags: u32,
         pub name: *const c_char,
         pub description: *const c_char,
-        pub init: Option<unsafe extern "C" fn(*mut Module) -> i32>,
-        pub exit: Option<unsafe extern "C" fn(*mut Module)>,
+        pub init: Option<unsafe extern "C" fn(*const Module) -> i32>,
+        pub exit: Option<unsafe extern "C" fn(*const Module)>,
     }
 
     // SAFETY: all callback tables and module descriptors used by the DDK are
@@ -415,6 +438,7 @@ pub mod raw {
     // SAFETY: see `Sync`; registration handles callback concurrency.
     unsafe impl Send for BusDef {}
 
+    const _: () = assert!(core::mem::size_of::<InterfaceBindingInfo>() == 32);
     const _: () = assert!(core::mem::size_of::<Mmio>() == 24);
     const _: () = assert!(core::mem::size_of::<Dma>() == 32);
     const _: () = assert!(core::mem::size_of::<Match>() == 72);
@@ -480,9 +504,6 @@ pub const IFACE_SINGLETON: u32 = 1 << 3;
 pub const MATCH_COMPATIBLE: u32 = 1;
 pub const MATCH_ID: u32 = 5;
 pub const NODE_CHARACTER: u32 = 1;
-pub const DMA_FROM_DEVICE: u32 = 1;
-pub const DMA_TO_DEVICE: u32 = 2;
-pub const DMA_BIDIRECTIONAL: u32 = 3;
 pub const DMA_ZERO: u32 = 1;
 pub const DMA_ADDRESS32: u32 = 1 << 1;
 pub const OPEN_NONBLOCK: u32 = 1 << 8;
@@ -493,19 +514,6 @@ pub const POLL_NVAL: u16 = 0x0020;
 pub const POLL_RDNORM: u16 = 0x0040;
 pub const POLL_WRNORM: u16 = 0x0100;
 pub const CONSOLE_RESET_ON_LAST_CLOSE: u64 = 1;
-pub const FS_KIND_REGULAR: u32 = 1;
-pub const FS_KIND_DIRECTORY: u32 = 2;
-pub const FS_KIND_SYMLINK: u32 = 3;
-pub const FS_KIND_CHARACTER_DEVICE: u32 = 4;
-pub const FS_KIND_BLOCK_DEVICE: u32 = 5;
-pub const FS_CREATE_REGULAR: u32 = 1;
-pub const FS_CREATE_DIRECTORY: u32 = 2;
-pub const FS_CREATE_SYMLINK: u32 = 3;
-pub const FS_SETATTR_SIZE: u32 = 1;
-pub const FS_SETATTR_MODE: u32 = 1 << 1;
-pub const DEVFS_EVENT_READABLE: u32 = 1;
-pub const DEVFS_EVENT_WRITABLE: u32 = 2;
-pub const DEVFS_EVENT_HANGUP: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error(i32);
@@ -631,8 +639,8 @@ impl Module {
     /// # Safety
     /// `pointer` must be the live module callback argument supplied by the
     /// loader; it is never dereferenced by this wrapper.
-    pub unsafe fn from_raw(pointer: *mut raw::Module) -> Option<Self> {
-        NonNull::new(pointer).map(Self)
+    pub unsafe fn from_raw(pointer: *const raw::Module) -> Option<Self> {
+        NonNull::new(pointer.cast_mut()).map(Self)
     }
 
     const fn as_ptr(self) -> *const raw::Module {
@@ -687,6 +695,7 @@ impl Bus {
 }
 
 /// Unique receipt for a bus registered by this module.
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct BusRegistration(Option<NonNull<raw::Bus>>);
 
 // SAFETY: the receipt is opaque and registration teardown is externally
@@ -733,6 +742,9 @@ impl BusRegistration {
     }
 }
 
+/// Non-owning, revocable device view. Copying it retains neither the device
+/// registration nor callback context. Kernel operations validate the identity
+/// each time; a retired device reports `ENODEV`.
 #[derive(Clone, Copy)]
 pub struct Device(*const raw::Device);
 
@@ -744,8 +756,9 @@ unsafe impl Sync for Device {}
 
 impl Device {
     /// # Safety
-    /// `pointer` must remain a kernel-owned device handle for the wrapper's
-    /// use. Probe and remove callbacks meet this requirement.
+    /// `pointer` must be an identity issued by the kernel. Probe and remove
+    /// callback arguments meet this requirement. Keeping the view does not
+    /// extend callback context lifetime or prevent identity revocation.
     pub unsafe fn from_raw(pointer: *const raw::Device) -> Option<Self> {
         NonNull::new(pointer.cast_mut()).map(|value| Self(value.as_ptr().cast_const()))
     }
@@ -812,8 +825,7 @@ impl Device {
     pub unsafe fn set_data(self, value: *mut c_void) -> Result<()> {
         // SAFETY: upheld by the caller; the kernel only stores this opaque
         // driver-private pointer.
-        unsafe { imports::device_set_data(self.0, value) };
-        Ok(())
+        unsafe { result(imports::device_set_data_checked(self.0, value)) }
     }
 
     /// # Safety
@@ -823,9 +835,32 @@ impl Device {
         unsafe { imports::device_data(self.0) }
     }
 
+    /// Requests removal through a non-owning view. This can revoke other
+    /// views; publication owners retain their unique cleanup receipt until
+    /// removal succeeds or an already-retired identity is acknowledged.
     pub fn remove(self) -> Result<()> {
-        // SAFETY: the device is kernel-owned and valid until removal returns.
+        // SAFETY: the kernel validates this opaque identity before removal.
         unsafe { result(imports::device_remove(self.0)) }
+    }
+    /// Finds a resource by its bus/firmware name, preserving indices across kinds.
+    pub fn resource_named(self, kind: u32, name: &CStr) -> Result<Resource> {
+        let mut resource = Resource {
+            start: 0,
+            length: 0,
+            flags: 0,
+        };
+        // SAFETY: name is NUL-terminated and output fields are writable.
+        unsafe {
+            result(imports::device_resource_named(
+                self.0,
+                kind,
+                name.as_ptr(),
+                &raw mut resource.start,
+                &raw mut resource.length,
+                &raw mut resource.flags,
+            ))?;
+        }
+        Ok(resource)
     }
 }
 
@@ -833,6 +868,38 @@ pub struct Resource {
     pub start: u64,
     pub length: u64,
     pub flags: u32,
+}
+
+/// Unique cleanup receipt for a device published by this module.
+///
+/// Cleanup is explicit: `remove` preserves this receipt on refusal. Dropping a
+/// live receipt leaves the registration in the module's kernel registry; it
+/// does not prove that associated callback context can be freed.
+///
+#[must_use = "retain the publication receipt until checked removal succeeds"]
+pub struct DeviceRegistration(Option<Device>);
+
+impl DeviceRegistration {
+    /// Returns a non-owning view, which may already have been revoked by a
+    /// parent removal or module sweep.
+    pub fn device(&self) -> Result<Device> {
+        self.0.ok_or(Error::from_status(ENODEV))
+    }
+
+    /// Removes this publication. Busy/error results retain the receipt, while
+    /// an already-revoked identity acknowledges completed ancestor removal.
+    pub fn remove(&mut self) -> Result<()> {
+        let Some(device) = self.0 else {
+            return Ok(());
+        };
+        match device.remove() {
+            Ok(()) => {}
+            Err(error) if error.status() == ENODEV => {}
+            Err(error) => return Err(error),
+        }
+        self.0 = None;
+        Ok(())
+    }
 }
 
 pub struct DeviceBuilder {
@@ -902,14 +969,15 @@ impl DeviceBuilder {
         }
     }
 
-    pub fn add_strings(&mut self, name: &CStr, values: &[*const c_char]) -> Result<()> {
-        // SAFETY: `values` holds NUL-terminated static strings for this call.
+    pub fn add_strings(&mut self, name: &CStr, values: &[&CStr]) -> Result<()> {
+        let pointers: alloc::vec::Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+        // SAFETY: every borrowed C string and the pointer array outlive the call.
         unsafe {
             result(imports::device_add_strings(
                 self.pointer()?,
                 name.as_ptr(),
-                values.as_ptr(),
-                values.len(),
+                pointers.as_ptr(),
+                pointers.len(),
             ))
         }
     }
@@ -923,6 +991,20 @@ impl DeviceBuilder {
                 values.as_ptr(),
                 values.len(),
                 0,
+            ))
+        }
+    }
+
+    /// Adds a copied list of 64-bit cells, preserving bus/CPU address widths.
+    pub fn add_u64_list(&mut self, name: &CStr, values: &[u64]) -> Result<()> {
+        // SAFETY: the kernel copies the slice during this immediate call.
+        unsafe {
+            result(imports::device_add_cells(
+                self.pointer()?,
+                name.as_ptr(),
+                values.as_ptr(),
+                values.len(),
+                1,
             ))
         }
     }
@@ -960,13 +1042,28 @@ impl DeviceBuilder {
         }
     }
 
-    pub fn publish(mut self) -> Result<Device> {
+    /// Retains a firmware controller identity until that domain is available.
+    pub fn add_firmware_irq(&mut self, phandle: u32, cells: &[u32]) -> Result<()> {
+        // SAFETY: the builder is live and the kernel copies these cells.
+        unsafe {
+            result(imports::device_add_firmware_irq(
+                self.pointer()?,
+                phandle,
+                cells.as_ptr(),
+                cells.len(),
+            ))
+        }
+    }
+
+    pub fn publish(mut self) -> Result<DeviceRegistration> {
         let mut device = ptr::null();
-        // SAFETY: this transfers the builder receipt to the kernel exactly once.
-        unsafe { result(imports::device_add(self.pointer()?, &raw mut device))? };
-        self.raw = None;
+        let builder = self.raw.take().ok_or(Error::from_status(EINVAL))?;
+        // SAFETY: the kernel consumes this receipt on success AND failure.
+        unsafe { result(imports::device_add(builder.as_ptr(), &raw mut device))? };
         // SAFETY: the service returns a live, kernel-owned device handle.
-        unsafe { Device::from_raw(device) }.ok_or(Error::from_status(EINVAL))
+        unsafe { Device::from_raw(device) }
+            .map(|device| DeviceRegistration(Some(device)))
+            .ok_or(Error::from_status(EINVAL))
     }
 }
 
@@ -980,6 +1077,7 @@ impl Drop for DeviceBuilder {
     }
 }
 
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct InterfacePublication(Option<NonNull<raw::Interface>>);
 
 // SAFETY: withdrawal is externally serialized and the opaque handle is never
@@ -1038,43 +1136,69 @@ pub struct InterfaceBinding {
     raw: Option<NonNull<raw::InterfaceBinding>>,
     operations: NonNull<c_void>,
     context: *mut c_void,
+    operations_size: usize,
+    version: u32,
+    flags: u32,
 }
 
 // SAFETY: the binding is immutable and unbinding is externally serialized.
 unsafe impl Send for InterfaceBinding {}
 
 impl InterfaceBinding {
+    /// Legacy selection: revisions are assumed backward compatible through
+    /// `u32::MAX`. Prefer a bounded range or `TypedInterface` for new services.
     pub fn bind(name: &CStr, minimum_version: u32) -> Result<Self> {
+        Self::bind_versioned(name, minimum_version, u32::MAX)
+    }
+
+    /// Selects the newest service revision within an inclusive supported range.
+    pub fn bind_versioned(name: &CStr, minimum_version: u32, maximum_version: u32) -> Result<Self> {
         let mut binding = ptr::null_mut();
-        let mut operations = ptr::null_mut();
-        let mut context = ptr::null_mut();
-        // SAFETY: all outputs are writable and the name is NUL-terminated.
+        let mut info = raw::InterfaceBindingInfo {
+            ops: ptr::null(),
+            context: ptr::null_mut(),
+            ops_size: 0,
+            version: 0,
+            flags: 0,
+        };
+        // SAFETY: name is NUL-terminated; both outputs are writable.
         unsafe {
-            result(imports::iface_bind(
+            result(imports::iface_bind_global(
                 module()?.as_ptr(),
-                ptr::null(),
-                0,
                 name.as_ptr(),
                 minimum_version,
+                maximum_version,
                 &raw mut binding,
-                &raw mut operations,
-                &raw mut context,
+                &raw mut info,
             ))?;
         }
-        let Some(binding) = NonNull::new(binding) else {
-            return Err(Error::from_status(EINVAL));
-        };
-        let Some(operations) = NonNull::new(operations) else {
-            // SAFETY: the kernel returned a binding receipt but no usable
-            // operation table, so release it before reporting the error.
+        let binding = NonNull::new(binding).ok_or(Error::from_status(EINVAL))?;
+        let Some(operations) = NonNull::new(info.ops.cast_mut()) else {
+            // SAFETY: release the receipt accompanying an unusable table.
             unsafe { imports::iface_unbind(binding.as_ptr()) };
             return Err(Error::from_status(EINVAL));
         };
         Ok(Self {
             raw: Some(binding),
             operations,
-            context,
+            context: info.context,
+            operations_size: info.ops_size,
+            version: info.version,
+            flags: info.flags,
         })
+    }
+
+    #[must_use]
+    pub const fn operations_size(&self) -> usize {
+        self.operations_size
+    }
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+    #[must_use]
+    pub const fn flags(&self) -> u32 {
+        self.flags
     }
 
     #[must_use]
@@ -1101,11 +1225,69 @@ impl Drop for InterfaceBinding {
     }
 }
 
+/// A retained operation table whose published extent and behavior were checked
+/// before constructing a typed reference. Operations may be called only in the
+/// execution contexts permitted by the service contract and its published flags.
+pub struct TypedInterface<T> {
+    binding: InterfaceBinding,
+    _table: PhantomData<T>,
+}
+
+impl<T> TypedInterface<T> {
+    /// # Safety
+    /// `name` and the supported revision range must identify immutable tables
+    /// with the layout and valid values of `T`, including callback signatures,
+    /// whenever the reported byte extent and alignment suffice for `T`.
+    /// Metadata checks do not validate arbitrary function pointers or context.
+    pub unsafe fn bind(
+        name: &CStr,
+        minimum: u32,
+        maximum: u32,
+        required_flags: u32,
+    ) -> Result<Self> {
+        let binding = InterfaceBinding::bind_versioned(name, minimum, maximum)?;
+        if binding.operations_size() < size_of::<T>()
+            || !binding.operations().addr().is_multiple_of(align_of::<T>())
+            || binding.flags() & required_flags != required_flags
+            || !(minimum..=maximum).contains(&binding.version())
+        {
+            return Err(Error::from_status(ENOTSUP));
+        }
+        Ok(Self {
+            binding,
+            _table: PhantomData,
+        })
+    }
+
+    #[must_use]
+    pub fn ops(&self) -> &T {
+        // SAFETY: bind validated extent/alignment; its unsafe contract validates
+        // the table's layout and contents. This borrow retains the provider.
+        unsafe { &*self.binding.operations().cast::<T>() }
+    }
+
+    #[must_use]
+    pub fn context(&self) -> *mut c_void {
+        self.binding.context()
+    }
+
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.binding.version()
+    }
+
+    #[must_use]
+    pub fn flags(&self) -> u32 {
+        self.binding.flags()
+    }
+}
+
 /// Receipt returned by registering a driver with a bus.
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct DriverRegistration(Option<NonNull<raw::Driver>>);
 
-// SAFETY: the receipt is consumed only while held in a `TicketLock`; it is an
-// opaque kernel handle and this wrapper never dereferences it.
+// SAFETY: registration teardown is externally serialized; this opaque
+// receipt never dereferences kernel memory.
 unsafe impl Send for DriverRegistration {}
 
 impl DriverRegistration {
@@ -1200,9 +1382,13 @@ impl Mmio {
                 .checked_add(width)
                 .is_some_and(|end| end <= self.raw.length)
         );
-        // SAFETY: the range assertion proves this pointer remains within the
-        // kernel mapping, which owns the full `raw.length` extent.
-        unsafe { self.raw.base.cast::<u8>().add(offset) }
+        // SAFETY: the range assertion bounds this pointer within the mapping.
+        let address = unsafe { self.raw.base.cast::<u8>().add(offset) };
+        assert!(
+            (address as usize).is_multiple_of(width),
+            "unaligned MMIO register"
+        );
+        address
     }
 
     #[must_use]
@@ -1349,8 +1535,7 @@ pub struct TicketLock<T> {
 }
 
 // SAFETY: the ticket protocol permits access only through its exclusive guards.
-// `SpinGuard` is limited to thread-context state; interrupt-shared state uses
-// `IrqGuard` and keeps local interrupts disabled.
+// `IrqGuard` keeps local interrupts disabled; longer thread operations use Mutex.
 unsafe impl<T: Send> Sync for TicketLock<T> {}
 
 impl<T> TicketLock<T> {
@@ -1378,36 +1563,6 @@ impl<T> TicketLock<T> {
         }
     }
 
-    /// Acquires a ticket lock without changing interrupt state.
-    ///
-    /// This variant is for thread-context state that is never touched by an
-    /// interrupt handler. Callers must not sleep or invoke a blocking backend
-    /// operation while the returned guard is live.
-    pub fn lock(&self) -> SpinGuard<'_, T> {
-        self.lock_ticket();
-        SpinGuard {
-            lock: self,
-            marker: PhantomData,
-        }
-    }
-
-    /// Attempts to acquire an uncontended non-IRQ ticket lock.
-    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
-        let serving = self.serving.load(Ordering::Acquire);
-        self.next
-            .compare_exchange(
-                serving,
-                serving.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .ok()
-            .map(|_| SpinGuard {
-                lock: self,
-                marker: PhantomData,
-            })
-    }
-
     fn lock_ticket(&self) {
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
         while self.serving.load(Ordering::Acquire) != ticket {
@@ -1416,39 +1571,12 @@ impl<T> TicketLock<T> {
     }
 }
 
-/// Guard for [`TicketLock::lock`].
-pub struct SpinGuard<'a, T> {
-    lock: &'a TicketLock<T>,
-    marker: PhantomData<&'a mut T>,
-}
-
-impl<T> Deref for SpinGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: the ticket lock is held by this guard, giving unique mutable
-        // access; reborrowing it immutably is therefore valid.
-        unsafe { &*self.lock.value.get() }
-    }
-}
-
-impl<T> DerefMut for SpinGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the ticket lock is held by this guard and its lifetime
-        // prevents another guard from accessing the value concurrently.
-        unsafe { &mut *self.lock.value.get() }
-    }
-}
-
-impl<T> Drop for SpinGuard<'_, T> {
-    fn drop(&mut self) {
-        self.lock.serving.fetch_add(1, Ordering::Release);
-    }
-}
-
+/// Local interrupt state must be restored on the acquiring thread.
+///
 pub struct IrqGuard<'a, T> {
     lock: &'a TicketLock<T>,
     flags: usize,
-    marker: PhantomData<&'a mut T>,
+    marker: PhantomData<(&'a mut T, *mut ())>,
 }
 
 impl<T> Deref for IrqGuard<'_, T> {
@@ -1527,26 +1655,58 @@ fn irq_restore(state: usize) {
     #[cfg(target_arch = "riscv64")]
     if state & (1 << 1) != 0 {
         // SAFETY: restores SIE only if it was set by the saved status word.
-        unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 2usize, options(nomem, nostack)) };
+        unsafe {
+            core::arch::asm!("csrs sstatus, {}", in(reg) 2usize, options(nomem, nostack));
+        };
     }
 }
 
+/// Unique owner of a module event. Dropping it revokes the identity and wakes
+/// existing waiters; kernel operations already in flight retain their storage.
+/// Destruction is a thread-context operation, so move owners out of IRQ locks
+/// before dropping them. Module teardown revokes any deliberately leaked owner.
+///
+pub struct OwnedEvent(Event);
+
+impl OwnedEvent {
+    pub fn create() -> Result<Self> {
+        let mut event = 0;
+        // SAFETY: module is live and event is writable output storage.
+        unsafe { result(imports::event_create(module()?.as_ptr(), &raw mut event))? };
+        Event::from_id(event)
+            .map(Self)
+            .ok_or_else(|| Error::from_status(EINVAL))
+    }
+
+    /// Returns a non-owning, revocable handle, suitable for an IRQ or wait.
+    #[must_use]
+    pub const fn event(&self) -> Event {
+        self.0
+    }
+}
+
+impl Deref for OwnedEvent {
+    type Target = Event;
+
+    fn deref(&self) -> &Event {
+        &self.0
+    }
+}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        // Destruction cannot be busy. An already swept identity is harmless.
+        let _ = event_call(imports::event_destroy, self.0.id());
+    }
+}
+
+/// Non-owning event identity. Copying it does not extend the owner's lifetime.
+/// Revoked identities fail lookup; waits already admitted are woken on revoke.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct Event(usize);
 
 impl Event {
-    pub fn create() -> Result<Self> {
-        let mut event = 0;
-        // SAFETY: module is live and event is writable output storage.
-        unsafe { result(imports::event_create(module()?.as_ptr(), &raw mut event))? };
-        if event == 0 {
-            Err(Error::from_status(EINVAL))
-        } else {
-            Ok(Self(event))
-        }
-    }
-
     #[must_use]
     pub const fn id(self) -> usize {
         self.0
@@ -1565,9 +1725,6 @@ impl Event {
     }
     pub fn wait(self) -> Result<()> {
         event_call(imports::event_wait, self.0)
-    }
-    pub fn destroy(self) -> Result<()> {
-        event_call(imports::event_destroy, self.0)
     }
 
     /// Waits until any event in `events` is signalled and returns its index.
@@ -1603,6 +1760,7 @@ impl Event {
 }
 
 /// Receipt for a kernel thread executing a module callback.
+#[must_use = "retain this callback receipt until release or join completes"]
 pub struct Worker(Option<NonNull<raw::Worker>>);
 
 // SAFETY: worker ownership is transferred between terminal lifecycle code; the
@@ -1615,24 +1773,26 @@ impl Worker {
     /// # Safety
     /// `entry` and `context` must remain valid until `join` returns.
     pub unsafe fn spawn(entry: raw::WorkerEntry, context: *mut c_void) -> Result<Self> {
-        let mut worker = ptr::null_mut::<c_void>();
+        let mut worker = ptr::null_mut::<raw::Worker>();
         // SAFETY: the callback and context meet this method's contract and
         // `worker` is writable output storage.
         let status =
             unsafe { imports::worker_spawn(module()?.as_ptr(), entry, context, &raw mut worker) };
         result(status)?;
-        NonNull::new(worker.cast())
+        NonNull::new(worker)
             .map(|value| Self(Some(value)))
             .ok_or(Error::from_status(EINVAL))
     }
 
-    /// Waits for the worker to finish and releases its kernel receipt.
+    /// Waits for the worker to finish and consumes its kernel receipt, even
+    /// when the ABI reports an invalid/stale receipt. Never join from that
+    /// worker's own callback.
     pub fn join(&mut self) -> Result<()> {
         let Some(worker) = self.0.take() else {
             return Ok(());
         };
         // SAFETY: this uniquely consumes the worker receipt.
-        let status = unsafe { imports::worker_join(worker.as_ptr().cast()) };
+        let status = unsafe { imports::worker_join(worker.as_ptr()) };
         result(status)
     }
 }
@@ -1643,13 +1803,21 @@ fn event_call(function: unsafe extern "C" fn(usize) -> i32, event: usize) -> Res
     unsafe { result(function(event)) }
 }
 
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct IrqDomain(Option<NonNull<raw::IrqDomain>>);
 
 // SAFETY: registration lifetime is externally synchronized by its owner.
 unsafe impl Send for IrqDomain {}
 
 impl IrqDomain {
-    pub fn register(
+    /// Registers controller callbacks owned by the current module.
+    ///
+    /// # Safety
+    /// Callback targets and context must remain valid until unregister succeeds.
+    /// Mask, unmask, EOI, claim and complete must be IRQ-safe; callbacks must
+    /// tolerate concurrent calls. Do not withdraw the domain or the current
+    /// mapping from its own callback, or recursively register from setup.
+    pub unsafe fn register(
         name: &CStr,
         flags: u32,
         count: u32,
@@ -1680,6 +1848,20 @@ impl IrqDomain {
         unsafe { result(imports::irq_domain_unregister(domain.as_ptr().cast_const()))? };
         self.0 = None;
         Ok(())
+    }
+
+    /// Publishes the identity of a fully initialized firmware controller.
+    /// Thread context only; this can synchronously retry deferred consumers,
+    /// so callbacks and hardware state must already be ready.
+    pub fn set_device(&self, device: Device) -> Result<()> {
+        let domain = self.0.ok_or(Error::from_status(EINVAL))?;
+        // SAFETY: both opaque identities are validated by the kernel.
+        unsafe {
+            result(imports::irq_domain_set_device(
+                domain.as_ptr(),
+                device.as_raw(),
+            ))
+        }
     }
 
     pub fn map(&self, hwirq: u64, flags: u32) -> Result<u32> {
@@ -1720,6 +1902,7 @@ impl IrqDomain {
     }
 }
 
+#[must_use = "retain this callback receipt until release or join completes"]
 pub struct Irq(Option<NonNull<raw::Irq>>);
 
 // SAFETY: IRQ release is synchronized by the kernel and the wrapper never
@@ -1727,7 +1910,13 @@ pub struct Irq(Option<NonNull<raw::Irq>>);
 unsafe impl Send for Irq {}
 
 impl Irq {
-    pub fn request(
+    /// Registers a hard interrupt handler.
+    ///
+    /// # Safety
+    /// The handler and context must remain valid until release completes, and
+    /// tolerate concurrent hard-interrupt invocation. The context must not be
+    /// freed while a registered threaded callback can still access it.
+    pub unsafe fn request(
         device: Device,
         virq: u32,
         name: &CStr,
@@ -1742,8 +1931,12 @@ impl Irq {
     /// The hard handler quiets its source and returns `IRQ_WAKE_THREAD`. The service
     /// callback drains authoritative state and rearms it. Both callbacks and their
     /// context must stay live until release; service must not release itself.
+    ///
+    /// # Safety
+    /// Both callbacks and the context must remain valid until release completes.
+    /// They must synchronize shared state and the hard handler must not sleep.
     #[allow(clippy::too_many_arguments)]
-    pub fn request_threaded(
+    pub unsafe fn request_threaded(
         device: Device,
         virq: u32,
         name: &CStr,
@@ -1785,6 +1978,9 @@ impl Irq {
             .ok_or(Error::from_status(EINVAL))
     }
 
+    /// Consumes the action receipt and drains callbacks. This is a consuming
+    /// ABI operation even on stale-receipt errors; never call it from this
+    /// action's own hard or threaded callback.
     pub fn release(&mut self) -> Result<()> {
         let Some(irq) = self.0.take() else {
             return Ok(());
@@ -1814,9 +2010,9 @@ pub fn irq_alloc_vector(virq: u32) -> Result<u32> {
     Ok(vector)
 }
 
-pub fn irq_free_vector(vector: u32) {
+pub fn irq_free_vector(vector: u32) -> Result<()> {
     // SAFETY: vector came from `irq_alloc_vector` in this module.
-    unsafe { imports::irq_free_vector(vector) };
+    unsafe { result(imports::irq_free_vector(vector)) }
 }
 
 pub fn irq_set_affinity(virq: u32, cpu: u32) -> Result<()> {
@@ -1858,9 +2054,8 @@ fn firmware(
     }
 }
 
-pub struct Devfs;
-
 /// Unique receipt for a hardware block device owned by this module.
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct BlockRegistration(Option<NonNull<raw::BlockDevice>>);
 
 // SAFETY: the receipt is opaque. Drivers must serialize access to their own
@@ -1910,15 +2105,12 @@ impl BlockRegistration {
     }
 }
 
-impl Drop for BlockRegistration {
-    fn drop(&mut self) {
-        let _ = self.unregister();
-    }
-}
-
-impl Devfs {
+/// Device-filesystem operations. Registration and removal resolve the calling
+/// module at the operation that needs it; lookup/root need no module receipt.
+pub mod devfs {
+    use super::{CStr, NODE_CHARACTER, Result, imports, module, raw, result};
     /// Looks up a path relative to the devfs root, such as `input/event0`.
-    pub fn lookup(&self, path: &CStr) -> Result<u64> {
+    pub fn lookup(path: &CStr) -> Result<u64> {
         let mut node = 0;
         // SAFETY: path and output storage remain live for this lookup.
         unsafe {
@@ -1927,12 +2119,7 @@ impl Devfs {
         Ok(node)
     }
 
-    pub fn current() -> Result<Self> {
-        let _ = module()?;
-        Ok(Self)
-    }
-
-    pub fn root(&self) -> Result<u64> {
+    pub fn root() -> Result<u64> {
         let mut node = 0;
         // SAFETY: the versioned import has the C ABI checked in kernel exports.
         let status = unsafe { imports::devfs_root(&raw mut node) };
@@ -1940,7 +2127,7 @@ impl Devfs {
         Ok(node)
     }
 
-    pub fn mkdir(&self, parent: u64, name: &CStr, mode: u16) -> Result<u64> {
+    pub fn mkdir(parent: u64, name: &CStr, mode: u16) -> Result<u64> {
         let mut node = 0;
         // SAFETY: name and output storage remain valid during this call.
         unsafe {
@@ -1960,7 +2147,6 @@ impl Devfs {
     /// size-prefixed table during this call; its context and callback targets
     /// must remain valid until the node is removed.
     pub unsafe fn create_character(
-        &self,
         parent: u64,
         name: &CStr,
         mode: u16,
@@ -1983,7 +2169,7 @@ impl Devfs {
         Ok(node)
     }
 
-    pub fn remove(&self, node: u64) -> Result<()> {
+    pub fn remove(node: u64) -> Result<()> {
         // SAFETY: the node receipt belongs to this module and is consumed by
         // the kernel's device-filesystem removal path.
         let status = unsafe { imports::devfs_remove(module()?.as_ptr(), node) };
@@ -1991,6 +2177,7 @@ impl Devfs {
     }
 }
 
+#[must_use = "retain this registration and its context until checked cleanup succeeds"]
 pub struct Tty(Option<NonNull<raw::Tty>>);
 
 // SAFETY: terminal receipt use is serialized by its driver state lock.
@@ -2049,26 +2236,24 @@ pub fn monotonic_ns() -> u64 {
     unsafe { imports::time_monotonic() }
 }
 
-pub fn random_fill(bytes: &mut [u8]) -> Result<()> {
+pub fn random_fill(bytes: &mut [u8]) {
     if bytes.is_empty() {
-        return Ok(());
+        return;
     }
     // SAFETY: the slice is writable for exactly its length.
     unsafe {
         imports::random_fill(bytes.as_mut_ptr(), bytes.len());
     };
-    Ok(())
 }
 
-pub fn random_mix(bytes: &[u8]) -> Result<()> {
+pub fn random_mix(bytes: &[u8]) {
     if bytes.is_empty() {
-        return Ok(());
+        return;
     }
     // SAFETY: the slice is readable for exactly its length.
     unsafe {
         imports::random_mix(bytes.as_ptr(), bytes.len());
     };
-    Ok(())
 }
 
 pub fn alloc_zeroed(size: usize, align: usize) -> Result<NonNull<u8>> {
@@ -2085,6 +2270,20 @@ pub unsafe fn free(pointer: NonNull<u8>, size: usize, align: usize) {
     unsafe {
         imports::free(pointer.as_ptr().cast(), size, align);
     };
+}
+
+/// Orders coherent DMA memory and device register accesses.
+/// Use before publishing a descriptor through a doorbell and after observing
+/// device completion before reading the associated DMA payload.
+#[inline]
+pub fn device_barrier() {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: orders memory and device I/O without changing execution state.
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 pub fn port_read8(port: u16) -> u8 {
@@ -2246,7 +2445,7 @@ macro_rules! module {
         static __RDF_MODULE_NAME: &[u8] = $name;
         static __RDF_MODULE_DESCRIPTION: &[u8] = $description;
 
-        unsafe extern "C" fn __rdf_module_init(pointer: *mut $crate::raw::Module) -> i32 {
+        unsafe extern "C" fn __rdf_module_init(pointer: *const $crate::raw::Module) -> i32 {
             // SAFETY: the loader supplies the live module callback handle.
             let Some(module) = (unsafe { $crate::Module::from_raw(pointer) }) else {
                 return $crate::EINVAL;
@@ -2258,7 +2457,7 @@ macro_rules! module {
             }
         }
 
-        unsafe extern "C" fn __rdf_module_exit(pointer: *mut $crate::raw::Module) {
+        unsafe extern "C" fn __rdf_module_exit(pointer: *const $crate::raw::Module) {
             // SAFETY: the loader supplies the live module callback handle.
             if let Some(module) = unsafe { $crate::Module::from_raw(pointer) } {
                 ($exit)(module);

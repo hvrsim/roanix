@@ -1,14 +1,9 @@
-//! Reference-counted framework objects addressed by stable pointers.
+//! Reference-counted framework objects addressed through opaque identities.
 //!
-//! The previous framework translated every driver call through an identifier
-//! map guarded by one global lock, so each call paid a lock acquisition and a
-//! logarithmic lookup. This module replaces that with direct pointers into
-//! reference-counted allocations: handle validation is a constant-time tag
-//! check and no lock is taken.
-//!
-//! Every object begins with an [`ObjHeader`] carrying a type-mixed magic word.
-//! A handle is the address of that header, so a driver-supplied pointer is
-//! rejected unless it addresses a live object of the expected type.
+//! Handle lookup retains an Arc before accessing an object. Retired identities
+//! cannot alias a future allocation; neither stale pointers nor type tags are
+//! read from memory supplied by a module. Metadata remains separately indexed
+//! for diagnostics.
 
 use alloc::{
     boxed::Box,
@@ -18,6 +13,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::Any,
     ffi::c_void,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
@@ -99,6 +95,7 @@ struct ObjMetadata {
 
 struct Registry {
     entries: Mutex<BTreeMap<ObjId, Weak<ObjMetadata>>>,
+    handles: super::handle::HandleTable<Arc<dyn Any + Send + Sync>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +104,7 @@ static REGISTRY: Once<Registry> = Once::new();
 pub(crate) fn init() {
     REGISTRY.call_once(|| Registry {
         entries: Mutex::new(BTreeMap::new()),
+        handles: super::handle::HandleTable::new(),
     });
 }
 
@@ -155,7 +153,9 @@ impl ObjHeader {
         owner: Option<ObjId>,
         parent: Option<ObjId>,
     ) -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("framework object identities exhausted");
         Self {
             magic: AtomicU32::new(kind.magic()),
             kind: kind as u32,
@@ -232,6 +232,7 @@ impl ObjHeader {
         self.magic.store(MAGIC_DEAD | self.kind, Ordering::Release);
         if let Some(registry) = registry() {
             registry.entries.lock().remove(&self.id);
+            registry.handles.retain(|id, _| id != self.id as usize);
         }
     }
 
@@ -284,14 +285,8 @@ pub fn enumerate() -> Vec<ObjInfo> {
     snapshot()
 }
 
-/// A framework type reachable through a driver-visible handle.
-///
-/// # Safety
-///
-/// Implementors must store the header returned by [`Object::header`] as the
-/// first field of a `#[repr(C)]` type so that the object address and the header
-/// address are identical.
-pub unsafe trait Object: Sized {
+/// A framework type reachable through an opaque, typed driver identity.
+pub trait Object: Sized + Any + Send + Sync {
     /// Type tag validated on every handle conversion.
     const KIND: ObjKind;
 
@@ -334,60 +329,52 @@ pub unsafe trait Object: Sized {
     }
 }
 
-/// Borrows an object from a driver-supplied handle.
-///
-/// The returned reference is only valid while the caller keeps the object
-/// alive, which callbacks guarantee by holding a reference across the call.
-///
-/// # Safety
-///
-/// `handle` must be null or address a framework object allocation.
-pub unsafe fn borrow<'a, T: Object>(handle: *const c_void) -> Result<&'a T> {
-    if handle.is_null() || (handle as usize) & (align_of::<ObjHeader>() - 1) != 0 {
-        return Err(Error::InvalidArgument);
-    }
-    // SAFETY: the caller guarantees `handle` addresses a framework object, so
-    // its first field is a header whose tag distinguishes the concrete type.
-    let header = unsafe { &*handle.cast::<ObjHeader>() };
-    if header.kind != T::KIND as u32 {
-        return Err(Error::WrongKind);
-    }
-    if !header.is_live() {
+/// Resolves an opaque identity and retains the object for the operation.
+/// Stale or fabricated identities are rejected without accessing caller memory.
+pub fn upgrade<T: Object>(handle: *const c_void) -> Result<Arc<T>> {
+    let registry = registry().ok_or(Error::NotInitialized)?;
+    let object = registry
+        .handles
+        .get(handle as usize)
+        .ok_or(Error::NoDevice)?;
+    let object = object.downcast::<T>().map_err(|_| Error::WrongKind)?;
+    if !object.object_is_live() {
         return Err(Error::NoDevice);
     }
-    // SAFETY: the tag matched `T::KIND`, and `Object` requires the header to be
-    // the first field of a `#[repr(C)]` layout, so the addresses coincide.
-    Ok(unsafe { &*handle.cast::<T>() })
+    Ok(object)
 }
 
-/// Borrows an object and clones a counted reference to it.
-///
-/// # Safety
-///
-/// `handle` must satisfy the [`borrow`] contract and must have originated from
-/// an [`Arc`] allocation of `T`.
-pub unsafe fn upgrade<T: Object>(handle: *const c_void) -> Result<Arc<T>> {
-    // SAFETY: forwarded from this function's caller.
-    let object = unsafe { borrow::<T>(handle) }?;
-    // SAFETY: the caller guarantees the object lives inside an `Arc<T>`, and
-    // the borrow above proves the allocation is still live.
-    let arc = unsafe { Arc::from_raw(object as *const T) };
-    let clone = arc.clone();
-    let _ = Arc::into_raw(arc);
-    Ok(clone)
+/// Borrows an object for an IRQ-safe, nonblocking scalar operation. The caller
+/// must not return borrowed Rust references or reenter handle lookup in `action`.
+pub fn with<T: Object, R>(handle: *const c_void, action: impl FnOnce(&T) -> R) -> Result<R> {
+    registry()
+        .ok_or(Error::NotInitialized)?
+        .handles
+        .with(handle as usize, |object| {
+            let object = object.downcast_ref::<T>().ok_or(Error::WrongKind)?;
+            if !object.object_is_live() {
+                return Err(Error::NoDevice);
+            }
+            Ok(action(object))
+        })
+        .ok_or(Error::NoDevice)?
 }
 
-/// Returns the driver-visible handle for an object.
+/// Returns a non-dereferenceable identity for a live framework object.
 pub fn handle<T: Object>(object: &Arc<T>) -> *const c_void {
-    Arc::as_ptr(object).cast()
+    let id = object.object_id() as usize;
+    let registry = registry().expect("driver object registry initialized");
+    if registry.handles.get(id).is_none() {
+        let erased: Arc<dyn Any + Send + Sync> = object.clone();
+        registry.handles.insert(id, erased);
+    }
+    id as *const c_void
 }
 
 /// Declares a framework object type with an embedded header.
 macro_rules! framework_object {
     ($type:ty, $kind:ident) => {
-        // SAFETY: the type stores `header` as the first field of a `#[repr(C)]`
-        // layout, so the object and header addresses coincide.
-        unsafe impl $crate::driver::obj::Object for $type {
+        impl $crate::driver::obj::Object for $type {
             const KIND: $crate::driver::obj::ObjKind = $crate::driver::obj::ObjKind::$kind;
 
             fn header(&self) -> &$crate::driver::obj::ObjHeader {

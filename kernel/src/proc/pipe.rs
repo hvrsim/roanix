@@ -1,5 +1,7 @@
 //! Anonymous byte pipes used by process descriptors.
 
+use crate::sys::event::EventSource;
+
 use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -214,18 +216,18 @@ impl PipeEnd {
     pub(crate) fn poll_events<'a>(
         &'a self,
         events: PollEvents,
-        output: &mut alloc::vec::Vec<&'a Event>,
+        output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
         match self.direction {
             Direction::Read
                 if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) =>
             {
-                output.push(&self.pipe.readable);
+                output.push((&self.pipe.readable).into());
             }
             Direction::Write
                 if events.intersects(PollEvents::OUT | PollEvents::WRNORM | PollEvents::ERR) =>
             {
-                output.push(&self.pipe.writable);
+                output.push((&self.pipe.writable).into());
             }
             _ => {}
         }

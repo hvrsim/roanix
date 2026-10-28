@@ -1977,6 +1977,7 @@ impl Scheduler {
         for cpu_id in 0..self.cpu_count {
             self.reap_exited(cpu_id);
         }
+        super::thread::reap_thread_lifetimes();
     }
 
     fn publish_deferred_exit(&self) {
@@ -2318,6 +2319,11 @@ pub(crate) use crate::sys::thread::NICE_MIN;
 /// Highest nice value, granting the least CPU share.
 pub(crate) use crate::sys::thread::NICE_MAX;
 
+/// Before scheduler publication, only the bootstrap CPU executes kernel code.
+pub(crate) fn in_bootstrap() -> bool {
+    SCHEDULER.get().is_none()
+}
+
 /// Returns the thread currently executing on this CPU.
 pub(crate) fn current_thread() -> *mut Thread {
     current_thread_opt().expect("sched: current thread unavailable")
@@ -2366,25 +2372,23 @@ pub(crate) fn thread_priority(thread: *mut Thread) -> u8 {
 /// Lends `priority` to `thread` while a waiter blocks on a lock it holds.
 ///
 /// Every call must be paired with exactly one [`unboost_priority`].
-pub(crate) fn boost_priority(thread: *mut Thread, priority: u8) {
-    let Some(thread) = NonNull::new(thread) else {
-        return;
-    };
-    let Some(scheduler) = SCHEDULER.get() else {
-        return;
-    };
-    scheduler.adjust_boost(thread, Some(priority));
+pub(crate) fn boost_priority(thread: &super::thread::ThreadLifetime, priority: u8) {
+    if let Some(scheduler) = SCHEDULER.get() {
+        thread.with_live(|thread| {
+            let thread = NonNull::new(thread).expect("live thread token");
+            scheduler.adjust_boost(thread, Some(priority));
+        });
+    }
 }
 
-/// Releases one priority boost previously applied to `thread`.
-pub(crate) fn unboost_priority(thread: *mut Thread) {
-    let Some(thread) = NonNull::new(thread) else {
-        return;
-    };
-    let Some(scheduler) = SCHEDULER.get() else {
-        return;
-    };
-    scheduler.adjust_boost(thread, None);
+/// Releases one priority boost, or ignores an owner already reaped.
+pub(crate) fn unboost_priority(thread: &super::thread::ThreadLifetime) {
+    if let Some(scheduler) = SCHEDULER.get() {
+        thread.with_live(|thread| {
+            let thread = NonNull::new(thread).expect("live thread token");
+            scheduler.adjust_boost(thread, None);
+        });
+    }
 }
 
 /// Publishes a thread whose final stack switch has completed.

@@ -23,9 +23,8 @@ use ddk::{
     Bus, BusRegistration, Device, DriverRegistration, Error, InterfacePublication, Irq, Module,
     Result, TicketLock, Worker, raw,
 };
-use ring::Trb;
 
-static CONTROLLERS: TicketLock<Vec<(u32, Weak<Controller>)>> = TicketLock::new(Vec::new());
+static CONTROLLERS: ddk::Mutex<Vec<(u32, Weak<Controller>)>> = ddk::Mutex::new(Vec::new());
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 static DRIVER_RECEIPT: TicketLock<Option<DriverRegistration>> = TicketLock::new(None);
 static BUS_RECEIPT: TicketLock<Option<BusRegistration>> = TicketLock::new(None);
@@ -171,27 +170,10 @@ unsafe extern "C" fn receive(
         let endpoint = device.integer(c"usb.endpoint")? as u8;
         let packet = device.integer(c"usb.max-packet")? as u16;
         let interval = device.integer(c"usb.interval")? as u8;
-        let dci = controller.configure_interrupt(slot, endpoint, packet, interval)?;
-        let event = {
-            let mut h = controller.hardware.lock_irqsave();
-            let endpoint = h.endpoint_mut(slot, dci)?;
-            let event = endpoint.prepare(length)?;
-            endpoint.pending = endpoint.ring.push(Trb {
-                parameter: endpoint.buffer.device_address(),
-                status: length as u32,
-                control: (1 << 10) | (1 << 5) | 4,
-            });
-            h.registers.write32(h.doorbell + slot * 4, dci as u32);
-            event
-        };
-        let count = controller.wait_transfer(slot, dci, event)?;
-        let mut h = controller.hardware.lock_irqsave();
-        let endpoint = h.endpoint_mut(slot, dci)?;
-        // SAFETY: transfer completion published count bytes within both buffers.
-        unsafe {
-            ptr::copy_nonoverlapping(endpoint.buffer.as_ptr(), buffer, count);
-        }
-        Ok(count)
+        // SAFETY: USB ABI caller owns length writable bytes for this call.
+        controller.receive_interrupt(slot, endpoint, packet, interval, unsafe {
+            slice::from_raw_parts_mut(buffer, length)
+        })
     })();
     result.map_or_else(|e| i64::from(e.status()), |count| i64::from(count as u32))
 }
@@ -227,18 +209,20 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
         #[cfg(target_arch = "riscv64")]
         let virq = ddk::irq_of_device(device, 0)?;
         let context = Arc::as_ptr(&controller).cast_mut().cast();
-        let irq = Irq::request(
-            device,
-            virq,
-            c"xhci",
-            if cfg!(target_arch = "riscv64") {
-                ddk::IRQ_SHARED
-            } else {
-                0
-            },
-            interrupt,
-            context,
-        )?;
+        let irq = unsafe {
+            Irq::request(
+                device,
+                virq,
+                c"xhci",
+                if cfg!(target_arch = "riscv64") {
+                    ddk::IRQ_SHARED
+                } else {
+                    0
+                },
+                interrupt,
+                context,
+            )
+        }?;
         *controller.irq.lock_irqsave() = Some(irq);
         #[cfg(target_arch = "x86_64")]
         controller.msi.unmask()?;
@@ -257,10 +241,13 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, _: usize
             }
         };
         *controller.worker.lock_irqsave() = Some(worker);
-        // SAFETY: this Arc reference is recovered exactly once by remove.
-        unsafe {
-            device.set_data(Arc::into_raw(controller).cast_mut().cast())?;
+        // SAFETY: retain ownership until the kernel accepts the live identity.
+        if let Err(error) = unsafe { device.set_data(context) } {
+            forget_controller(controller.id);
+            return Err(error);
         }
+        // Remove recovers this reference exactly once after successful transfer.
+        let _ = Arc::into_raw(controller);
         ddk::log(ddk::LOG_INFO, c"xHCI controller started");
         Ok(())
     })();
@@ -319,6 +306,7 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     remove: Some(remove),
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: None,
 });
 static BUS: TicketLock<raw::BusDef> = TicketLock::new(raw::BusDef {
     size: size_of::<raw::BusDef>() as u32,
@@ -331,13 +319,13 @@ static BUS: TicketLock<raw::BusDef> = TicketLock::new(raw::BusDef {
 fn init(_: Module) -> Result<()> {
     // SAFETY: BUS, HOST_OPS, and their callback targets are static.
     let bus_definition = {
-        let bus = BUS.lock();
+        let bus = BUS.lock_irqsave();
         // SAFETY: the bus definition is immutable static storage.
         unsafe { &*ptr::from_ref(&*bus) }
     };
     let bus = unsafe { BusRegistration::register(c"usb", bus_definition) }?;
-    *BUS_RECEIPT.lock() = Some(bus);
-    *PUBLICATION.lock() = Some(unsafe {
+    *BUS_RECEIPT.lock_irqsave() = Some(bus);
+    *PUBLICATION.lock_irqsave() = Some(unsafe {
         InterfacePublication::publish(
             usb::HOST_INTERFACE,
             1,
@@ -347,27 +335,28 @@ fn init(_: Module) -> Result<()> {
             ptr::null_mut(),
         )
     }?);
+    let pci_bus = Bus::find(c"pci")?;
     let definition = {
-        let mut driver = DRIVER.lock();
-        driver.bus = Bus::find(c"pci")?.as_raw();
+        let mut driver = DRIVER.lock_irqsave();
+        driver.bus = pci_bus.as_raw();
         // SAFETY: publication serializes initialization of this static table.
         unsafe { &*ptr::from_ref(&*driver) }
     };
     // SAFETY: the driver definition remains static until unregister completes.
     let registration = unsafe { DriverRegistration::register(definition) }?;
-    *DRIVER_RECEIPT.lock() = Some(registration);
+    *DRIVER_RECEIPT.lock_irqsave() = Some(registration);
     Ok(())
 }
 fn exit(_: Module) {
-    let driver = { DRIVER_RECEIPT.lock().take() };
+    let driver = { DRIVER_RECEIPT.lock_irqsave().take() };
     if let Some(mut driver) = driver {
         let _ = driver.unregister();
     }
-    let publication = { PUBLICATION.lock().take() };
+    let publication = { PUBLICATION.lock_irqsave().take() };
     if let Some(mut publication) = publication {
         let _ = publication.withdraw();
     }
-    let bus = { BUS_RECEIPT.lock().take() };
+    let bus = { BUS_RECEIPT.lock_irqsave().take() };
     if let Some(mut bus) = bus {
         let _ = bus.unregister();
     }

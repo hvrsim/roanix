@@ -8,13 +8,13 @@ fn module_ref(handle: *const c_void) -> Result<Option<Arc<Module>>> {
     }
     // SAFETY: the handle came from the framework, which only hands out module
     // pointers, and the tag check rejects anything else.
-    unsafe { obj::upgrade::<Module>(handle) }.map(Some)
+    obj::upgrade::<Module>(handle).map(Some)
 }
 
 fn object<T: Object>(handle: *const c_void) -> Result<Arc<T>> {
     // SAFETY: the handle came from the framework and the tag check rejects a
     // pointer of the wrong type or to a poisoned object.
-    unsafe { obj::upgrade::<T>(handle) }
+    obj::upgrade::<T>(handle)
 }
 
 fn optional_object<T: Object>(handle: *const c_void) -> Result<Option<Arc<T>>> {
@@ -87,11 +87,8 @@ unsafe extern "C" fn shim_free(pointer: *mut c_void, size: usize, align: usize) 
 // --- Modules ----------------------------------------------------------------
 
 unsafe extern "C" fn shim_module_name(handle: *const c_void) -> *const c_char {
-    // SAFETY: the handle came from the framework.
-    match unsafe { obj::borrow::<Module>(handle) } {
-        Ok(module) => module.name_c_ptr(),
-        Err(_) => core::ptr::null(),
-    }
+    // The calling module keeps its own name live through the enclosing callback.
+    obj::with::<Module, _>(handle, Module::name_c_ptr).unwrap_or(core::ptr::null())
 }
 
 unsafe extern "C" fn shim_module_find(name: *const c_char, out: *mut *const c_void) -> i32 {
@@ -223,7 +220,10 @@ unsafe extern "C" fn shim_device_add_string(
         let name = unsafe { borrow_str(name) }?;
         // SAFETY: as above.
         let value = unsafe { borrow_str(value) }?;
-        target.property(name, PropValue::Str(alloc::string::String::from(value).into()))
+        target.property(
+            name,
+            PropValue::Str(alloc::string::String::from(value).into()),
+        )
     })())
 }
 
@@ -324,6 +324,29 @@ unsafe extern "C" fn shim_device_add_irq(
     })())
 }
 
+unsafe extern "C" fn shim_device_add_firmware_irq(
+    handle: *mut c_void,
+    phandle: u32,
+    cells: *const u32,
+    count: usize,
+) -> i32 {
+    status((|| -> Result<()> {
+        let target = builder(handle)?;
+        // SAFETY: the ABI supplies count readable specifier cells.
+        let cells = unsafe { borrow_slice(cells, count) }?;
+        target.firmware_irq(phandle, cells).map(|_| ())
+    })())
+}
+
+unsafe extern "C" fn shim_irq_domain_set_device(
+    domain: *const c_void,
+    device: *const c_void,
+) -> i32 {
+    status((|| -> Result<()> {
+        irq::set_domain_device(&object(domain)?, &object(device)?)
+    })())
+}
+
 unsafe extern "C" fn shim_device_add(handle: *mut c_void, out: *mut *const c_void) -> i32 {
     status((|| -> Result<()> {
         if handle.is_null() {
@@ -366,7 +389,7 @@ unsafe extern "C" fn shim_device_root(out: *mut *const c_void) -> i32 {
 
 unsafe extern "C" fn shim_device_name(handle: *const c_void) -> *const c_char {
     // SAFETY: the handle came from the framework.
-    match unsafe { obj::borrow::<Device>(handle) } {
+    match obj::upgrade::<Device>(handle) {
         Ok(device) => device.name_c_ptr(),
         Err(_) => core::ptr::null(),
     }
@@ -374,7 +397,7 @@ unsafe extern "C" fn shim_device_name(handle: *const c_void) -> *const c_char {
 
 unsafe extern "C" fn shim_device_parent(handle: *const c_void) -> *const c_void {
     // SAFETY: the handle came from the framework.
-    let Ok(device) = (unsafe { obj::borrow::<Device>(handle) }) else {
+    let Ok(device) = obj::upgrade::<Device>(handle) else {
         return core::ptr::null();
     };
     match device.parent() {
@@ -385,12 +408,12 @@ unsafe extern "C" fn shim_device_parent(handle: *const c_void) -> *const c_void 
 
 unsafe extern "C" fn shim_device_child_count(handle: *const c_void) -> usize {
     // SAFETY: the handle came from the framework.
-    unsafe { obj::borrow::<Device>(handle) }.map_or(0, |device| device.children().len())
+    obj::upgrade::<Device>(handle).map_or(0, |device| device.children().len())
 }
 
 unsafe extern "C" fn shim_device_child(handle: *const c_void, index: usize) -> *const c_void {
     // SAFETY: the handle came from the framework.
-    let Ok(device) = (unsafe { obj::borrow::<Device>(handle) }) else {
+    let Ok(device) = obj::upgrade::<Device>(handle) else {
         return core::ptr::null();
     };
     match device.children().get(index) {
@@ -400,16 +423,22 @@ unsafe extern "C" fn shim_device_child(handle: *const c_void, index: usize) -> *
 }
 
 unsafe extern "C" fn shim_device_data(handle: *const c_void) -> *mut c_void {
-    // SAFETY: the handle came from the framework.
-    unsafe { obj::borrow::<Device>(handle) }
-        .map_or(core::ptr::null_mut(), |device| device.drvdata() as *mut c_void)
+    obj::with::<Device, _>(handle, |device| device.drvdata() as *mut c_void)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 unsafe extern "C" fn shim_device_set_data(handle: *const c_void, value: *mut c_void) {
-    // SAFETY: the handle came from the framework.
-    if let Ok(device) = unsafe { obj::borrow::<Device>(handle) } {
-        device.set_drvdata(value as usize);
-    }
+    // Retain the original infallible import for existing C modules.
+    let _ = obj::with::<Device, _>(handle, |device| device.set_drvdata(value as usize));
+}
+
+unsafe extern "C" fn shim_device_set_data_checked(
+    handle: *const c_void,
+    value: *mut c_void,
+) -> i32 {
+    status(obj::with::<Device, _>(handle, |device| {
+        device.set_drvdata(value as usize)
+    }))
 }
 
 unsafe extern "C" fn shim_device_int(
@@ -500,12 +529,9 @@ unsafe extern "C" fn shim_device_bytes(
     })())
 }
 
-unsafe extern "C" fn shim_device_property_len(
-    handle: *const c_void,
-    name: *const c_char,
-) -> usize {
+unsafe extern "C" fn shim_device_property_len(handle: *const c_void, name: *const c_char) -> usize {
     // SAFETY: the handle came from the framework.
-    let Ok(device) = (unsafe { obj::borrow::<Device>(handle) }) else {
+    let Ok(device) = obj::upgrade::<Device>(handle) else {
         return 0;
     };
     // SAFETY: the ABI requires a NUL-terminated string.
@@ -527,6 +553,29 @@ unsafe extern "C" fn shim_device_resource(
         let device = object::<Device>(handle)?;
         let resource = device.resource(kind, index).ok_or(Error::NotFound)?;
         // SAFETY: the ABI requires writable output pointers or null.
+        unsafe {
+            write_out(start, resource.start);
+            write_out(size, resource.size);
+            write_out(flags, resource.flags);
+        }
+        Ok(())
+    })())
+}
+
+unsafe extern "C" fn shim_device_resource_named(
+    handle: *const c_void,
+    kind: u32,
+    name: *const c_char,
+    start: *mut u64,
+    size: *mut u64,
+    flags: *mut u32,
+) -> i32 {
+    status((|| -> Result<()> {
+        let device = object::<Device>(handle)?;
+        // SAFETY: the ABI requires a NUL-terminated resource name.
+        let name = unsafe { borrow_str(name) }?;
+        let resource = device.resource_named(kind, name).ok_or(Error::NotFound)?;
+        // SAFETY: the caller supplies writable output slots or null.
         unsafe {
             write_out(start, resource.start);
             write_out(size, resource.size);
@@ -607,12 +656,15 @@ unsafe extern "C" fn shim_bus_find(name: *const c_char, out: *mut *const c_void)
     })())
 }
 
-unsafe extern "C" fn shim_bus_set_dma_ops(handle: *const c_void, ops: *const c_void) -> i32 {
+unsafe extern "C" fn shim_bus_set_dma_ops(
+    handle: *const c_void,
+    ops: *const crate::driver::io::dma::DmaOps,
+) -> i32 {
     status((|| -> Result<()> {
         let bus = object::<Bus>(handle)?;
         // SAFETY: the module contract requires the table to stay valid until
         // the bus is unregistered.
-        unsafe { bus.set_dma_ops(ops) };
+        unsafe { bus.set_dma_ops(ops.cast()) };
         Ok(())
     })())
 }
@@ -627,9 +679,30 @@ unsafe extern "C" fn shim_driver_register(
         if definition.is_null() {
             return Err(Error::InvalidArgument);
         }
-        // SAFETY: the ABI requires a readable definition record.
-        let definition = unsafe { &*definition };
-        if (definition.size as usize) < size_of::<DriverDef>() {
+        // Read only the declared, complete prefix. Legacy ABI v2 records end
+        // at byte 80; never construct a reference beyond that readable extent.
+        // SAFETY: size is the first mandatory field of a readable ABI record.
+        let declared = unsafe { definition.cast::<u32>().read() } as usize;
+        if declared < 80 {
+            return Err(Error::InvalidArgument);
+        }
+        let extent = if declared >= size_of::<DriverDef>() {
+            size_of::<DriverDef>()
+        } else {
+            80
+        };
+        let mut copied = core::mem::MaybeUninit::<DriverDef>::zeroed();
+        // SAFETY: extent includes only complete fields in the declared record;
+        // zero initializes the optional callback in older registrations.
+        let definition = unsafe {
+            core::ptr::copy_nonoverlapping(
+                definition.cast::<u8>(),
+                copied.as_mut_ptr().cast::<u8>(),
+                extent,
+            );
+            copied.assume_init()
+        };
+        if definition.remove.is_some() && definition.try_remove.is_some() {
             return Err(Error::InvalidArgument);
         }
         // SAFETY: the ABI requires a NUL-terminated string.
@@ -667,6 +740,7 @@ unsafe extern "C" fn shim_driver_register(
             DriverOps {
                 probe,
                 remove: definition.remove,
+                try_remove: definition.try_remove,
                 shutdown: definition.shutdown,
                 context: definition.context,
             },
@@ -716,9 +790,7 @@ unsafe extern "C" fn shim_iface_publish(
         let interface = match optional_object::<Device>(device)? {
             // SAFETY: the module contract requires the operation table to stay
             // valid until the interface is withdrawn.
-            Some(device) => unsafe {
-                iface::publish_device(owner.as_ref(), &device, publication)
-            }?,
+            Some(device) => unsafe { iface::publish_device(owner.as_ref(), &device, publication) }?,
             // SAFETY: the same operation-table lifetime contract applies to a
             // global interface.
             None => unsafe { iface::publish_global(owner.as_ref(), publication) }?,
@@ -743,7 +815,7 @@ unsafe extern "C" fn shim_iface_bind(
     bind_scope: u32,
     name: *const c_char,
     min_version: u32,
-    binding: *mut *const c_void,
+    binding: *mut *mut c_void,
     ops: *mut *mut c_void,
     context: *mut *mut c_void,
 ) -> i32 {
@@ -769,10 +841,42 @@ unsafe extern "C" fn shim_iface_bind(
         unsafe {
             write_out(ops, table.cast_mut());
             write_out(context, call_context);
-            write_out(
-                binding,
-                alloc::boxed::Box::into_raw(boxed).cast::<c_void>().cast_const(),
-            );
+            write_out(binding, alloc::boxed::Box::into_raw(boxed).cast::<c_void>());
+        }
+        Ok(())
+    })())
+}
+
+unsafe extern "C" fn shim_iface_bind_global(
+    module: *const c_void,
+    name: *const c_char,
+    min_version: u32,
+    max_version: u32,
+    binding: *mut *mut c_void,
+    info: *mut InterfaceBindingInfo,
+) -> i32 {
+    status((|| -> Result<()> {
+        if binding.is_null() || info.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        let consumer = module_ref(module)?;
+        // SAFETY: the ABI requires a NUL-terminated name.
+        let name = unsafe { borrow_str(name) }?;
+        let reference =
+            iface::bind_global_range(consumer.as_ref(), name, min_version, max_version)?;
+        let interface = reference.interface();
+        let metadata = InterfaceBindingInfo {
+            ops: interface.ops(),
+            context: interface.context(),
+            ops_size: interface.ops_size(),
+            version: interface.version(),
+            flags: interface.flags(),
+        };
+        let boxed = alloc::boxed::Box::new(reference);
+        // SAFETY: the caller supplies writable output storage for both records.
+        unsafe {
+            info.write(metadata);
+            binding.write(alloc::boxed::Box::into_raw(boxed).cast());
         }
         Ok(())
     })())
@@ -898,11 +1002,7 @@ unsafe extern "C" fn shim_irq_unmap(domain: *const c_void, hwirq: u64) -> i32 {
     })())
 }
 
-unsafe extern "C" fn shim_irq_of_device(
-    device: *const c_void,
-    index: usize,
-    out: *mut u32,
-) -> i32 {
+unsafe extern "C" fn shim_irq_of_device(device: *const c_void, index: usize, out: *mut u32) -> i32 {
     status((|| -> Result<()> {
         let device = object::<Device>(device)?;
         let virq = irq::device_virq(&device, index)?;
@@ -1125,7 +1225,12 @@ unsafe extern "C" fn shim_dma_map(
     })())
 }
 
-unsafe extern "C" fn shim_dma_unmap(device: *const c_void, address: u64, size: usize, direction: u32) {
+unsafe extern "C" fn shim_dma_unmap(
+    device: *const c_void,
+    address: u64,
+    size: usize,
+    direction: u32,
+) {
     let device = optional_object::<Device>(device).ok().flatten();
     dma::unmap_single(device.as_ref(), address, size, direction);
 }
@@ -1251,17 +1356,11 @@ unsafe extern "C" fn shim_event_wait(handle: usize) -> i32 {
 }
 
 unsafe extern "C" fn shim_event_signal(handle: usize) -> i32 {
-    status(super::events::with(handle, |event| {
-        event.signal();
-        Ok(())
-    }))
+    status(super::events::notify(handle, true))
 }
 
 unsafe extern "C" fn shim_event_reset(handle: usize) -> i32 {
-    status(super::events::with(handle, |event| {
-        event.reset();
-        Ok(())
-    }))
+    status(super::events::notify(handle, false))
 }
 
 unsafe extern "C" fn shim_event_wait_any(
@@ -1281,7 +1380,8 @@ unsafe extern "C" fn shim_event_wait_any(
         for handle in handles {
             events.push(super::events::resolve(*handle).ok_or(Error::InvalidArgument)?);
         }
-        let winner = Event::wait_any(&events);
+        let references: Vec<_> = events.iter().map(Arc::as_ref).collect();
+        let winner = Event::wait_any(&references);
         // SAFETY: the ABI requires a writable output pointer or null.
         unsafe { write_out(out, winner) };
         Ok(())
@@ -1654,4 +1754,30 @@ unsafe extern "C" fn shim_klog_set_console_level(level: u32) -> u32 {
 /// level rather than rejecting the call.
 fn clamp_level(level: u32) -> klog::Level {
     klog::Level::from_raw(level.min(u32::from(klog::LEVEL_COUNT) - 1) as u8)
+}
+
+// --- Sleepable mutexes ------------------------------------------------------
+unsafe extern "C" fn shim_mutex_create(owner: *const c_void, out: *mut usize) -> i32 {
+    status((|| -> Result<()> {
+        if out.is_null() {
+            return Err(Error::InvalidArgument);
+        }
+        let owner = module_ref(owner)?;
+        let id = super::mutexes::create(owner.as_ref())?;
+        // SAFETY: the caller supplies writable output storage.
+        unsafe { out.write(id) };
+        Ok(())
+    })())
+}
+unsafe extern "C" fn shim_mutex_lock(id: usize) -> i32 {
+    status(super::mutexes::acquire(id, true))
+}
+unsafe extern "C" fn shim_mutex_try_lock(id: usize) -> i32 {
+    status(super::mutexes::acquire(id, false))
+}
+unsafe extern "C" fn shim_mutex_unlock(id: usize) -> i32 {
+    status(super::mutexes::release(id))
+}
+unsafe extern "C" fn shim_mutex_destroy(id: usize) -> i32 {
+    status(super::mutexes::destroy(id))
 }

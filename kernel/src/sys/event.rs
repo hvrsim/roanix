@@ -4,7 +4,7 @@ use super::{
     parking::wait::{self, Entry, INLINE_WAITERS, WaitSource},
     sync::MutexGuard,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const SIGNALED: u64 = 1;
@@ -34,9 +34,41 @@ pub struct Event {
 /// Notifications after capture remain observable even before `wait` starts.
 /// Epoch equality assumes fewer than 2^62 notifications between capture and wait.
 #[must_use = "a listener must be waited on to observe notifications"]
+#[derive(Clone, Copy)]
 pub struct EventListener<'a> {
     event: &'a Event,
     observed: u64,
+}
+
+/// Retains either a native borrowed event or a module event's counted storage
+/// until a readiness scan and its wait registration have both finished.
+pub enum EventSource<'a> {
+    /// Native event kept alive by the descriptor supplying it.
+    Borrowed(&'a Event),
+    /// Module event retained independently of its revoked driver identity.
+    Owned(Arc<Event>),
+}
+
+impl<'a> From<&'a Event> for EventSource<'a> {
+    fn from(event: &'a Event) -> Self {
+        Self::Borrowed(event)
+    }
+}
+
+impl From<Arc<Event>> for EventSource<'_> {
+    fn from(event: Arc<Event>) -> Self {
+        Self::Owned(event)
+    }
+}
+
+impl core::ops::Deref for EventSource<'_> {
+    type Target = Event;
+    fn deref(&self) -> &Event {
+        match self {
+            Self::Borrowed(event) => event,
+            Self::Owned(event) => event,
+        }
+    }
 }
 
 impl Event {
@@ -134,11 +166,33 @@ impl Event {
 }
 
 impl<'event> EventListener<'event> {
-    fn entry(&self) -> Entry<'event> {
+    pub(crate) fn entry(&self) -> Entry<'event> {
         Entry {
             source: self.event,
             ticket: self.observed,
         }
+    }
+
+    /// Waits using generations captured before the caller checked readiness.
+    /// No notification between that check and wait registration can be lost.
+    pub fn wait_any(listeners: &[Self]) -> usize {
+        assert!(!listeners.is_empty(), "event: empty listener set");
+        wait::assert_wait_context();
+        if listeners.len() <= INLINE_WAITERS {
+            let mut entries = [listeners[0].entry(); INLINE_WAITERS];
+            for (entry, listener) in entries.iter_mut().zip(listeners) {
+                *entry = listener.entry();
+            }
+            wait::wait(&entries[..listeners.len()], || {})
+        } else {
+            let entries = listeners.iter().map(Self::entry).collect::<Vec<_>>();
+            wait::wait(&entries, || {})
+        }
+    }
+
+    /// Whether this listener has observed a persistent or transient notification.
+    pub(crate) fn notified(&self) -> bool {
+        !self.event.should_wait(self.observed)
     }
 
     /// Waits for a signal or notification since this listener was captured.

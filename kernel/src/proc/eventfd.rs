@@ -1,5 +1,7 @@
 //! Shared event counters used for userspace event-loop notifications.
 
+use crate::sys::event::EventSource;
+
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -104,13 +106,13 @@ impl EventFd {
     pub(crate) fn poll_events<'a>(
         &'a self,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         if events.intersects(PollEvents::IN | PollEvents::RDNORM) {
-            output.push(&self.readable);
+            output.push((&self.readable).into());
         }
         if events.intersects(PollEvents::OUT | PollEvents::WRNORM) {
-            output.push(&self.writable);
+            output.push((&self.writable).into());
         }
         true
     }

@@ -685,9 +685,9 @@ extern "C" fn rtrap(frame: &mut TrapFrame) -> *mut TrapFrame {
         }
         log::error!(
             "unhandled exception vec=0x{:X} ec=0x{:X} ip=0x{:X} cr2=0x{:X} cs=0x{:X} ss=0x{:X} sp=0x{:X} rflags=0x{:X} cpu={} tid={}",
-            frame.ip,
             frame.vec,
             frame.ec,
+            frame.ip,
             Cr2::read_raw(),
             frame.cs,
             frame.ss,

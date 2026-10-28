@@ -37,8 +37,10 @@ pub type RemoveFn = unsafe extern "C" fn(context: *mut c_void, device: *const c_
 pub struct DriverOps {
     /// Required probe callback.
     pub probe: ProbeFn,
-    /// Optional remove callback.
+    /// Legacy mandatory remove callback, which must complete disconnection.
     pub remove: Option<RemoveFn>,
+    /// Checked removal; errors preserve the binding and framework resources.
+    pub try_remove: Option<unsafe extern "C" fn(*mut c_void, *const c_void) -> i32>,
     /// Optional callback invoked during orderly system shutdown.
     pub shutdown: Option<RemoveFn>,
     /// Context passed to every callback.
@@ -52,10 +54,15 @@ pub struct Driver {
     name: Box<str>,
     owner: Option<Arc<Module>>,
     bus: Option<Arc<Bus>>,
+    bus_lease: Mutex<Option<module::ModuleLease>>,
     priority: i32,
     matches: Box<[MatchEntry]>,
     ops: DriverOps,
     bound: AtomicU64,
+    // Serializes probe admission with withdrawing this driver from matching.
+    // The count covers a complete binding transaction, including publication
+    // of BOUND, rather than only the module's callback body.
+    probes: Mutex<usize>,
     /// Set at registration; lets `evaluate` clone a handle without a registry
     /// lock and linear scan on every match attempt.
     self_ref: Mutex<Weak<Driver>>,
@@ -72,6 +79,14 @@ unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
 
 impl Driver {
+    pub(super) fn begin_probe(&self) -> Result<ProbeActivity<'_>> {
+        let mut probes = self.probes.lock();
+        if self.header.state() != ObjState::Live {
+            return Err(Error::NoDevice);
+        }
+        *probes = probes.checked_add(1).ok_or(Error::Busy)?;
+        Ok(ProbeActivity(self))
+    }
     /// Returns the driver name.
     pub fn name(&self) -> &str {
         &self.name
@@ -138,14 +153,18 @@ impl Driver {
         error::from_status(status)
     }
 
-    pub(super) fn remove(&self, device: &Arc<Device>) {
-        let Some(callback) = self.ops.remove else {
-            return;
-        };
+    pub(super) fn remove(&self, device: &Arc<Device>) -> Result<()> {
         let handle = super::super::obj::handle(device);
-        // SAFETY: registration validated the callback, and the handle addresses
-        // a live device that the probe engine keeps alive across the call.
-        unsafe { callback(self.ops.context, handle) };
+        if let Some(callback) = self.ops.try_remove {
+            // SAFETY: registration pins callback code and the device binding
+            // exclusively owns this removal transaction until it returns.
+            return error::from_status(unsafe { callback(self.ops.context, handle) });
+        }
+        if let Some(callback) = self.ops.remove {
+            // SAFETY: the legacy callback guarantees complete disconnection.
+            unsafe { callback(self.ops.context, handle) };
+        }
+        Ok(())
     }
 
     pub(super) fn note_bound(&self) {
@@ -160,6 +179,17 @@ impl Driver {
     /// Pins the module owning this driver across a callback.
     pub(super) fn pin(&self, allow_unloading: bool) -> Result<module::ModuleGuard> {
         module::pin_owner(self.owner.as_ref(), allow_unloading)
+    }
+}
+
+pub(super) struct ProbeActivity<'a>(&'a Driver);
+
+impl Drop for ProbeActivity<'_> {
+    fn drop(&mut self) {
+        let mut probes = self.0.probes.lock();
+        *probes = probes
+            .checked_sub(1)
+            .expect("driver probe activity underflow");
     }
 }
 
@@ -203,7 +233,21 @@ pub unsafe fn register(
     owner: Option<&Arc<Module>>,
     registration: Registration,
 ) -> Result<Arc<Driver>> {
+    let _owner = module::pin_owner(owner, false)?;
+    let bus_lease = if owner.is_none() {
+        registration
+            .bus
+            .as_ref()
+            .and_then(|bus| bus.owner())
+            .map(module::lease)
+            .transpose()?
+    } else {
+        None
+    };
     if registration.name.is_empty() || registration.name.len() > MAX_NAME {
+        return Err(Error::InvalidArgument);
+    }
+    if registration.ops.remove.is_some() && registration.ops.try_remove.is_some() {
         return Err(Error::InvalidArgument);
     }
     match_table::validate(&registration.matches)?;
@@ -227,10 +271,12 @@ pub unsafe fn register(
         name: registration.name,
         owner: owner.cloned(),
         bus: registration.bus,
+        bus_lease: Mutex::new(bus_lease),
         priority: registration.priority,
         matches: registration.matches,
         ops: registration.ops,
         bound: AtomicU64::new(0),
+        probes: Mutex::new(0),
         self_ref: Mutex::new(Weak::new()),
     });
     *driver.self_ref.lock() = Arc::downgrade(&driver);
@@ -250,37 +296,35 @@ pub fn unregister(driver: &Arc<Driver>) -> Result<()> {
     // the final unregister. A rescan holding an older snapshot still sees the
     // Removing state and declines through `evaluate`.
     {
+        let probes = driver.probes.lock();
         let mut drivers = registry.drivers.lock();
         if !drivers.iter().any(|entry| Arc::ptr_eq(entry, driver)) {
-            return Ok(());
+            return if driver.header.state() == ObjState::Removing {
+                Err(Error::Busy)
+            } else {
+                Ok(())
+            };
+        }
+        if *probes != 0 {
+            return Err(Error::Busy);
         }
         driver.header.set_state(ObjState::Removing);
         drivers.retain(|entry| !Arc::ptr_eq(entry, driver));
     }
-    super::probe::detach_driver(driver);
-    if driver.bound_count() != 0 {
-        // Restore availability: a bind that raced the claim completed after
-        // the detach sweep, so the driver keeps its remaining devices.
+    let result = super::probe::detach_driver(driver);
+    if result.is_err() || driver.bound_count() != 0 {
+        // Busy resources retain their binding and the caller's registration
+        // receipt. Devices already detached remain available for reprobe.
+        let _probes = driver.probes.lock();
         driver.header.set_state(ObjState::Live);
         registry.drivers.lock().push(driver.clone());
-        return Err(Error::Busy);
+        return result.and(Err(Error::Busy));
     }
     driver.header.poison();
+    let bus_lease = driver.bus_lease.lock().take();
+    drop(bus_lease);
     super::probe::retrigger();
     Ok(())
-}
-
-fn force_unregister(driver: &Arc<Driver>) {
-    driver
-        .header
-        .set_state(super::super::obj::ObjState::Removing);
-    if let Ok(registry) = registry() {
-        registry
-            .drivers
-            .lock()
-            .retain(|entry| !Arc::ptr_eq(entry, driver));
-    }
-    driver.header.poison();
 }
 
 /// Returns every registered driver.
@@ -299,8 +343,23 @@ pub(super) fn bus_has_drivers(bus: &Arc<Bus>) -> bool {
     })
 }
 
-pub(super) fn remove_module_drivers(module: &Arc<Module>) {
-    let owned: Vec<Arc<Driver>> = all()
+/// Detaches bindings before module exit while unload can still roll back.
+pub(super) fn detach_module_drivers(module: &Arc<Module>) -> Result<()> {
+    for driver in owned(module) {
+        super::probe::detach_driver(&driver)?;
+    }
+    Ok(())
+}
+
+pub(super) fn remove_module_drivers(module: &Arc<Module>) -> Result<()> {
+    for driver in owned(module) {
+        unregister(&driver)?;
+    }
+    Ok(())
+}
+
+fn owned(module: &Arc<Module>) -> Vec<Arc<Driver>> {
+    all()
         .into_iter()
         .filter(|driver| {
             driver
@@ -308,20 +367,7 @@ pub(super) fn remove_module_drivers(module: &Arc<Module>) {
                 .as_ref()
                 .is_some_and(|owner| Arc::ptr_eq(owner, module))
         })
-        .collect();
-    for driver in owned {
-        // Teardown is not cancellable, so claim first and detach after; a
-        // racing rescan must never rebind a driver that is being removed.
-        if let Ok(registry) = registry() {
-            driver.header.set_state(ObjState::Removing);
-            registry
-                .drivers
-                .lock()
-                .retain(|entry| !Arc::ptr_eq(entry, &driver));
-        }
-        super::probe::detach_driver(&driver);
-        force_unregister(&driver);
-    }
+        .collect()
 }
 
 /// Snapshot of one registered driver.

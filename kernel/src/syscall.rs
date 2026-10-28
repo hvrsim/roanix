@@ -13,7 +13,7 @@ const MAX_EXEC_ITEMS: usize = 256;
 const MAX_EXEC_BYTES: usize = 64 * 1024;
 
 #[repr(i64)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Errno {
     Permission = 1,
     NoEntry = 2,
@@ -47,6 +47,7 @@ pub(crate) enum Errno {
     Overflow = 75,
     NotSupported = 95,
     TimedOut = 110,
+    Canceled = 125,
 }
 
 pub(crate) type Result<T> = core::result::Result<T, Errno>;

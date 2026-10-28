@@ -20,15 +20,15 @@
 //!   needs a service which has not appeared yet defers, and the probe engine
 //!   retries it when the topology changes.
 //!
-//! Handles crossing the C boundary are pointers to reference-counted objects
-//! rather than identifiers resolved through a table, so no lock is taken and no
-//! lookup is performed to make a framework call. Register access, after the
-//! window is mapped, involves no framework call at all.
+//! Handles crossing the C boundary are opaque identities. Lookups retain a
+//! counted reference through an IRQ-safe snapshot before accessing memory.
+//! Register accesses remain inline after a window has been mapped.
 //!
 
 pub mod abi;
 pub mod core;
 pub mod error;
+mod handle;
 pub mod io;
 pub mod irq;
 pub mod obj;

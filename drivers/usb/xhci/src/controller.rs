@@ -2,11 +2,13 @@
 use crate::ring::{self, EventRing, Ring, Trb};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
-    ops::Deref,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
-use ddk::{Device, Dma, Error, Event, Irq, Mmio, Result, TicketLock, Worker};
+use ddk::{
+    Device, DeviceRegistration, Dma, Error, Event, Irq, Mmio, OwnedEvent, Result, TicketLock,
+    Worker,
+};
 
 pub const TIMEOUT: u64 = 2_000_000_000;
 pub fn error() -> Error {
@@ -21,34 +23,16 @@ pub fn status(value: i32) -> Result<()> {
     }
 }
 
-pub struct Signal(Event);
-impl Signal {
-    fn new() -> Result<Self> {
-        Ok(Self(Event::create()?))
-    }
-}
-impl Deref for Signal {
-    type Target = Event;
-    fn deref(&self) -> &Event {
-        &self.0
-    }
-}
-impl Drop for Signal {
-    fn drop(&mut self) {
-        let _ = self.0.destroy();
-    }
-}
-
 pub struct Gate {
     busy: AtomicBool,
-    ready: Event,
+    ready: OwnedEvent,
 }
 pub struct Guard<'a>(&'a Gate);
 impl Gate {
     fn new() -> Result<Self> {
         Ok(Self {
             busy: AtomicBool::new(false),
-            ready: Event::create()?,
+            ready: OwnedEvent::create()?,
         })
     }
     pub fn lock(&self) -> Result<Guard<'_>> {
@@ -71,52 +55,47 @@ impl Drop for Guard<'_> {
         let _ = self.0.ready.signal();
     }
 }
-impl Drop for Gate {
-    fn drop(&mut self) {
-        let _ = self.ready.destroy();
-    }
-}
 
 pub struct Endpoint {
     pub ring: Ring,
     pub buffer: Dma,
-    pub event: Event,
+    pub event: OwnedEvent,
     pub pending: u64,
     pub complete: bool,
     pub code: u32,
     pub requested: usize,
     pub received: usize,
     pub cancelled: bool,
+    pub configured: bool,
 }
 impl Endpoint {
     pub fn new(device: Device, flags: u32) -> Result<Self> {
         Ok(Self {
             ring: Ring::new(device, flags)?,
             buffer: Dma::allocate(Some(device), 4096, 4096, flags | ddk::DMA_ZERO)?,
-            event: Event::create()?,
+            event: OwnedEvent::create()?,
             pending: 0,
             complete: false,
             code: 0,
             requested: 0,
             received: 0,
             cancelled: false,
+            configured: false,
         })
     }
     pub fn prepare(&mut self, length: usize) -> Result<Event> {
-        if self.cancelled || self.pending != 0 {
+        if self.cancelled {
             return Err(Error::from_status(ddk::ENODEV));
+        }
+        if self.pending != 0 {
+            return Err(Error::from_status(ddk::EBUSY));
         }
         self.event.reset()?;
         self.complete = false;
         self.code = 0;
         self.requested = length;
         self.received = length;
-        Ok(self.event)
-    }
-}
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        let _ = self.event.destroy();
+        Ok(self.event.event())
     }
 }
 
@@ -124,7 +103,7 @@ pub struct Slot {
     pub context: Dma,
     pub input: Dma,
     pub endpoints: [Option<Endpoint>; 32],
-    pub children: Vec<Device>,
+    pub children: Vec<DeviceRegistration>,
     pub online: bool,
     pub speed: u32,
     pub cancelled: u32,
@@ -133,7 +112,8 @@ impl Slot {
     pub fn new(device: Device, flags: u32, speed: u32) -> Result<Box<Self>> {
         let context = Dma::allocate(Some(device), 4096, 4096, flags | ddk::DMA_ZERO)?;
         let input = Dma::allocate(Some(device), 4096, 4096, flags | ddk::DMA_ZERO)?;
-        let ep0 = Endpoint::new(device, flags)?;
+        let mut ep0 = Endpoint::new(device, flags)?;
+        ep0.configured = true;
         let mut endpoints = core::array::from_fn(|_| None);
         endpoints[1] = Some(ep0);
         Ok(Box::new(Self {
@@ -167,7 +147,7 @@ pub struct Hardware {
 }
 impl Hardware {
     pub fn create(device: Device) -> Result<Self> {
-        let resource = device.resource(ddk::RESOURCE_MEMORY, 0)?;
+        let resource = ddk::pci::memory_bar(device, 0)?;
         let registers = Mmio::map(resource.start, resource.length as usize, ddk::MMIO_DEVICE)?;
         if registers.len() < 0x400 {
             return Err(error());
@@ -291,8 +271,8 @@ pub struct Controller {
     pub device: Device,
     pub hardware: TicketLock<Hardware>,
     pub transaction: Gate,
-    pub command_event: Signal,
-    pub port_event: Signal,
+    pub command_event: OwnedEvent,
+    pub port_event: OwnedEvent,
     pub stopping: AtomicBool,
     pub failed: AtomicBool,
     pub irq: TicketLock<Option<Irq>>,
@@ -304,8 +284,8 @@ impl Controller {
     pub fn new(device: Device, id: u32) -> Result<Arc<Self>> {
         let hardware = Hardware::create(device)?;
         let transaction = Gate::new()?;
-        let command_event = Signal::new()?;
-        let port_event = Signal::new()?;
+        let command_event = OwnedEvent::create()?;
+        let port_event = OwnedEvent::create()?;
         #[cfg(target_arch = "x86_64")]
         let msi = crate::pci::Msi::new(device)?;
         Ok(Arc::new(Self {
@@ -356,10 +336,11 @@ impl Controller {
                     return Err(Error::from_status(ddk::ENODEV));
                 }
                 if endpoint.complete {
-                    endpoint.pending = 0;
                     return if matches!(endpoint.code, 1 | 13) {
+                        // The caller retains admission until its DMA copy finishes.
                         Ok(endpoint.received)
                     } else {
+                        endpoint.pending = 0;
                         Err(error())
                     };
                 }
@@ -429,14 +410,15 @@ impl Controller {
             event
         };
         let count = self.wait_transfer(slot, 1, event)?;
+        let mut h = self.hardware.lock_irqsave();
+        let endpoint = h.endpoint_mut(slot, 1)?;
         if input {
-            let mut h = self.hardware.lock_irqsave();
-            let endpoint = h.endpoint_mut(slot, 1)?;
             // SAFETY: completion published count bytes within both buffers.
             unsafe {
                 ptr::copy_nonoverlapping(endpoint.buffer.as_ptr(), buffer.as_mut_ptr(), count);
             }
         }
+        endpoint.pending = 0;
         Ok(count)
     }
     pub fn cancel(&self, slot: usize) {

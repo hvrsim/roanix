@@ -6,4 +6,5 @@
 pub mod api;
 pub mod events;
 pub mod loader;
+pub mod mutexes;
 pub mod types;

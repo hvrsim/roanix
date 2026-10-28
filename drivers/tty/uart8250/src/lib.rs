@@ -20,7 +20,8 @@ use core::{
     ptr, slice,
 };
 use ddk::{
-    Bus, Device, DriverRegistration, Event, Irq, Mmio, Module, Result, TicketLock, Tty, raw,
+    Bus, Device, DriverRegistration, Event, Irq, Mmio, Module, OwnedEvent, Result, TicketLock, Tty,
+    raw,
 };
 
 const DATA: u32 = 0;
@@ -142,9 +143,9 @@ struct Port {
     tx: Ring,
     rx_store: [u8; RX],
     tx_store: [u8; TX],
-    readable: Option<Event>,
-    writable: Option<Event>,
-    drained: Option<Event>,
+    readable: Option<OwnedEvent>,
+    writable: Option<OwnedEvent>,
+    drained: Option<OwnedEvent>,
     ops: raw::ConsoleOps,
 }
 impl Port {
@@ -433,9 +434,10 @@ static DRIVER: TicketLock<raw::DriverDef> = TicketLock::new(raw::DriverDef {
     matches: MATCHES.as_ptr(),
     match_count: MATCHES.len(),
     probe: Some(probe),
-    remove: Some(remove),
+    remove: None,
     shutdown: None,
     context: ptr::null_mut(),
+    try_remove: Some(remove),
 });
 
 fn context(pointer: *mut c_void) -> Option<&'static TicketLock<Port>> {
@@ -470,10 +472,13 @@ fn release_port(index: usize) {
     ALLOCATED_PORTS.lock_irqsave()[index] = false;
 }
 
-fn cleanup_port(lock: &'static TicketLock<Port>) {
+fn cleanup_port(lock: &'static TicketLock<Port>) -> Result<()> {
     let tty = { lock.lock_irqsave().tty.take() };
     if let Some(mut tty) = tty {
-        let _ = tty.unregister();
+        if let Err(error) = tty.unregister() {
+            lock.lock_irqsave().tty = Some(tty);
+            return Err(error);
+        }
     }
     let (irq, events, mapping) = {
         let mut port = lock.lock_irqsave();
@@ -495,34 +500,21 @@ fn cleanup_port(lock: &'static TicketLock<Port>) {
     if let Some(mut irq) = irq {
         let _ = irq.release();
     }
-    for event in events.into_iter().flatten() {
-        let _ = event.destroy();
-    }
+    drop(events);
     drop(mapping);
+    Ok(())
 }
 
-fn create_events() -> Result<(Event, Event, Event)> {
-    let readable = Event::create()?;
-    let writable = match Event::create() {
-        Ok(event) => event,
-        Err(error) => {
-            let _ = readable.destroy();
-            return Err(error);
-        }
-    };
-    let drained = match Event::create() {
-        Ok(event) => event,
-        Err(error) => {
-            let _ = writable.destroy();
-            let _ = readable.destroy();
-            return Err(error);
-        }
-    };
-    Ok((readable, writable, drained))
+fn create_events() -> Result<(OwnedEvent, OwnedEvent, OwnedEvent)> {
+    Ok((
+        OwnedEvent::create()?,
+        OwnedEvent::create()?,
+        OwnedEvent::create()?,
+    ))
 }
 
 fn fail_probe(index: usize, status: i32) -> i32 {
-    cleanup_port(&PORTS[index]);
+    cleanup_port(&PORTS[index]).expect("unpublished UART must be idle");
     release_port(index);
     status
 }
@@ -571,7 +563,14 @@ unsafe extern "C" fn irq_service(context_pointer: *mut c_void, _virq: u32) {
         port.reg_read(MSR);
         port.service_pending = false;
         port.reg_write(IER, port.ier);
-        (wake, (port.readable, port.writable, port.drained))
+        (
+            wake,
+            (
+                port.readable.as_ref().map(OwnedEvent::event),
+                port.writable.as_ref().map(OwnedEvent::event),
+                port.drained.as_ref().map(OwnedEvent::event),
+            ),
+        )
     };
     if wake & WAKE_RX != 0 {
         signal(events.0);
@@ -602,7 +601,11 @@ unsafe extern "C" fn read(context_pointer: *mut c_void, out: *mut u8, length: us
             rx.read(rx_store, output)
         };
         if port.rx.length == 0 {
-            let _ = port.readable.map(Event::reset);
+            let _ = port
+                .readable
+                .as_ref()
+                .map(OwnedEvent::event)
+                .map(Event::reset);
         }
         count
     };
@@ -647,14 +650,22 @@ unsafe extern "C" fn write(
                     tx.write(tx_store, &data[offset..])
                 };
                 offset += written;
-                let _ = port.drained.map(Event::reset);
+                let _ = port
+                    .drained
+                    .as_ref()
+                    .map(OwnedEvent::event)
+                    .map(Event::reset);
                 let wake = port.fill_tx();
                 if port.tx.available(TX) == 0 {
-                    let _ = port.writable.map(Event::reset);
+                    let _ = port
+                        .writable
+                        .as_ref()
+                        .map(OwnedEvent::event)
+                        .map(Event::reset);
                 }
                 wake
             } else {
-                wait = port.writable;
+                wait = port.writable.as_ref().map(OwnedEvent::event);
                 let _ = wait.map(Event::reset);
                 0
             }
@@ -662,7 +673,11 @@ unsafe extern "C" fn write(
         if wake != 0 {
             let events = {
                 let port = lock.lock_irqsave();
-                (port.readable, port.writable, port.drained)
+                (
+                    port.readable.as_ref().map(OwnedEvent::event),
+                    port.writable.as_ref().map(OwnedEvent::event),
+                    port.drained.as_ref().map(OwnedEvent::event),
+                )
             };
             if wake & WAKE_RX != 0 {
                 signal(events.0);
@@ -720,13 +735,13 @@ unsafe extern "C" fn flush_input(context_pointer: *mut c_void) -> i32 {
     let Some(lock) = context(context_pointer) else {
         return ddk::EINVAL;
     };
-    let event = {
+    {
         let mut port = lock.lock_irqsave();
         port.rx.clear();
         port.reg_write(FCR, 3);
-        port.readable
+        let event = port.readable.as_ref().map(OwnedEvent::event);
+        let _ = event.map(Event::reset);
     };
-    let _ = event.map(Event::reset);
     ddk::OK
 }
 unsafe extern "C" fn flush_output(context_pointer: *mut c_void) -> i32 {
@@ -739,7 +754,10 @@ unsafe extern "C" fn flush_output(context_pointer: *mut c_void) -> i32 {
         let ier = port.ier & !IER_TX;
         port.set_ier(ier);
         port.reg_write(FCR, 5);
-        (port.writable, port.drained)
+        (
+            port.writable.as_ref().map(OwnedEvent::event),
+            port.drained.as_ref().map(OwnedEvent::event),
+        )
     };
     signal(events.0);
     signal(events.1);
@@ -755,7 +773,7 @@ unsafe extern "C" fn flush(context_pointer: *mut c_void) -> i32 {
             if port.tx.length == 0 {
                 break port.character_ns.saturating_mul(port.in_flight as u64);
             }
-            port.drained
+            port.drained.as_ref().map(OwnedEvent::event)
         };
         let _ = event.map(Event::wait);
     };
@@ -844,8 +862,16 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         };
         (Some(mapping), 0, shift, width)
     } else if let Ok(resource) = device.resource(ddk::RESOURCE_IO, 0) {
-        if resource.start > u64::from(u16::MAX) {
+        if !cfg!(target_arch = "x86_64")
+            || resource
+                .start
+                .checked_add(7)
+                .is_none_or(|end| end > u64::from(u16::MAX))
+        {
             return fail_probe(index, ddk::ENOTSUP);
+        }
+        if resource.length < 8 {
+            return fail_probe(index, ddk::EINVAL);
         }
         (None, resource.start as u16, 0, 1)
     } else {
@@ -891,28 +917,30 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         Ok(events) => events,
         Err(error) => return fail_probe(index, error.status()),
     };
+    signal(Some(writable.event()));
+    signal(Some(drained.event()));
     {
         let mut port = lock.lock_irqsave();
         port.readable = Some(readable);
         port.writable = Some(writable);
         port.drained = Some(drained);
     }
-    signal(Some(writable));
-    signal(Some(drained));
     let virq = match ddk::irq_of_device(device, 0) {
         Ok(value) => value,
         Err(error) => return fail_probe(index, error.status()),
     };
     let context = core::ptr::from_ref(lock) as *mut c_void;
-    let irq_receipt = match Irq::request_threaded(
-        device,
-        virq,
-        c"uart",
-        ddk::IRQ_SHARED,
-        irq,
-        irq_service,
-        context,
-    ) {
+    let irq_receipt = match unsafe {
+        Irq::request_threaded(
+            device,
+            virq,
+            c"uart",
+            ddk::IRQ_SHARED,
+            irq,
+            irq_service,
+            context,
+        )
+    } {
         Ok(value) => value,
         Err(error) => return fail_probe(index, error.status()),
     };
@@ -924,10 +952,10 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
         port.reg_read(MSR);
         port.set_ier(IER_RX);
         if received {
-            signal(port.readable);
+            signal(port.readable.as_ref().map(OwnedEvent::event));
         }
     }
-    let root = match ddk::Devfs::current().and_then(|devfs| devfs.root()) {
+    let root = match ddk::devfs::root() {
         Ok(root) => root,
         Err(e) => {
             return fail_probe(index, e.status());
@@ -938,10 +966,23 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
     {
         let mut port = lock.lock_irqsave();
         port.ops.context = core::ptr::from_ref(lock) as *mut c_void;
-        port.ops.readable_event = port.readable.map_or(0, Event::id);
-        port.ops.writable_event = port.writable.map_or(0, Event::id);
+        port.ops.readable_event = port
+            .readable
+            .as_ref()
+            .map(OwnedEvent::event)
+            .map_or(0, Event::id);
+        port.ops.writable_event = port
+            .writable
+            .as_ref()
+            .map(OwnedEvent::event)
+            .map_or(0, Event::id);
     }
     let operations = { lock.lock_irqsave().ops };
+    // SAFETY: reserve the bound context before publishing a terminal that may
+    // immediately acquire external users. No fallible ownership transfer follows.
+    if let Err(error) = unsafe { device.set_data(context) } {
+        return fail_probe(index, error.status());
+    }
     // SAFETY: registration copies the table. Callback context is this reserved
     // static port and remains live until terminal removal completes.
     let registration =
@@ -949,20 +990,15 @@ unsafe extern "C" fn probe(_: *mut c_void, pointer: *const raw::Device, match_da
     match registration {
         Ok(tty) => {
             lock.lock_irqsave().tty = Some(tty);
-            // SAFETY: the saved pointer identifies this static port and is
-            // cleared before its slot can be reused.
-            unsafe {
-                let _ = device.set_data(core::ptr::from_ref(lock) as *mut c_void);
-            };
             ddk::OK
         }
         Err(e) => fail_probe(index, e.status()),
     }
 }
-unsafe extern "C" fn remove(_: *mut c_void, pointer: *const raw::Device) {
+unsafe extern "C" fn remove(_: *mut c_void, pointer: *const raw::Device) -> i32 {
     // SAFETY: the driver core supplies the live device previously probed.
     let Some(device) = (unsafe { Device::from_raw(pointer) }) else {
-        return;
+        return ddk::EINVAL;
     };
     // SAFETY: probe stored either a validated static-port pointer or null.
     let saved = unsafe { device.data() };
@@ -970,13 +1006,16 @@ unsafe extern "C" fn remove(_: *mut c_void, pointer: *const raw::Device) {
         let index = (core::ptr::from_ref::<TicketLock<Port>>(lock) as usize
             - PORTS.as_ptr() as usize)
             / core::mem::size_of::<TicketLock<Port>>();
-        cleanup_port(lock);
+        if let Err(error) = cleanup_port(lock) {
+            return error.status();
+        }
         release_port(index);
         // SAFETY: removal clears the opaque pointer before slot reuse.
         unsafe {
             let _ = device.set_data(ptr::null_mut());
         };
     }
+    ddk::OK
 }
 fn init(_: Module) -> Result<()> {
     let bus = Bus::find(c"platform")?;

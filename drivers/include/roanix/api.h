@@ -15,6 +15,16 @@ extern "C" {
 
 /* --- Records exchanged with the kernel ---------------------------------- */
 
+/* Retained binding metadata. Check extent, alignment, version and behavior
+ * before interpreting ops as a complete service table. */
+struct rdf_iface_binding_info {
+    const void *ops;
+    void *context;
+    size_t ops_size;
+    uint32_t version;
+    uint32_t flags;
+};
+
 /* A mapped register window. */
 struct rdf_mmio {
     /* First mapped byte. */
@@ -69,19 +79,23 @@ struct rdf_driver_def {
     int32_t priority;
     const struct rdf_match *matches;
     size_t match_count;
-    int32_t (*probe)(void *context, struct rdf_device *device, uintptr_t match_data);
-    void (*remove)(void *context, struct rdf_device *device);
-    void (*shutdown)(void *context, struct rdf_device *device);
+    int32_t (*probe)(void *context, const struct rdf_device *device, uintptr_t match_data);
+    void (*remove)(void *context, const struct rdf_device *device);
+    void (*shutdown)(void *context, const struct rdf_device *device);
     void *context;
+    /* Optional 88-byte extension, mutually exclusive with remove. On failure,
+     * retain callbacks and context for still-published resources. Successful
+     * removals of descendants/resources remain removed on a later failure. */
+    int32_t (*try_remove)(void *context, const struct rdf_device *device);
 };
 
 /* Bus callbacks. */
 struct rdf_bus_def {
     uint32_t size;
-    int32_t (*match)(void *context, struct rdf_device *device, struct rdf_driver *driver);
-    int32_t (*prepare)(void *context, struct rdf_device *device);
-    void (*cleanup)(void *context, struct rdf_device *device);
-    void (*shutdown)(void *context, struct rdf_device *device);
+    int32_t (*match)(void *context, const struct rdf_device *device, const struct rdf_driver *driver);
+    int32_t (*prepare)(void *context, const struct rdf_device *device);
+    void (*cleanup)(void *context, const struct rdf_device *device);
+    void (*shutdown)(void *context, const struct rdf_device *device);
     void *context;
 };
 
@@ -244,17 +258,20 @@ extern int32_t rdf_api_v2_device_add_resource(struct rdf_device_builder *builder
 extern int32_t rdf_api_v2_device_add_irq(struct rdf_device_builder *builder,
                           const struct rdf_irq_domain *domain, const uint32_t *cells,
                           size_t count);
-extern int32_t rdf_api_v2_device_add(struct rdf_device_builder *builder, struct rdf_device **out);
+extern int32_t rdf_api_v2_device_add_firmware_irq(struct rdf_device_builder *builder, uint32_t phandle,
+    const uint32_t *cells, size_t count);
+extern int32_t rdf_api_v2_device_add(struct rdf_device_builder *builder, const struct rdf_device **out);
 extern void rdf_api_v2_device_discard(struct rdf_device_builder *builder);
 extern int32_t rdf_api_v2_device_remove(const struct rdf_device *device);
 
-extern int32_t rdf_api_v2_device_root(struct rdf_device **out);
+extern int32_t rdf_api_v2_device_root(const struct rdf_device **out);
 extern const char *rdf_api_v2_device_name(const struct rdf_device *device);
-extern struct rdf_device *rdf_api_v2_device_parent(const struct rdf_device *device);
+extern const struct rdf_device *rdf_api_v2_device_parent(const struct rdf_device *device);
 extern size_t rdf_api_v2_device_child_count(const struct rdf_device *device);
-extern struct rdf_device *rdf_api_v2_device_child(const struct rdf_device *device, size_t index);
+extern const struct rdf_device *rdf_api_v2_device_child(const struct rdf_device *device, size_t index);
 extern void *rdf_api_v2_device_data(const struct rdf_device *device);
 extern void rdf_api_v2_device_set_data(const struct rdf_device *device, void *value);
+extern int32_t rdf_api_v2_device_set_data_checked(const struct rdf_device *device, void *value);
 extern int32_t rdf_api_v2_device_int(const struct rdf_device *device, const char *name, uint64_t *out);
 extern int32_t rdf_api_v2_device_cell(const struct rdf_device *device, const char *name, size_t index,
                        uint64_t *out);
@@ -265,6 +282,9 @@ extern int32_t rdf_api_v2_device_bytes(const struct rdf_device *device, const ch
 extern size_t rdf_api_v2_device_property_len(const struct rdf_device *device, const char *name);
 extern int32_t rdf_api_v2_device_resource(const struct rdf_device *device, uint32_t kind, size_t index,
                            uint64_t *start, uint64_t *size, uint32_t *flags);
+/* Names preserve bus-specific indices, such as PCI bar0 through bar5. */
+extern int32_t rdf_api_v2_device_resource_named(const struct rdf_device *device,
+    uint32_t kind, const char *name, uint64_t *start, uint64_t *size, uint32_t *flags);
 extern int32_t rdf_api_v2_device_fwnode(const struct rdf_device *device, uint32_t *kind, uint64_t *token);
 
 extern int32_t rdf_api_v2_bus_register(const struct rdf_module *module, const char *name,
@@ -283,16 +303,22 @@ extern int32_t rdf_api_v2_iface_withdraw(const struct rdf_iface *iface);
 extern int32_t rdf_api_v2_iface_bind(const struct rdf_module *module, const struct rdf_device *device,
                       uint32_t scope, const char *name, uint32_t min_version,
                       struct rdf_iface_binding **binding, void **ops, void **context);
+/* Select the newest service revision within the inclusive supported range.
+ * Both output pointers are required. Unbind releases the provider reference. */
+extern int32_t rdf_api_v2_iface_bind_global(const struct rdf_module *module,
+    const char *name, uint32_t min_version, uint32_t max_version,
+    struct rdf_iface_binding **binding, struct rdf_iface_binding_info *info);
 extern void rdf_api_v2_iface_unbind(struct rdf_iface_binding *binding);
 extern int32_t rdf_api_v2_iface_available(const char *name, uint32_t min_version);
 extern size_t rdf_api_v2_iface_count(const char *name, uint32_t min_version);
-extern struct rdf_iface *rdf_api_v2_iface_provider(const char *name, uint32_t min_version, size_t index);
+extern const struct rdf_iface *rdf_api_v2_iface_provider(const char *name, uint32_t min_version, size_t index);
 extern void rdf_api_v2_probe_retrigger(void);
 
 extern int32_t rdf_api_v2_irq_domain_register(const struct rdf_module *module, const char *name,
                                uint32_t flags, uint32_t hwirq_count,
                                const struct rdf_irq_domain_def *definition,
                                const struct rdf_irq_domain **out);
+extern int32_t rdf_api_v2_irq_domain_set_device(const struct rdf_irq_domain *domain, const struct rdf_device *device);
 extern int32_t rdf_api_v2_irq_domain_unregister(const struct rdf_irq_domain *domain);
 extern int32_t rdf_api_v2_irq_map(const struct rdf_irq_domain *domain, uint64_t hwirq, uint32_t flags,
                    uint32_t *out_virq);
@@ -335,6 +361,17 @@ extern int32_t rdf_api_v2_timer_create(const struct rdf_module *module, rdf_work
 extern int32_t rdf_api_v2_timer_arm(struct rdf_timer *timer, uint64_t delay_ns, uint64_t period_ns);
 extern int32_t rdf_api_v2_timer_cancel(struct rdf_timer *timer);
 extern int32_t rdf_api_v2_timer_destroy(struct rdf_timer *timer);
+/* Sleepable mutex identities. Use in thread context or uncontended bootstrap
+ * code before the scheduler exists. Successful
+ * lock/try_lock must be paired with unlock on the acquiring thread. Destroy
+ * returns busy while holders or waiters exist. try_lock does not wait for the
+ * protected mutex, but receipt bookkeeping may sleep. */
+extern int32_t rdf_api_v2_mutex_create(const struct rdf_module *module, uintptr_t *out);
+extern int32_t rdf_api_v2_mutex_lock(uintptr_t mutex);
+extern int32_t rdf_api_v2_mutex_try_lock(uintptr_t mutex);
+extern int32_t rdf_api_v2_mutex_unlock(uintptr_t mutex);
+extern int32_t rdf_api_v2_mutex_destroy(uintptr_t mutex);
+
 extern int32_t rdf_api_v2_event_create(const struct rdf_module *module, rdf_event_t *out);
 extern int32_t rdf_api_v2_event_destroy(rdf_event_t event);
 extern int32_t rdf_api_v2_event_wait(rdf_event_t event);
@@ -399,8 +436,8 @@ struct rdf_module_def {
     uint32_t flags;
     const char *name;
     const char *description;
-    int32_t (*init)(struct rdf_module *self);
-    void (*exit)(struct rdf_module *self);
+    int32_t (*init)(const struct rdf_module *self);
+    void (*exit)(const struct rdf_module *self);
 };
 
 #ifdef __cplusplus

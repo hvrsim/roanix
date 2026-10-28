@@ -1,5 +1,7 @@
 //! POSIX signal state, delivery, and signal file descriptors.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     collections::VecDeque,
     sync::{Arc, Weak},
@@ -566,7 +568,7 @@ impl SignalFd {
     pub(crate) fn poll_events<'a>(
         &'a self,
         _requested: PollEvents,
-        _output: &mut alloc::vec::Vec<&'a Event>,
+        _output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
         false
     }

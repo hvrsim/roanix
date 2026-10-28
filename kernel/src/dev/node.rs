@@ -9,6 +9,8 @@
 //! module for the duration of every callback, so a driver's code cannot be
 //! unloaded while userspace is inside one of its operations.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     boxed::Box,
     string::{String, ToString},
@@ -159,7 +161,7 @@ impl Node {
         &self,
         callback: Option<unsafe extern "C" fn(*mut c_void, usize) -> usize>,
         file_context: usize,
-    ) -> Option<&'static Event> {
+    ) -> Option<Arc<Event>> {
         let callback = callback?;
         let _pin = self.pin().ok()?;
         // SAFETY: registration validated the callback.
@@ -353,23 +355,23 @@ impl DeviceNodeOps for Node {
         &'a self,
         file_context: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         let mut registered = false;
         if events.intersects(PollEvents::IN | PollEvents::RDNORM)
             && let Some(event) = self.event(self.ops.readable_event, file_context)
         {
-            output.push(event);
+            output.push((event).into());
             registered = true;
         }
         if events.intersects(PollEvents::OUT | PollEvents::WRNORM)
             && let Some(event) = self.event(self.ops.writable_event, file_context)
         {
-            output.push(event);
+            output.push((event).into());
             registered = true;
         }
         if let Some(event) = self.event(self.ops.hangup_event, file_context) {
-            output.push(event);
+            output.push((event).into());
             registered = true;
         }
         registered

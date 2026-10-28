@@ -15,6 +15,8 @@
 //! must be readable even when driver loading is exactly what went wrong.
 //!
 
+use crate::sys::event::EventSource;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,7 +25,7 @@ use crate::{
     fs::devfs::DeviceNodeOps,
     fs::{Error, OpenFlags, PollEvents, Result, vnode::IoctlContext},
     mem::{IoSink, IoSource},
-    sys::{event::Event, sync::Mutex},
+    sys::sync::Mutex,
 };
 
 use super::{Level, ReadError, packet};
@@ -301,10 +303,10 @@ impl DeviceNodeOps for LogDevice {
         &'a self,
         _file_context: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         if events.intersects(PollEvents::IN | PollEvents::RDNORM) {
-            output.push(super::arrival_event());
+            output.push((super::arrival_event()).into());
         }
         true
     }

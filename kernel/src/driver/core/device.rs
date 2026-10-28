@@ -63,11 +63,18 @@ pub mod state {
 /// An interrupt line described by firmware but not yet routed.
 pub struct DeviceIrq {
     domain: Mutex<Option<Arc<IrqDomain>>>,
+    explicit_domain: bool,
+    firmware_parent: Option<u32>,
     cells: Box<[u32]>,
     virq: AtomicU32,
 }
 
 impl DeviceIrq {
+    /// Firmware controller identity retained independently for each specifier.
+    pub fn firmware_parent(&self) -> Option<u32> {
+        self.firmware_parent
+    }
+
     /// Returns the raw firmware specifier cells.
     pub fn cells(&self) -> &[u32] {
         &self.cells
@@ -90,8 +97,12 @@ impl DeviceIrq {
         self.virq.store(virq, Ordering::Release);
     }
 
-    pub(crate) fn set_domain(&self, domain: Arc<IrqDomain>) {
-        *self.domain.lock() = Some(domain);
+    pub(crate) fn resolution(&self) -> crate::sys::sync::MutexGuard<'_, Option<Arc<IrqDomain>>> {
+        self.domain.lock()
+    }
+
+    pub(crate) fn has_explicit_domain(&self) -> bool {
+        self.explicit_domain
     }
 }
 
@@ -110,6 +121,7 @@ pub struct Device {
     path: Box<str>,
     parent: Option<Weak<Device>>,
     bus: Option<Arc<Bus>>,
+    bus_lease: Mutex<Option<module::ModuleLease>>,
     owner: Option<Arc<Module>>,
     fwnode: Option<Arc<Fwnode>>,
     properties: Properties,
@@ -260,6 +272,11 @@ impl Device {
 
     pub(super) fn attach_interface(&self, interface: Arc<Interface>) -> Result<()> {
         let mut inner = self.inner.lock();
+        if matches!(self.state(), state::REMOVING | state::DEAD)
+            || !interface.binding_matches(inner.driver.as_ref())
+        {
+            return Err(Error::NoDevice);
+        }
         if inner
             .interfaces
             .iter()
@@ -269,6 +286,50 @@ impl Device {
         }
         inner.interfaces.push(interface);
         Ok(())
+    }
+
+    /// Joins interface use under the same lock that closes removal admission.
+    pub(super) fn admit_interface(&self, interface: &Arc<Interface>) -> Result<()> {
+        let inner = self.inner.lock();
+        if matches!(self.state(), state::REMOVING | state::DEAD)
+            || !inner
+                .interfaces
+                .iter()
+                .any(|entry| Arc::ptr_eq(entry, interface))
+        {
+            return Err(Error::NoDevice);
+        }
+        interface.admit()
+    }
+
+    /// Removal owns admission already. Descendants retire first so their
+    /// references to ancestor services can drain before this check.
+    pub(super) fn interfaces_idle(&self) -> Result<()> {
+        if self
+            .inner
+            .lock()
+            .interfaces
+            .iter()
+            .any(|entry| entry.bind_count() != 0)
+        {
+            Err(Error::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn driver_interfaces_idle(&self, driver: &Arc<Driver>) -> Result<()> {
+        if self
+            .inner
+            .lock()
+            .interfaces
+            .iter()
+            .any(|entry| entry.belongs_to(driver) && entry.bind_count() != 0)
+        {
+            Err(Error::Busy)
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn detach_interface(&self, interface: &Arc<Interface>) {
@@ -382,10 +443,21 @@ impl DeviceBuilder {
         }
         let index = self.irqs.len();
         self.irqs.push(DeviceIrq {
+            explicit_domain: domain.is_some(),
+            firmware_parent: None,
             domain: Mutex::new(domain),
             cells: cells.to_vec().into_boxed_slice(),
             virq: AtomicU32::new(0),
         });
+        Ok(index)
+    }
+    /// Adds a specifier whose controller may register after firmware publication.
+    pub fn firmware_irq(&mut self, phandle: u32, cells: &[u32]) -> Result<usize> {
+        if phandle == 0 || phandle == u32::MAX {
+            return Err(Error::InvalidArgument);
+        }
+        let index = self.irq(None, cells)?;
+        self.irqs[index].firmware_parent = Some(phandle);
         Ok(index)
     }
 }
@@ -407,6 +479,7 @@ pub(crate) fn init() {
             path: Box::from("/"),
             parent: None,
             bus: None,
+            bus_lease: Mutex::new(None),
             owner: None,
             fwnode: None,
             properties: Properties::empty(),
@@ -441,12 +514,25 @@ pub fn root() -> Result<Arc<Device>> {
 
 /// Publishes a described device and attempts to bind a driver to it.
 pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
+    // Join owner admission before publishing anything. Unload closes new pins
+    // and checks active users before sweeping the owner's devices.
+    let _owner = module::pin_owner(builder.owner.as_ref(), false)?;
+    let bus_lease = if builder.owner.is_none() {
+        builder
+            .bus
+            .as_ref()
+            .and_then(|bus| bus.owner())
+            .map(module::lease)
+            .transpose()?
+    } else {
+        None
+    };
     let registry = registry()?;
     let parent = match builder.parent {
         Some(parent) => parent,
         None => registry.root.clone(),
     };
-    if parent.state() == state::DEAD {
+    if matches!(parent.state(), state::REMOVING | state::DEAD) {
         return Err(Error::NoDevice);
     }
 
@@ -480,6 +566,7 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
         path: path.into_boxed_str(),
         parent: Some(Arc::downgrade(&parent)),
         bus: builder.bus,
+        bus_lease: Mutex::new(bus_lease),
         owner: builder.owner,
         fwnode: builder.fwnode,
         properties: builder.properties.build(),
@@ -509,7 +596,7 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
             device.header.poison();
             return Err(Error::AlreadyExists);
         }
-        if parent.state() == state::DEAD {
+        if matches!(parent.state(), state::REMOVING | state::DEAD) {
             device.header.poison();
             return Err(Error::NoDevice);
         }
@@ -533,49 +620,95 @@ pub fn add(builder: DeviceBuilder) -> Result<Arc<Device>> {
     Ok(device)
 }
 
-/// Removes a device and everything below it.
+/// Exclusive ownership of a device's removal transition. Dropping an unfinished
+/// claim restores admission; no callback may run without owning this claim.
+pub(super) struct Removal {
+    device: Arc<Device>,
+    previous: u32,
+    finished: bool,
+}
+
+impl Removal {
+    pub(super) fn claim(device: &Arc<Device>) -> Result<Option<Self>> {
+        // Serialize with child publication, which checks the parent's state
+        // under this same lock before adding its child.
+        let _inner = device.inner.lock();
+        loop {
+            let previous = device.state();
+            match previous {
+                state::DEAD => return Ok(None),
+                state::PROBING | state::REMOVING => return Err(Error::Busy),
+                _ => {}
+            }
+            if device.transition(previous, state::REMOVING) {
+                return Ok(Some(Self {
+                    device: device.clone(),
+                    previous,
+                    finished: false,
+                }));
+            }
+        }
+    }
+
+    pub(super) fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    pub(super) fn finish(mut self, state: u32) {
+        self.device.set_state(state);
+        self.finished = true;
+    }
+}
+
+impl Drop for Removal {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.device.set_state(self.previous);
+        }
+    }
+}
+
+/// Removes a device and everything below it. Claim the complete subtree before
+/// invoking any callback, so a probing/busy child cannot strand a removed parent.
+/// Checked callback failures restore the failing device and unprocessed ancestors
+/// to their previous states. Descendants already removed remain removed; their
+/// successful teardown is never undone or falsely presented as still bound.
 pub fn remove(device: &Arc<Device>) -> Result<()> {
     if Arc::ptr_eq(device, &registry()?.root) {
         return Err(Error::PermissionDenied);
     }
-    // Claim the device through the same atomic transition protocol the bind
-    // engine uses. Refuse while a probe is in flight instead of overwriting
-    // its state: stealing PROBING used to let removal run concurrently with
-    // a driver probe and resurrect the device as BOUND afterwards.
-    loop {
-        let previous = device.state();
-        match previous {
-            state::DEAD => return Ok(()),
-            state::PROBING => return Err(Error::Busy),
-            _ => {}
-        }
-        if device.transition(previous, state::REMOVING) {
-            break;
+    let mut pending = alloc::vec![device.clone()];
+    let mut claims = Vec::new();
+    while let Some(device) = pending.pop() {
+        if let Some(claim) = Removal::claim(&device)? {
+            pending.extend(device.children());
+            claims.push(claim);
         }
     }
-
-    for child in device.children() {
-        let _ = remove(&child);
+    for claim in claims.into_iter().rev() {
+        let device = claim.device();
+        device.interfaces_idle()?;
+        super::probe::detach(&claim)?;
+        for interface in device.interfaces() {
+            match super::iface::withdraw(&interface) {
+                Ok(()) | Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        super::super::irq::release_device_interrupts(device);
+        module::unlink(device.owner(), device.bus().and_then(|bus| bus.owner()));
+        if let Some(parent) = device.parent() {
+            parent
+                .inner
+                .lock()
+                .children
+                .retain(|child| !Arc::ptr_eq(child, device));
+        }
+        device.header.poison();
+        let bus_lease = device.bus_lease.lock().take();
+        drop(bus_lease);
+        claim.finish(state::DEAD);
     }
-
-    super::probe::detach(device);
-
-    for interface in device.interfaces() {
-        let _ = super::iface::withdraw(&interface);
-    }
-    super::super::irq::release_device_interrupts(device);
-
-    module::unlink(device.owner(), device.bus().and_then(|bus| bus.owner()));
-
-    if let Some(parent) = device.parent() {
-        parent
-            .inner
-            .lock()
-            .children
-            .retain(|child| !Arc::ptr_eq(child, device));
-    }
-    device.set_state(state::DEAD);
-    device.header.poison();
     Ok(())
 }
 
@@ -615,40 +748,28 @@ pub fn lookup(path: &str) -> Result<Arc<Device>> {
     Ok(current)
 }
 
-pub(super) fn remove_module_devices(module: &Arc<Module>) {
-    loop {
-        let owned: Vec<Arc<Device>> = {
-            let mut found = Vec::new();
-            for_each(|device| {
-                if device
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| Arc::ptr_eq(owner, module))
-                    && device.state() != state::DEAD
-                {
-                    found.push(device.clone());
-                }
-            });
-            found
-        };
-        if owned.is_empty() {
-            break;
+/// Withdraws every device owned by a module while its callback contexts remain
+/// valid. A refusal leaves the failed device and unprocessed receipts published.
+pub(super) fn remove_module_devices(module: &Arc<Module>) -> Result<()> {
+    let mut owned = Vec::new();
+    for_each(|device| {
+        if device
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, module))
+        {
+            owned.push(device.clone());
         }
-        // Remove the deepest devices first so parents outlive their children.
-        let mut deepest = owned;
-        deepest.sort_unstable_by_key(|device| {
-            core::cmp::Reverse(device.path.bytes().filter(|byte| *byte == b'/').count())
-        });
-        let mut progress = false;
-        for device in deepest {
-            if device.state() != state::DEAD && remove(&device).is_ok() {
-                progress = true;
-            }
-        }
-        if !progress {
-            break;
-        }
+    });
+    // Children retire before their parents; remove() itself claims complete
+    // subtrees, including children owned by kernel clients or other modules.
+    owned.sort_unstable_by_key(|device| {
+        core::cmp::Reverse(device.path.bytes().filter(|byte| *byte == b'/').count())
+    });
+    for device in owned {
+        remove(&device)?;
     }
+    Ok(())
 }
 
 /// Snapshot of one device for diagnostics.

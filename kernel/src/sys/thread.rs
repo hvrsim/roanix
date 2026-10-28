@@ -4,7 +4,7 @@
 //! Kernel thread storage and bootstrap helpers used by the scheduler.
 //!
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicI8, AtomicU8, AtomicU64, AtomicUsize, Ordering},
@@ -14,7 +14,7 @@ use crate::{
     arch,
     mem::{VirtAddr, VmSpace, kstack},
     proc::Process,
-    sys::smp::IrqSpinLock,
+    sys::{smp::IrqSpinLock, sync::Mutex},
 };
 use bitflags::bitflags;
 use intrusive_collections::{LinkedListLink, UnsafeRef, intrusive_adapter};
@@ -82,6 +82,49 @@ bitflags! {
     }
 }
 
+/// Revocable lifetime token used by priority inheritance. Holding this token
+/// retains metadata, not the exited thread's stack or process resources.
+pub(crate) struct ThreadLifetime {
+    thread: IrqSpinLock<*mut Thread>,
+}
+
+// SAFETY: all pointer access is scoped under `thread`; the reaper clears it
+// under the same lock before freeing the TCB. Scheduler CPU locks protect state.
+unsafe impl Send for ThreadLifetime {}
+// SAFETY: the same scoped-access protocol applies to shared tokens.
+unsafe impl Sync for ThreadLifetime {}
+
+impl ThreadLifetime {
+    fn new() -> Self {
+        Self {
+            thread: IrqSpinLock::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// The pointer is valid only during this closure. Do not hold CPU locks
+    /// before entering: priority changes acquire the target CPU lock inside.
+    pub(crate) fn with_live<R>(&self, action: impl FnOnce(*mut Thread) -> R) -> Option<R> {
+        let thread = self.thread.lock();
+        (!thread.is_null()).then(|| action(*thread))
+    }
+}
+
+impl Drop for ThreadLifetime {
+    fn drop(&mut self) {
+        crate::sys::smp::assert_sleepable("thread lifetime retirement");
+    }
+}
+
+// Keep one reference until all IRQ/parking-lock users have released theirs, so
+// their Arc drops never perform the token's final allocation destruction.
+static RETIRED_LIFETIMES: Mutex<Vec<Arc<ThreadLifetime>>> = Mutex::new(Vec::new());
+
+pub(crate) fn reap_thread_lifetimes() {
+    RETIRED_LIFETIMES
+        .lock()
+        .retain(|token| Arc::strong_count(token) != 1);
+}
+
 /// Scheduler-owned kernel thread record and execution context.
 pub(crate) struct Thread {
     /// Intrusive link used by per-priority run queues.
@@ -95,6 +138,9 @@ pub(crate) struct Thread {
 
     /// Monotonic thread identifier assigned by the scheduler.
     pub(crate) id: usize,
+
+    /// Stable, revocable identity for priority-inheritance references.
+    pub(crate) lifetime: Arc<ThreadLifetime>,
 
     /// Current lifecycle state.
     pub(crate) state: ThreadState,
@@ -252,8 +298,9 @@ impl ThreadName {
     }
 }
 
-// SAFETY: `Thread` instances are scheduler-owned, live for the lifetime of the
-// kernel, and are only mutated under scheduler-defined synchronization.
+// SAFETY: `Thread` instances are scheduler-owned and mutated under scheduler
+// synchronization. Reaping excludes all run/registry users and revokes scoped
+// priority-inheritance access before releasing storage.
 unsafe impl Send for Thread {}
 // SAFETY: shared access is coordinated by the scheduler and low-level locks.
 unsafe impl Sync for Thread {}
@@ -751,11 +798,12 @@ fn allocate_thread_record(
     } else {
         ThreadState::Ready
     };
-    Box::leak(Box::new(Thread {
+    let thread = Box::leak(Box::new(Thread {
         runq_link: LinkedListLink::new(),
         reap_link: LinkedListLink::new(),
         all_link: LinkedListLink::new(),
         id,
+        lifetime: Arc::new(ThreadLifetime::new()),
         state,
         class,
         flags,
@@ -793,7 +841,9 @@ fn allocate_thread_record(
         address_space: IrqSpinLock::new(address_space),
         thread_pointer: AtomicU64::new(0),
         name: IrqSpinLock::new(ThreadName::new()),
-    }))
+    }));
+    *thread.lifetime.thread.lock() = core::ptr::from_mut(thread);
+    thread
 }
 
 /// Reclaims a thread allocation after it has permanently exited.
@@ -803,8 +853,16 @@ fn allocate_thread_record(
 /// `thread` must point to a thread that is no longer runnable or executing on
 /// any CPU.
 pub(crate) unsafe fn free_thread(thread: *mut Thread) {
-    // SAFETY: upheld by this function's ownership contract.
+    // SAFETY: the reaper owns this TCB, and the immutable lifetime field is
+    // accessed separately while scoped priority updates may still be finishing.
+    let lifetime = unsafe { &(*thread).lifetime }.clone();
+    // Join all in-flight scoped accesses before releasing the thread storage.
+    *lifetime.thread.lock() = core::ptr::null_mut();
+    // SAFETY: reaper ownership and token revocation now exclude all readers.
     drop(unsafe { Box::from_raw(thread) });
+    if Arc::strong_count(&lifetime) != 1 {
+        RETIRED_LIFETIMES.lock().push(lifetime);
+    }
 }
 
 /// Default idle loop that halts until the next interrupt arrives.

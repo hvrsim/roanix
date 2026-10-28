@@ -1,5 +1,7 @@
 //! inotify filesystem notification descriptors.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
@@ -236,10 +238,10 @@ impl Inotify {
     pub(crate) fn poll_events<'a>(
         &'a self,
         requested: PollEvents,
-        output: &mut alloc::vec::Vec<&'a Event>,
+        output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
         if requested.contains(PollEvents::IN) {
-            output.push(&self.event);
+            output.push((&self.event).into());
         }
         true
     }

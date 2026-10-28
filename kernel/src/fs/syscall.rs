@@ -10,7 +10,10 @@ use crate::{
     },
     mem::{IoSink, IoSource, VirtAddr},
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
-    sys::{clock, event::Event},
+    sys::{
+        clock,
+        event::{Event, EventListener},
+    },
     syscall::{
         Errno, Result, current_process, map_fs_error, map_memory_error, map_process_error,
         read_user_path,
@@ -742,6 +745,29 @@ crate::syscall_handler! {
         loop {
             let mut ready = 0usize;
             let descriptors = process.descriptors(&fds);
+            // Arm signal interruption before sleeping so a blocked poll can be
+            // aborted by a signal instead of waiting forever.
+            let mut wait_events = Vec::new();
+            wait_events
+                .try_reserve(entries.len().saturating_add(1))
+                .map_err(|_| Errno::OutOfMemory)?;
+            wait_events.push(process.interrupt_event().into());
+            let mut event_driven = true;
+            for (entry, descriptor) in entries.iter().zip(&descriptors) {
+                if entry.fd < 0 {
+                    continue;
+                }
+                let Some(descriptor) = descriptor else {
+                    continue;
+                };
+                let requested = PollEvents::from_bits_retain(entry.events as u16)
+                    | PollEvents::ERR
+                    | PollEvents::HUP;
+                event_driven &= descriptor.poll_events(requested, &mut wait_events);
+            }
+            wait_events.sort_unstable_by_key(|event| &**event as *const Event as usize);
+            wait_events.dedup_by_key(|event| &**event as *const Event as usize);
+            let listeners = wait_events.iter().map(|event| event.listen()).collect::<Vec<_>>();
             for (entry, descriptor) in entries.iter_mut().zip(&descriptors) {
                 entry.revents = 0;
                 if entry.fd < 0 {
@@ -776,40 +802,18 @@ crate::syscall_handler! {
                 return Ok(ready as u64);
             }
 
-            // Arm signal interruption before sleeping so a blocked poll can be
-            // aborted by a signal instead of waiting forever.
             if process.prepare_interrupt_wait() {
                 return Err(Errno::Interrupted);
             }
-            let mut wait_events = Vec::new();
-            wait_events
-                .try_reserve(entries.len().saturating_add(1))
-                .map_err(|_| Errno::OutOfMemory)?;
-            wait_events.push(process.interrupt_event());
-            let mut event_driven = true;
-            for (entry, descriptor) in entries.iter().zip(&descriptors) {
-                if entry.fd < 0 {
-                    continue;
-                }
-                let Some(descriptor) = descriptor else {
-                    continue;
-                };
-                let requested = PollEvents::from_bits_retain(entry.events as u16)
-                    | PollEvents::ERR
-                    | PollEvents::HUP;
-                event_driven &= descriptor.poll_events(requested, &mut wait_events);
-            }
-            wait_events.sort_unstable_by_key(|event| *event as *const Event as usize);
-            wait_events.dedup_by_key(|event| *event as *const Event as usize);
             if event_driven && wait_events.len() > 1 {
                 if let Some(deadline) = deadline {
                     let remaining = deadline.saturating_sub(now).max(1);
-                    let _ = clock::wait_any_timeout(
-                        &wait_events,
+                    let _ = clock::wait_listeners_timeout(
+                        &listeners,
                         Duration::from_nanos(remaining),
                     );
                 } else {
-                    Event::wait_any(&wait_events);
+                    EventListener::wait_any(&listeners);
                 }
             } else {
                 let sleep_ns = deadline

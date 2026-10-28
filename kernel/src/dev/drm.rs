@@ -5,6 +5,8 @@
 //! Universal primary-plane and atomic KMS ioctls share state with legacy KMS.
 //! Commits complete after copying; the boot display has no vblank interrupt.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     collections::{BTreeMap, VecDeque},
     format,
@@ -586,10 +588,10 @@ impl DeviceNodeOps for Card {
         &'a self,
         _: usize,
         events: PollEvents,
-        output: &mut Vec<&'a Event>,
+        output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         if events.intersects(PollEvents::IN | PollEvents::RDNORM) {
-            output.push(&self.readable);
+            output.push((&self.readable).into());
         }
         true
     }

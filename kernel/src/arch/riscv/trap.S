@@ -44,7 +44,7 @@ rtrap_entry:
     sd sp, 8(tp)
 
 .save_context:
-    addi sp, sp, -288 /* size_of::<TrapFrame>() aligned to 16-bytes */
+    addi sp, sp, -560 /* size_of::<TrapFrame>() aligned to 16-bytes */
 
     /* store the general purpose registers */
     sd a0, 0(sp)
@@ -82,6 +82,61 @@ rtrap_entry:
     sd a0, 232(sp)
     csrr a0, sscratch
     sd a0, 240(sp)
+
+    /* Eagerly retain user FP state before disabling FS. Kernel traps have
+     * FS=Off; initialize their unused slots so TrapFrame is fully defined. */
+    sd zero, 280(sp)
+    sd zero, 552(sp)
+    csrr t0, sstatus
+    li t1, 0x6000
+    and t0, t0, t1
+    beqz t0, .zero_fpu
+.option push
+.option arch, +f, +d
+    fsd f0, 288(sp)
+    fsd f1, 296(sp)
+    fsd f2, 304(sp)
+    fsd f3, 312(sp)
+    fsd f4, 320(sp)
+    fsd f5, 328(sp)
+    fsd f6, 336(sp)
+    fsd f7, 344(sp)
+    fsd f8, 352(sp)
+    fsd f9, 360(sp)
+    fsd f10, 368(sp)
+    fsd f11, 376(sp)
+    fsd f12, 384(sp)
+    fsd f13, 392(sp)
+    fsd f14, 400(sp)
+    fsd f15, 408(sp)
+    fsd f16, 416(sp)
+    fsd f17, 424(sp)
+    fsd f18, 432(sp)
+    fsd f19, 440(sp)
+    fsd f20, 448(sp)
+    fsd f21, 456(sp)
+    fsd f22, 464(sp)
+    fsd f23, 472(sp)
+    fsd f24, 480(sp)
+    fsd f25, 488(sp)
+    fsd f26, 496(sp)
+    fsd f27, 504(sp)
+    fsd f28, 512(sp)
+    fsd f29, 520(sp)
+    fsd f30, 528(sp)
+    fsd f31, 536(sp)
+    frcsr t0
+    sd t0, 544(sp)
+.option pop
+    j .fpu_saved
+.zero_fpu:
+    addi t0, sp, 288
+    addi t1, sp, 552
+1:
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    bne t0, t1, 1b
+.fpu_saved:
 
     /* disable FPU and clear sscratch for nested interrupts */
     li t0, 0x6000ull
@@ -167,6 +222,51 @@ rtrap_entry:
     csrw sscratch, zero
 
 .restore_context:
+    /* FS is Off throughout kernel code. Enable it only while restoring the
+     * selected user frame, then restore the frame's sanitized status below. */
+    ld t0, 272(sp)
+    li t1, 0x6000
+    and t0, t0, t1
+    beqz t0, .fpu_restored
+    csrs sstatus, t1
+.option push
+.option arch, +f, +d
+    fld f0, 288(sp)
+    fld f1, 296(sp)
+    fld f2, 304(sp)
+    fld f3, 312(sp)
+    fld f4, 320(sp)
+    fld f5, 328(sp)
+    fld f6, 336(sp)
+    fld f7, 344(sp)
+    fld f8, 352(sp)
+    fld f9, 360(sp)
+    fld f10, 368(sp)
+    fld f11, 376(sp)
+    fld f12, 384(sp)
+    fld f13, 392(sp)
+    fld f14, 400(sp)
+    fld f15, 408(sp)
+    fld f16, 416(sp)
+    fld f17, 424(sp)
+    fld f18, 432(sp)
+    fld f19, 440(sp)
+    fld f20, 448(sp)
+    fld f21, 456(sp)
+    fld f22, 464(sp)
+    fld f23, 472(sp)
+    fld f24, 480(sp)
+    fld f25, 488(sp)
+    fld f26, 496(sp)
+    fld f27, 504(sp)
+    fld f28, 512(sp)
+    fld f29, 520(sp)
+    fld f30, 528(sp)
+    fld f31, 536(sp)
+    ld t0, 544(sp)
+    fscsr t0
+.option pop
+.fpu_restored:
     /* restore the general purpose registers */
     ld a1, 8(sp)
     ld a2, 16(sp)

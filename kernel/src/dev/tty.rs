@@ -6,6 +6,8 @@
 //! expects from a terminal lives here so that a UART, a pseudo-terminal, and a
 //! future console over a display all behave identically.
 
+use crate::sys::event::EventSource;
+
 use alloc::{
     boxed::Box,
     collections::VecDeque,
@@ -1300,22 +1302,22 @@ impl DeviceNodeOps for Tty {
         &'a self,
         _file_context: usize,
         events: PollEvents,
-        output: &mut alloc::vec::Vec<&'a Event>,
+        output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
         let state = self.state.lock();
         let mut complete = true;
         if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) {
             if self.input_worker.lock().is_some() {
-                output.push(&self.input_ready);
+                output.push((&self.input_ready).into());
             } else {
                 complete = false;
             }
         }
         if events.intersects(PollEvents::OUT | PollEvents::WRNORM) {
             if state.output_stopped {
-                output.push(&self.output_resumed);
+                output.push((&self.output_resumed).into());
             } else if let Some(event) = self.backend.writable_event() {
-                output.push(event);
+                output.push((event).into());
             } else {
                 complete = false;
             }

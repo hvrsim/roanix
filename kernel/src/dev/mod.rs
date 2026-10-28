@@ -4,6 +4,7 @@
 //! semantics, pseudo-devices, and other software-only facilities live here.
 
 pub mod block;
+mod block_ranges;
 pub mod console;
 pub mod drm;
 pub mod node;

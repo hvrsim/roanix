@@ -75,6 +75,21 @@ pub struct DmaWindow {
     pub token: *mut c_void,
 }
 
+/// Immutable metadata returned with a retained interface binding.
+#[repr(C)]
+pub struct InterfaceBindingInfo {
+    /// Operation table, valid for the lifetime of the binding.
+    pub ops: *const c_void,
+    /// Provider call context.
+    pub context: *mut c_void,
+    /// Published byte extent of the table.
+    pub ops_size: usize,
+    /// Selected service revision.
+    pub version: u32,
+    /// Published execution-context and concurrency flags.
+    pub flags: u32,
+}
+
 /// One entry of a driver's match table.
 #[repr(C)]
 pub struct MatchDef {
@@ -123,6 +138,8 @@ pub struct DriverDef {
     pub shutdown: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
     /// Context passed to every callback.
     pub context: *mut c_void,
+    /// Checked removal. On failure, retain the binding and all reachable context.
+    pub try_remove: Option<unsafe extern "C" fn(*mut c_void, *const c_void) -> i32>,
 }
 
 /// Bus callbacks supplied from C.
@@ -195,7 +212,7 @@ mod layout {
     const _: () = assert!(size_of::<NodeOps>() == 120);
     const _: () = assert!(size_of::<ConsoleOps>() == 160);
     const _: () = assert!(size_of::<MatchDef>() == 72);
-    const _: () = assert!(size_of::<DriverDef>() == 80);
+    const _: () = assert!(size_of::<DriverDef>() == 88);
     const _: () = assert!(size_of::<MmioWindow>() == 24);
     const _: () = assert!(size_of::<DmaWindow>() == 32);
     const _: () = assert!(size_of::<BusRegistration>() == 48);
@@ -245,6 +262,7 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         device_add_bytes => shim_device_add_bytes,
         device_add_resource => shim_device_add_resource,
         device_add_irq => shim_device_add_irq,
+        device_add_firmware_irq => shim_device_add_firmware_irq,
         device_add => shim_device_add,
         device_discard => shim_device_discard,
         device_remove => shim_device_remove,
@@ -255,12 +273,14 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         device_child => shim_device_child,
         device_data => shim_device_data,
         device_set_data => shim_device_set_data,
+        device_set_data_checked => shim_device_set_data_checked,
         device_int => shim_device_int,
         device_cell => shim_device_cell,
         device_string => shim_device_string,
         device_bytes => shim_device_bytes,
         device_property_len => shim_device_property_len,
         device_resource => shim_device_resource,
+        device_resource_named => shim_device_resource_named,
         device_fwnode => shim_device_fwnode,
         bus_register => shim_bus_register,
         bus_unregister => shim_bus_unregister,
@@ -271,6 +291,7 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         iface_publish => shim_iface_publish,
         iface_withdraw => shim_iface_withdraw,
         iface_bind => shim_iface_bind,
+        iface_bind_global => shim_iface_bind_global,
         iface_unbind => shim_iface_unbind,
         iface_available => shim_iface_available,
         iface_count => shim_iface_count,
@@ -278,6 +299,7 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         probe_retrigger => shim_probe_retrigger,
         irq_domain_register => shim_irq_domain_register,
         irq_domain_unregister => shim_irq_domain_unregister,
+        irq_domain_set_device => shim_irq_domain_set_device,
         irq_map => shim_irq_map,
         irq_unmap => shim_irq_unmap,
         irq_of_device => shim_irq_of_device,
@@ -305,6 +327,11 @@ pub(super) fn resolve_import(name: &[u8]) -> Option<usize> {
         timer_arm => shim_timer_arm,
         timer_cancel => shim_timer_cancel,
         timer_destroy => shim_timer_destroy,
+        mutex_create => shim_mutex_create,
+        mutex_lock => shim_mutex_lock,
+        mutex_try_lock => shim_mutex_try_lock,
+        mutex_unlock => shim_mutex_unlock,
+        mutex_destroy => shim_mutex_destroy,
         event_create => shim_event_create,
         event_destroy => shim_event_destroy,
         event_wait => shim_event_wait,

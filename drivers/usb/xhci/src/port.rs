@@ -4,7 +4,7 @@ use crate::{
     ring::{self, Trb},
 };
 use alloc::{ffi::CString, format, vec::Vec};
-use core::sync::atomic::Ordering;
+use core::{ptr, sync::atomic::Ordering};
 use ddk::{Bus, DeviceBuilder, Error, Result};
 
 impl Controller {
@@ -275,8 +275,12 @@ impl Controller {
             if slot.cancelled & (1 << dci) != 0 {
                 return Err(Error::from_status(ddk::ENODEV));
             }
-            if slot.endpoints[dci].is_some() {
-                return Ok(dci);
+            if let Some(endpoint) = &slot.endpoints[dci] {
+                return if endpoint.configured {
+                    Ok(dci)
+                } else {
+                    Err(error())
+                };
             }
             h.flags
         };
@@ -331,8 +335,48 @@ impl Controller {
             control: (12 << 10) | ((slot_id as u32) << 24),
             ..Trb::default()
         })?;
+        self.hardware
+            .lock_irqsave()
+            .endpoint_mut(slot_id, dci)?
+            .configured = true;
         Ok(dci)
     }
+    pub fn receive_interrupt(
+        &self,
+        slot: usize,
+        endpoint: u8,
+        packet: u16,
+        interval: u8,
+        buffer: &mut [u8],
+    ) -> Result<usize> {
+        if buffer.is_empty() || buffer.len() > 4096 {
+            return Err(Error::from_status(ddk::EINVAL));
+        }
+        let dci = self.configure_interrupt(slot, endpoint, packet, interval)?;
+        let event = {
+            let mut h = self.hardware.lock_irqsave();
+            let endpoint = h.endpoint_mut(slot, dci)?;
+            let event = endpoint.prepare(buffer.len())?;
+            endpoint.pending = endpoint.ring.push(Trb {
+                parameter: endpoint.buffer.device_address(),
+                status: buffer.len() as u32,
+                control: (1 << 10) | (1 << 5) | 4,
+            });
+            h.registers.write32(h.doorbell + slot * 4, dci as u32);
+            event
+        };
+        let count = self.wait_transfer(slot, dci, event)?;
+        let mut h = self.hardware.lock_irqsave();
+        let endpoint = h.endpoint_mut(slot, dci)?;
+        // SAFETY: completion publishes at most the requested buffer length;
+        // pending retains admission while this hardware lock protects the copy.
+        unsafe {
+            ptr::copy_nonoverlapping(endpoint.buffer.as_ptr(), buffer.as_mut_ptr(), count);
+        }
+        endpoint.pending = 0;
+        Ok(count)
+    }
+
     pub fn disconnect(&self, port: usize, slot_id: usize) {
         self.cancel(slot_id);
         let children = {
@@ -345,7 +389,7 @@ impl Controller {
         };
         let remaining: Vec<_> = children
             .into_iter()
-            .filter(|child| child.remove().is_err())
+            .filter_map(|mut child| child.remove().err().map(|_| child))
             .collect();
         if !remaining.is_empty() {
             self.hardware.lock_irqsave().slots[slot_id]

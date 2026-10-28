@@ -35,6 +35,7 @@ use super::{
         obj::{ObjHeader, ObjKind, Object, framework_object},
     },
     device::Device,
+    driver::Driver,
     module::Module,
 };
 
@@ -65,6 +66,7 @@ pub struct Interface {
     context: *mut c_void,
     owner: Option<Arc<Module>>,
     device: Option<Weak<Device>>,
+    driver: Option<Weak<Driver>>,
     revoked: AtomicBool,
     binds: AtomicU64,
 }
@@ -120,9 +122,39 @@ impl Interface {
         self.device.as_ref().and_then(Weak::upgrade)
     }
 
+    /// Driver-scoped publications retire with this binding, independently of
+    /// whether the publisher's code lives in a module or in the kernel.
+    pub(super) fn belongs_to(&self, driver: &Arc<Driver>) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|owner| Weak::ptr_eq(owner, &Arc::downgrade(driver)))
+    }
+
+    /// Revalidate the captured binding at device publication, after any
+    /// concurrent unbind/rebind that occurred while constructing metadata.
+    pub(super) fn binding_matches(&self, current: Option<&Arc<Driver>>) -> bool {
+        self.driver.as_ref().is_none_or(|owner| {
+            current.is_some_and(|driver| Weak::ptr_eq(owner, &Arc::downgrade(driver)))
+        })
+    }
+
     /// Returns whether the interface is still usable.
     pub fn is_live(&self) -> bool {
-        !self.revoked.load(Ordering::Acquire)
+        !self.revoked.load(Ordering::SeqCst)
+    }
+
+    /// Orders admission against withdrawal across the binding/revocation atomics.
+    pub(super) fn admit(&self) -> Result<()> {
+        self.binds
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| Error::NoSpace)?;
+        if !self.is_live() {
+            self.binds.fetch_sub(1, Ordering::Release);
+            return Err(Error::NoDevice);
+        }
+        Ok(())
     }
 
     /// Returns the number of active bindings.
@@ -135,7 +167,8 @@ impl Interface {
 pub struct Publication {
     /// Interface name, such as `roanix.block`.
     pub name: Box<str>,
-    /// Implementation version. Consumers request a minimum.
+    /// Service revision. Consumers request a supported inclusive range; legacy
+    /// bindings assume compatibility with every revision above their minimum.
     pub version: u32,
     /// Behaviour flags drawn from [`flags`].
     pub flags: u32,
@@ -154,6 +187,7 @@ pub struct Publication {
 pub struct InterfaceRef {
     interface: Arc<Interface>,
     consumer: Option<Arc<Module>>,
+    _provider_lease: Option<super::module::ModuleLease>,
 }
 
 impl InterfaceRef {
@@ -212,6 +246,7 @@ pub unsafe fn publish_global(
     owner: Option<&Arc<Module>>,
     publication: Publication,
 ) -> Result<Arc<Interface>> {
+    let _owner = super::module::pin_owner(owner, false)?;
     validate(&publication)?;
     let registry = registry()?;
     let mut global = registry.global.lock();
@@ -235,6 +270,7 @@ pub unsafe fn publish_global(
         context: publication.context,
         owner: owner.cloned(),
         device: None,
+        driver: None,
         revoked: AtomicBool::new(false),
         binds: AtomicU64::new(0),
     });
@@ -247,6 +283,11 @@ pub unsafe fn publish_global(
 
 /// Publishes an interface describing one device's capability.
 ///
+/// Publications by the currently bound driver belong to that binding (matching
+/// its module owner, or kernel ownership). They retire on unbind. Capabilities
+/// published independently of a binding remain until explicit withdrawal or
+/// device removal. Retained bindings can reject either lifetime's destruction.
+///
 /// # Safety
 ///
 /// The same requirements as [`publish_global`] apply.
@@ -255,7 +296,15 @@ pub unsafe fn publish_device(
     device: &Arc<Device>,
     publication: Publication,
 ) -> Result<Arc<Interface>> {
+    let _owner = super::module::pin_owner(owner, false)?;
     validate(&publication)?;
+    let driver = device
+        .driver()
+        .filter(|driver| match (owner, driver.owner()) {
+            (Some(owner), Some(provider)) => Arc::ptr_eq(owner, provider),
+            (None, None) => true,
+            _ => false,
+        });
     let header = ObjHeader::new_with(
         ObjKind::Interface,
         Some(&publication.name),
@@ -272,12 +321,13 @@ pub unsafe fn publish_device(
         context: publication.context,
         owner: owner.cloned(),
         device: Some(Arc::downgrade(device)),
+        driver: driver.as_ref().map(Arc::downgrade),
         revoked: AtomicBool::new(false),
         binds: AtomicU64::new(0),
     });
-    device.attach_interface(interface.clone())?;
-    if let Err(error) = interface.header.register() {
-        device.detach_interface(&interface);
+    interface.header.register()?;
+    if let Err(error) = device.attach_interface(interface.clone()) {
+        interface.header.poison();
         return Err(error);
     }
     super::probe::retrigger();
@@ -286,12 +336,12 @@ pub unsafe fn publish_device(
 
 /// Withdraws an interface once no consumer is bound to it.
 pub fn withdraw(interface: &Arc<Interface>) -> Result<()> {
-    if interface.binds.load(Ordering::Acquire) != 0 {
+    if interface.binds.load(Ordering::SeqCst) != 0 {
         return Err(Error::Busy);
     }
     if interface
         .revoked
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return Err(Error::NotFound);
@@ -299,8 +349,8 @@ pub fn withdraw(interface: &Arc<Interface>) -> Result<()> {
     interface
         .header
         .set_state(super::super::obj::ObjState::Removing);
-    if interface.binds.load(Ordering::Acquire) != 0 {
-        interface.revoked.store(false, Ordering::Release);
+    if interface.binds.load(Ordering::SeqCst) != 0 {
+        interface.revoked.store(false, Ordering::SeqCst);
         interface
             .header
             .set_state(super::super::obj::ObjState::Live);
@@ -309,19 +359,6 @@ pub fn withdraw(interface: &Arc<Interface>) -> Result<()> {
     detach(interface);
     interface.header.poison();
     Ok(())
-}
-
-/// Withdraws an interface even if consumers remain bound.
-///
-/// Used only while tearing a module down, where consumers are being removed in
-/// the same pass.
-fn force_withdraw(interface: &Arc<Interface>) {
-    interface
-        .header
-        .set_state(super::super::obj::ObjState::Removing);
-    interface.revoked.store(true, Ordering::Release);
-    detach(interface);
-    interface.header.poison();
 }
 
 fn detach(interface: &Arc<Interface>) {
@@ -342,16 +379,31 @@ fn detach(interface: &Arc<Interface>) {
 }
 
 fn attach_ref(consumer: Option<&Arc<Module>>, interface: Arc<Interface>) -> Result<InterfaceRef> {
+    let provider_lease = if consumer.is_none() {
+        interface
+            .owner
+            .as_ref()
+            .map(super::module::lease)
+            .transpose()?
+    } else {
+        None
+    };
     super::module::link(consumer, interface.owner.as_ref())?;
-    interface.binds.fetch_add(1, Ordering::AcqRel);
-    if !interface.is_live() {
-        interface.binds.fetch_sub(1, Ordering::Release);
+    let admitted = match interface.device.as_ref() {
+        Some(device) => device
+            .upgrade()
+            .ok_or(Error::NoDevice)
+            .and_then(|device| device.admit_interface(&interface)),
+        None => interface.admit(),
+    };
+    if let Err(error) = admitted {
         super::module::unlink(consumer, interface.owner.as_ref());
-        return Err(Error::NoDevice);
+        return Err(error);
     }
     Ok(InterfaceRef {
         interface,
         consumer: consumer.cloned(),
+        _provider_lease: provider_lease,
     })
 }
 
@@ -364,13 +416,29 @@ pub fn bind_global(
     name: &str,
     min_version: u32,
 ) -> Result<InterfaceRef> {
+    bind_global_range(consumer, name, min_version, u32::MAX)
+}
+
+/// Binds to the newest provider within an inclusive, supported version range.
+/// Versions outside the range may have incompatible table layouts.
+pub fn bind_global_range(
+    consumer: Option<&Arc<Module>>,
+    name: &str,
+    min_version: u32,
+    max_version: u32,
+) -> Result<InterfaceRef> {
+    if min_version > max_version {
+        return Err(Error::InvalidArgument);
+    }
     let registry = registry()?;
     let candidate = {
         let global = registry.global.lock();
         global.get(name).and_then(|entries| {
             entries
                 .iter()
-                .filter(|entry| entry.is_live() && entry.version >= min_version)
+                .filter(|entry| {
+                    entry.is_live() && (min_version..=max_version).contains(&entry.version)
+                })
                 .max_by_key(|entry| entry.version)
                 .cloned()
         })
@@ -441,10 +509,8 @@ pub fn available(name: &str, min_version: u32) -> bool {
     })
 }
 
-pub(super) fn remove_module_interfaces(module: &Arc<Module>) {
-    let Ok(registry) = registry() else {
-        return;
-    };
+pub(super) fn remove_module_interfaces(module: &Arc<Module>) -> Result<()> {
+    let registry = registry()?;
     let owned: Vec<Arc<Interface>> = registry
         .global
         .lock()
@@ -459,8 +525,9 @@ pub(super) fn remove_module_interfaces(module: &Arc<Module>) {
         .cloned()
         .collect();
     for interface in owned {
-        force_withdraw(&interface);
+        withdraw(&interface)?;
     }
+    Ok(())
 }
 
 /// Snapshot of one published interface.

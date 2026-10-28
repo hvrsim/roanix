@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.87"
 autolib = false
 
+[lib]
+name = "firmware_tree"
+path = "src/firmware.rs"
+
 [[bin]]
 name = "fdt"
 path = "src/lib.rs"

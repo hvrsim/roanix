@@ -6,12 +6,7 @@
 //! Wakeups run after releasing that lock to preserve scheduler lock ordering.
 
 use alloc::vec::Vec;
-use core::{
-    hint::spin_loop,
-    ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use core::{hint::spin_loop, ptr::NonNull, time::Duration};
 
 use intrusive_collections::{KeyAdapter, RBTree, RBTreeLink, UnsafeRef, intrusive_adapter};
 use log::{debug, info};
@@ -19,7 +14,7 @@ use log::{debug, info};
 use crate::{
     arch,
     sys::{
-        event::Event,
+        event::{Event, EventListener},
         sched,
         smp::{self, IrqSpinLock},
         sync::Once,
@@ -328,8 +323,38 @@ pub(crate) fn scheduler_deadline(
 static CLOCK_SETUP: Once<()> = Once::new();
 static CLOCKSOURCE: Once<RegisteredClockSource> = Once::new();
 static EVENT_TIMER: Once<&'static dyn EventTimer> = Once::new();
-/// Offset from the monotonic clock to the Unix epoch, or `0` when unknown.
-static REALTIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+struct RealtimeState {
+    offset_ns: u64,
+    generation: u64,
+}
+
+// Publish the offset and discontinuity generation as one coherent sample.
+static REALTIME: IrqSpinLock<RealtimeState> = IrqSpinLock::new(RealtimeState {
+    offset_ns: 0,
+    generation: 0,
+});
+static REALTIME_CHANGED: Event = Event::new();
+
+#[derive(Clone, Copy)]
+pub(crate) struct ClockSnapshot {
+    pub(crate) monotonic_ns: u64,
+    pub(crate) realtime_ns: u64,
+    pub(crate) realtime_generation: u64,
+}
+
+pub(crate) fn clock_snapshot() -> ClockSnapshot {
+    let realtime = REALTIME.lock();
+    let monotonic_ns = monotonic_ns();
+    ClockSnapshot {
+        monotonic_ns,
+        realtime_ns: monotonic_ns.saturating_add(realtime.offset_ns),
+        realtime_generation: realtime.generation,
+    }
+}
+
+pub(crate) fn realtime_changed() -> &'static Event {
+    &REALTIME_CHANGED
+}
 
 /// Monotonic counter source used for timekeeping and delays.
 pub trait ClockSource: Sync {
@@ -553,10 +578,31 @@ pub(crate) fn wait_timeout(event: &Event, duration: Duration) -> bool {
 /// Waits for any event or a timeout and returns the winning event index.
 pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<usize> {
     assert!(!events.is_empty(), "clock: timed wait requires an event");
+    if events.len() <= 8 {
+        let mut listeners = [events[0].listen(); 8];
+        for (listener, event) in listeners.iter_mut().zip(events) {
+            *listener = event.listen();
+        }
+        wait_listeners_timeout(&listeners[..events.len()], duration)
+    } else {
+        let listeners = events
+            .iter()
+            .map(|event| event.listen())
+            .collect::<Vec<_>>();
+        wait_listeners_timeout(&listeners, duration)
+    }
+}
+
+/// Timed wait preserving notification epochs captured before a readiness scan.
+pub(crate) fn wait_listeners_timeout(
+    listeners: &[EventListener<'_>],
+    duration: Duration,
+) -> Option<usize> {
+    assert!(!listeners.is_empty(), "clock: timed wait requires an event");
     super::parking::wait::assert_wait_context();
     let duration_ns = duration_to_ns(duration);
     if duration_ns == 0 {
-        return events.iter().position(|event| event.is_signaled());
+        return listeners.iter().position(EventListener::notified);
     }
 
     let current = sched::current_thread();
@@ -578,32 +624,32 @@ pub(crate) fn wait_any_timeout(events: &[&Event], duration: Duration) -> Option<
     with_local_clock(|local| local.insert_timer(timer.as_mut().get_mut()));
     arch::irqset(true);
 
-    let winner = wait_with_timeout_event(events, timeout_event.as_ref().get_ref());
+    let winner = wait_with_timeout_event(listeners, timeout_event.as_ref().get_ref());
 
     // Always unlink: on the timeout path the timer already fired, but any
     // other outcome leaves this stack-pinned node in the CPU's timer queue.
     remove_timer(timer.as_ref().get_ref());
     current_ref.unpin_migration();
 
-    (winner != events.len()).then_some(winner)
+    (winner != listeners.len()).then_some(winner)
 }
 
 /// Waits on `events` plus a trailing timeout event without heap allocation for
 /// the common small-set case.
-fn wait_with_timeout_event(events: &[&Event], timeout: &Event) -> usize {
+fn wait_with_timeout_event(listeners: &[EventListener<'_>], timeout: &Event) -> usize {
     const INLINE: usize = 8;
 
-    if events.len() < INLINE {
-        let mut inline: [&Event; INLINE] = [timeout; INLINE];
-        inline[..events.len()].copy_from_slice(events);
-        inline[events.len()] = timeout;
-        return Event::wait_any(&inline[..events.len() + 1]);
+    if listeners.len() < INLINE {
+        let mut inline = [timeout.listen(); INLINE];
+        inline[..listeners.len()].copy_from_slice(listeners);
+        inline[listeners.len()] = timeout.listen();
+        return EventListener::wait_any(&inline[..listeners.len() + 1]);
     }
 
-    let mut wait_events = Vec::with_capacity(events.len() + 1);
-    wait_events.extend_from_slice(events);
-    wait_events.push(timeout);
-    Event::wait_any(&wait_events)
+    let mut wait_events = Vec::with_capacity(listeners.len() + 1);
+    wait_events.extend_from_slice(listeners);
+    wait_events.push(timeout.listen());
+    EventListener::wait_any(&wait_events)
 }
 
 /// Returns monotonic nanoseconds since the clocksource was registered.
@@ -637,18 +683,31 @@ fn elapsed_ns(registered: &RegisteredClockSource) -> u64 {
 /// rather than silently mislabelled monotonic time.
 #[inline]
 pub fn realtime_ns() -> u64 {
-    monotonic_ns().saturating_add(REALTIME_OFFSET_NS.load(Ordering::Relaxed))
+    clock_snapshot().realtime_ns
 }
 
 /// Returns whether wall-clock time has been established by a driver.
 #[inline]
 pub fn realtime_is_set() -> bool {
-    REALTIME_OFFSET_NS.load(Ordering::Relaxed) != 0
+    REALTIME.lock().offset_ns != 0
 }
 
 /// Records the offset between the monotonic clock and the Unix epoch.
 pub fn set_realtime_offset(offset_ns: u64) {
-    REALTIME_OFFSET_NS.store(offset_ns, Ordering::Relaxed);
+    {
+        let mut realtime = REALTIME.lock();
+        if realtime.offset_ns == offset_ns {
+            return;
+        }
+        realtime.generation = realtime
+            .generation
+            .checked_add(1)
+            .expect("realtime discontinuity generation exhausted");
+        realtime.offset_ns = offset_ns;
+    }
+    // Listeners capture their generation before sampling the clock. Notify
+    // outside the clock lock, including when a timer is currently disarmed.
+    REALTIME_CHANGED.wake_all();
 }
 
 /// Updates the current CPU's scheduler deadline and re-arms the local timer if

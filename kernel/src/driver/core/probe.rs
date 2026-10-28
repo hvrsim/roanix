@@ -74,21 +74,23 @@ pub(super) fn offer_driver(driver: &Arc<Driver>) {
 }
 
 /// Unbinds every device currently claimed by `driver`.
-pub(super) fn detach_driver(driver: &Arc<Driver>) {
+pub(super) fn detach_driver(driver: &Arc<Driver>) -> Result<()> {
     for device in device::all() {
         let bound = device
             .driver()
             .is_some_and(|current| Arc::ptr_eq(&current, driver));
         if bound {
-            unbind(&device);
+            unbind(&device)?;
         }
     }
+    Ok(())
 }
 
 /// Unbinds `device` from its driver, if any.
-pub(super) fn detach(device: &Arc<Device>) {
-    unbind(device);
-    forget_deferred(device);
+pub(super) fn detach(claim: &device::Removal) -> Result<()> {
+    unbind_claimed(claim.device())?;
+    forget_deferred(claim.device());
+    Ok(())
 }
 
 /// Requests a rescan of parked devices after a topology change.
@@ -219,7 +221,6 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
     for (_, match_data, candidate) in candidates {
         match bind_one(device, &candidate, match_data) {
             Ok(()) => {
-                device.set_state(state::BOUND);
                 return;
             }
             Err(Error::Deferred) => {
@@ -251,6 +252,7 @@ fn try_bind_with(device: &Arc<Device>, only: Option<&Arc<Driver>>) {
 
 fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Result<()> {
     let _pin = driver.pin(false)?;
+    let _activity = driver.begin_probe()?;
     // Pin the bus before recording the dependency, so no failure path between
     // the two can leave an edge behind that nothing will ever remove.
     let bus_pin = match device.bus() {
@@ -273,6 +275,7 @@ fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Re
         Some(bus) => match bus.prepare(device) {
             Ok(()) => true,
             Err(error) => {
+                super::super::irq::release_device_mappings(device);
                 module::unlink(driver.owner(), bus_owner.as_ref());
                 module::unlink(driver.owner(), provider.as_ref());
                 return Err(error);
@@ -286,6 +289,7 @@ fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Re
     match driver.probe(device, match_data) {
         Ok(()) => {
             driver.note_bound();
+            device.set_state(state::BOUND);
             Ok(())
         }
         Err(error) => {
@@ -305,21 +309,22 @@ fn bind_one(device: &Arc<Device>, driver: &Arc<Driver>, match_data: usize) -> Re
     }
 }
 
-fn unbind(device: &Arc<Device>) {
-    let Some(driver) = device.driver() else {
-        return;
+fn unbind(device: &Arc<Device>) -> Result<()> {
+    let Some(claim) = device::Removal::claim(device)? else {
+        return Ok(());
     };
-    let previous = device.state();
-    if previous != state::BOUND && previous != state::REMOVING {
-        return;
-    }
-    if previous == state::BOUND && !device.transition(state::BOUND, state::REMOVING) {
-        return;
-    }
+    unbind_claimed(claim.device())?;
+    claim.finish(state::UNBOUND);
+    Ok(())
+}
 
-    if let Ok(_pin) = driver.pin(true) {
-        driver.remove(device);
-    }
+fn unbind_claimed(device: &Arc<Device>) -> Result<()> {
+    let Some(driver) = device.driver() else {
+        return Ok(());
+    };
+    device.driver_interfaces_idle(&driver)?;
+    let _pin = driver.pin(true)?;
+    driver.remove(device)?;
     device.set_driver(None);
     device.set_drvdata(0);
     release_driver_state(device, &driver);
@@ -332,10 +337,7 @@ fn unbind(device: &Arc<Device>) {
     module::unlink(driver.owner(), device.owner());
     module::unlink(driver.owner(), device.bus().and_then(|bus| bus.owner()));
     driver.note_unbound();
-
-    if previous == state::BOUND {
-        device.set_state(state::UNBOUND);
-    }
+    Ok(())
 }
 
 /// Releases framework state a driver may have left attached to `device`.
@@ -343,18 +345,16 @@ fn unbind(device: &Arc<Device>) {
 /// Drivers are expected to clean up in their remove callback, but a failed
 /// probe or a misbehaving driver must not leak interrupts or interfaces.
 fn release_driver_state(device: &Arc<Device>, driver: &Arc<Driver>) {
-    let Some(owner) = driver.owner() else {
-        return;
-    };
     for interface in device.interfaces() {
-        if interface
-            .owner()
-            .is_some_and(|module| Arc::ptr_eq(module, owner))
-        {
+        if interface.belongs_to(driver) {
             let _ = super::iface::withdraw(&interface);
         }
     }
-    super::super::irq::release_device_module_interrupts(device, owner);
+    if let Some(owner) = driver.owner() {
+        super::super::irq::release_device_module_interrupts(device, owner);
+    } else {
+        super::super::irq::release_device_mappings(device);
+    }
 }
 
 /// Returns the number of devices currently waiting for a prerequisite.

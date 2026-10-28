@@ -18,15 +18,8 @@ impl Trb {
     }
 }
 
-pub fn barrier() {
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: orders coherent DMA and device I/O without accessing stack data.
-    unsafe {
-        core::arch::asm!("fence iorw, iorw", options(nostack));
-    }
-    #[cfg(not(target_arch = "riscv64"))]
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-}
+pub use ddk::device_barrier as barrier;
+
 pub struct Ring {
     pub memory: Dma,
     index: usize,

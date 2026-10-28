@@ -5,13 +5,14 @@
 //! kernel scheduler.
 //!
 
+use alloc::sync::Arc;
 use core::{
     cell::UnsafeCell,
     hint::spin_loop,
     marker::PhantomData,
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
     sys::{
         parking::{self, Node},
         sched, smp,
-        thread::Thread,
+        thread::{Thread, ThreadLifetime},
     },
 };
 
@@ -194,8 +195,9 @@ impl Drop for OnceInitGuard<'_> {
 
 /// A compact adaptive mutex with an optimistic CAS fast path.
 ///
-/// The uncontended path is a single compare-exchange. Under short contention it
-/// spins briefly to avoid scheduler traffic, then falls back to FIFO sleeping
+/// Uncontended ownership uses a compare-exchange and retains the owning
+/// thread's lifetime token. Under short contention it spins briefly to avoid
+/// scheduler traffic, then falls back to FIFO sleeping
 /// waiters to avoid burning CPU time. Waiters sleep through the kernel
 /// scheduler, so blocking while holding the lock can delay unrelated threads.
 ///
@@ -204,11 +206,8 @@ impl Drop for OnceInitGuard<'_> {
 pub struct Mutex<T: ?Sized> {
     state: AtomicU8,
     class: Option<&'static super::lockdep::LockClass>,
-    /// Thread currently holding the lock, for priority inheritance.
-    ///
-    /// Written with a relaxed store on the uncontended path so acquiring stays
-    /// a single compare-exchange plus one store.
-    owner: AtomicPtr<Thread>,
+    /// Retained identity of the owner; its pointer is revoked before reaping.
+    owner: smp::IrqSpinLock<Option<Arc<ThreadLifetime>>>,
     value: UnsafeCell<T>,
 }
 
@@ -228,11 +227,12 @@ struct MutexWaiter {
     park_seq: u64,
     /// Priority lent to the lock holder while this waiter is queued.
     priority: u8,
-    /// Thread this waiter is currently boosting, or null when not boosting.
+    lifetime: Arc<ThreadLifetime>,
+    /// Thread this waiter is currently boosting, or none when not boosting.
     ///
     /// Ownership can transfer while this waiter sleeps, so the boost has to be
     /// released against whichever thread actually received it.
-    boosted: AtomicPtr<Thread>,
+    boosted: smp::IrqSpinLock<Option<Arc<ThreadLifetime>>>,
     granted: AtomicBool,
 }
 
@@ -269,7 +269,7 @@ impl<T> Mutex<T> {
         Self {
             state: AtomicU8::new(0),
             class: None,
-            owner: AtomicPtr::new(core::ptr::null_mut()),
+            owner: smp::IrqSpinLock::new(None),
             value: UnsafeCell::new(value),
         }
     }
@@ -324,27 +324,36 @@ impl<T: ?Sized> Mutex<T> {
 
     #[inline]
     fn try_lock_fast(&self) -> bool {
+        // Serialize publication with donation lookup. A waiter that observes
+        // LOCKED must not miss its owner between the CAS and identity store.
+        let mut owner = self.owner.lock();
         let acquired = self
             .state
             .compare_exchange(0, STATE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
         if acquired {
-            self.publish_owner();
+            *owner = Self::current_lifetime();
         }
         acquired
+    }
+
+    fn current_lifetime() -> Option<Arc<ThreadLifetime>> {
+        sched::current_thread_opt().map(|thread| {
+            // SAFETY: the currently executing thread cannot be reaped.
+            unsafe { &(*thread).lifetime }.clone()
+        })
     }
 
     /// Records the acquiring thread so waiters can lend it their priority.
     #[inline]
     fn publish_owner(&self) {
-        let owner = sched::current_thread_opt().unwrap_or(core::ptr::null_mut());
-        self.owner.store(owner, Ordering::Relaxed);
+        *self.owner.lock() = Self::current_lifetime();
     }
 
     /// Lends the queued waiter's priority to the current lock holder.
     fn lend_to_owner(&self, waiter: &MutexWaiter) {
-        let owner = self.owner.load(Ordering::Relaxed);
-        if !owner.is_null() {
+        let owner = self.owner.lock().clone();
+        if let Some(owner) = owner {
             waiter.boost(owner);
         }
     }
@@ -418,7 +427,7 @@ impl<T: ?Sized> Mutex<T> {
                 assert!(queue.remove(node.as_ref().get_ref()));
                 assert!(queue.is_empty());
                 self.state.store(STATE_LOCKED, Ordering::Relaxed);
-                self.owner.store(current, Ordering::Relaxed);
+                self.publish_owner();
                 let restore = queue.unlock_keep_irqs_disabled();
                 assert!(sched::wake(current, seq));
                 arch::irqset(restore);
@@ -442,13 +451,19 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     fn unlock(&self) {
         assert_mutex_context();
-        self.owner.store(core::ptr::null_mut(), Ordering::Relaxed);
-        if self
-            .state
-            .compare_exchange(STATE_LOCKED, 0, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
         {
-            return;
+            let mut owner = self.owner.lock();
+            if self
+                .state
+                .compare_exchange(STATE_LOCKED, 0, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                *owner = None;
+                return;
+            }
+            // Keep the outgoing owner visible until the queued handoff below.
+            // A high-priority waiter must still be able to donate while this
+            // thread is preempted before acquiring the parking bucket.
         }
 
         let (target, restore) = {
@@ -461,11 +476,11 @@ impl<T: ?Sized> Mutex<T> {
                 thread: waiter.thread,
                 park_seq: waiter.park_seq,
             };
-            self.owner.store(target.thread, Ordering::Relaxed);
+            *self.owner.lock() = Some(waiter.lifetime.clone());
             waiter.release_boost();
             queue.for_each(|node| {
                 // SAFETY: the bucket keeps every matching pinned waiter live.
-                unsafe { &*node.data.cast::<MutexWaiter>() }.boost(target.thread);
+                unsafe { &*node.data.cast::<MutexWaiter>() }.boost(waiter.lifetime.clone());
             });
             waiter.granted.store(true, Ordering::Release);
             self.state.store(
@@ -477,6 +492,33 @@ impl<T: ?Sized> Mutex<T> {
         let woke = sched::wake(target.thread, target.park_seq);
         arch::irqset(restore);
         assert!(woke, "sync: granted mutex waiter had a stale park sequence");
+    }
+}
+
+impl Mutex<()> {
+    /// Checks the thread affinity of a driver guard represented across the ABI.
+    pub(crate) fn owned_by_current(&self) -> bool {
+        let Some(current) = Self::current_lifetime() else {
+            // Native mutexes permit uncontended early-boot use. Before scheduler
+            // publication only the bootstrap CPU runs; no TCB exists to retain.
+            return sched::in_bootstrap() && self.owner.lock().is_none() && self.is_locked();
+        };
+        self.owner
+            .lock()
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &current))
+    }
+
+    /// # Safety
+    /// Exactly one guard acquired on this thread was forgotten, and the native
+    /// allocation remains retained until this method returns.
+    pub(crate) unsafe fn release_driver_guard(&self) {
+        assert!(
+            self.owned_by_current(),
+            "mutex: driver guard released by non-owner"
+        );
+        super::lockdep::released(self.key());
+        self.unlock();
     }
 }
 
@@ -514,27 +556,26 @@ impl MutexWaiter {
             thread,
             park_seq,
             priority,
-            boosted: AtomicPtr::new(core::ptr::null_mut()),
+            // SAFETY: callers create a waiter only for their live current thread.
+            lifetime: unsafe { &(*thread).lifetime }.clone(),
+            boosted: smp::IrqSpinLock::new(None),
             granted: AtomicBool::new(false),
         }
     }
 
     /// Boosts `owner` on this waiter's behalf, replacing any previous boost.
-    fn boost(&self, owner: *mut Thread) {
-        let previous = self.boosted.swap(owner, Ordering::Relaxed);
-        if !owner.is_null() {
-            sched::boost_priority(owner, self.priority);
-        }
-        if !previous.is_null() {
-            sched::unboost_priority(previous);
+    fn boost(&self, owner: Arc<ThreadLifetime>) {
+        let mut boosted = self.boosted.lock();
+        sched::boost_priority(&owner, self.priority);
+        if let Some(previous) = boosted.replace(owner) {
+            sched::unboost_priority(&previous);
         }
     }
 
     /// Releases this waiter's boost, if it holds one.
     fn release_boost(&self) {
-        let previous = self.boosted.swap(core::ptr::null_mut(), Ordering::Relaxed);
-        if !previous.is_null() {
-            sched::unboost_priority(previous);
+        if let Some(previous) = self.boosted.lock().take() {
+            sched::unboost_priority(&previous);
         }
     }
 }
