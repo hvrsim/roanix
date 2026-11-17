@@ -25,6 +25,8 @@ pub(crate) enum PipeError {
     BrokenPipe,
     /// The caller buffer could not be accessed.
     Fault,
+    /// A pending signal interrupted the blocking operation.
+    Interrupted,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -117,7 +119,7 @@ impl PipeEnd {
             }
             self.pipe.readable.reset();
             drop(state);
-            self.pipe.readable.wait();
+            wait_interruptibly(&self.pipe.readable)?;
         }
     }
 
@@ -165,7 +167,7 @@ impl PipeEnd {
             }
             self.pipe.writable.reset();
             drop(state);
-            self.pipe.writable.wait();
+            wait_interruptibly(&self.pipe.writable)?;
         }
     }
 
@@ -233,6 +235,20 @@ impl PipeEnd {
         }
         true
     }
+}
+
+fn wait_interruptibly(event: &Event) -> Result<(), PipeError> {
+    let ready = event.listen();
+    if let Some(process) = super::current() {
+        let interrupt = process.interrupt_event().listen();
+        if process.is_exited() || process.prepare_interrupt_wait() {
+            return Err(PipeError::Interrupted);
+        }
+        crate::sys::event::EventListener::wait_any(&[ready, interrupt]);
+    } else {
+        ready.wait();
+    }
+    Ok(())
 }
 
 impl Drop for PipeEnd {

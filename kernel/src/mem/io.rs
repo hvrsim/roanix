@@ -308,24 +308,66 @@ impl<'a> IoSink<'a> {
 }
 
 /// Source of bytes consumed by a write-style operation.
-pub struct IoSource<'a>(Buffer<'a, &'a [u8]>);
+pub struct IoSource<'a>(SourceBuffer<'a>);
+
+/// One nonempty segment, ending at `end` in the logical concatenation.
+/// Ends must increase strictly; the first segment starts at zero.
+pub struct IoVector {
+    /// Address of the first byte in this userspace segment.
+    pub address: VirtAddr,
+    /// Exclusive byte offset after this segment in the concatenated source.
+    pub end: usize,
+}
+
+enum SourceBuffer<'a> {
+    Kernel(&'a [u8]),
+    User(UserRange<'a>),
+    Vectored {
+        space: &'a VmSpace,
+        vectors: &'a [IoVector],
+        start: usize,
+        length: usize,
+    },
+}
 
 impl<'a> IoSource<'a> {
     /// Creates a source backed by kernel memory.
     pub fn kernel(buffer: &'a [u8]) -> Self {
-        Self(Buffer::Kernel(buffer))
+        Self(SourceBuffer::Kernel(buffer))
     }
 
     /// Creates a source backed by a validated user range.
     pub fn user(space: &'a VmSpace, address: VirtAddr, length: usize) -> Result<Self> {
-        UserRange::new(space, address, length).map(|range| Self(Buffer::User(range)))
+        UserRange::new(space, address, length).map(|range| Self(SourceBuffer::User(range)))
+    }
+
+    /// Borrows validated vector metadata without copying the payload. Page
+    /// faults remain lazy, so device and filesystem writes retain short-I/O rules.
+    pub fn vectored(space: &'a VmSpace, vectors: &'a [IoVector]) -> Result<Self> {
+        let mut end = 0;
+        for vector in vectors {
+            let length = vector
+                .end
+                .checked_sub(end)
+                .filter(|length| *length != 0)
+                .ok_or(Error::InvalidAddress)?;
+            space.validate_user(vector.address, length)?;
+            end = vector.end;
+        }
+        Ok(Self(SourceBuffer::Vectored {
+            space,
+            vectors,
+            start: 0,
+            length: end,
+        }))
     }
 
     /// Returns the total transfer length.
     pub fn len(&self) -> usize {
         match &self.0 {
-            Buffer::Kernel(buffer) => buffer.len(),
-            Buffer::User(range) => range.length,
+            SourceBuffer::Kernel(buffer) => buffer.len(),
+            SourceBuffer::User(range) => range.length,
+            SourceBuffer::Vectored { length, .. } => *length,
         }
     }
 
@@ -337,17 +379,31 @@ impl<'a> IoSource<'a> {
     /// Borrows a shorter source covering `offset..offset + length`.
     pub fn slice(&self, offset: usize, length: usize) -> Result<IoSource<'_>> {
         Ok(match &self.0 {
-            Buffer::Kernel(buffer) => IoSource(Buffer::Kernel(
+            SourceBuffer::Kernel(buffer) => IoSource(SourceBuffer::Kernel(
                 &buffer[checked_subrange(buffer.len(), offset, length)?],
             )),
-            Buffer::User(range) => IoSource(Buffer::User(range.slice(offset, length)?)),
+            SourceBuffer::User(range) => IoSource(SourceBuffer::User(range.slice(offset, length)?)),
+            SourceBuffer::Vectored {
+                space,
+                vectors,
+                start,
+                length: total,
+            } => {
+                checked_subrange(*total, offset, length)?;
+                IoSource(SourceBuffer::Vectored {
+                    space,
+                    vectors,
+                    start: start + offset,
+                    length,
+                })
+            }
         })
     }
 
     /// Returns a readable window of at most `maximum` bytes starting at `offset`.
     ///
-    /// The window stops at the next page boundary, so callers must loop until
-    /// the requested count is satisfied. The returned guard pins a user frame
+    /// The window stops at the next page or vector boundary, so callers must
+    /// loop until the requested count is satisfied. The guard pins a user frame
     /// against reclamation; drop it as soon as the bytes are no longer in use.
     pub fn window(&self, offset: usize, maximum: usize) -> Result<SourceWindow<'_>> {
         let maximum = window_length(self.len(), offset, maximum)?;
@@ -355,14 +411,36 @@ impl<'a> IoSource<'a> {
             return Ok(SourceWindow::empty());
         }
         match &self.0 {
-            Buffer::Kernel(buffer) => Ok(SourceWindow(Window::Kernel(
+            SourceBuffer::Kernel(buffer) => Ok(SourceWindow(Window::Kernel(
                 &buffer[offset..offset + maximum],
             ))),
-            Buffer::User(range) => Ok(SourceWindow(Window::User(range.window(
+            SourceBuffer::User(range) => Ok(SourceWindow(Window::User(range.window(
                 offset,
                 maximum,
                 FaultAccess::Read,
             )?))),
+            SourceBuffer::Vectored {
+                space,
+                vectors,
+                start,
+                ..
+            } => {
+                let position = start + offset;
+                let index = vectors.partition_point(|vector| vector.end <= position);
+                let vector = vectors.get(index).ok_or(Error::InvalidAddress)?;
+                let beginning = if index == 0 {
+                    0
+                } else {
+                    vectors[index - 1].end
+                };
+                Ok(SourceWindow(Window::User(PinnedWindow::resolve(
+                    space,
+                    vector.address,
+                    position - beginning,
+                    maximum.min(vector.end - position),
+                    FaultAccess::Read,
+                )?)))
+            }
         }
     }
 

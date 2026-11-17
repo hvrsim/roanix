@@ -8,7 +8,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     fs::PollEvents,
     mem::{IoSink, IoSource},
-    sys::{event::Event, sync::Mutex},
+    sys::{
+        event::{Event, EventListener},
+        sync::Mutex,
+    },
     syscall::{Errno, Result, current_process, map_process_error},
 };
 
@@ -43,8 +46,9 @@ impl EventFd {
         if sink.len() < 8 {
             return Err(Errno::Invalid);
         }
+        let process = current_process()?;
         loop {
-            let wait = self.readable.listen();
+            let listeners = [self.readable.listen(), process.interrupt_event().listen()];
             {
                 let mut count = self.count.lock();
                 if *count != 0 {
@@ -60,7 +64,10 @@ impl EventFd {
             if self.is_nonblocking() {
                 return Err(Errno::TryAgain);
             }
-            wait.wait();
+            if process.is_exited() || process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            EventListener::wait_any(&listeners);
         }
     }
 
@@ -74,8 +81,9 @@ impl EventFd {
         if value == u64::MAX {
             return Err(Errno::Invalid);
         }
+        let process = current_process()?;
         loop {
-            let wait = self.writable.listen();
+            let listeners = [self.writable.listen(), process.interrupt_event().listen()];
             {
                 let mut count = self.count.lock();
                 if value <= MAX_COUNT - *count {
@@ -87,7 +95,10 @@ impl EventFd {
             if self.is_nonblocking() {
                 return Err(Errno::TryAgain);
             }
-            wait.wait();
+            if process.is_exited() || process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            EventListener::wait_any(&listeners);
         }
     }
 

@@ -470,8 +470,8 @@ impl Drop for PmapInner {
     }
 }
 
-/// Reference the translation map and
-/// try its lock with PV held, release PV, and if contended wait then restart.
+/// Retain the translation map under PV, then release PV before taking its lock.
+/// Revalidate the mapping after the handoff because V->P operations may change it.
 /// The Arc outlives both guards, so its final destructor never runs at IPL_VM.
 fn visit_reverse_mappings(
     page: &PageRef,
@@ -497,8 +497,8 @@ fn visit_reverse_mappings(
                 continue;
             }
         };
-        let locked = pmap.try_lock();
         drop(reverse);
+        let locked = pmap.try_lock();
         let Some(mut locked) = locked else {
             drop(pmap.lock());
             cursor = None;

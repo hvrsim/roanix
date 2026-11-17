@@ -28,7 +28,12 @@ use crate::{
     },
     mem::{IoSink, IoSource},
     proc,
-    sys::{clock, event::Event, sched, sync::Mutex},
+    sys::{
+        clock,
+        event::{Event, EventListener},
+        sched,
+        sync::Mutex,
+    },
 };
 
 const INPUT_CAPACITY: usize = 4096;
@@ -179,6 +184,29 @@ pub struct SerialSettings {
     pub parity: bool,
     /// Whether enabled parity is odd.
     pub odd_parity: bool,
+}
+
+/// Waits for terminal I/O or a process signal; false means the timeout elapsed.
+/// Kernel input workers have no current process and only wait for I/O.
+pub(super) fn wait_interruptibly(event: &Event, timeout: Option<Duration>) -> FsResult<bool> {
+    let ready = event.listen();
+    let wait = |listeners: &[EventListener<'_>]| {
+        if let Some(timeout) = timeout {
+            clock::wait_listeners_timeout(listeners, timeout).is_some()
+        } else {
+            EventListener::wait_any(listeners);
+            true
+        }
+    };
+    if let Some(process) = proc::current() {
+        let interrupt = process.interrupt_event().listen();
+        if process.is_exited() || process.prepare_interrupt_wait() {
+            return Err(FsError::Interrupted);
+        }
+        Ok(wait(&[ready, interrupt]))
+    } else {
+        Ok(wait(core::slice::from_ref(&ready)))
+    }
 }
 
 /// Hardware backend consumed by the shared TTY line discipline.
@@ -849,9 +877,9 @@ impl Tty {
                 self.input_ready.reset();
             }
             if self.input_worker.lock().is_some() {
-                self.input_ready.wait();
+                wait_interruptibly(&self.input_ready, None)?;
             } else {
-                clock::sleep(FALLBACK_POLL_INTERVAL);
+                wait_interruptibly(&self.input_ready, Some(FALLBACK_POLL_INTERVAL))?;
             }
         }
     }
@@ -923,29 +951,24 @@ impl Tty {
             }
 
             let now = clock::monotonic_ns();
-            if let Some(deadline) = deadline {
-                if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Ok(read);
+            }
+            let worker = self.input_worker.lock().is_some();
+            let timeout = match (worker, deadline) {
+                (true, Some(deadline)) => Some(Duration::from_nanos(deadline - now)),
+                (true, None) => None,
+                (false, Some(deadline)) => Some(Duration::from_nanos(
+                    (deadline - now).min(FALLBACK_POLL_INTERVAL.as_nanos() as u64),
+                )),
+                (false, None) => Some(FALLBACK_POLL_INTERVAL),
+            };
+            match wait_interruptibly(&self.input_ready, timeout) {
+                Err(error) => return if read != 0 { Ok(read) } else { Err(error) },
+                Ok(false) if deadline.is_some_and(|deadline| clock::monotonic_ns() >= deadline) => {
                     return Ok(read);
                 }
-                if self.input_worker.lock().is_some() {
-                    if !clock::wait_timeout(
-                        &self.input_ready,
-                        Duration::from_nanos(deadline.saturating_sub(now).max(1)),
-                    ) {
-                        return Ok(read);
-                    }
-                } else {
-                    clock::sleep(Duration::from_nanos(
-                        deadline
-                            .saturating_sub(now)
-                            .min(FALLBACK_POLL_INTERVAL.as_nanos() as u64)
-                            .max(1),
-                    ));
-                }
-            } else if self.input_worker.lock().is_some() {
-                self.input_ready.wait();
-            } else {
-                clock::sleep(FALLBACK_POLL_INTERVAL);
+                _ => {}
             }
         }
     }
@@ -965,8 +988,9 @@ impl Tty {
             }
             if self.input_worker.lock().is_none() {
                 self.pump_input(false);
+                wait_interruptibly(&self.output_resumed, Some(FALLBACK_POLL_INTERVAL))?;
             } else {
-                self.output_resumed.wait();
+                wait_interruptibly(&self.output_resumed, None)?;
             }
         }
         let (output_flags, discard_output) = {

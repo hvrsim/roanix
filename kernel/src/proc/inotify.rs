@@ -15,7 +15,7 @@ use crate::{
     mem::IoSink,
     proc::Descriptor,
     sys::{
-        event::Event,
+        event::{Event, EventListener},
         sync::{Mutex, Once},
     },
     syscall::{Errno, Result, current_process, map_fs_error, map_process_error, read_user_path},
@@ -186,7 +186,9 @@ impl Inotify {
 
     pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> Result<usize> {
         let capacity = sink.len();
+        let process = current_process()?;
         loop {
+            let listeners = [self.event.listen(), process.interrupt_event().listen()];
             let mut state = self.state.lock();
             if let Some(first) = state.queue.front() {
                 if first.len() > capacity {
@@ -223,7 +225,10 @@ impl Inotify {
             }
             self.event.reset();
             drop(state);
-            self.event.wait();
+            if process.is_exited() || process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
+            EventListener::wait_any(&listeners);
         }
     }
 

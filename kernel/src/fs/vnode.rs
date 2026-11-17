@@ -108,6 +108,8 @@ bitflags! {
         const WRNORM = 0x0100;
         /// Priority data can be written without blocking.
         const WRBAND = 0x0200;
+        /// The peer has shut down its write direction.
+        const RDHUP = 0x2000;
     }
 }
 
@@ -174,6 +176,8 @@ pub enum CreateKind {
     Directory,
     /// Create a symbolic link containing the supplied target.
     Symlink(Vec<u8>),
+    /// Create a local socket rendezvous inode, without file data.
+    Socket,
 }
 
 /// One directory entry returned by `readdir`.
@@ -195,6 +199,10 @@ pub struct DirEntry {
 /// Filesystem capacity and usage snapshot.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct StatFs {
+    /// Stable filesystem format identifier reported to userspace.
+    pub filesystem_type: u64,
+    /// Unit used for filesystem capacity accounting.
+    pub block_size: u64,
     /// Total addressable bytes.
     pub total_bytes: u64,
     /// Currently allocated bytes.
@@ -218,6 +226,11 @@ pub trait FileSystem: Send + Sync {
 
     /// Returns a capacity and usage snapshot.
     fn statfs(&self) -> StatFs;
+
+    /// Whether this implementation rejects persistent namespace and data writes.
+    fn read_only(&self) -> bool {
+        false
+    }
 
     /// Flushes filesystem state. Memory-only filesystems may return success.
     fn sync(&self) -> Result<()> {
@@ -257,6 +270,12 @@ pub trait VnodeOps: Any + Send + Sync {
     /// Looks up one direct child.
     fn lookup(&self, _directory: &Vnode, _name: &[u8]) -> Result<Vnode> {
         Err(Error::NotDirectory)
+    }
+
+    /// Whether component hits and misses remain valid until a VFS mutation.
+    /// Live namespaces such as procfs change outside the VFS mutation path.
+    fn cache_names(&self) -> bool {
+        true
     }
 
     /// Returns the logical parent directory.
@@ -420,6 +439,12 @@ pub trait VnodeOps: Any + Send + Sync {
         Err(Error::InvalidArgument)
     }
 
+    /// Resolves a kernel-owned file link without converting its anchor
+    /// into text. Ordinary symbolic links use `readlink` instead.
+    fn file_link(&self, _vnode: &Vnode) -> Result<Option<super::file::FileRef>> {
+        Ok(None)
+    }
+
     /// Reads directory entries beginning at `cursor`.
     fn readdir(
         &self,
@@ -554,6 +579,9 @@ impl Vnode {
             return self.parent();
         }
         super::path::validate_leaf_name(name)?;
+        if !self.inner.operations.cache_names() {
+            return self.inner.operations.lookup(self, name);
+        }
         super::namecache::lookup(self, name, &self.inner.names, || {
             self.inner.operations.lookup(self, name)
         })
@@ -846,6 +874,11 @@ impl Vnode {
         self.inner
             .operations
             .mapping_object(self, file_context, offset, length)
+    }
+
+    /// Follows a kernel-owned descriptor link while retaining its open description.
+    pub(super) fn file_link(&self) -> Result<Option<super::file::FileRef>> {
+        self.inner.operations.file_link(self)
     }
 
     /// Reads a symbolic-link target.

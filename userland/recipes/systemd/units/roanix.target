@@ -1,0 +1,6 @@
+[Unit]
+Description=Roanix
+Requires=basic.target
+After=basic.target
+Wants=roanix-serial.service roanix-kmscon.service
+AllowIsolate=yes

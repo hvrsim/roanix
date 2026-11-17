@@ -49,6 +49,7 @@ fn early_init() -> ! {
     sys::klog::init();
     arch::init_boot_cpu();
     info!(target: "boot", "welcome to roanix!");
+    sys::cmdline::init();
     sys::initramfs::init();
 
     mem::init();

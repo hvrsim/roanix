@@ -1,8 +1,9 @@
 //! Mount topology and directory mutation interlock.
 //!
-//! Directory mutations share the gate from before path resolution through the
-//! backend operation. Mount, unmount and root replacement hold it exclusively,
-//! also before resolution. A mount can therefore neither appear between a busy
+//! Opens and directory creation share the gate from before path resolution
+//! through path registration. Unlink and rename hold it exclusively so retained
+//! entry paths change atomically with the backend. Mount, unmount and root
+//! replacement also hold it exclusively before resolution. A mount can therefore neither appear between a busy
 //! check and unlink/rename, nor publish a directory detached during lookup.
 //!
 //! Lock order: this gate, namespace table, filesystem locks. The table lock is

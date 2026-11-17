@@ -58,7 +58,7 @@ mod vmem;
 pub use addr::{PAGE_SIZE, PhysAddr, VirtAddr, align_down, align_up, pages_for_len};
 pub(crate) use alloc::HEAP_BASE;
 pub use error::{Error, Result};
-pub use io::{IoSink, IoSource, SinkWindow, SourceWindow};
+pub use io::{IoSink, IoSource, IoVector, SinkWindow, SourceWindow};
 pub use map::{
     FaultAccess, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmAdvice, VmBacking, VmInheritance, VmMap,
     VmMapEntry, VmMapping, VmPlacement, VmProtection,

@@ -92,6 +92,9 @@ crate::syscall_handler! {
             let Descriptor::File(file) = descriptor else {
                 return Err(Errno::BadFileDescriptor);
             };
+            if file.is_path() {
+                return Err(Errno::BadFileDescriptor);
+            }
             if !file.flags().contains(OpenFlags::READ) {
                 return Err(Errno::Access);
             }

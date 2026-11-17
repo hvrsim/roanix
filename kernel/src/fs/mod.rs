@@ -3,16 +3,19 @@
 extern crate alloc;
 
 mod cache;
+pub mod cgroupfs;
 pub mod devfs;
 pub mod error;
 pub mod ext4;
 pub mod fat32;
 pub mod file;
 mod io;
+mod location;
 pub(crate) mod namecache;
 mod namespace;
 pub mod partition;
 pub mod path;
+pub mod procfs;
 mod syscall;
 pub mod tmpfs;
 pub mod vfs;
@@ -49,20 +52,35 @@ pub fn mount_block(source: &str, target: &[u8], filesystem: &str) -> Result<()> 
     };
     if target == b"/" {
         validate_system_root(&mounted)?;
-        replace_root(mounted)?;
+        // Prepare memory-backed filesystems before discarding the initramfs,
+        // so allocation failures do not leave a partially replaced root.
+        let temporary = runtime_tmpfs(0o1777)?;
+        let runtime = runtime_tmpfs(0o755)?;
+        let shared = runtime_tmpfs(0o1777)?;
+        replace_root(mounted, source.as_bytes())?;
         devfs::remount_global()?;
-        let temporary: FileSystemRef = tmpfs::Tmpfs::new()?;
         vfs::mount(b"/tmp", temporary)?;
+        vfs::mount(b"/run", runtime)?;
+        vfs::mount(b"/dev/shm", shared)?;
     } else {
-        vfs::mount(target, mounted)?;
+        vfs::mount_with_source(target, mounted, source.as_bytes())?;
     }
     Ok(())
+}
+
+fn runtime_tmpfs(mode: u16) -> Result<FileSystemRef> {
+    let filesystem: FileSystemRef = tmpfs::Tmpfs::new()?;
+    filesystem.root().setattr(SetAttr {
+        mode: Some(mode),
+        size: None,
+    })?;
+    Ok(filesystem)
 }
 
 /// Rejects arbitrary disk volumes before the initramfs is discarded.
 fn validate_system_root(filesystem: &FileSystemRef) -> Result<()> {
     let root = filesystem.root();
-    for directory in [b"dev".as_slice(), b"etc", b"sbin", b"tmp", b"usr"] {
+    for directory in [b"dev".as_slice(), b"etc", b"run", b"sbin", b"tmp", b"usr"] {
         if root.lookup(directory)?.kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }

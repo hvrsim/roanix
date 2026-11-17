@@ -20,6 +20,7 @@ pub(crate) enum Errno {
     NoProcess = 3,
     Interrupted = 4,
     Io = 5,
+    ExecFormat = 8,
     BadFileDescriptor = 9,
     NoChild = 10,
     TryAgain = 11,
@@ -45,8 +46,18 @@ pub(crate) enum Errno {
     NotEmpty = 39,
     Loop = 40,
     Overflow = 75,
+    NotSocket = 88,
+    DestinationRequired = 89,
+    MessageSize = 90,
+    ProtocolType = 91,
+    ProtocolNotSupported = 93,
     NotSupported = 95,
+    AddressInUse = 98,
+    AlreadyConnected = 106,
+    AlreadyInProgress = 114,
+    NotConnected = 107,
     TimedOut = 110,
+    ConnectionRefused = 111,
     Canceled = 125,
 }
 
@@ -240,9 +251,8 @@ pub(crate) fn map_process_error(error: proc::Error) -> Errno {
         proc::Error::NoChild => Errno::NoChild,
         proc::Error::Interrupted => Errno::Interrupted,
         proc::Error::PermissionDenied => Errno::Permission,
-        proc::Error::InvalidArgument | proc::Error::InvalidElf(_) | proc::Error::UnsupportedElf => {
-            Errno::Invalid
-        }
+        proc::Error::InvalidArgument => Errno::Invalid,
+        proc::Error::InvalidElf(_) | proc::Error::UnsupportedElf => Errno::ExecFormat,
     }
 }
 

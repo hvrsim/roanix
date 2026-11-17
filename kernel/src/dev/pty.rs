@@ -162,7 +162,7 @@ impl Master {
                     &slot.events.master_readable
                 }
             };
-            wait.wait();
+            tty::wait_interruptibly(wait, None)?;
         }
     }
 
@@ -197,7 +197,7 @@ impl Master {
                     &slot.events.slave_writable
                 }
             };
-            wait.wait();
+            tty::wait_interruptibly(wait, None)?;
         }
     }
 }
@@ -412,30 +412,36 @@ impl ConsoleBackend for SlaveBackend {
     }
 
     fn write(&self, bytes: &[u8], nonblocking: bool) -> Result<()> {
-        let mut offset = 0;
-        while offset < bytes.len() {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if bytes.len() > RING_CAPACITY {
+            return Err(Error::InvalidArgument);
+        }
+        loop {
             let wait = {
                 let mut state = self.slot.state.lock();
                 if !state.active() {
                     return Err(Error::Io);
                 }
-                if nonblocking && RING_CAPACITY - state.to_master.len() < bytes.len() - offset {
-                    return Err(Error::WouldBlock);
-                }
-                if state.to_master.len() < RING_CAPACITY {
-                    offset += append(&mut state.to_master, &bytes[offset..]);
+                // ConsoleBackend promises all-or-nothing writes. Only enqueue
+                // a whole TTY batch so an interrupted wait leaves no bytes behind.
+                if RING_CAPACITY - state.to_master.len() >= bytes.len() {
+                    append(&mut state.to_master, bytes);
                     if state.to_master.len() == RING_CAPACITY {
                         self.slot.events.master_writable.reset();
                     }
                     self.slot.events.master_readable.signal();
-                    continue;
+                    return Ok(());
+                }
+                if nonblocking {
+                    return Err(Error::WouldBlock);
                 }
                 self.slot.events.master_writable.reset();
                 &self.slot.events.master_writable
             };
-            wait.wait();
+            tty::wait_interruptibly(wait, None)?;
         }
-        Ok(())
     }
 
     fn configure(&self, _settings: SerialSettings) -> Result<()> {

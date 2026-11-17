@@ -1,0 +1,5 @@
+[Unit]
+Description=Roanix System Initialization
+# The bootstrap mounts the root; the kernel supplies native API filesystems.
+# Linux udev, sysctl, modules-load and filesystem generators do not apply.
+DefaultDependencies=no

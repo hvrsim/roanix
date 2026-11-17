@@ -20,6 +20,23 @@ const PRIO_PROCESS: u64 = 0;
 const PRIO_PGRP: u64 = 1;
 const PRIO_USER: u64 = 2;
 
+crate::syscall_handler! {
+    syscall_system_power(_frame, action: u64 = 0) {
+        if current_process()?.pid() != 1 {
+            return Err(Errno::Permission);
+        }
+        super::power::transition(action)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_sync(_frame) {
+        crate::fs::sync_all().map_err(crate::syscall::map_fs_error)?;
+        Ok(0)
+    }
+}
+
 /// Userspace nice values are biased by this so `getpriority` never returns a
 /// negative value, which the syscall ABI reserves for errors.
 const PRIO_BIAS: i64 = 20;

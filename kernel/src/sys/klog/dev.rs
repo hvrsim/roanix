@@ -269,18 +269,35 @@ impl DeviceNodeOps for LogDevice {
         if length == 0 {
             return Ok(0);
         }
-        if length > MAX_USER_WRITE {
-            return Err(Error::InvalidArgument);
+        // Bound bounce storage, while allowing ordinary buffered stdio writes.
+        let capacity = length.min(USER_WRITE_CHUNK_SIZE);
+        let mut bytes = alloc::vec::Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::OutOfMemory)?;
+        bytes.resize(capacity, 0);
+        let mut written = 0;
+        let mut level = Level::Info;
+        while written < length {
+            let count = bytes.len().min(length - written);
+            if source.load(written, &mut bytes[..count]).is_err() {
+                return if written == 0 {
+                    Err(Error::InvalidArgument)
+                } else {
+                    Ok(written)
+                };
+            }
+            let message = if written == 0 {
+                let (priority, message) = split_level_prefix(&bytes[..count]);
+                level = priority;
+                message
+            } else {
+                &bytes[..count]
+            };
+            super::append_userspace(level, message);
+            written += count;
         }
-
-        let mut bytes = alloc::vec![0u8; length];
-        source
-            .load(0, &mut bytes)
-            .map_err(|_| Error::InvalidArgument)?;
-
-        let (level, message) = split_level_prefix(&bytes);
-        super::append_userspace(level, message);
-        Ok(length)
+        Ok(written)
     }
 
     fn poll(
@@ -373,8 +390,8 @@ impl DeviceNodeOps for LogDevice {
     }
 }
 
-/// Largest single write accepted through a log device.
-const MAX_USER_WRITE: usize = 4096;
+/// Maximum bounce storage used while streaming a userspace log write.
+const USER_WRITE_CHUNK_SIZE: usize = 4096;
 
 /// Publishes `/dev/klog` and `/dev/kmsg`.
 pub(crate) fn register() -> Result<()> {

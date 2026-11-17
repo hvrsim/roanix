@@ -1,5 +1,6 @@
 //! Process ownership and executable startup.
 
+pub(crate) mod cgroup;
 mod descriptor_life;
 mod elf;
 pub(crate) mod epoll;
@@ -9,6 +10,7 @@ mod pipe;
 pub(crate) mod signal;
 pub(crate) mod syscall;
 pub(crate) mod timerfd;
+pub(crate) mod unix;
 
 use crate::sys::event::EventSource;
 use descriptor_life::{DescriptorLife, OpenHandle};
@@ -20,7 +22,7 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU16, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU8, AtomicU16, AtomicUsize, Ordering},
 };
 
 use log::{debug, info, trace};
@@ -30,7 +32,7 @@ use crate::{
     fs::{FileRef, IoctlContext, PathAnchor, PollEvents, VnodeKey, VnodeKind},
     mem::{self, USER_ADDRESS_MAX, USER_ADDRESS_MIN, VmSpace},
     sys::{
-        event::Event,
+        event::{Event, EventListener},
         sched,
         smp::IrqSpinLock,
         sync::{Mutex, Once},
@@ -128,6 +130,8 @@ pub(crate) enum Descriptor {
     TimerFd(Arc<TimerFd>),
     /// Userspace notification counter.
     EventFd(Arc<EventFd>),
+    /// Local socket endpoint.
+    Unix(Arc<unix::UnixSocket>),
 }
 
 /// Stable identity of one open descriptor description.
@@ -140,6 +144,10 @@ pub(crate) struct DescriptorKey {
 impl Descriptor {
     pub(crate) fn key(&self) -> DescriptorKey {
         match self {
+            Self::Unix(value) => DescriptorKey {
+                kind: 7,
+                pointer: Arc::as_ptr(value) as usize,
+            },
             Self::File(value) => DescriptorKey {
                 kind: 0,
                 pointer: Arc::as_ptr(value) as usize,
@@ -173,6 +181,7 @@ impl Descriptor {
 
     pub(crate) fn poll(&self, requested: PollEvents) -> PollEvents {
         match self {
+            Self::Unix(socket) => socket.poll(requested),
             Self::File(file) => file.poll(requested).unwrap_or(PollEvents::ERR),
             Self::Pipe(pipe) => pipe.poll(requested),
             Self::SignalFd(signal_fd) => signal_fd.poll(requested),
@@ -189,6 +198,7 @@ impl Descriptor {
         output: &mut Vec<EventSource<'a>>,
     ) -> bool {
         match self {
+            Self::Unix(socket) => socket.poll_events(requested, output),
             Self::File(file) => file.poll_events(requested, output),
             Self::Pipe(pipe) => pipe.poll_events(requested, output),
             Self::SignalFd(signal_fd) => signal_fd.poll_events(requested, output),
@@ -218,13 +228,40 @@ struct ProcessRegistry {
     init: Weak<Process>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DescriptorLimit {
+    pub(crate) soft: usize,
+    pub(crate) hard: usize,
+}
+
+#[derive(Clone)]
+struct DescriptorTable {
+    slots: Vec<Option<DescriptorEntry>>,
+    limit: DescriptorLimit,
+}
+
+impl DescriptorTable {
+    fn available(&self, minimum: usize) -> impl Iterator<Item = usize> + '_ {
+        (minimum..self.limit.soft).filter(|&fd| self.slots.get(fd).is_none_or(Option::is_none))
+    }
+
+    fn insert(&mut self, index: usize, entry: DescriptorEntry) {
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.slots[index] = Some(entry);
+    }
+}
+
 /// Shared resources owned by one userspace process.
 pub(crate) struct Process {
     pid: usize,
     address_space: IrqSpinLock<Arc<VmSpace>>,
-    files: Mutex<Vec<Option<DescriptorEntry>>>,
+    executable: Mutex<Option<FileRef>>,
+    files: Mutex<DescriptorTable>,
     cwd: Mutex<WorkingDirectory>,
     parent: Mutex<Weak<Process>>,
+    parent_death_signal: AtomicU8,
     children: Mutex<BTreeMap<usize, Arc<Process>>>,
     child_event: Event,
     session: AtomicUsize,
@@ -234,6 +271,7 @@ pub(crate) struct Process {
     umask: AtomicU16,
     nice: AtomicI8,
     active_threads: AtomicUsize,
+    main_thread: AtomicUsize,
     exited: AtomicBool,
     exit_status: AtomicI32,
     wait_status: AtomicI32,
@@ -249,7 +287,7 @@ impl ProcessRegistry {
 }
 
 impl Process {
-    fn new_root(address_space: Arc<VmSpace>) -> Arc<Self> {
+    fn new_root(address_space: Arc<VmSpace>, executable: FileRef) -> Arc<Self> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         let cwd = WorkingDirectory {
             path: b"/".to_vec(),
@@ -258,9 +296,17 @@ impl Process {
         let process = Arc::new(Self {
             pid,
             address_space: IrqSpinLock::new(address_space),
-            files: Mutex::new(Vec::new()),
+            executable: Mutex::new(Some(executable)),
+            files: Mutex::new(DescriptorTable {
+                slots: Vec::new(),
+                limit: DescriptorLimit {
+                    soft: MAX_FILES,
+                    hard: MAX_FILES,
+                },
+            }),
             cwd: Mutex::new(cwd),
             parent: Mutex::new(Weak::new()),
+            parent_death_signal: AtomicU8::new(0),
             children: Mutex::new(BTreeMap::new()),
             child_event: Event::new(),
             session: AtomicUsize::new(pid),
@@ -270,24 +316,28 @@ impl Process {
             umask: AtomicU16::new(DEFAULT_UMASK),
             nice: AtomicI8::new(0),
             active_threads: AtomicUsize::new(0),
+            main_thread: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
             wait_status: AtomicI32::new(0),
         });
+        cgroup::register(&process, None).expect("proc: register root cgroup");
         let mut registry = process_registry().lock();
         registry.init = Arc::downgrade(&process);
         registry.processes.insert(pid, Arc::downgrade(&process));
         process
     }
 
-    fn fork_from(parent: &Arc<Self>, address_space: Arc<VmSpace>) -> Arc<Self> {
+    fn fork_from(parent: &Arc<Self>, address_space: Arc<VmSpace>) -> Result<Arc<Self>> {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         let process = Arc::new(Self {
             pid,
             address_space: IrqSpinLock::new(address_space),
+            executable: Mutex::new(parent.executable()),
             files: Mutex::new(parent.files.lock().clone()),
             cwd: Mutex::new(parent.cwd.lock().clone()),
             parent: Mutex::new(Arc::downgrade(parent)),
+            parent_death_signal: AtomicU8::new(0),
             children: Mutex::new(BTreeMap::new()),
             child_event: Event::new(),
             session: AtomicUsize::new(parent.session()),
@@ -297,16 +347,18 @@ impl Process {
             umask: AtomicU16::new(parent.umask()),
             nice: AtomicI8::new(parent.nice()),
             active_threads: AtomicUsize::new(0),
+            main_thread: AtomicUsize::new(0),
             exited: AtomicBool::new(false),
             exit_status: AtomicI32::new(0),
             wait_status: AtomicI32::new(0),
         });
+        cgroup::register(&process, Some(parent.pid()))?;
         parent.children.lock().insert(pid, process.clone());
         process_registry()
             .lock()
             .processes
             .insert(pid, Arc::downgrade(&process));
-        process
+        Ok(process)
     }
 
     /// Returns this process's scheduler nice value.
@@ -324,9 +376,54 @@ impl Process {
         self.pid
     }
 
+    /// Returns the current parent, or zero when there is none.
+    pub(crate) fn parent_pid(&self) -> usize {
+        self.parent
+            .lock()
+            .upgrade()
+            .map_or(0, |parent| parent.pid())
+    }
+
+    /// Changes the signal sent when this process's parent exits. Fork clears
+    /// the setting, while exec preserves it under the native fixed-root model.
+    pub(crate) fn set_parent_death_signal(&self, signal: u8) {
+        // Serialize with adoption so a setting applies either before or after
+        // the parent changes. Signal delivery happens outside this lock.
+        let _parent = self.parent.lock();
+        self.parent_death_signal.store(signal, Ordering::Relaxed);
+    }
+
+    pub(crate) fn parent_death_signal(&self) -> u8 {
+        self.parent_death_signal.load(Ordering::Relaxed)
+    }
+
+    /// Snapshots occupied descriptor numbers without creating descriptor owners.
+    pub(crate) fn descriptor_numbers(&self) -> Vec<i32> {
+        self.files
+            .lock()
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, entry)| entry.as_ref().map(|_| fd as i32))
+            .collect()
+    }
+
+    /// Reads a description and its close-on-exec bit under one table lock.
+    pub(crate) fn descriptor_info(&self, fd: i32) -> Option<(Descriptor, bool)> {
+        let index = usize::try_from(fd).ok()?;
+        let files = self.files.lock();
+        let entry = files.slots.get(index)?.as_ref()?;
+        Some((entry.descriptor.clone(), entry.close_on_exec))
+    }
+
     /// Returns the process address space.
     pub(crate) fn address_space(&self) -> Arc<VmSpace> {
         self.address_space.lock().clone()
+    }
+
+    /// Returns the file used to load the current executable image.
+    pub(crate) fn executable(&self) -> Option<FileRef> {
+        self.executable.lock().clone()
     }
 
     fn replace_address_space(&self, space: Arc<VmSpace>) -> Arc<VmSpace> {
@@ -430,29 +527,44 @@ impl Process {
         self.cwd.lock().anchor.clone()
     }
 
-    fn install_descriptor(&self, entry: DescriptorEntry, minimum: usize) -> Result<i32> {
-        if minimum >= MAX_FILES {
-            return Err(Error::TooManyFiles);
+    /// Snapshots the old limit and commits the new one only after successful copyout.
+    pub(crate) fn update_descriptor_limit(
+        &self,
+        new: Option<DescriptorLimit>,
+        publish: impl FnOnce(DescriptorLimit) -> crate::syscall::Result<()>,
+    ) -> crate::syscall::Result<()> {
+        use crate::syscall::Errno;
+        if let Some(limit) = new {
+            if limit.soft > limit.hard {
+                return Err(Errno::Invalid);
+            }
+            if limit.hard > MAX_FILES {
+                return Err(Errno::Permission);
+            }
         }
         let mut files = self.files.lock();
-        if files.len() < minimum {
-            files.resize(minimum, None);
+        publish(files.limit)?;
+        if let Some(limit) = new {
+            files.limit = limit;
         }
-        if let Some((index, slot)) = files
-            .iter_mut()
-            .enumerate()
-            .skip(minimum)
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(entry);
-            return i32::try_from(index).map_err(|_| Error::TooManyFiles);
-        }
-        if files.len() >= MAX_FILES {
-            return Err(Error::TooManyFiles);
-        }
-        let fd = i32::try_from(files.len()).map_err(|_| Error::TooManyFiles)?;
-        files.push(Some(entry));
-        Ok(fd)
+        Ok(())
+    }
+
+    fn install_descriptor(&self, entry: DescriptorEntry, minimum: usize) -> Result<i32> {
+        self.install_descriptor_from(minimum, || entry)
+    }
+
+    // Construct ownership only after a slot is available. A failed installation
+    // must not close a socket still owned by a listener's pending queue.
+    fn install_descriptor_from(
+        &self,
+        minimum: usize,
+        make: impl FnOnce() -> DescriptorEntry,
+    ) -> Result<i32> {
+        let mut files = self.files.lock();
+        let index = files.available(minimum).next().ok_or(Error::TooManyFiles)?;
+        files.insert(index, make());
+        Ok(index as i32)
     }
 
     /// Installs an open file and returns its new descriptor number.
@@ -473,14 +585,11 @@ impl Process {
         descriptor: Descriptor,
         close_on_exec: bool,
     ) -> Result<i32> {
-        self.install_descriptor(
-            DescriptorEntry {
-                handle: OpenHandle::new(),
-                descriptor,
-                close_on_exec,
-            },
-            0,
-        )
+        self.install_descriptor_from(0, || DescriptorEntry {
+            handle: OpenHandle::for_descriptor(&descriptor),
+            descriptor,
+            close_on_exec,
+        })
     }
 
     /// Returns a cloned descriptor table entry.
@@ -488,6 +597,7 @@ impl Process {
         let index = usize::try_from(fd).ok()?;
         self.files
             .lock()
+            .slots
             .get(index)?
             .as_ref()
             .map(|entry| entry.descriptor.clone())
@@ -503,6 +613,7 @@ impl Process {
             .map(|fd| {
                 let index = usize::try_from(*fd).ok()?;
                 files
+                    .slots
                     .get(index)?
                     .as_ref()
                     .map(|entry| entry.descriptor.clone())
@@ -514,7 +625,7 @@ impl Process {
     pub(crate) fn watch_target(&self, fd: i32) -> Option<(Descriptor, Arc<DescriptorLife>)> {
         let index = usize::try_from(fd).ok()?;
         let files = self.files.lock();
-        let entry = files.get(index)?.as_ref()?;
+        let entry = files.slots.get(index)?.as_ref()?;
         Some((entry.descriptor.clone(), entry.handle.life()))
     }
 
@@ -529,6 +640,7 @@ impl Process {
         let mut entry = self
             .files
             .lock()
+            .slots
             .get(index)
             .and_then(Option::as_ref)
             .cloned()
@@ -546,11 +658,9 @@ impl Process {
     ) -> Result<i32> {
         let old_index = usize::try_from(old_fd).map_err(|_| Error::BadFileDescriptor)?;
         let new_index = usize::try_from(new_fd).map_err(|_| Error::InvalidArgument)?;
-        if new_index >= MAX_FILES {
-            return Err(Error::TooManyFiles);
-        }
         let mut files = self.files.lock();
         let mut entry = files
+            .slots
             .get(old_index)
             .and_then(Option::as_ref)
             .cloned()
@@ -558,11 +668,11 @@ impl Process {
         if old_index == new_index {
             return Ok(new_fd);
         }
-        if files.len() <= new_index {
-            files.resize(new_index + 1, None);
+        if new_index >= files.limit.soft {
+            return Err(Error::TooManyFiles);
         }
         entry.close_on_exec = close_on_exec;
-        files[new_index] = Some(entry);
+        files.insert(new_index, entry);
         Ok(new_fd)
     }
 
@@ -571,6 +681,7 @@ impl Process {
         let index = usize::try_from(fd).ok()?;
         self.files
             .lock()
+            .slots
             .get(index)?
             .as_ref()
             .map(|entry| entry.close_on_exec)
@@ -582,7 +693,7 @@ impl Process {
             return false;
         };
         let mut files = self.files.lock();
-        let Some(Some(entry)) = files.get_mut(index) else {
+        let Some(Some(entry)) = files.slots.get_mut(index) else {
             return false;
         };
         entry.close_on_exec = value;
@@ -595,14 +706,14 @@ impl Process {
             return false;
         };
         let mut files = self.files.lock();
-        let Some(slot) = files.get_mut(index) else {
+        let Some(slot) = files.slots.get_mut(index) else {
             return false;
         };
         slot.take().is_some()
     }
 
     fn close_exec_descriptors(&self) {
-        for slot in self.files.lock().iter_mut() {
+        for slot in self.files.lock().slots.iter_mut() {
             if slot.as_ref().is_some_and(|entry| entry.close_on_exec) {
                 *slot = None;
             }
@@ -666,8 +777,15 @@ impl Process {
         self.exited.load(Ordering::Acquire)
     }
 
-    pub(crate) fn register_thread(&self) {
+    pub(crate) fn register_thread(&self, tid: usize) {
+        let _ = self
+            .main_thread
+            .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire);
         self.active_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn main_thread(&self) -> usize {
+        self.main_thread.load(Ordering::Acquire)
     }
 
     fn unregister_thread(&self) -> bool {
@@ -676,7 +794,7 @@ impl Process {
         previous == 1
     }
 
-    fn thread_count(&self) -> usize {
+    pub(crate) fn thread_count(&self) -> usize {
         self.active_threads.load(Ordering::Acquire)
     }
 
@@ -684,12 +802,11 @@ impl Process {
         self.exit_status.load(Ordering::Acquire)
     }
 
-    fn matches_wait(&self, selector: isize, caller_group: usize) -> bool {
+    fn matches_wait(&self, selector: WaitSelector) -> bool {
         match selector {
-            value if value > 0 => self.pid == value as usize,
-            -1 => true,
-            0 => self.process_group() == caller_group,
-            value => self.process_group() == value.unsigned_abs(),
+            WaitSelector::All => true,
+            WaitSelector::Process(pid) => self.pid == pid,
+            WaitSelector::Group(group) => self.process_group() == group,
         }
     }
 
@@ -716,7 +833,10 @@ impl Process {
         self.reparent_children();
 
         let parent = self.parent.lock().upgrade();
-        self.files.lock().clear();
+        let executable = self.executable.lock().take();
+        drop(executable);
+        self.files.lock().slots.clear();
+        cgroup::exited(self.pid);
         if let Some(parent) = &parent {
             let _children = parent.children.lock();
             self.exit_status.store(encoded_status, Ordering::Release);
@@ -740,19 +860,25 @@ impl Process {
             return;
         }
         let init = process_registry().lock().init.upgrade();
-        let Some(init) = init.filter(|init| !Arc::ptr_eq(init, self)) else {
-            for child in children.into_values() {
-                *child.parent.lock() = Weak::new();
-            }
-            return;
-        };
+        let init = init.filter(|init| !Arc::ptr_eq(init, self));
         for (pid, child) in children {
-            let mut parent = child.parent.lock();
-            let mut init_children = init.children.lock();
-            *parent = Arc::downgrade(&init);
-            init_children.insert(pid, child.clone());
-            if child.is_exited() {
+            let death_signal = {
+                let mut parent = child.parent.lock();
+                *parent = init.as_ref().map_or_else(Weak::new, Arc::downgrade);
+                if let Some(init) = &init {
+                    init.children.lock().insert(pid, child.clone());
+                }
+                child.parent_death_signal()
+            };
+            // Both wakeups can reschedule immediately. Release process locks
+            // before a waiter or signal handler can inspect the child.
+            if let Some(init) = &init
+                && child.is_exited()
+            {
                 init.child_event.signal();
+            }
+            if death_signal != 0 && !child.is_exited() {
+                signal::send_kernel(&child, death_signal);
             }
         }
     }
@@ -774,11 +900,22 @@ fn process_registry() -> &'static Mutex<ProcessRegistry> {
 
 fn unregister_process(pid: usize) {
     process_registry().lock().processes.remove(&pid);
+    cgroup::reaped(pid);
 }
 
 /// Finds one live or zombie process by identifier.
 pub(crate) fn find(pid: usize) -> Option<Arc<Process>> {
     process_registry().lock().processes.get(&pid)?.upgrade()
+}
+
+/// Snapshots registered process numbers. A process may exit after this returns.
+pub(crate) fn process_ids() -> Vec<usize> {
+    process_registry()
+        .lock()
+        .processes
+        .iter()
+        .filter_map(|(pid, process)| (process.strong_count() != 0).then_some(*pid))
+        .collect()
 }
 
 /// Loads and schedules `/sbin/init`.
@@ -788,7 +925,7 @@ pub fn spawn_init() -> Result<usize> {
         &[b"/sbin/init".as_slice()],
         &[b"PATH=/usr/bin:/bin".as_slice(), b"HOME=/".as_slice()],
     )?;
-    let process = Process::new_root(image.address_space);
+    let process = Process::new_root(image.address_space, image.executable);
     let pid = process.pid();
     let tid = sched::run_user(process, image.entry, image.stack);
     info!("started /sbin/init as pid {pid}, tid {tid}");
@@ -829,7 +966,7 @@ pub(crate) fn set_current_thread_pointer(pointer: u64) -> Result<()> {
 pub(crate) fn fork_current(frame: &TrapFrame) -> Result<usize> {
     let parent = current().ok_or(Error::InvalidArgument)?;
     let child_space = parent.address_space().fork()?;
-    let child = Process::fork_from(&parent, child_space);
+    let child = Process::fork_from(&parent, child_space)?;
     let pid = child.pid();
     sched::run_forked_user(child, frame, current_thread_pointer());
     Ok(pid)
@@ -871,8 +1008,13 @@ pub(crate) fn exec_current(
     let previous = process.replace_address_space(image.address_space.clone());
     mem::install_current_space(image.address_space);
     drop(previous);
+    let previous = process.executable.lock().replace(image.executable);
+    drop(previous);
     process.close_exec_descriptors();
     process.signals.reset_for_exec();
+    process
+        .main_thread
+        .store(crate::arch::thiscpu().current_thread, Ordering::Release);
     set_current_thread_pointer(0)?;
     // SAFETY: `frame` is the current thread's live syscall frame.
     unsafe {
@@ -883,53 +1025,88 @@ pub(crate) fn exec_current(
     Ok(())
 }
 
-/// Waits for and reaps one matching child process.
+/// Process selection shared by waitpid and waitid. Group 1 is distinct from all.
+#[derive(Clone, Copy)]
+pub(crate) enum WaitSelector {
+    All,
+    Process(usize),
+    Group(usize),
+}
+
+/// Child events to report and whether observing them consumes their status.
+pub(crate) struct WaitOptions {
+    pub(crate) nohang: bool,
+    pub(crate) exited: bool,
+    pub(crate) stopped: bool,
+    pub(crate) continued: bool,
+    pub(crate) nowait: bool,
+}
+
+/// Waits for a matching child event. Delivery precedes consumption under the
+/// children lock, so a failed user copy does not lose a zombie or stop report.
+/// The callback must not enter process lifecycle operations.
 pub(crate) fn wait_current(
-    selector: isize,
-    nohang: bool,
-    untraced: bool,
-    continued: bool,
+    selector: WaitSelector,
+    options: WaitOptions,
+    mut deliver: impl FnMut(Option<(usize, i32)>) -> Result<()>,
 ) -> Result<Option<(usize, i32)>> {
-    if selector < -1 && selector == isize::MIN {
-        return Err(Error::InvalidArgument);
-    }
     let parent = current().ok_or(Error::InvalidArgument)?;
     loop {
+        // Preserve notifications through the scan/park gap even if another
+        // waiter resets the shared level while waiting for different events.
+        let listeners = [
+            parent.child_event.listen(),
+            parent.interrupt_event().listen(),
+        ];
         let reaped = {
             let mut children = parent.children.lock();
             let mut matching = false;
             let mut exited = None;
             for (pid, child) in children.iter() {
-                if !child.matches_wait(selector, parent.process_group()) {
+                if !child.matches_wait(selector) {
                     continue;
                 }
                 matching = true;
                 if child.is_exited() {
-                    exited = Some(*pid);
-                    break;
+                    if options.exited {
+                        exited = Some(*pid);
+                        break;
+                    }
+                    continue;
                 }
                 let status = child.wait_status.load(Ordering::Acquire);
-                if ((untraced && status & 0xff == 0x7f) || (continued && status == 0xffff))
-                    && child
-                        .wait_status
-                        .compare_exchange(status, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
+                if (options.stopped && status & 0xff == 0x7f)
+                    || (options.continued && status == 0xffff)
                 {
-                    return Ok(Some((*pid, status)));
+                    deliver(Some((*pid, status)))?;
+                    if options.nowait
+                        || child
+                            .wait_status
+                            .compare_exchange(status, 0, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        return Ok(Some((*pid, status)));
+                    }
                 }
             }
             if !matching {
                 return Err(Error::NoChild);
             }
             if let Some(pid) = exited {
-                let child = children
+                let status = children[&pid].encoded_exit_status();
+                deliver(Some((pid, status)))?;
+                if options.nowait {
+                    return Ok(Some((pid, status)));
+                }
+                children
                     .remove(&pid)
                     .expect("proc: selected child vanished before reap");
                 if !children.values().any(|child| child.is_exited()) {
                     parent.child_event.reset();
                 }
-                Some((pid, child.encoded_exit_status()))
-            } else if nohang {
+                Some((pid, status))
+            } else if options.nohang {
+                deliver(None)?;
                 return Ok(None);
             } else {
                 parent.child_event.reset();
@@ -943,7 +1120,7 @@ pub(crate) fn wait_current(
         if parent.prepare_interrupt_wait() {
             return Err(Error::Interrupted);
         }
-        Event::wait_any(&[&parent.child_event, parent.interrupt_event()]);
+        EventListener::wait_any(&listeners);
     }
 }
 

@@ -101,9 +101,8 @@ impl TimerState {
                 let count = elapsed + 1;
                 self.deadline_ns = self
                     .interval_ns
-                    .checked_mul(count)
-                    .and_then(|elapsed| self.deadline_ns.checked_add(elapsed))
-                    .unwrap_or(0);
+                    .saturating_mul(count)
+                    .saturating_add(self.deadline_ns);
                 count
             }
         };
@@ -143,10 +142,7 @@ impl TimerFd {
         } else if absolute {
             value_ns
         } else {
-            clock
-                .monotonic_ns
-                .checked_add(value_ns)
-                .ok_or(Errno::Overflow)?
+            clock.monotonic_ns.saturating_add(value_ns)
         };
         state.refresh(clock);
         let previous = state.setting(clock);
@@ -181,10 +177,15 @@ impl TimerFd {
         if sink.len() < size_of::<u64>() {
             return Err(Errno::Invalid);
         }
+        let process = current_process()?;
         loop {
             // Capture notifications before sampling state and clock. A settime
             // or discontinuity in the scan/park gap must not be lost.
-            let listeners = [self.changed.listen(), clock::realtime_changed().listen()];
+            let listeners = [
+                self.changed.listen(),
+                process.interrupt_event().listen(),
+                clock::realtime_changed().listen(),
+            ];
             let wake_deadline = {
                 let mut state = self.state.lock();
                 let clock = clock::clock_snapshot();
@@ -214,8 +215,11 @@ impl TimerFd {
             let listeners = if self.clock_id == CLOCK_REALTIME {
                 &listeners[..]
             } else {
-                &listeners[..1]
+                &listeners[..2]
             };
+            if process.is_exited() || process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
             if let Some(deadline) = wake_deadline {
                 let remaining = deadline.saturating_sub(clock::monotonic_ns());
                 let _ = clock::wait_listeners_timeout(
@@ -368,10 +372,12 @@ fn decode_timespec(bytes: &[u8]) -> Result<u64> {
     if seconds < 0 || !(0..NANOSECONDS_PER_SECOND as i64).contains(&nanoseconds) {
         return Err(Errno::Invalid);
     }
-    (seconds as u64)
-        .checked_mul(NANOSECONDS_PER_SECOND)
-        .and_then(|value| value.checked_add(nanoseconds as u64))
-        .ok_or(Errno::Overflow)
+    // A valid time_t can exceed the clock's nanosecond range. Keep a distant
+    // timer armed at the latest representable instant, including systemd's
+    // TIME_T_MAX clock-change watcher. Invalid timespecs still fail above.
+    Ok((seconds as u64)
+        .saturating_mul(NANOSECONDS_PER_SECOND)
+        .saturating_add(nanoseconds as u64))
 }
 
 fn encode_timespec(bytes: &mut [u8], nanoseconds: u64) {

@@ -78,6 +78,7 @@ struct TmpfsNode {
 }
 
 enum TmpfsData {
+    Socket,
     // Shared reads may fault and copy concurrently. Length-changing writes,
     // append and truncate remain exclusive to preserve their ordering.
     File(RwLock<TmpfsFile>),
@@ -185,6 +186,7 @@ impl Tmpfs {
         let id = NodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
         let now_ns = clock::monotonic_ns();
         let (vnode_kind, size, links, data) = match kind {
+            CreateKind::Socket => (VnodeKind::Socket, 0, 1, TmpfsData::Socket),
             CreateKind::Regular => (
                 VnodeKind::Regular,
                 0,
@@ -265,6 +267,8 @@ impl FileSystem for Tmpfs {
 
     fn statfs(&self) -> StatFs {
         StatFs {
+            filesystem_type: 0x0102_1994,
+            block_size: PAGE_SIZE,
             total_bytes: self
                 .page_account
                 .limit()
@@ -293,7 +297,7 @@ impl TmpfsNode {
         match &self.data {
             TmpfsData::File(file) => Ok(file),
             TmpfsData::Directory(_) => Err(Error::IsDirectory),
-            TmpfsData::Symlink(_) => Err(Error::InvalidArgument),
+            TmpfsData::Symlink(_) | TmpfsData::Socket => Err(Error::InvalidArgument),
         }
     }
 
@@ -421,6 +425,14 @@ impl TmpfsNode {
 }
 
 impl VnodeOps for TmpfsNode {
+    fn open(&self, _vnode: &Vnode, _flags: u32) -> Result<usize> {
+        if self.kind == VnodeKind::Socket {
+            Err(Error::Unsupported)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

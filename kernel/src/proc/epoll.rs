@@ -415,6 +415,9 @@ crate::syscall_handler! {
             return Err(Errno::Invalid);
         };
         let (descriptor, life) = process.watch_target(fd).ok_or(Errno::BadFileDescriptor)?;
+        if matches!(&descriptor, Descriptor::File(file) if file.is_path()) {
+            return Err(Errno::BadFileDescriptor);
+        }
         let event = if operation == EPOLL_CTL_DEL {
             None
         } else {

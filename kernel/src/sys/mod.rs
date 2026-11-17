@@ -6,6 +6,7 @@
 //!
 
 pub mod clock;
+pub(crate) mod cmdline;
 pub mod context;
 pub mod event;
 pub mod executor;
@@ -15,6 +16,7 @@ pub mod klog;
 pub mod lockdep;
 pub mod panic;
 mod parking;
+mod power;
 pub mod random;
 pub mod sched;
 pub mod service;

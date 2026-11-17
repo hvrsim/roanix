@@ -870,9 +870,9 @@ impl Scheduler {
     }
 
     fn spawn_user(&self, process: Arc<Process>, entry: u64, stack: u64) -> usize {
-        process.register_thread();
         let cpu_id = self.pick_spawn_cpu();
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        process.register_thread(tid);
         let thread = allocate_user_thread(
             tid,
             cpu_id,
@@ -894,9 +894,9 @@ impl Scheduler {
         stack: u64,
         thread_pointer: u64,
     ) -> usize {
-        process.register_thread();
         let cpu_id = self.pick_spawn_cpu();
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        process.register_thread(tid);
         let thread = allocate_user_thread(
             tid,
             cpu_id,
@@ -919,9 +919,9 @@ impl Scheduler {
         parent_frame: &TrapFrame,
         thread_pointer: u64,
     ) -> usize {
-        process.register_thread();
         let cpu_id = self.pick_spawn_cpu();
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        process.register_thread(tid);
         let thread = allocate_forked_user_thread(
             tid,
             cpu_id,

@@ -268,22 +268,111 @@ crate::syscall_handler! {
             return Err(Errno::Invalid);
         }
         let selector = isize::try_from(selector).map_err(|_| Errno::Invalid)?;
-        let Some((pid, encoded_status)) =
-            proc::wait_current(selector, flags & WNOHANG != 0,
-                flags & WUNTRACED != 0, flags & WCONTINUED != 0).map_err(map_process_error)?
-        else {
-            return Ok(0);
+        let process = current_process()?;
+        let selector = match selector {
+            isize::MIN => return Err(Errno::Invalid),
+            -1 => proc::WaitSelector::All,
+            0 => proc::WaitSelector::Group(process.process_group()),
+            pid if pid > 0 => proc::WaitSelector::Process(pid as usize),
+            group => proc::WaitSelector::Group(group.unsigned_abs()),
         };
-        if status != 0 {
-            current_process()?
-                .address_space()
-                .write_user(
-                    crate::mem::VirtAddr::new(status),
-                    &encoded_status.to_ne_bytes(),
-                )
-                .map_err(map_memory_error)?;
-        }
+        let event = proc::wait_current(selector, proc::WaitOptions {
+            nohang: flags & WNOHANG != 0, exited: true,
+            stopped: flags & WUNTRACED != 0, continued: flags & WCONTINUED != 0,
+            nowait: false,
+        }, |event| {
+            if status != 0 && let Some((_, encoded_status)) = event {
+                process.address_space().write_user(
+                    crate::mem::VirtAddr::new(status), &encoded_status.to_ne_bytes())?;
+            }
+            Ok(())
+        }).map_err(map_process_error)?;
+        let Some((pid, _)) = event else { return Ok(0); };
         Ok(pid as u64)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_process_waitid(_frame, kind: u64 = 0, id: u64 = 1, flags: u64 = 2, output: u64 = 3) {
+        const WEXITED: u64 = 4;
+        const WNOWAIT: u64 = 0x0100_0000;
+        let events = WEXITED | WUNTRACED | WCONTINUED;
+        if flags & !(events | WNOHANG | WNOWAIT) != 0 || flags & events == 0 {
+            return Err(Errno::Invalid);
+        }
+        if output == 0 { return Err(Errno::Fault); }
+        let process = current_process()?;
+        let id = usize::try_from(id).map_err(|_| Errno::Invalid)?;
+        let selector = match kind {
+            0 => proc::WaitSelector::All,
+            1 if id != 0 => proc::WaitSelector::Process(id),
+            2 => proc::WaitSelector::Group(if id == 0 { process.process_group() } else { id }),
+            _ => return Err(Errno::Invalid),
+        };
+        proc::wait_current(selector, proc::WaitOptions {
+            nohang: flags & WNOHANG != 0, exited: flags & WEXITED != 0,
+            stopped: flags & WUNTRACED != 0, continued: flags & WCONTINUED != 0,
+            nowait: flags & WNOWAIT != 0,
+        }, |event| {
+            // Native 16-byte record: u64 pid, i32 wait status, reserved u32.
+            // Libc constructs siginfo_t; its padding/layout is not kernel ABI.
+            let (pid, status) = event.unwrap_or((0, 0));
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(pid as u64).to_ne_bytes());
+            bytes[8..12].copy_from_slice(&status.to_ne_bytes());
+            process.address_space().write_user(crate::mem::VirtAddr::new(output), &bytes)?;
+            Ok(())
+        }).map_err(map_process_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_process_nofile(_frame, pid: i32 = 0, new_limit: u64 = 1, old_limit: u64 = 2) {
+        use crate::mem::VirtAddr;
+
+        let caller = current_process()?;
+        let target = match pid {
+            0 => caller.clone(),
+            1.. => proc::find(pid as usize).ok_or(Errno::NoProcess)?,
+            _ => return Err(Errno::Invalid),
+        };
+        let space = caller.address_space();
+        // Native ABI: two u64 values, soft followed by hard.
+        let new = if new_limit == 0 {
+            None
+        } else {
+            let mut bytes = [0; 16];
+            space.read_user(VirtAddr::new(new_limit), &mut bytes).map_err(map_memory_error)?;
+            Some(proc::DescriptorLimit {
+                soft: u64::from_ne_bytes(bytes[..8].try_into().unwrap()) as usize,
+                hard: u64::from_ne_bytes(bytes[8..].try_into().unwrap()) as usize,
+            })
+        };
+        target.update_descriptor_limit(new, |old| {
+            if old_limit != 0 {
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&(old.soft as u64).to_ne_bytes());
+                bytes[8..].copy_from_slice(&(old.hard as u64).to_ne_bytes());
+                space.write_user(VirtAddr::new(old_limit), &bytes).map_err(map_memory_error)?;
+            }
+            Ok(())
+        })?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_process_parent_signal(_frame, operation: u64 = 0, value: u64 = 1) {
+        let process = current_process()?;
+        match operation {
+            0 => Ok(u64::from(process.parent_death_signal())),
+            1 if value <= 64 => {
+                process.set_parent_death_signal(value as u8);
+                Ok(0)
+            }
+            _ => Err(Errno::Invalid),
+        }
     }
 }
 
@@ -344,6 +433,12 @@ crate::syscall_handler! {
 crate::syscall_handler! {
     syscall_process_gettid(_frame) {
         Ok(crate::arch::thiscpu().current_thread as u64)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_process_getmain_tid(_frame) {
+        Ok(current_process()?.main_thread() as u64)
     }
 }
 

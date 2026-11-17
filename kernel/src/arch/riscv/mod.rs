@@ -40,6 +40,7 @@ const DEBUG_EXT_ID: usize = 0x4442434E;
 const SBI_EXT_IPI: usize = 0x735049;
 const SBI_EXT_IPI_SEND: usize = 0;
 const SBI_LEGACY_SEND_IPI: usize = 0x04;
+const SBI_EXT_SRST: usize = 0x5352_5354;
 
 /// Result tuple returned by an SBI call.
 #[derive(Copy, Clone)]
@@ -243,6 +244,22 @@ pub fn wfi() {
     unsafe {
         asm!("wfi", options(nomem, nostack, preserves_flags));
     }
+}
+
+/// Disable local wake sources before permanently parking this hart.
+pub(crate) fn mask_halt_interrupts() {
+    // SAFETY: SIE is a hart-local supervisor CSR. The halt path has already
+    // disabled supervisor interrupts and will never resume the current task.
+    unsafe {
+        asm!("csrw sie, zero", options(nomem, nostack));
+    }
+}
+
+/// Request a cold reboot or shutdown through the SBI System Reset extension.
+pub(crate) fn system_reset(cold_reboot: bool) -> isize {
+    const RESET: usize = 0;
+    const NO_REASON: usize = 0;
+    sbi_call3(usize::from(cold_reboot), NO_REASON, 0, SBI_EXT_SRST, RESET).error
 }
 
 /// Synchronizes newly written executable code with local instruction fetch.

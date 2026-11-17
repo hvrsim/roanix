@@ -42,6 +42,8 @@ bitflags! {
         const NONBLOCK  = 1 << 8;
         /// Do not acquire a controlling terminal.
         const NOCTTY    = 1 << 9;
+        /// Retain a namespace location without opening the underlying node.
+        const PATH      = 1 << 10;
     }
 }
 
@@ -63,7 +65,7 @@ pub enum SeekFrom {
 pub struct OpenFile {
     anchor: PathAnchor,
     flags: AtomicU32,
-    file_context: usize,
+    file_context: Option<usize>,
     offset: FileOffset,
 }
 
@@ -127,6 +129,14 @@ impl FileOffset {
 
 impl OpenFile {
     pub(crate) fn new(anchor: PathAnchor, flags: OpenFlags) -> Result<FileRef> {
+        if flags.contains(OpenFlags::PATH) {
+            return Ok(Arc::new(Self {
+                anchor,
+                offset: FileOffset::new(VnodeKind::Regular, 0),
+                flags: AtomicU32::new(flags.bits()),
+                file_context: None,
+            }));
+        }
         let vnode = anchor.vnode();
         let file_context = vnode.open(flags.bits())?;
         // Truncation happens only once the filesystem has accepted the open, so
@@ -150,8 +160,17 @@ impl OpenFile {
             anchor,
             offset: FileOffset::new(kind, offset),
             flags: AtomicU32::new(flags.bits()),
-            file_context,
+            file_context: Some(file_context),
         }))
+    }
+
+    /// Path descriptions have no device or filesystem open context.
+    pub(crate) fn is_path(&self) -> bool {
+        self.file_context.is_none()
+    }
+
+    fn io_context(&self) -> Result<usize> {
+        self.file_context.ok_or(Error::BadFileDescriptor)
     }
 
     /// Returns the underlying vnode.
@@ -162,6 +181,11 @@ impl OpenFile {
     /// Returns the stable namespace location used for directory-relative lookup.
     pub(crate) fn path_anchor(&self) -> PathAnchor {
         self.anchor.clone()
+    }
+
+    /// Returns the shared position without changing it or invoking a device.
+    pub(crate) fn position(&self) -> u64 {
+        self.offset.poll_offset()
     }
 
     /// Returns open flags.
@@ -186,7 +210,7 @@ impl OpenFile {
         let mut offset = self.offset.read().lock();
         let read =
             self.vnode()
-                .read_at_with_flags(self.file_context, *offset, sink, flags.bits())?;
+                .read_at_with_flags(self.io_context()?, *offset, sink, flags.bits())?;
         *offset = offset.checked_add(read as u64).ok_or(Error::FileTooLarge)?;
         self.offset.publish_read(*offset);
         Ok(read)
@@ -207,7 +231,7 @@ impl OpenFile {
 
         let written =
             self.vnode()
-                .write_at_with_flags(self.file_context, *offset, source, flags.bits())?;
+                .write_at_with_flags(self.io_context()?, *offset, source, flags.bits())?;
         *offset = offset
             .checked_add(written as u64)
             .ok_or(Error::FileTooLarge)?;
@@ -216,10 +240,12 @@ impl OpenFile {
 
     /// Reads without changing the shared offset.
     pub fn read_at(&self, offset: u64, sink: &mut IoSink<'_>) -> Result<usize> {
-        if !self.flags().contains(OpenFlags::READ) {
+        let flags = self.flags();
+        if !flags.contains(OpenFlags::READ) {
             return Err(Error::BadFileDescriptor);
         }
-        self.vnode().read_at(offset, sink)
+        self.vnode()
+            .read_at_with_flags(self.io_context()?, offset, sink, flags.bits())
     }
 
     /// Writes without changing the shared offset.
@@ -232,6 +258,7 @@ impl OpenFile {
 
     /// Changes and returns the shared offset.
     pub fn seek(&self, from: SeekFrom) -> Result<u64> {
+        self.io_context()?;
         let mut offset = self.offset.seekable().ok_or(Error::IllegalSeek)?.lock();
         let base = match from {
             SeekFrom::Start(value) => {
@@ -262,6 +289,7 @@ impl OpenFile {
 
     /// Changes permission bits on the underlying vnode.
     pub fn set_mode(&self, mode: u16) -> Result<()> {
+        self.io_context()?;
         self.vnode().setattr(super::vnode::SetAttr {
             size: None,
             mode: Some(mode),
@@ -270,9 +298,12 @@ impl OpenFile {
 
     /// Returns requested events that are immediately ready.
     pub fn poll(&self, events: PollEvents) -> Result<PollEvents> {
+        let Some(context) = self.file_context else {
+            return Ok(PollEvents::NVAL);
+        };
         let offset = self.offset.poll_offset();
         self.vnode()
-            .poll_with_flags(self.file_context, offset, events, self.flags().bits())
+            .poll_with_flags(context, offset, events, self.flags().bits())
     }
 
     /// Appends events that can wake a readiness rescan.
@@ -281,6 +312,9 @@ impl OpenFile {
         mut events: PollEvents,
         output: &mut Vec<EventSource<'a>>,
     ) -> bool {
+        let Some(context) = self.file_context else {
+            return true;
+        };
         let flags = self.flags();
         if !flags.contains(OpenFlags::READ) {
             events.remove(PollEvents::IN | PollEvents::RDNORM);
@@ -288,11 +322,12 @@ impl OpenFile {
         if !flags.contains(OpenFlags::WRITE) {
             events.remove(PollEvents::OUT | PollEvents::WRNORM);
         }
-        self.vnode().poll_events(self.file_context, events, output)
+        self.vnode().poll_events(context, events, output)
     }
 
     /// Returns terminal job-control state for this open file.
     pub(crate) fn terminal_state(&self) -> Option<TerminalState> {
+        self.file_context?;
         self.vnode().terminal_state()
     }
 
@@ -303,7 +338,7 @@ impl OpenFile {
         length: u64,
     ) -> Result<(Arc<crate::mem::VmObject>, u64)> {
         self.vnode()
-            .mapping_object(self.file_context, offset, length)
+            .mapping_object(self.io_context()?, offset, length)
     }
 
     /// Performs a device- or filesystem-specific control operation.
@@ -315,11 +350,12 @@ impl OpenFile {
         argument: &mut [u8],
     ) -> Result<u64> {
         self.vnode()
-            .ioctl(self.file_context, context, request, value, argument)
+            .ioctl(self.io_context()?, context, request, value, argument)
     }
 
     /// Reads a directory batch using the shared offset as the directory cookie.
     pub fn readdir(&self, maximum: usize) -> Result<Vec<DirEntry>> {
+        self.io_context()?;
         if self.vnode().kind() != VnodeKind::Directory {
             return Err(Error::NotDirectory);
         }
@@ -332,7 +368,9 @@ impl OpenFile {
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        self.vnode()
-            .close(self.file_context, self.flags.load(Ordering::Relaxed));
+        if let Some(context) = self.file_context {
+            self.vnode()
+                .close(context, self.flags.load(Ordering::Relaxed));
+        }
     }
 }

@@ -1,0 +1,35 @@
+#! /bin/sh
+
+version=2.73
+revision=1
+tarball_url="https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-${version}.tar.xz"
+tarball_blake2b="c8ea9b8accc4034adfd31295ec9356dcce3ae46b3e532e089248c20d0f148de17c9a0525e9f15ac839f83351cdff9e0f9e91ee8966c34116ad1411917f9358b2"
+imagedeps="build-essential"
+hostdeps="gcc-host binutils"
+builddeps="linux-headers"
+deps="sys-libs"
+
+configure() {
+    cp -a "${source_dir}"/. .
+}
+
+cap_make() {
+    make -C libcap \
+        CROSS_COMPILE="${OS_TRIPLET}-" \
+        BUILD_CC=gcc \
+        BUILD_CFLAGS=-O2 \
+        prefix="${prefix}" lib=lib \
+        PAM_CAP=no GOLANG=no PTHREADS=no USE_GPERF=no \
+        COPTS="${TARGET_CFLAGS}" \
+        LDFLAGS="${TARGET_LDFLAGS}" \
+        "$@"
+}
+
+build() {
+    cap_make -j"${parallelism}"
+}
+
+package() {
+    cap_make FAKEROOT="${dest_dir}" install-shared-cap
+    post_package_strip
+}

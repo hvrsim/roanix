@@ -86,6 +86,27 @@ syscall_table:
     .quad syscall_thread_get_name
     .quad syscall_file_mount
     .quad syscall_eventfd_create
+    .quad syscall_file_statfs
+    .quad syscall_process_waitid
+    .quad syscall_socket_create
+    .quad syscall_socket_pair
+    .quad syscall_socket_bind
+    .quad syscall_socket_connect
+    .quad syscall_socket_name
+    .quad syscall_socket_option
+    .quad syscall_socket_shutdown
+    .quad syscall_socket_send
+    .quad syscall_socket_receive
+    .quad syscall_socket_listen
+    .quad syscall_socket_accept
+    .quad syscall_socket_peercred
+    .quad syscall_system_power
+    .quad syscall_file_umount_nofollow
+    .quad syscall_file_sync
+    .quad syscall_process_nofile
+    .quad syscall_process_parent_signal
+    .quad syscall_process_getmain_tid
+    .quad syscall_file_writev
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

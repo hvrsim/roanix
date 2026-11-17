@@ -1,0 +1,3 @@
+# Native boot services are pulled in explicitly by roanix.target.
+# Do not enable upstream Linux services during first-boot preset processing.
+disable *

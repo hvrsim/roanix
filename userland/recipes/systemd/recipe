@@ -1,0 +1,90 @@
+#! /bin/sh
+
+version=257
+revision=22
+tarball_url="https://github.com/systemd/systemd/archive/refs/tags/v${version}.tar.gz"
+tarball_blake2b="ada784bbad28f5bdcfb77d232f44d116b77f32df295aeb1b96416ebb37f7a702362fed5a4279d63602ca340687df2e257a917936a9bce12afe811e9f5181e328"
+imagedeps="build-essential python3-jinja2 gperf"
+hostdeps="gcc-host pkg-config"
+builddeps="linux-headers"
+deps="sys-libs libcap util-linux"
+
+configure() {
+    # Build PID 1, the service manager, systemctl, and journal tools. Native
+    # boot uses kmsg; optional Linux administration daemons stay disabled.
+    meson_configure \
+        -Dmode=release \
+        -Dauto_features=disabled \
+        -Dtests=false \
+        -Dtranslations=false \
+        -Dgshadow=false \
+        -Dsmack=false \
+        -Dima=false \
+        -Dipe=false \
+        -Dsplit-bin=false \
+        -Dsysvinit-path= \
+        -Dsysvrcnd-path= \
+        -Dutmp=false \
+        -Dhibernate=false \
+        -Dldconfig=false \
+        -Dresolve=false \
+        -Defi=false \
+        -Dtpm=false \
+        -Dinitrd=false \
+        -Dbinfmt=false \
+        -Dcoredump=false \
+        -Dpstore=false \
+        -Doomd=false \
+        -Dlogind=false \
+        -Dhostnamed=false \
+        -Dlocaled=false \
+        -Dmachined=false \
+        -Dportabled=false \
+        -Dsysext=false \
+        -Dmountfsd=false \
+        -Duserdb=false \
+        -Dnetworkd=false \
+        -Dtimedated=false \
+        -Dtimesyncd=false \
+        -Dnsresourced=false \
+        -Dnss-myhostname=false \
+        -Dnss-systemd=false \
+        -Dfirstboot=false \
+        -Drandomseed=false \
+        -Dbacklight=false \
+        -Dvconsole=false \
+        -Dquotacheck=false \
+        -Dsysusers=false \
+        -Dstoragetm=false \
+        -Dhwdb=false \
+        -Drfkill=false \
+        -Dxdg-autostart=false \
+        -Dkernel-install=false
+}
+
+build() {
+    ninja -j"${parallelism}"
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+    # Roanix's initramfs bootstrap owns init and mounts the real root before
+    # execing the manager. Do not replace it with systemd's compatibility link.
+    rm "${dest_dir}/usr/bin/init"
+    # Native APIs and devices exist before PID 1 starts. Upstream boot hooks
+    # depend on Linux sysfs, udev, writable /etc, or unsupported namespaces.
+    rm -r "${dest_dir}/usr/lib/systemd/system-generators"
+    for directory in "${dest_dir}"/usr/lib/systemd/system/*.wants; do
+        rm -r "$directory"
+    done
+    for unit in "${recipe_dir}"/units/*; do
+        install -Dm644 "$unit" "${dest_dir}/usr/lib/systemd/system/${unit##*/}"
+    done
+    rm "${dest_dir}/usr/lib/systemd/system/default.target"
+    ln -s roanix.target "${dest_dir}/usr/lib/systemd/system/default.target"
+    install -Dm644 "${recipe_dir}/roanix.preset" \
+        "${dest_dir}/usr/lib/systemd/system-preset/00-roanix.preset"
+    install -Dm644 "${recipe_dir}/roanix.conf" \
+        "${dest_dir}/usr/lib/systemd/system.conf.d/00-roanix.conf"
+    post_package_strip
+}

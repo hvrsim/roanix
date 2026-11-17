@@ -15,6 +15,217 @@ index 9b7d774..2bc5079 100644
  elif host_machine.system() == 'ironclad'
  	rtld_include_dirs += include_directories('sysdeps/ironclad/include')
  	libc_include_dirs += include_directories('sysdeps/ironclad/include')
+diff --git mlibc-clean/options/glibc/generic/printf.cpp mlibc-workdir/options/glibc/generic/printf.cpp
+index 4abb00d..2bffe59 100644
+--- mlibc-clean/options/glibc/generic/printf.cpp
++++ mlibc-workdir/options/glibc/generic/printf.cpp
+@@ -1,7 +1,100 @@
+-#include <bits/ensure.h>
+ #include <printf.h>
++#include <stdint.h>
++#include <stddef.h>
+-
++
+-size_t parse_printf_format(const char * __restrict, size_t, int * __restrict) {
+-	__ensure(!"Not implemented");
+-	__builtin_unreachable();
++namespace {
++bool digit(char c) { return c >= '0' && c <= '9'; }
++
++// Consume decimal digits without allowing a hostile positional index to wrap.
++bool number(const char *&cursor, size_t &value) {
++    value = 0;
++    bool valid = true;
++    while (digit(*cursor)) {
++        unsigned d = *cursor++ - '0';
++        if (value > (SIZE_MAX - d) / 10) valid = false;
++        else if (valid) value = value * 10 + d;
++    }
++    return valid;
++}
++
++// Return SIZE_MAX for a sequential argument; positions in the format are one based.
++size_t position(const char *&cursor) {
++    const char *start = cursor;
++    if (!digit(*cursor)) return SIZE_MAX;
++    size_t value;
++    bool valid = number(cursor, value);
++    if (*cursor == '$' && valid && value != 0) { ++cursor; return value - 1; }
++    cursor = start;
++    return SIZE_MAX;
++}
++int integer_size(size_t size) {
++    if (size > sizeof(int) && size == sizeof(long)) return PA_FLAG_LONG;
++    if (size > sizeof(int)) return PA_FLAG_LONG_LONG;
++    return 0;
++}
++}
++
++size_t parse_printf_format(const char *__restrict format, size_t capacity, int *__restrict types) {
++    size_t next = 0, total = 0;
++    auto argument = [&](size_t index, int type) {
++        if (index == SIZE_MAX) index = next++;
++        if (index < capacity) types[index] = type;
++        if (index + 1 > total) total = index + 1;
++    };
++    const char *p = format;
++    while (*p) {
++        if (*p++ != '%') continue;
++        if (*p == '%') { ++p; continue; }
++        size_t index = position(p);
++        while (*p && (*p == '#' || *p == '0' || *p == '-' || *p == ' ' ||
++                      *p == '+' || *p == '\'' || *p == 'I')) ++p;
++        if (*p == '*') { ++p; argument(position(p), PA_INT); }
++        else { size_t ignored; number(p, ignored); }
++        if (*p == '.') {
++            ++p;
++            if (*p == '*') { ++p; argument(position(p), PA_INT); }
++            else { size_t ignored; number(p, ignored); }
++        }
++        int modifier = 0;
++        bool long_double = false;
++        switch (*p) {
++            case 'h':
++                ++p;
++                if (*p == 'h') { ++p; modifier = PA_CHAR; }
++                else modifier = PA_FLAG_SHORT;
++                break;
++            case 'l':
++                ++p;
++                if (*p == 'l') { ++p; modifier = integer_size(sizeof(long long)); }
++                else modifier = integer_size(sizeof(long));
++                break;
++            // glibc's introspection treats legacy q/L integer conversions as
++            // PA_INT, while their floating conversions use long double.
++            case 'q': case 'L': ++p; long_double = true; break;
++            case 'j': ++p; modifier = integer_size(sizeof(intmax_t)); break;
++            case 'z': case 'Z': ++p; modifier = integer_size(sizeof(size_t)); break;
++            case 't': ++p; modifier = integer_size(sizeof(ptrdiff_t)); break;
++        }
++        if (!*p) break;
++        int type;
++        switch (*p++) {
++            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'b': case 'B':
++                type = modifier == PA_CHAR ? PA_CHAR : PA_INT | modifier;
++                break;
++            case 'c': type = PA_CHAR; break;
++            case 'C': type = PA_WCHAR; break;
++            case 's': type = PA_STRING; break;
++            case 'S': type = PA_WSTRING; break;
++            case 'p': type = PA_POINTER; break;
++            case 'n': type = PA_INT | PA_FLAG_PTR; break;
++            case 'e': case 'E': case 'f': case 'F': case 'g': case 'G': case 'a': case 'A':
++                type = PA_DOUBLE | (long_double ? PA_FLAG_LONG_DOUBLE : 0);
++                break;
++            // %% and GNU %m consume no value. Unknown conversions have no
++            // registered extension handler in mlibc, so consume no value either.
++            default: continue;
++        }
++        argument(index, type);
++    }
++    return total;
+ }
+diff --git mlibc-clean/options/internal/generic/getopt.cpp mlibc-workdir/options/internal/generic/getopt.cpp
+index bf8126b..b8ce2d4 100644
+--- mlibc-clean/options/internal/generic/getopt.cpp
++++ mlibc-workdir/options/internal/generic/getopt.cpp
+@@ -126,6 +126,11 @@ int getopt_common_internal(int argc, char * const argv[], const char *optstring,
+-		return frg::null_opt;
++		return frg::null_opt;
+-	};
++	};
+-
++
++	// GNU return-in-order mode treats positional arguments as option 1.
++	// The leading '-' selects the mode and is not a short option.
++	bool return_in_order = optstring[0] == '-';
++	if(return_in_order)
++		++optstring;
+-	bool colon = optstring[0] == ':';
++	bool colon = optstring[0] == ':';
+-	bool stop_at_first_nonarg = (optstring[0] == '+' || getenv("POSIXLY_CORRECT"));
++	bool stop_at_first_nonarg = (optstring[0] == '+' || getenv("POSIXLY_CORRECT"));
+-
++
+@@ -154,6 +159,12 @@ int getopt_common_internal(int argc, char * const argv[], const char *optstring,
+-				return -1;
++				return -1;
+-			}
++			}
+-
++
++			if(return_in_order) {
++				optarg = arg;
++				optind++;
++				return 1;
++			}
++
+-			if(stop_at_first_nonarg) {
++			if(stop_at_first_nonarg) {
+-				optarg = nullptr;
++				optarg = nullptr;
+-				return -1;
++				return -1;
+diff --git mlibc-clean/options/internal/include/mlibc/sysdep-signatures.hpp mlibc-workdir/options/internal/include/mlibc/sysdep-signatures.hpp
+index 35f023f..90ca671 100644
+--- mlibc-clean/options/internal/include/mlibc/sysdep-signatures.hpp
++++ mlibc-workdir/options/internal/include/mlibc/sysdep-signatures.hpp
+@@ -135,6 +135,7 @@ SYSDEP_FUNC(Pselect, int num_fds, fd_set *read_set, fd_set *write_set, fd_set *e
+ SYSDEP_FUNC(GetRusage, int scope, struct rusage *usage);
+ SYSDEP_FUNC(GetRlimit, int resource, struct rlimit *limit);
+ SYSDEP_FUNC(SetRlimit, int resource, const struct rlimit *limit);
++SYSDEP_FUNC(Prlimit, pid_t pid, int resource, const struct rlimit *new_limit, struct rlimit *old_limit);
+ SYSDEP_FUNC(GetPriority, int which, id_t who, int *value);
+ SYSDEP_FUNC(SetPriority, int which, id_t who, int prio);
+ SYSDEP_FUNC(GetSchedparam, void *tcb, int *policy, struct sched_param *param);
+diff --git mlibc-clean/options/internal/include/mlibc/sysdep-tags.hpp mlibc-workdir/options/internal/include/mlibc/sysdep-tags.hpp
+index 25d7520..edf1939 100644
+--- mlibc-clean/options/internal/include/mlibc/sysdep-tags.hpp
++++ mlibc-workdir/options/internal/include/mlibc/sysdep-tags.hpp
+@@ -294,6 +294,8 @@ struct GetRusage {};
+ struct GetRlimit {};
+ // int sys_setrlimit(int resource, const struct rlimit *limit);
+ struct SetRlimit {};
++// int sys_prlimit(pid_t pid, int resource, const struct rlimit *new_limit, struct rlimit *old_limit);
++struct Prlimit {};
+ // int sys_getpriority(int which, id_t who, int *value);
+ struct GetPriority {};
+ // int sys_setpriority(int which, id_t who, int prio);
+diff --git mlibc-clean/options/linux/generic/sched.cpp mlibc-workdir/options/linux/generic/sched.cpp
+index c7db3e0..c6c7402 100644
+--- mlibc-clean/options/linux/generic/sched.cpp
++++ mlibc-workdir/options/linux/generic/sched.cpp
+@@ -37,12 +37,22 @@ int unshare(int flags) {
+-	return 0;
++	return 0;
+ }
+-
++
+-int sched_setaffinity(pid_t, size_t, const cpu_set_t *) {
+-	__ensure(!"Not implemented");
+-	__builtin_unreachable();
++int sched_setaffinity(pid_t pid, size_t size, const cpu_set_t *mask) {
++    if (int e = mlibc::sysdep_or_enosys<SetAffinity>(pid, size, mask)) {
++        errno = e;
++        return -1;
++    }
++    return 0;
+ }
+-
++
+ int clone(int (*)(void *), void *, int, void *, ...) {
+-	__ensure(!"Not implemented");
+-	__builtin_unreachable();
++#ifdef __roanix__
++    // Native fork and pthread creation use their own sysdeps. Linux callback
++    // clones, particularly CLONE_FILES, cannot be emulated by ordinary fork.
++    errno = EOPNOTSUPP;
++    return -1;
++#else
++    __ensure(!"Not implemented");
++    __builtin_unreachable();
++#endif
+ }
 diff --git mlibc-clean/options/linux/generic/sys-fsuid.cpp mlibc-workdir/options/linux/generic/sys-fsuid.cpp
 index 653456c..1eecf0d 100644
 --- mlibc-clean/options/linux/generic/sys-fsuid.cpp
@@ -36,7 +247,7 @@ index 653456c..1eecf0d 100644
 +	return getegid();
  }
 diff --git mlibc-clean/options/posix/generic/sys-resource.cpp mlibc-workdir/options/posix/generic/sys-resource.cpp
-index 4ec13b1..d388bbd 100644
+index 4ec13b1..bacd6c8 100644
 --- mlibc-clean/options/posix/generic/sys-resource.cpp
 +++ mlibc-workdir/options/posix/generic/sys-resource.cpp
 @@ -11,6 +11,7 @@ int getpriority(int which, id_t who) {
@@ -47,6 +258,38 @@ index 4ec13b1..d388bbd 100644
  	}
  	return value;
  }
+@@ -55,7 +56,10 @@ int setrlimit(int resource, const struct rlimit *limit) {
+ [[gnu::alias("setrlimit")]] int setrlimit64(int resource, const struct rlimit *limit);
+ #endif /* !__MLIBC_LINUX_OPTION */
+-
++
+-int prlimit(pid_t, int, const struct rlimit *, struct rlimit *) {
+-	__ensure(!"Not implemented");
+-	__builtin_unreachable();
++int prlimit(pid_t pid, int resource, const struct rlimit *new_limit, struct rlimit *old_limit) {
++	if(int e = mlibc::sysdep_or_enosys<Prlimit>(pid, resource, new_limit, old_limit); e) {
++		errno = e;
++		return -1;
++	}
++	return 0;
+ }
+diff --git mlibc-clean/options/posix/generic/sys-uio.cpp mlibc-workdir/options/posix/generic/sys-uio.cpp
+index 6d11040..c09363e 100644
+--- mlibc-clean/options/posix/generic/sys-uio.cpp
++++ mlibc-workdir/options/posix/generic/sys-uio.cpp
+@@ -23,8 +23,6 @@ ssize_t readv(int fd, const struct iovec *iovs, int iovc) {
+ }
+-
++
+ ssize_t writev(int fd, const struct iovec *iovs, int iovc) {
+-	__ensure(iovc);
+-
+-	ssize_t written = 0;
++	ssize_t written = 0;
+-
++
+-	if constexpr (mlibc::IsImplemented<Writev>) {
++	if constexpr (mlibc::IsImplemented<Writev>) {
 diff --git mlibc-workdir/sysdeps/roanix/generic/entry.cpp mlibc-workdir/sysdeps/roanix/generic/entry.cpp
 new file mode 100644
 index 0000000..9e8955e
@@ -72,12 +315,308 @@ index 0000000..9e8955e
 +    );
 +    exit(result);
 +}
+diff --git mlibc-workdir/sysdeps/roanix/generic/sockets.cpp mlibc-workdir/sysdeps/roanix/generic/sockets.cpp
+new file mode 100644
+index 0000000..0cc493b
+--- /dev/null
++++ mlibc-workdir/sysdeps/roanix/generic/sockets.cpp
+@@ -0,0 +1,290 @@
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/uio.h>
++#include <mlibc/all-sysdeps.hpp>
++#include <roanix/syscall.h>
++
++namespace {
++long pointer(const void *p) { return static_cast<long>(reinterpret_cast<uintptr_t>(p)); }
++int error(long result) { return result < 0 && result >= -4095 ? static_cast<int>(-result) : 0; }
++
++int socket_type(int domain, int type, int protocol, unsigned *kind, unsigned *flags) {
++    if (domain != AF_UNIX) return EAFNOSUPPORT;
++    if (protocol != 0) return EPROTONOSUPPORT;
++    *kind = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
++    *flags = (type & SOCK_NONBLOCK ? 1 : 0) | (type & SOCK_CLOEXEC ? 2 : 0);
++    return 0;
++}
++int encode_address(const sockaddr *address, socklen_t size, roanix_socket_address *out) {
++    if (!address) return EFAULT;
++    if (size < sizeof(sa_family_t)) return EINVAL;
++    sa_family_t family;
++    memcpy(&family, address, sizeof(family));
++    *out = {};
++    if (family == AF_UNSPEC) { out->kind = 3; return 0; }
++    if (family != AF_UNIX) return EAFNOSUPPORT;
++    constexpr size_t prefix = offsetof(sockaddr_un, sun_path);
++    if (size < prefix || size > sizeof(sockaddr_un)) return EINVAL;
++    if (size == prefix) return 0;
++    const char *name = reinterpret_cast<const char *>(address) + prefix;
++    size_t length = size - prefix;
++    if (!name[0]) {
++        out->kind = 2;
++        --length; ++name;
++    } else {
++        out->kind = 1;
++        length = strnlen(name, length);
++        if (length > 107) return ENAMETOOLONG;
++    }
++    out->length = length;
++    memcpy(out->name, name, length);
++    return 0;
++}
++int copy_address(const roanix_socket_address &address, sockaddr *out, socklen_t capacity,
++                 socklen_t *actual) {
++    sockaddr_un native = {};
++    native.sun_family = AF_UNIX;
++    size_t length = offsetof(sockaddr_un, sun_path);
++    if (address.kind == 1) {
++        memcpy(native.sun_path, address.name, address.length);
++        length += address.length + 1;
++    } else if (address.kind == 2) {
++        memcpy(native.sun_path + 1, address.name, address.length);
++        length += address.length + 1;
++    }
++    size_t copied = capacity < length ? capacity : length;
++    if (copied && !out) return EFAULT;
++    if (copied) memcpy(out, &native, copied);
++    *actual = length;
++    return 0;
++}
++int name(int fd, bool peer, sockaddr *out, socklen_t capacity, socklen_t *actual) {
++    roanix_socket_address address = {};
++    int e = error(roanix_syscall3(ROANIX_SYS_SOCKET_NAME, fd, peer, pointer(&address)));
++    return e ? e : copy_address(address, out, capacity, actual);
++}
++int option_number(int layer, int number) {
++    if (layer != SOL_SOCKET) return 0;
++    switch (number) {
++        case SO_PASSCRED: return 1;
++        case SO_RCVBUF: return 2;
++        case SO_SNDBUF: return 3;
++        case SO_ERROR: return 4;
++        case SO_TYPE: return 5;
++        case SO_ACCEPTCONN: return 6;
++        default: return 0;
++    }
++}
++bool append_control(msghdr *header, size_t capacity, int type, const void *payload, size_t bytes) {
++    size_t used = header->msg_controllen;
++    if (capacity - used < CMSG_LEN(bytes)) return false;
++    size_t space = CMSG_SPACE(bytes);
++    if (space > capacity - used) space = capacity - used;
++    auto *out = static_cast<unsigned char *>(header->msg_control) + used;
++    memset(out, 0, space);
++    cmsghdr cmsg = {};
++    cmsg.cmsg_len = CMSG_LEN(bytes);
++    cmsg.cmsg_level = SOL_SOCKET; cmsg.cmsg_type = type;
++    memcpy(out, &cmsg, sizeof(cmsg));
++    memcpy(out + CMSG_LEN(0), payload, bytes);
++    header->msg_controllen += space;
++    return true;
++}
++
++}
++
++namespace mlibc {
++int Sysdeps<Socket>::operator()(int domain, int type, int protocol, int *fd) {
++    unsigned kind, flags;
++    if (int e = socket_type(domain, type, protocol, &kind, &flags)) return e;
++    long result = roanix_syscall2(ROANIX_SYS_SOCKET_CREATE, kind, flags);
++    int e = error(result);
++    if (!e) *fd = result;
++    return e;
++}
++int Sysdeps<Socketpair>::operator()(int domain, int type, int protocol, int *fds) {
++    unsigned kind, flags;
++    if (int e = socket_type(domain, type, protocol, &kind, &flags)) return e;
++    return error(roanix_syscall3(ROANIX_SYS_SOCKET_PAIR, kind, flags, pointer(fds)));
++}
++int Sysdeps<Bind>::operator()(int fd, const sockaddr *address, socklen_t size) {
++    roanix_socket_address native;
++    if (int e = encode_address(address, size, &native)) return e;
++    return error(roanix_syscall2(ROANIX_SYS_SOCKET_BIND, fd, pointer(&native)));
++}
++int Sysdeps<Listen>::operator()(int fd, int backlog) {
++    return error(roanix_syscall2(ROANIX_SYS_SOCKET_LISTEN, fd, backlog < 0 ? 0 : backlog));
++}
++int Sysdeps<Accept>::operator()(int fd, int *newfd, sockaddr *out, socklen_t *size, int flags) {
++    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) return EINVAL;
++    if (out && !size) return EFAULT;
++    roanix_socket_address address = {};
++    long result = roanix_syscall3(ROANIX_SYS_SOCKET_ACCEPT, fd,
++        (flags & SOCK_NONBLOCK ? 1 : 0) | (flags & SOCK_CLOEXEC ? 2 : 0), out ? pointer(&address) : 0);
++    if (int e = error(result)) return e;
++    if (out) {
++        if (int e = copy_address(address, out, *size, size)) {
++            roanix_syscall1(ROANIX_SYS_FILE_CLOSE, result); return e;
++        }
++    }
++    *newfd = result;
++    return 0;
++}
++int Sysdeps<Connect>::operator()(int fd, const sockaddr *address, socklen_t size) {
++    roanix_socket_address native;
++    if (int e = encode_address(address, size, &native)) return e;
++    return error(roanix_syscall2(ROANIX_SYS_SOCKET_CONNECT, fd, pointer(&native)));
++}
++int Sysdeps<Sockname>::operator()(int fd, sockaddr *out, socklen_t size, socklen_t *actual) {
++    return name(fd, false, out, size, actual);
++}
++int Sysdeps<Peername>::operator()(int fd, sockaddr *out, socklen_t size, socklen_t *actual) {
++    return name(fd, true, out, size, actual);
++}
++int Sysdeps<Shutdown>::operator()(int fd, int how) {
++    return error(roanix_syscall2(ROANIX_SYS_SOCKET_SHUTDOWN, fd, how));
++}
++int Sysdeps<GetSockopt>::operator()(int fd, int layer, int number, void *buffer, socklen_t *size) {
++    if (!size) return EFAULT;
++    if (layer == SOL_SOCKET && number == SO_PEERCRED) {
++        roanix_socket_credentials credentials = {};
++        if (int e = error(roanix_syscall2(ROANIX_SYS_SOCKET_PEERCRED, fd, pointer(&credentials)))) return e;
++        ucred value = {static_cast<pid_t>(credentials.pid), credentials.uid, credentials.gid};
++        size_t count = *size < sizeof(value) ? *size : sizeof(value);
++        if (count && !buffer) return EFAULT;
++        if (count) memcpy(buffer, &value, count);
++        *size = count;
++        return 0;
++    }
++    int option = option_number(layer, number);
++    if (!option) return ENOPROTOOPT;
++    long result = roanix_syscall4(ROANIX_SYS_SOCKET_OPTION, fd, option, 0, 0);
++    if (int e = error(result)) return e;
++    int value = result;
++    size_t count = *size < sizeof(value) ? *size : sizeof(value);
++    if (count && !buffer) return EFAULT;
++    if (count) memcpy(buffer, &value, count);
++    *size = count;
++    return 0;
++}
++int Sysdeps<SetSockopt>::operator()(int fd, int layer, int number, const void *buffer, socklen_t size) {
++    int option = option_number(layer, number);
++    if (!option) return ENOPROTOOPT;
++    if (size < sizeof(int)) return EINVAL;
++    if (!buffer) return EFAULT;
++    int value;
++    memcpy(&value, buffer, sizeof(value));
++    return error(roanix_syscall4(ROANIX_SYS_SOCKET_OPTION, fd, option, 1, value));
++}
++int Sysdeps<MsgSend>::operator()(int fd, const msghdr *header, int flags, ssize_t *length) {
++    if (!header) return EFAULT;
++    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) return EOPNOTSUPP;
++    roanix_socket_address address;
++    roanix_socket_credentials credentials = {};
++    roanix_socket_message message = {};
++    if (header->msg_name) {
++        if (int e = encode_address(static_cast<const sockaddr *>(header->msg_name), header->msg_namelen, &address)) return e;
++        if (address.kind == 3) return EINVAL;
++        message.address = pointer(&address);
++    }
++    static_assert(sizeof(iovec) == 16 && offsetof(iovec, iov_len) == 8);
++    message.iov = pointer(header->msg_iov);
++    message.iov_count = header->msg_iovlen;
++    if (header->msg_controllen > 4096) return EINVAL;
++    if (header->msg_controllen && !header->msg_control) return EFAULT;
++    const auto *control = static_cast<const unsigned char *>(header->msg_control);
++    int rights[ROANIX_SOCKET_MAX_RIGHTS];
++    size_t right_count = 0;
++    size_t remaining = header->msg_controllen;
++    while (remaining >= sizeof(cmsghdr)) {
++        cmsghdr cmsg;
++        memcpy(&cmsg, control, sizeof(cmsg));
++        if (cmsg.cmsg_len < CMSG_LEN(0) || cmsg.cmsg_len > remaining) return EINVAL;
++        if (cmsg.cmsg_level != SOL_SOCKET) return EINVAL;
++        if (cmsg.cmsg_type == SCM_RIGHTS) {
++            size_t bytes = cmsg.cmsg_len - CMSG_LEN(0);
++            if (bytes % sizeof(int)) return EINVAL;
++            size_t count = bytes / sizeof(int);
++            if (count > ROANIX_SOCKET_MAX_RIGHTS - right_count) return EMSGSIZE;
++            memcpy(rights + right_count, control + CMSG_LEN(0), bytes);
++            right_count += count;
++        } else {
++            if (cmsg.cmsg_type != SCM_CREDENTIALS || cmsg.cmsg_len != CMSG_LEN(sizeof(ucred))) return EINVAL;
++            ucred cred;
++            memcpy(&cred, control + CMSG_LEN(0), sizeof(cred));
++            credentials.pid = cred.pid; credentials.uid = cred.uid; credentials.gid = cred.gid;
++            message.credentials = pointer(&credentials);
++        }
++        size_t aligned = CMSG_ALIGN(cmsg.cmsg_len);
++        if (aligned > remaining) break;
++        remaining -= aligned; control += aligned;
++    }
++    message.rights = pointer(rights); message.rights_count = right_count;
++    long result = roanix_syscall3(ROANIX_SYS_SOCKET_SEND, fd, pointer(&message),
++        16 | (flags & MSG_DONTWAIT ? 1 : 0) | (flags & MSG_NOSIGNAL ? 8 : 0));
++    int e = error(result);
++    if (!e) *length = result;
++    return e;
++}
++int Sysdeps<MsgRecv>::operator()(int fd, msghdr *header, int flags, ssize_t *length) {
++    if (!header) return EFAULT;
++    if (flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC | MSG_CMSG_CLOEXEC)) return EOPNOTSUPP;
++    if (header->msg_controllen && !header->msg_control) return EFAULT;
++    roanix_socket_address address = {};
++    roanix_socket_credentials credentials = {};
++    roanix_socket_message message = {};
++    int rights[ROANIX_SOCKET_MAX_RIGHTS];
++    size_t capacity = header->msg_controllen;
++    // Rights have priority in this control buffer. Every installed descriptor
++    // must be reported; credentials that do not fit are explicitly truncated.
++    size_t count = capacity >= CMSG_LEN(sizeof(int)) ? (capacity - CMSG_LEN(0)) / sizeof(int) : 0;
++    if (count > ROANIX_SOCKET_MAX_RIGHTS) count = ROANIX_SOCKET_MAX_RIGHTS;
++    message.rights = pointer(rights); message.rights_count = count;
++    message.address = pointer(&address);
++    message.credentials = pointer(&credentials);
++    message.iov = pointer(header->msg_iov);
++    message.iov_count = header->msg_iovlen;
++    long result = roanix_syscall3(ROANIX_SYS_SOCKET_RECEIVE, fd, pointer(&message),
++        16 | (flags & MSG_DONTWAIT ? 1 : 0) | (flags & MSG_PEEK ? 2 : 0) |
++        (flags & MSG_TRUNC ? 4 : 0) | (flags & MSG_CMSG_CLOEXEC ? 32 : 0));
++    if (int e = error(result)) return e;
++    if (header->msg_name) {
++        if (int e = copy_address(address, static_cast<sockaddr *>(header->msg_name), header->msg_namelen, &header->msg_namelen)) return e;
++    } else header->msg_namelen = 0;
++    header->msg_flags = (message.flags & 1 ? MSG_TRUNC : 0) | (message.flags & 4 ? MSG_CTRUNC : 0);
++    header->msg_controllen = 0;
++    if (message.rights_count && !append_control(header, capacity, SCM_RIGHTS, rights, message.rights_count * sizeof(int))) {
++        for (size_t i = 0; i < message.rights_count; i++) roanix_syscall1(ROANIX_SYS_FILE_CLOSE, rights[i]);
++        return EIO;
++    }
++    if (message.flags & 2) {
++        ucred cred = {static_cast<pid_t>(credentials.pid), credentials.uid, credentials.gid};
++        if (!append_control(header, capacity, SCM_CREDENTIALS, &cred, sizeof(cred))) header->msg_flags |= MSG_CTRUNC;
++    }
++    *length = result;
++    return 0;
++}
++int Sysdeps<Sendto>::operator()(int fd, const void *buffer, size_t size, int flags,
++        const sockaddr *address, socklen_t address_size, ssize_t *length) {
++    iovec iov = {const_cast<void *>(buffer), size};
++    msghdr header = {};
++    header.msg_name = const_cast<sockaddr *>(address); header.msg_namelen = address_size;
++    header.msg_iov = &iov; header.msg_iovlen = 1;
++    return Sysdeps<MsgSend>::operator()(fd, &header, flags, length);
++}
++int Sysdeps<Recvfrom>::operator()(int fd, void *buffer, size_t size, int flags,
++        sockaddr *address, socklen_t *address_size, ssize_t *length) {
++    if (address && !address_size) return EFAULT;
++    iovec iov = {buffer, size};
++    msghdr header = {};
++    header.msg_name = address; header.msg_namelen = address ? *address_size : 0;
++    header.msg_iov = &iov; header.msg_iovlen = 1;
++    int e = Sysdeps<MsgRecv>::operator()(fd, &header, flags, length);
++    if (!e && address) *address_size = header.msg_namelen;
++    return e;
++}
++} // namespace mlibc
 diff --git mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
 new file mode 100644
-index 0000000..f7de462
+index 0000000..807d0b0
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1412 @@
+@@ -0,0 +1,1682 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -87,10 +626,19 @@ index 0000000..f7de462
 +#include <stdarg.h>
 +#include <string.h>
 +#include <sys/resource.h>
++#include <sys/prctl.h>
 +#include <sys/mman.h>
++#include <sys/mount.h>
++#include <sys/reboot.h>
 +#include <sys/select.h>
 +#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <sys/statvfs.h>
++#include <sys/sysmacros.h>
++#include <sys/socket.h>
++#include <sys/un.h>
 +#include <sys/time.h>
++#include <sys/uio.h>
 +#include <sys/utsname.h>
 +#include <sys/wait.h>
 +#include <termios.h>
@@ -379,9 +927,6 @@ index 0000000..f7de462
 +    return error;
 +}
 +
-+int Sysdeps<Socket>::operator()(int, int, int, int *) {
-+    return ENOSYS;
-+}
 +
 +int Sysdeps<Close>::operator()(int fd) {
 +    return syscall_error(roanix_syscall1(ROANIX_SYS_FILE_CLOSE, fd));
@@ -459,6 +1004,44 @@ index 0000000..f7de462
 +    if (!error)
 +        *result_out = static_cast<pid_t>(result);
 +    return error;
++}
++
++int Sysdeps<Waitid>::operator()(idtype_t type, id_t id, siginfo_t *info, int options) {
++    if (!info)
++        return EFAULT;
++    unsigned kind;
++    switch (type) {
++        case P_ALL: kind = 0; break;
++        case P_PID: kind = 1; break;
++        case P_PGID: kind = 2; break;
++        default: return EINVAL;
++    }
++    struct roanix_wait_result result = {};
++    static_assert(sizeof(result) == 16);
++    int error = syscall_error(roanix_syscall4(
++        ROANIX_SYS_PROCESS_WAITID, kind, id, options, as_word(&result)));
++    if (error)
++        return error;
++    *info = {};
++    if (!result.pid)
++        return 0;
++    info->si_signo = SIGCHLD;
++    info->si_pid = static_cast<pid_t>(result.pid);
++    info->si_uid = 0; // The native kernel currently has a root-only credential model.
++    if (WIFCONTINUED(result.status)) {
++        info->si_code = CLD_CONTINUED;
++        info->si_status = SIGCONT;
++    } else if (WIFSTOPPED(result.status)) {
++        info->si_code = CLD_STOPPED;
++        info->si_status = WSTOPSIG(result.status);
++    } else if (WIFEXITED(result.status)) {
++        info->si_code = CLD_EXITED;
++        info->si_status = WEXITSTATUS(result.status);
++    } else {
++        info->si_code = WCOREDUMP(result.status) ? CLD_DUMPED : CLD_KILLED;
++        info->si_status = WTERMSIG(result.status);
++    }
++    return 0;
 +}
 +
 +pid_t Sysdeps<GetPid>::operator()() {
@@ -612,6 +1195,74 @@ index 0000000..f7de462
 +        ROANIX_SYS_FILE_ACCESSAT, dirfd, as_word(path), mode, flags));
 +}
 +
++namespace {
++
++int filesystem_stats(int dirfd, const char *path, struct statfs *output) {
++    struct roanix_statfs source;
++    static_assert(sizeof(source) == 80);
++    int error = syscall_error(roanix_syscall3(
++        ROANIX_SYS_FILE_STATFS, dirfd, as_word(path), as_word(&source)));
++    if (error)
++        return error;
++    memset(output, 0, sizeof(*output));
++    output->f_type = source.filesystem_type;
++    output->f_bsize = source.block_size;
++    output->f_blocks = source.blocks;
++    output->f_bfree = source.blocks_free;
++    output->f_bavail = source.blocks_available;
++    output->f_files = source.files;
++    output->f_ffree = source.files_free;
++    output->f_fsid.__val[0] = static_cast<int>(source.filesystem_id & UINT32_MAX);
++    output->f_fsid.__val[1] = static_cast<int>(source.filesystem_id >> 32);
++    output->f_namelen = source.name_max;
++    output->f_frsize = source.block_size;
++    output->f_flags = source.flags;
++    return 0;
++}
++
++int filesystem_vfs_stats(int dirfd, const char *path, struct statvfs *output) {
++    struct statfs source;
++    int error = filesystem_stats(dirfd, path, &source);
++    if (error)
++        return error;
++    memset(output, 0, sizeof(*output));
++    output->f_bsize = source.f_bsize;
++    output->f_frsize = source.f_frsize;
++    output->f_blocks = source.f_blocks;
++    output->f_bfree = source.f_bfree;
++    output->f_bavail = source.f_bavail;
++    output->f_files = source.f_files;
++    output->f_ffree = source.f_ffree;
++    output->f_favail = source.f_ffree;
++    output->f_fsid = static_cast<uint32_t>(source.f_fsid.__val[0])
++        | (static_cast<uint64_t>(static_cast<uint32_t>(source.f_fsid.__val[1])) << 32);
++    output->f_flag = source.f_flags;
++    output->f_namemax = source.f_namelen;
++    return 0;
++}
++
++} // namespace
++
++int Sysdeps<Statfs>::operator()(const char *path, struct statfs *output) {
++    if (!path)
++        return EFAULT;
++    return filesystem_stats(AT_FDCWD, path, output);
++}
++
++int Sysdeps<Fstatfs>::operator()(int fd, struct statfs *output) {
++    return filesystem_stats(fd, nullptr, output);
++}
++
++int Sysdeps<Statvfs>::operator()(const char *path, struct statvfs *output) {
++    if (!path)
++        return EFAULT;
++    return filesystem_vfs_stats(AT_FDCWD, path, output);
++}
++
++int Sysdeps<Fstatvfs>::operator()(int fd, struct statvfs *output) {
++    return filesystem_vfs_stats(fd, nullptr, output);
++}
++
 +int Sysdeps<Stat>::operator()(
 +        mlibc::fsfd_target target,
 +        int fd,
@@ -646,6 +1297,50 @@ index 0000000..f7de462
 +    if (!error)
 +        fill_stat(source, output);
 +    return error;
++}
++
++int Sysdeps<Statx>::operator()(int dirfd, const char *path, int flags,
++        unsigned int mask, struct statx *output) {
++    constexpr int supported = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT
++        | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
++    if ((flags & ~supported) || (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE
++            || (mask & 0x80000000U))
++        return EINVAL;
++    if (!path || !output)
++        return EFAULT;
++
++    // Native metadata is local and coherent; the synchronization hints need
++    // no separate fetch. Only advertise fields the native stat supplies.
++    struct stat source;
++    int error = Sysdeps<Stat>::operator()(mlibc::fsfd_target::fd_path,
++        dirfd, path, flags & ~AT_STATX_SYNC_TYPE, &source);
++    if (error)
++        return error;
++    memset(output, 0, sizeof(*output));
++    output->stx_mask = STATX_BASIC_STATS;
++    output->stx_blksize = source.st_blksize;
++    output->stx_nlink = source.st_nlink;
++    output->stx_uid = source.st_uid;
++    output->stx_gid = source.st_gid;
++    output->stx_mode = source.st_mode;
++    output->stx_ino = source.st_ino;
++    output->stx_size = source.st_size;
++    output->stx_blocks = source.st_blocks;
++    output->stx_atime.tv_sec = source.st_atim.tv_sec;
++    output->stx_atime.tv_nsec = source.st_atim.tv_nsec;
++    output->stx_mtime.tv_sec = source.st_mtim.tv_sec;
++    output->stx_mtime.tv_nsec = source.st_mtim.tv_nsec;
++    output->stx_ctime.tv_sec = source.st_ctim.tv_sec;
++    output->stx_ctime.tv_nsec = source.st_ctim.tv_nsec;
++    output->stx_dev_major = major(source.st_dev);
++    output->stx_dev_minor = minor(source.st_dev);
++    output->stx_rdev_major = major(source.st_rdev);
++    output->stx_rdev_minor = minor(source.st_rdev);
++    return 0;
++}
++
++int Sysdeps<NameToHandleAt>::operator()(int, const char *, struct file_handle *, int *, int) {
++    return ENOSYS;
 +}
 +
 +int Sysdeps<OpenDir>::operator()(const char *path, int *handle) {
@@ -936,20 +1631,65 @@ index 0000000..f7de462
 +    return 0;
 +}
 +
-+int Sysdeps<SetResuid>::operator()(uid_t, uid_t, uid_t) { return 0; }
-+int Sysdeps<SetResgid>::operator()(gid_t, gid_t, gid_t) { return 0; }
-+
-+int Sysdeps<GetRlimit>::operator()(int, struct rlimit *limit) {
-+    limit->rlim_cur = RLIM_INFINITY;
-+    limit->rlim_max = RLIM_INFINITY;
-+    return 0;
++// The native kernel currently has one fixed root identity. Accept requests
++// that preserve it; never report a successful change to an unsupported ID.
++int Sysdeps<SetResuid>::operator()(uid_t real, uid_t effective, uid_t saved) {
++    auto unchanged = [](uid_t id) { return id == 0 || id == static_cast<uid_t>(-1); };
++    return unchanged(real) && unchanged(effective) && unchanged(saved) ? 0 : EOPNOTSUPP;
++}
++int Sysdeps<SetResgid>::operator()(gid_t real, gid_t effective, gid_t saved) {
++    auto unchanged = [](gid_t id) { return id == 0 || id == static_cast<gid_t>(-1); };
++    return unchanged(real) && unchanged(effective) && unchanged(saved) ? 0 : EOPNOTSUPP;
 +}
 +
-+int Sysdeps<SetRlimit>::operator()(int, const struct rlimit *) { return 0; }
++int Sysdeps<Prlimit>::operator()(pid_t pid, int resource, const struct rlimit *new_limit, struct rlimit *old_limit) {
++    static_assert(sizeof(rlimit) == 2 * sizeof(uint64_t));
++    if (resource < 0 || resource >= RLIM_NLIMITS)
++        return EINVAL;
++    if (resource != RLIMIT_NOFILE)
++        return EOPNOTSUPP;
++    return syscall_error(roanix_syscall3(
++        ROANIX_SYS_PROCESS_NOFILE, pid, as_word(new_limit), as_word(old_limit)));
++}
 +
-+int Sysdeps<GetRusage>::operator()(int, struct rusage *usage) {
-+    memset(usage, 0, sizeof(*usage));
-+    return 0;
++int Sysdeps<GetRlimit>::operator()(int resource, struct rlimit *limit) {
++    if (!limit)
++        return EFAULT;
++    return Sysdeps<Prlimit>{}(0, resource, nullptr, limit);
++}
++
++int Sysdeps<SetRlimit>::operator()(int resource, const struct rlimit *limit) {
++    if (!limit)
++        return EFAULT;
++    return Sysdeps<Prlimit>{}(0, resource, limit, nullptr);
++}
++
++int Sysdeps<Prctl>::operator()(int option, va_list arguments, int *out) {
++    *out = 0;
++    switch (option) {
++        case PR_SET_PDEATHSIG: {
++            unsigned long signal = va_arg(arguments, unsigned long);
++            return syscall_error(roanix_syscall2(ROANIX_SYS_PROCESS_PARENT_SIGNAL, 1, signal));
++        }
++        case PR_GET_PDEATHSIG: {
++            int *signal = va_arg(arguments, int *);
++            if (!signal)
++                return EFAULT;
++            long result = roanix_syscall2(ROANIX_SYS_PROCESS_PARENT_SIGNAL, 0, 0);
++            int error = syscall_error(result);
++            if (!error)
++                *signal = static_cast<int>(result);
++            return error;
++        }
++        default:
++            return EOPNOTSUPP;
++    }
++}
++
++int Sysdeps<GetRusage>::operator()(int who, struct rusage *) {
++    if (who != RUSAGE_SELF && who != RUSAGE_CHILDREN)
++        return EINVAL;
++    return EOPNOTSUPP;
 +}
 +
 +int Sysdeps<GetHostname>::operator()(char *buffer, size_t size) {
@@ -969,7 +1709,13 @@ index 0000000..f7de462
 +int Sysdeps<Sysconf>::operator()(int number, long *result) {
 +    switch (number) {
 +        case _SC_PAGESIZE: *result = 4096; return 0;
-+        case _SC_OPEN_MAX: *result = 1024; return 0;
++        case _SC_OPEN_MAX: {
++            struct rlimit limit;
++            int error = sysdep<GetRlimit>(RLIMIT_NOFILE, &limit);
++            if (!error)
++                *result = static_cast<long>(limit.rlim_cur);
++            return error;
++        }
 +        case _SC_CHILD_MAX: *result = 256; return 0;
 +        case _SC_CLK_TCK: *result = 100; return 0;
 +        case _SC_NPROCESSORS_CONF:
@@ -1011,7 +1757,20 @@ index 0000000..f7de462
 +}
 +
 +int Sysdeps<SetItimer>::operator()(
-+        int, const struct itimerval *, struct itimerval *old_value) {
++        int which, const struct itimerval *value, struct itimerval *old_value) {
++    if (which != ITIMER_REAL && which != ITIMER_VIRTUAL && which != ITIMER_PROF)
++        return EINVAL;
++    if (!value)
++        return EFAULT;
++    auto valid = [](const struct timeval &time) {
++        return time.tv_sec >= 0 && time.tv_usec >= 0 && time.tv_usec < 1000000;
++    };
++    if (!valid(value->it_value) || !valid(value->it_interval))
++        return EINVAL;
++    if (value->it_value.tv_sec || value->it_value.tv_usec ||
++        value->it_interval.tv_sec || value->it_interval.tv_usec)
++        return EOPNOTSUPP;
++    // No interval timer can be armed, so disarming always reports zero state.
 +    if (old_value)
 +        memset(old_value, 0, sizeof(*old_value));
 +    return 0;
@@ -1338,6 +2097,29 @@ index 0000000..f7de462
 +    return error;
 +}
 +
++int Sysdeps<Writev>::operator()(int fd, const struct iovec *vectors, int count, ssize_t *written) {
++    static_assert(sizeof(struct iovec) == 16 && offsetof(struct iovec, iov_len) == 8);
++    long result = roanix_syscall3(ROANIX_SYS_FILE_WRITEV, fd, as_word(vectors), count);
++    int error = syscall_error(result);
++    if (!error)
++        *written = result;
++    return error;
++}
++
++// These optional Linux facilities have no native equivalent. Callers may
++// fall back to ordinary I/O or omit capability-dependent behavior.
++int Sysdeps<Sendfile>::operator()(int, int, off_t *, size_t, ssize_t *) {
++    return ENOSYS;
++}
++
++int Sysdeps<Splice>::operator()(int, off_t *, int, off_t *, size_t, unsigned int, ssize_t *) {
++    return ENOSYS;
++}
++
++int Sysdeps<Capget>::operator()(cap_user_header_t, cap_user_data_t) {
++    return ENOSYS;
++}
++
 +int Sysdeps<Seek>::operator()(
 +        int fd, off_t offset, int whence, off_t *new_offset) {
 +    long result = roanix_syscall3(
@@ -1361,6 +2143,10 @@ index 0000000..f7de462
 +        as_word(nanoseconds)
 +    );
 +    return syscall_error(result);
++}
++
++int Sysdeps<ClockSet>::operator()(int, time_t, long) {
++    return ENOSYS;
 +}
 +
 +int Sysdeps<VmMap>::operator()(
@@ -1481,12 +2267,35 @@ index 0000000..f7de462
 +}
 +
 +int Sysdeps<Umount2>::operator()(const char *target, int flags) {
-+    // The kernel unmount path takes a target only; there is nothing to map the
-+    // Linux MNT_* flags onto, so reject them rather than silently ignoring.
-+    if (flags != 0)
-+        return EINVAL;
-+    long result = roanix_syscall1(ROANIX_SYS_FILE_UMOUNT, as_word(target));
-+    return syscall_error(result);
++    switch (flags) {
++        case 0:
++            return syscall_error(roanix_syscall1(ROANIX_SYS_FILE_UMOUNT, as_word(target)));
++        case UMOUNT_NOFOLLOW:
++            return syscall_error(roanix_syscall1(ROANIX_SYS_FILE_UMOUNT_NOFOLLOW, as_word(target)));
++        default:
++            return EINVAL;
++    }
++}
++
++int Sysdeps<Reboot>::operator()(int command) {
++    long action;
++    switch (static_cast<unsigned int>(command)) {
++        case RB_HALT_SYSTEM: action = ROANIX_POWER_HALT; break;
++        case RB_AUTOBOOT: action = ROANIX_POWER_REBOOT; break;
++        case RB_POWER_OFF: action = ROANIX_POWER_OFF; break;
++        case RB_ENABLE_CAD:
++        case RB_DISABLE_CAD:
++        case RB_SW_SUSPEND:
++        case RB_KEXEC:
++            return EOPNOTSUPP;
++        default:
++            return EINVAL;
++    }
++    return syscall_error(roanix_syscall1(ROANIX_SYS_SYSTEM_POWER, action));
++}
++
++void Sysdeps<Sync>::operator()() {
++    (void) roanix_syscall0(ROANIX_SYS_FILE_SYNC);
 +}
 +
 +} // namespace mlibc
@@ -1576,10 +2385,10 @@ index 0000000..375b4f1
 \ No newline at end of file
 diff --git mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
 new file mode 100644
-index 0000000..de1e002
+index 0000000..02d4459
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,174 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -1602,6 +2411,20 @@ index 0000000..de1e002
 +    Open,
 +    Openat,
 +    Socket,
++    Socketpair,
++    Bind,
++    Listen,
++    Accept,
++    Connect,
++    Sockname,
++    Peername,
++    GetSockopt,
++    SetSockopt,
++    Shutdown,
++    MsgSend,
++    MsgRecv,
++    Sendto,
++    Recvfrom,
 +    OpenDir,
 +    ReadEntries,
 +    Read,
@@ -1615,8 +2438,13 @@ index 0000000..de1e002
 +    Fork,
 +    Execve,
 +    Waitpid,
++    Waitid,
 +    GetPid,
 +    GetTid,
++    Writev,
++    Sendfile,
++    Splice,
++    Capget,
 +    GetPpid,
 +    GetPgid,
 +    SetPgid,
@@ -1637,6 +2465,12 @@ index 0000000..de1e002
 +    Access,
 +    Faccessat,
 +    Stat,
++    Statx,
++    NameToHandleAt,
++    Statfs,
++    Statvfs,
++    Fstatvfs,
++    Fstatfs,
 +    Readlink,
 +    Readlinkat,
 +    Rmdir,
@@ -1673,6 +2507,8 @@ index 0000000..de1e002
 +    SetResgid,
 +    GetRlimit,
 +    SetRlimit,
++    Prlimit,
++    Prctl,
 +    GetRusage,
 +    Chmod,
 +    Fchmod,
@@ -1701,6 +2537,7 @@ index 0000000..de1e002
 +    Tcgetwinsize,
 +    Tcsetwinsize,
 +    ClockGet,
++    ClockSet,
 +    VmMap,
 +    VmUnmap,
 +    VmProtect,
@@ -1710,6 +2547,8 @@ index 0000000..de1e002
 +    SetPriority,
 +    Mount,
 +    Umount2,
++    Reboot,
++    Sync,
 +    Yield,
 +    Tgkill,
 +    ThreadSetname,
@@ -1726,10 +2565,10 @@ index 0000000..de1e002
 +} // namespace mlibc
 diff --git mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
 new file mode 100644
-index 0000000..edf935f
+index 0000000..7d4e901
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,311 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -1818,7 +2657,34 @@ index 0000000..edf935f
 +    ROANIX_SYS_THREAD_SET_NAME,
 +    ROANIX_SYS_THREAD_GET_NAME,
 +    ROANIX_SYS_FILE_MOUNT,
-+    ROANIX_SYS_EVENTFD_CREATE
++    ROANIX_SYS_EVENTFD_CREATE,
++    ROANIX_SYS_FILE_STATFS,
++    ROANIX_SYS_PROCESS_WAITID,
++    ROANIX_SYS_SOCKET_CREATE,
++    ROANIX_SYS_SOCKET_PAIR,
++    ROANIX_SYS_SOCKET_BIND,
++    ROANIX_SYS_SOCKET_CONNECT,
++    ROANIX_SYS_SOCKET_NAME,
++    ROANIX_SYS_SOCKET_OPTION,
++    ROANIX_SYS_SOCKET_SHUTDOWN,
++    ROANIX_SYS_SOCKET_SEND,
++    ROANIX_SYS_SOCKET_RECEIVE,
++    ROANIX_SYS_SOCKET_LISTEN,
++    ROANIX_SYS_SOCKET_ACCEPT,
++    ROANIX_SYS_SOCKET_PEERCRED,
++    ROANIX_SYS_SYSTEM_POWER,
++    ROANIX_SYS_FILE_UMOUNT_NOFOLLOW,
++    ROANIX_SYS_FILE_SYNC,
++    ROANIX_SYS_PROCESS_NOFILE,
++    ROANIX_SYS_PROCESS_PARENT_SIGNAL,
++    ROANIX_SYS_PROCESS_GETMAIN_TID,
++    ROANIX_SYS_FILE_WRITEV
++};
++
++enum {
++    ROANIX_POWER_HALT = 0,
++    ROANIX_POWER_REBOOT = 1,
++    ROANIX_POWER_OFF = 2
 +};
 +
 +/// Longest thread name the kernel stores, excluding the NUL terminator.
@@ -1849,6 +2715,42 @@ index 0000000..edf935f
 +    uint64_t accessed_ns;
 +    uint64_t modified_ns;
 +    uint64_t changed_ns;
++};
++
++/* Filesystem accounting uses the supplied block size, not host page units. */
++#define ROANIX_DEVFS_MAGIC UINT64_C(0x52444556)
++/* Native local-socket records. Names exclude sockaddr family and terminators.
++ * Address kinds: 0 unnamed/autobind, 1 pathname, 2 abstract, 3 disconnect.
++ * Message flags: 1 payload truncated, 2 credentials present, 4 rights truncated.
++ * Syscall flag 16 selects the extended record with descriptor fields; without
++ * it only the original first 40 bytes are read. Receive flag 32 requests CLOEXEC.
++ * rights_count is the send count, or receive capacity replaced by actual count. */
++struct roanix_socket_address { uint32_t kind, length; uint8_t name[108]; };
++struct roanix_socket_credentials { uint64_t pid; uint32_t uid, gid; };
++struct roanix_socket_message {
++    uint64_t address, iov, iov_count, credentials, flags;
++    uint64_t rights, rights_count;
++};
++#define ROANIX_SOCKET_MAX_RIGHTS 64
++
++/* waitid returns native wait status; libc constructs its siginfo_t. */
++struct roanix_wait_result {
++    uint64_t pid;
++    int32_t status;
++    uint32_t reserved;
++};
++
++struct roanix_statfs {
++    uint64_t filesystem_type;
++    uint64_t block_size;
++    uint64_t blocks;
++    uint64_t blocks_free;
++    uint64_t blocks_available;
++    uint64_t files;
++    uint64_t files_free;
++    uint64_t filesystem_id;
++    uint64_t name_max;
++    uint64_t flags;
 +};
 +
 +typedef long roanix_syscall_word_t;
@@ -1980,10 +2882,10 @@ index 0000000..edf935f
 +#endif
 diff --git mlibc-workdir/sysdeps/roanix/meson.build mlibc-workdir/sysdeps/roanix/meson.build
 new file mode 100644
-index 0000000..6a5211f
+index 0000000..66a15a8
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/meson.build
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,133 @@
 +sysdep_supported_options = {
 +    'posix': true,
 +    'linux': true,
@@ -1997,6 +2899,7 @@ index 0000000..6a5211f
 +
 +libc_sources += files(
 +    'generic/entry.cpp',
++    'generic/sockets.cpp',
 +    'generic/sysdeps.cpp',
 +    'generic/thread.cpp',
 +    host_machine.cpu_family() / 'thread.S',

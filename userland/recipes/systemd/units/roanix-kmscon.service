@@ -1,0 +1,14 @@
+[Unit]
+Description=Roanix Graphical Console
+ConditionPathExists=/dev/dri/card0
+
+[Service]
+ExecStart=/usr/bin/kmscon --no-reset-env --session-control --login -- /usr/bin/bash
+Environment=TERM=vt220
+StandardInput=null
+StandardOutput=kmsg
+StandardError=inherit
+SendSIGHUP=yes
+TimeoutStopSec=5s
+Restart=always
+RestartSec=1s

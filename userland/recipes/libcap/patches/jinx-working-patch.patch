@@ -1,0 +1,66 @@
+diff --git libcap-clean/libcap/cap_proc.c libcap-workdir/libcap/cap_proc.c
+index 09b74ca..7d1cbfb 100644
+--- libcap-clean/libcap/cap_proc.c
++++ libcap-workdir/libcap/cap_proc.c
+@@ -13,7 +13,9 @@
+ #include <grp.h>
+ #include <sys/prctl.h>
+ #include <sys/securebits.h>
++#ifndef __roanix__
+ #include <sys/syscall.h>
++#endif
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+@@ -27,17 +29,51 @@
+  * using pthreads.
+  */
+ 
++#ifdef __roanix__
++/* Private dispatch tags: Roanix has no Linux syscall-number ABI. Keep these
++ * operations on libc so unsupported security operations return ENOSYS. */
++enum {
++    SYS_capset, SYS_prctl, SYS_setuid, SYS_setgroups, SYS_setgid, SYS_chroot
++};
++#endif
++
+ static long int _cap_syscall3(long int syscall_nr,
+ 			      long int arg1, long int arg2, long int arg3)
+ {
++#ifdef __roanix__
++    switch (syscall_nr) {
++    case SYS_capset:
++        return capset((cap_user_header_t) arg1, (cap_user_data_t) arg2);
++    case SYS_prctl:
++        return prctl((int) arg1, arg2, arg3, 0L, 0L);
++    case SYS_setuid:
++        return setuid((uid_t) arg1);
++    case SYS_setgroups:
++        return setgroups((size_t) arg1, (const gid_t *) arg2);
++    case SYS_setgid:
++        return setgid((gid_t) arg1);
++    case SYS_chroot:
++        return chroot((const char *) arg1);
++    default:
++        errno = ENOSYS;
++        return -1;
++    }
++#else
+     return syscall(syscall_nr, arg1, arg2, arg3);
++#endif
+ }
+ 
+ static long int _cap_syscall6(long int syscall_nr,
+ 			      long int arg1, long int arg2, long int arg3,
+ 			      long int arg4, long int arg5, long int arg6)
+ {
++#ifdef __roanix__
++    if (syscall_nr == SYS_prctl)
++        return prctl((int) arg1, arg2, arg3, arg4, arg5);
++    return _cap_syscall3(syscall_nr, arg1, arg2, arg3);
++#else
+     return syscall(syscall_nr, arg1, arg2, arg3, arg4, arg5, arg6);
++#endif
+ }
+ 
+ /*

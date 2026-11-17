@@ -640,6 +640,9 @@ impl FileSystem for Devfs {
 
     fn statfs(&self) -> StatFs {
         StatFs {
+            // Native devfs, distinct from Linux's tmpfs-backed devtmpfs.
+            filesystem_type: 0x5244_4556,
+            block_size: crate::mem::PAGE_SIZE,
             total_bytes: 0,
             used_bytes: 0,
             total_nodes: u64::MAX,
@@ -1102,6 +1105,9 @@ pub fn global() -> Result<&'static Arc<Devfs>> {
 
 pub(crate) fn mount_global() -> Result<()> {
     let filesystem = Devfs::new()?;
+    // Userspace cannot mutate the driver-owned device namespace. Reserve the
+    // shared-memory mount point here, before any device modules are published.
+    filesystem.create_dir(OwnerId::KERNEL, filesystem.root_id(), b"shm", 0o1777)?;
     match super::create_dir(b"/dev", 0o755) {
         Ok(_) | Err(Error::AlreadyExists) => {}
         Err(error) => return Err(error),

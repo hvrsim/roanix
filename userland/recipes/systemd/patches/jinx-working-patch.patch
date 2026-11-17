@@ -1,0 +1,1634 @@
+diff --git systemd-clean/meson.build systemd-workdir/meson.build
+index bffda86..75bcd37 100644
+--- systemd-clean/meson.build
++++ systemd-workdir/meson.build
+@@ -662,6 +662,8 @@ foreach ident : [
+                                  #include <unistd.h>
+                                  #include <signal.h>
+                                  #include <sys/wait.h>'''],
++        ['malloc_trim',       '''#include <malloc.h>'''],
++        ['malloc_info',       '''#include <malloc.h>'''],
+         ['mallinfo',          '''#include <malloc.h>'''],
+         ['mallinfo2',         '''#include <malloc.h>'''],
+         ['execveat',          '''#include <unistd.h>'''],
+diff --git systemd-clean/src/basic/build-path.c systemd-workdir/src/basic/build-path.c
+index b597265..5913e31 100644
+--- systemd-clean/src/basic/build-path.c
++++ systemd-workdir/src/basic/build-path.c
+@@ -33,11 +33,11 @@ static int get_runpath_from_dynamic(const ElfW(Dyn) *d, ElfW(Addr) bias, const c
+                         break;
+ 
+                 case DT_STRTAB:
+-                        /* On MIPS and RISC-V DT_STRTAB records an offset, not a valid address, so it has to be adjusted
+-                         * using the bias calculated earlier. */
++                        /* MIPS, RISC-V, and the native Roanix loader retain DT_STRTAB as an offset.
++                         * Adjust it using the executable load bias instead of dereferencing the offset. */
+                         if (d->d_un.d_val != 0)
+                                 strtab = (const char *) ((uintptr_t) d->d_un.d_val
+-#if defined(__mips__) || defined(__riscv)
++#if defined(__mips__) || defined(__riscv) || defined(__roanix__)
+                                          + bias
+ #endif
+                                 );
+diff --git systemd-clean/src/basic/fd-util.c systemd-workdir/src/basic/fd-util.c
+index c112f8d..5c45836 100644
+--- systemd-clean/src/basic/fd-util.c
++++ systemd-workdir/src/basic/fd-util.c
+@@ -1013,6 +1013,15 @@ int fd_verify_safe_flags_full(int fd, int extra_flags) {
+ }
+ 
+ int read_nr_open(void) {
++#ifdef __roanix__
++        struct rlimit limit;
++
++        /* The native manager uses the inherited descriptor ceiling. */
++        if (getrlimit(RLIMIT_NOFILE, &limit) >= 0)
++                return (int) limit.rlim_max;
++
++        return FD_SETSIZE;
++#else
+         _cleanup_free_ char *nr_open = NULL;
+         int r;
+ 
+@@ -1034,6 +1043,7 @@ int read_nr_open(void) {
+ 
+         /* If we fail, fall back to the hard-coded kernel limit of 1024 * 1024. */
+         return 1024 * 1024;
++#endif
+ }
+ 
+ int fd_get_diskseq(int fd, uint64_t *ret) {
+diff --git systemd-clean/src/basic/hashmap.c systemd-workdir/src/basic/hashmap.c
+index 951f63a..8ec1d28 100644
+--- systemd-clean/src/basic/hashmap.c
++++ systemd-workdir/src/basic/hashmap.c
+@@ -286,7 +286,11 @@ void hashmap_trim_pools(void) {
+ 
+         /* We build our own is_main_thread() here, which doesn't use C11 TLS based caching of the
+          * result. That's because valgrind apparently doesn't like TLS to be used from a GCC destructor. */
++#if defined(__roanix__)
++        if (!is_main_thread())
++#else
+         if (getpid() != gettid())
++#endif
+                 return (void) log_debug("Not cleaning up memory pools, not in main thread.");
+ 
+         r = get_process_threads(0);
+diff --git systemd-clean/src/basic/linux/libc-compat.h systemd-workdir/src/basic/linux/libc-compat.h
+index e25cd3f..91f4b57 100644
+--- systemd-clean/src/basic/linux/libc-compat.h
++++ systemd-workdir/src/basic/linux/libc-compat.h
+@@ -49,6 +49,14 @@
+ #ifndef _LIBC_COMPAT_H
+ #define _LIBC_COMPAT_H
+ 
++/* mlibc supplies these types and the corresponding __UAPI_DEF_* exclusions.
++ * Load them before the Linux defaults below claim ownership of the types,
++ * even when a caller includes Linux headers before libc network headers. */
++#ifdef __roanix__
++#include <net/if.h>
++#include <netinet/in.h>
++#endif
++
+ /* We have included glibc headers... */
+ #if defined(__GLIBC__)
+ 
+diff --git systemd-clean/src/basic/locale-util.c systemd-workdir/src/basic/locale-util.c
+index 2356527..ab5e1b9 100644
+--- systemd-clean/src/basic/locale-util.c
++++ systemd-workdir/src/basic/locale-util.c
+@@ -3,7 +3,9 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <langinfo.h>
++#ifndef __roanix__
+ #include <libintl.h>
++#endif
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+diff --git systemd-clean/src/basic/locale-util.h systemd-workdir/src/basic/locale-util.h
+index 81fe8d1..84bca86 100644
+--- systemd-clean/src/basic/locale-util.h
++++ systemd-workdir/src/basic/locale-util.h
+@@ -1,7 +1,9 @@
+ /* SPDX-License-Identifier: LGPL-2.1-or-later */
+ #pragma once
+ 
++#ifndef __roanix__
+ #include <libintl.h>
++#endif
+ #include <locale.h>
+ #include <stdbool.h>
+ 
+@@ -33,7 +35,12 @@ int get_locales(char ***l);
+ bool locale_is_valid(const char *name);
+ int locale_is_installed(const char *name);
+ 
++/* Roanix builds disable translations and have no gettext runtime. */
++#ifdef __roanix__
++#define _(String) (String)
++#else
+ #define _(String) dgettext(GETTEXT_PACKAGE, String)
++#endif
+ #define N_(String) String
+ 
+ bool is_locale_utf8(void);
+diff --git systemd-clean/src/basic/missing_syscall.h systemd-workdir/src/basic/missing_syscall.h
+index e2cd8b4..26c325c 100644
+--- systemd-clean/src/basic/missing_syscall.h
++++ systemd-workdir/src/basic/missing_syscall.h
+@@ -11,7 +11,9 @@
+ #include <linux/time_types.h>
+ #endif
+ #include <signal.h>
++#ifndef __roanix__
+ #include <sys/syscall.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+@@ -24,7 +26,10 @@
+ #include "missing_keyctl.h"
+ #include "missing_sched.h"
+ #include "missing_stat.h"
++/* These fallback numbers describe Linux, not the Roanix syscall ABI. */
++#ifndef __roanix__
+ #include "missing_syscall_def.h"
++#endif
+ 
+ /* linux/kcmp.h */
+ #ifndef KCMP_FILE /* 3f4994cfc15f38a3159c6e3a4b3ab2e1481a6b02 (3.19) */
+@@ -35,7 +40,7 @@
+ 
+ #if !HAVE_FCHMODAT2
+ static inline int missing_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
+-#  ifdef __NR_fchmodat2
++#  if !defined(__roanix__) && defined(__NR_fchmodat2)
+         return syscall(__NR_fchmodat2, dirfd, path, mode, flags);
+ #  else
+         errno = ENOSYS;
+@@ -50,7 +55,12 @@ static inline int missing_fchmodat2(int dirfd, const char *path, mode_t mode, in
+ 
+ #if !HAVE_PIVOT_ROOT
+ static inline int missing_pivot_root(const char *new_root, const char *put_old) {
++#ifdef __roanix__
++        errno = ENOSYS;
++        return -1;
++#else
+         return syscall(__NR_pivot_root, new_root, put_old);
++#endif
+ }
+ 
+ #  define pivot_root missing_pivot_root
+@@ -60,7 +70,12 @@ static inline int missing_pivot_root(const char *new_root, const char *put_old)
+ 
+ #if !HAVE_IOPRIO_GET
+ static inline int missing_ioprio_get(int which, int who) {
++#ifdef __roanix__
++        errno = ENOSYS;
++        return -1;
++#else
+         return syscall(__NR_ioprio_get, which, who);
++#endif
+ }
+ 
+ #  define ioprio_get missing_ioprio_get
+@@ -70,7 +85,12 @@ static inline int missing_ioprio_get(int which, int who) {
+ 
+ #if !HAVE_IOPRIO_SET
+ static inline int missing_ioprio_set(int which, int who, int ioprio) {
++#ifdef __roanix__
++        errno = ENOSYS;
++        return -1;
++#else
+         return syscall(__NR_ioprio_set, which, who, ioprio);
++#endif
+ }
+ 
+ #  define ioprio_set missing_ioprio_set
+@@ -80,7 +100,7 @@ static inline int missing_ioprio_set(int which, int who, int ioprio) {
+ 
+ #if !HAVE_MEMFD_CREATE
+ static inline int missing_memfd_create(const char *name, unsigned int flags) {
+-#  ifdef __NR_memfd_create
++#  if !defined(__roanix__) && defined(__NR_memfd_create)
+         return syscall(__NR_memfd_create, name, flags);
+ #  else
+         errno = ENOSYS;
+@@ -96,7 +116,7 @@ static inline int missing_memfd_create(const char *name, unsigned int flags) {
+ #if !HAVE_GETRANDOM
+ /* glibc says getrandom() returns ssize_t */
+ static inline ssize_t missing_getrandom(void *buffer, size_t count, unsigned flags) {
+-#  ifdef __NR_getrandom
++#  if !defined(__roanix__) && defined(__NR_getrandom)
+         return syscall(__NR_getrandom, buffer, count, flags);
+ #  else
+         errno = ENOSYS;
+@@ -112,7 +132,9 @@ static inline ssize_t missing_getrandom(void *buffer, size_t count, unsigned fla
+ /* The syscall has been defined since forever, but the glibc wrapper was missing. */
+ #if !HAVE_GETTID
+ static inline pid_t missing_gettid(void) {
+-#  if defined __NR_gettid && __NR_gettid >= 0
++#  if defined(__roanix__)
++        return gettid();
++#  elif defined __NR_gettid && __NR_gettid >= 0
+         return (pid_t) syscall(__NR_gettid);
+ #  else
+ #    error "__NR_gettid not defined"
+@@ -132,7 +154,7 @@ struct file_handle {
+ };
+ 
+ static inline int missing_name_to_handle_at(int fd, const char *name, struct file_handle *handle, int *mnt_id, int flags) {
+-#  ifdef __NR_name_to_handle_at
++#  if !defined(__roanix__) && defined(__NR_name_to_handle_at)
+         return syscall(__NR_name_to_handle_at, fd, name, handle, mnt_id, flags);
+ #  else
+         errno = ENOSYS;
+@@ -147,7 +169,7 @@ static inline int missing_name_to_handle_at(int fd, const char *name, struct fil
+ 
+ #if !HAVE_SETNS
+ static inline int missing_setns(int fd, int nstype) {
+-#  ifdef __NR_setns
++#  if !defined(__roanix__) && defined(__NR_setns)
+         return syscall(__NR_setns, fd, nstype);
+ #  else
+         errno = ENOSYS;
+@@ -161,7 +183,9 @@ static inline int missing_setns(int fd, int nstype) {
+ /* ======================================================================= */
+ 
+ static inline pid_t raw_getpid(void) {
+-#if defined(__alpha__)
++#if defined(__roanix__)
++        return getpid();
++#elif defined(__alpha__)
+         return (pid_t) syscall(__NR_getxpid);
+ #else
+         return (pid_t) syscall(__NR_getpid);
+@@ -172,7 +196,7 @@ static inline pid_t raw_getpid(void) {
+ 
+ #if !HAVE_RENAMEAT2
+ static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags) {
+-#  ifdef __NR_renameat2
++#  if !defined(__roanix__) && defined(__NR_renameat2)
+         return syscall(__NR_renameat2, oldfd, oldname, newfd, newname, flags);
+ #  else
+         errno = ENOSYS;
+@@ -187,7 +211,7 @@ static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, c
+ 
+ #if !HAVE_KCMP
+ static inline int missing_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2) {
+-#  if defined __NR_kcmp && __NR_kcmp >= 0
++#  if !defined(__roanix__) && defined __NR_kcmp && __NR_kcmp >= 0
+         return syscall(__NR_kcmp, pid1, pid2, type, idx1, idx2);
+ #  else
+         errno = ENOSYS;
+@@ -202,7 +226,7 @@ static inline int missing_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long i
+ 
+ #if !HAVE_KEYCTL
+ static inline long missing_keyctl(int cmd, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
+-#  if defined __NR_keyctl && __NR_keyctl >= 0
++#  if !defined(__roanix__) && defined __NR_keyctl && __NR_keyctl >= 0
+         return syscall(__NR_keyctl, cmd, arg2, arg3, arg4, arg5);
+ #  else
+         errno = ENOSYS;
+@@ -213,7 +237,7 @@ static inline long missing_keyctl(int cmd, unsigned long arg2, unsigned long arg
+ }
+ 
+ static inline key_serial_t missing_add_key(const char *type, const char *description, const void *payload, size_t plen, key_serial_t ringid) {
+-#  if defined __NR_add_key && __NR_add_key >= 0
++#  if !defined(__roanix__) && defined __NR_add_key && __NR_add_key >= 0
+         return syscall(__NR_add_key, type, description, payload, plen, ringid);
+ #  else
+         errno = ENOSYS;
+@@ -224,7 +248,7 @@ static inline key_serial_t missing_add_key(const char *type, const char *descrip
+ }
+ 
+ static inline key_serial_t missing_request_key(const char *type, const char *description, const char * callout_info, key_serial_t destringid) {
+-#  if defined __NR_request_key && __NR_request_key >= 0
++#  if !defined(__roanix__) && defined __NR_request_key && __NR_request_key >= 0
+         return syscall(__NR_request_key, type, description, callout_info, destringid);
+ #  else
+         errno = ENOSYS;
+@@ -242,7 +266,7 @@ static inline ssize_t missing_copy_file_range(int fd_in, loff_t *off_in,
+                                               int fd_out, loff_t *off_out,
+                                               size_t len,
+                                               unsigned int flags) {
+-#  ifdef __NR_copy_file_range
++#  if !defined(__roanix__) && defined(__NR_copy_file_range)
+         return syscall(__NR_copy_file_range, fd_in, off_in, fd_out, off_out, len, flags);
+ #  else
+         errno = ENOSYS;
+@@ -259,7 +283,7 @@ static inline ssize_t missing_copy_file_range(int fd_in, loff_t *off_in,
+ union bpf_attr;
+ 
+ static inline int missing_bpf(int cmd, union bpf_attr *attr, size_t size) {
+-#ifdef __NR_bpf
++#if !defined(__roanix__) && defined(__NR_bpf)
+         return (int) syscall(__NR_bpf, cmd, attr, size);
+ #else
+         errno = ENOSYS;
+@@ -276,7 +300,7 @@ static inline int missing_bpf(int cmd, union bpf_attr *attr, size_t size) {
+ struct statx;
+ 
+ static inline ssize_t missing_statx(int dfd, const char *filename, unsigned flags, unsigned int mask, struct statx *buffer) {
+-#  ifdef __NR_statx
++#  if !defined(__roanix__) && defined(__NR_statx)
+         return syscall(__NR_statx, dfd, filename, flags, mask, buffer);
+ #  else
+         errno = ENOSYS;
+@@ -306,7 +330,7 @@ enum {
+ static inline long missing_set_mempolicy(int mode, const unsigned long *nodemask,
+                            unsigned long maxnode) {
+         long i;
+-#  if defined __NR_set_mempolicy && __NR_set_mempolicy >= 0
++#  if !defined(__roanix__) && defined __NR_set_mempolicy && __NR_set_mempolicy >= 0
+         i = syscall(__NR_set_mempolicy, mode, nodemask, maxnode);
+ #  else
+         errno = ENOSYS;
+@@ -323,7 +347,7 @@ static inline long missing_get_mempolicy(int *mode, unsigned long *nodemask,
+                            unsigned long maxnode, void *addr,
+                            unsigned long flags) {
+         long i;
+-#  if defined __NR_get_mempolicy && __NR_get_mempolicy >= 0
++#  if !defined(__roanix__) && defined __NR_get_mempolicy && __NR_get_mempolicy >= 0
+         i = syscall(__NR_get_mempolicy, mode, nodemask, maxnode, addr, flags);
+ #  else
+         errno = ENOSYS;
+@@ -339,7 +363,7 @@ static inline long missing_get_mempolicy(int *mode, unsigned long *nodemask,
+ 
+ #if !HAVE_PIDFD_SEND_SIGNAL
+ static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, unsigned flags) {
+-#  ifdef __NR_pidfd_send_signal
++#  if !defined(__roanix__) && defined(__NR_pidfd_send_signal)
+         return syscall(__NR_pidfd_send_signal, fd, sig, info, flags);
+ #  else
+         errno = ENOSYS;
+@@ -352,7 +376,7 @@ static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, un
+ 
+ #if !HAVE_PIDFD_OPEN
+ static inline int missing_pidfd_open(pid_t pid, unsigned flags) {
+-#  ifdef __NR_pidfd_open
++#  if !defined(__roanix__) && defined(__NR_pidfd_open)
+         return syscall(__NR_pidfd_open, pid, flags);
+ #  else
+         errno = ENOSYS;
+@@ -367,10 +391,15 @@ static inline int missing_pidfd_open(pid_t pid, unsigned flags) {
+ 
+ #if !HAVE_RT_SIGQUEUEINFO
+ static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info) {
+-#  if defined __NR_rt_sigqueueinfo && __NR_rt_sigqueueinfo >= 0
++#  if !defined(__roanix__) && defined __NR_rt_sigqueueinfo && __NR_rt_sigqueueinfo >= 0
+         return syscall(__NR_rt_sigqueueinfo, tgid, sig, info);
+ #  else
+-#    error "__NR_rt_sigqueueinfo not defined"
++#    ifdef __roanix__
++        errno = ENOSYS;
++        return -1;
++#    else
++#      error "__NR_rt_sigqueueinfo not defined"
++#    endif
+ #  endif
+ }
+ 
+@@ -381,10 +410,15 @@ static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info)
+ 
+ #if !HAVE_RT_TGSIGQUEUEINFO
+ static inline int missing_rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int sig, siginfo_t *info) {
+-#  if defined __NR_rt_tgsigqueueinfo && __NR_rt_tgsigqueueinfo >= 0
++#  if !defined(__roanix__) && defined __NR_rt_tgsigqueueinfo && __NR_rt_tgsigqueueinfo >= 0
+         return syscall(__NR_rt_tgsigqueueinfo, tgid, tid, sig, info);
+ #  else
+-#    error "__NR_rt_tgsigqueueinfo not defined"
++#    ifdef __roanix__
++        errno = ENOSYS;
++        return -1;
++#    else
++#      error "__NR_rt_tgsigqueueinfo not defined"
++#    endif
+ #  endif
+ }
+ 
+@@ -397,7 +431,7 @@ static inline int missing_rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int sig, sigi
+ static inline int missing_execveat(int dirfd, const char *pathname,
+                                    char *const argv[], char *const envp[],
+                                    int flags) {
+-#  if defined __NR_execveat && __NR_execveat >= 0
++#  if !defined(__roanix__) && defined __NR_execveat && __NR_execveat >= 0
+         return syscall(__NR_execveat, dirfd, pathname, argv, envp, flags);
+ #  else
+         errno = ENOSYS;
+@@ -414,7 +448,7 @@ static inline int missing_execveat(int dirfd, const char *pathname,
+ 
+ #if !HAVE_CLOSE_RANGE
+ static inline int missing_close_range(unsigned first_fd, unsigned end_fd, unsigned flags) {
+-#  ifdef __NR_close_range
++#  if !defined(__roanix__) && defined(__NR_close_range)
+         /* Kernel-side the syscall expects fds as unsigned integers (just like close() actually), while
+          * userspace exclusively uses signed integers for fds. glibc chose to expose it 1:1 however, hence we
+          * do so here too, even if we end up passing signed fds to it most of the time. */
+@@ -505,7 +539,7 @@ static inline int missing_mount_setattr(
+                 struct mount_attr *attr,
+                 size_t size) {
+ 
+-#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
++#  if !defined(__roanix__) && defined __NR_mount_setattr && __NR_mount_setattr >= 0
+         return syscall(__NR_mount_setattr, dfd, path, flags, attr, size);
+ #  else
+         errno = ENOSYS;
+@@ -533,7 +567,7 @@ static inline int missing_open_tree(
+                 const char *filename,
+                 unsigned flags) {
+ 
+-#  if defined __NR_open_tree && __NR_open_tree >= 0
++#  if !defined(__roanix__) && defined __NR_open_tree && __NR_open_tree >= 0
+         return syscall(__NR_open_tree, dfd, filename, flags);
+ #  else
+         errno = ENOSYS;
+@@ -567,7 +601,7 @@ static inline int missing_move_mount(
+                 const char *to_pathname,
+                 unsigned flags) {
+ 
+-#  if defined __NR_move_mount && __NR_move_mount >= 0
++#  if !defined(__roanix__) && defined __NR_move_mount && __NR_move_mount >= 0
+         return syscall(__NR_move_mount, from_dfd, from_pathname, to_dfd, to_pathname, flags);
+ #  else
+         errno = ENOSYS;
+@@ -587,7 +621,7 @@ static inline int missing_move_mount(
+ #endif
+ 
+ static inline int missing_fsopen(const char *fsname, unsigned flags) {
+-#  if defined __NR_fsopen && __NR_fsopen >= 0
++#  if !defined(__roanix__) && defined __NR_fsopen && __NR_fsopen >= 0
+         return syscall(__NR_fsopen, fsname, flags);
+ #  else
+         errno = ENOSYS;
+@@ -619,7 +653,7 @@ static inline int missing_fsopen(const char *fsname, unsigned flags) {
+ #endif
+ 
+ static inline int missing_fsconfig(int fd, unsigned cmd, const char *key, const void *value, int aux) {
+-#  if defined __NR_fsconfig && __NR_fsconfig >= 0
++#  if !defined(__roanix__) && defined __NR_fsconfig && __NR_fsconfig >= 0
+         return syscall(__NR_fsconfig, fd, cmd, key, value, aux);
+ #  else
+         errno = ENOSYS;
+@@ -639,7 +673,7 @@ static inline int missing_fsconfig(int fd, unsigned cmd, const char *key, const
+ #endif
+ 
+ static inline int missing_fsmount(int fd, unsigned flags, unsigned ms_flags) {
+-#  if defined __NR_fsmount && __NR_fsmount >= 0
++#  if !defined(__roanix__) && defined __NR_fsmount && __NR_fsmount >= 0
+         return syscall(__NR_fsmount, fd, flags, ms_flags);
+ #  else
+         errno = ENOSYS;
+@@ -655,7 +689,7 @@ static inline int missing_fsmount(int fd, unsigned flags, unsigned ms_flags) {
+ #if !HAVE_GETDENTS64
+ 
+ static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
+-#  if defined __NR_getdents64 && __NR_getdents64 >= 0
++#  if !defined(__roanix__) && defined __NR_getdents64 && __NR_getdents64 >= 0
+         return syscall(__NR_getdents64, fd, buffer, length);
+ #  else
+         errno = ENOSYS;
+@@ -671,7 +705,7 @@ static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
+ #if !HAVE_SCHED_SETATTR
+ 
+ static inline ssize_t missing_sched_setattr(pid_t pid, struct sched_attr *attr, unsigned int flags) {
+-#  if defined __NR_sched_setattr
++#  if !defined(__roanix__) && defined __NR_sched_setattr
+         return syscall(__NR_sched_setattr, pid, attr, flags);
+ #  else
+         errno = ENOSYS;
+diff --git systemd-clean/src/basic/process-util.c systemd-workdir/src/basic/process-util.c
+index 3253a9c..33959aa 100644
+--- systemd-clean/src/basic/process-util.c
++++ systemd-workdir/src/basic/process-util.c
+@@ -16,6 +16,9 @@
+ #include <sys/wait.h>
+ #include <syslog.h>
+ #include <unistd.h>
++#if defined(__roanix__)
++#include <roanix/syscall.h>
++#endif
+ #if HAVE_VALGRIND_VALGRIND_H
+ #include <valgrind/valgrind.h>
+ #endif
+@@ -711,13 +714,25 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
+         if (pid == 1) /* PID 1 has no parent, shortcut this case */
+                 return -EADDRNOTAVAIL;
+ 
++#ifdef __roanix__
++        /* The native process registry exposes parent identity in status;
++         * it does not provide Linux's full scheduling/accounting stat record. */
++        p = procfs_file_alloca(pid, "status");
++        r = get_proc_field(p, "PPid", WHITESPACE, &line);
++#else
+         p = procfs_file_alloca(pid, "stat");
+         r = read_one_line_file(p, &line);
++#endif
+         if (r == -ENOENT)
+                 return -ESRCH;
+         if (r < 0)
+                 return r;
+ 
++#ifdef __roanix__
++        r = safe_atolu(line, &ppid);
++        if (r < 0)
++                return r;
++#else
+         /* Let's skip the pid and comm fields. The latter is enclosed in () but does not escape any () in its
+          * value, so let's skip over it manually */
+ 
+@@ -733,6 +748,8 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
+                    &ppid) != 1)
+                 return -EIO;
+ 
++#endif
++
+         /* If ppid is zero the process has no parent. Which might be the case for PID 1 but also for
+          * processes originating in other namespaces that are inserted into a pidns. Return a recognizable
+          * error in this case. */
+@@ -1226,12 +1243,16 @@ int pid_from_same_root_fs(pid_t pid) {
+ }
+ 
+ bool is_main_thread(void) {
++#if defined(__roanix__)
++        return roanix_syscall0(ROANIX_SYS_PROCESS_GETMAIN_TID) == gettid();
++#else
+         static thread_local int cached = 0;
+ 
+         if (_unlikely_(cached == 0))
+                 cached = getpid_cached() == gettid() ? 1 : -1;
+ 
+         return cached > 0;
++#endif
+ }
+ 
+ bool oom_score_adjust_is_valid(int oa) {
+diff --git systemd-clean/src/basic/raw-clone.h systemd-workdir/src/basic/raw-clone.h
+index 36202cc..806008f 100644
+--- systemd-clean/src/basic/raw-clone.h
++++ systemd-workdir/src/basic/raw-clone.h
+@@ -7,7 +7,9 @@
+ 
+ #include <errno.h>
+ #include <sched.h>
++#ifndef __roanix__
+ #include <sys/syscall.h>
++#endif
+ 
+ #include "log.h"
+ #include "macro.h"
+@@ -39,7 +41,15 @@ static inline pid_t raw_clone(unsigned long flags) {
+         pid_t ret;
+ 
+         assert((flags & (CLONE_VM|CLONE_PARENT_SETTID|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|CLONE_SETTLS|CLONE_PIDFD)) == 0);
+-#if defined(__s390x__) || defined(__s390__) || defined(__CRIS__)
++#if defined(__roanix__)
++        /* fork() supplies SIGCHLD; do not discard requested namespace or
++         * resource-sharing semantics, or a different termination signal. */
++        if (flags != SIGCHLD) {
++                errno = EOPNOTSUPP;
++                return -1;
++        }
++        ret = fork();
++#elif defined(__s390x__) || defined(__s390__) || defined(__CRIS__)
+         /* On s390/s390x and cris the order of the first and second arguments
+          * of the raw clone() system call is reversed. */
+         ret = (pid_t) syscall(__NR_clone, NULL, flags);
+diff --git systemd-clean/src/basic/raw-reboot.h systemd-workdir/src/basic/raw-reboot.h
+index e6bff30..9f6a842 100644
+--- systemd-clean/src/basic/raw-reboot.h
++++ systemd-workdir/src/basic/raw-reboot.h
+@@ -1,14 +1,25 @@
+ /* SPDX-License-Identifier: LGPL-2.1-or-later */
+ #pragma once
+ 
++#include <errno.h>
+ #include <linux/reboot.h>
+ #include <sys/reboot.h>
++#ifndef __roanix__
+ #include <sys/syscall.h>
++#endif
+ 
+ /* glibc defines the reboot() API call, which is a wrapper around the system call of the same name, but without the
+  * extra "arg" parameter. Since we need that parameter for some calls, let's add a "raw" wrapper that is defined the
+  * same way, except it takes the additional argument. */
+ 
+ static inline int raw_reboot(int cmd, const void *arg) {
++#ifdef __roanix__
++        if (arg) {
++                errno = EOPNOTSUPP;
++                return -1;
++        }
++        return reboot(cmd);
++#else
+         return (int) syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, arg);
++#endif
+ }
+diff --git systemd-clean/src/core/bpf-foreign.h systemd-workdir/src/core/bpf-foreign.h
+index e387b1b..af74b5b 100644
+--- systemd-clean/src/core/bpf-foreign.h
++++ systemd-workdir/src/core/bpf-foreign.h
+@@ -5,7 +5,12 @@
+ #include "unit.h"
+ 
+ static inline int bpf_foreign_supported(void) {
++#if defined(__roanix__)
++        /* Native process containment does not imply a BPF subsystem. */
++        return 0;
++#else
+         return cg_all_unified();
++#endif
+ }
+ 
+ /*
+diff --git systemd-clean/src/core/cgroup.c systemd-workdir/src/core/cgroup.c
+index 6933aae..c32ca21 100644
+--- systemd-clean/src/core/cgroup.c
++++ systemd-workdir/src/core/cgroup.c
+@@ -2472,6 +2472,29 @@ CGroupMask unit_get_own_mask(Unit *u) {
+         return unit_get_cgroup_mask(u) | unit_get_bpf_mask(u) | unit_get_delegate_mask(u);
+ }
+ 
++int unit_check_cgroup_support(Unit *u) {
++#ifdef __roanix__
++        /* Check ancestors too, since slice restrictions apply to every child. */
++        for (Unit *p = u; p; p = UNIT_GET_SLICE(p)) {
++                CGroupContext *c = unit_get_cgroup_context(p);
++                if (!c)
++                        continue;
++
++                if (unit_get_own_mask(p) != 0 || c->cpu_accounting ||
++                    c->cpu_quota_period_usec != USEC_INFINITY ||
++                    c->memory_oom_group || !c->memory_zswap_writeback ||
++                    c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_YES ||
++                    c->moom_swap != MANAGED_OOM_AUTO || c->moom_mem_pressure != MANAGED_OOM_AUTO ||
++                    c->moom_preference != MANAGED_OOM_PREFERENCE_NONE ||
++                    c->nft_set_context.n_sets > 0 || c->coredump_receive ||
++                    c->delegate || c->delegate_subgroup)
++                        return log_unit_error_errno(u, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                                    "Resource controller settings in %s are not supported on Roanix.", p->id);
++        }
++#endif
++        return 0;
++}
++
+ CGroupMask unit_get_delegate_mask(Unit *u) {
+         CGroupContext *c;
+ 
+diff --git systemd-clean/src/core/cgroup.h systemd-workdir/src/core/cgroup.h
+index 1ed7483..85694e7 100644
+--- systemd-clean/src/core/cgroup.h
++++ systemd-workdir/src/core/cgroup.h
+@@ -425,6 +425,7 @@ int cgroup_context_add_socket_bind_item_deny_dup(CGroupContext *c, const CGroupS
+ void unit_modify_nft_set(Unit *u, bool add);
+ 
+ CGroupMask unit_get_own_mask(Unit *u);
++int unit_check_cgroup_support(Unit *u);
+ CGroupMask unit_get_delegate_mask(Unit *u);
+ CGroupMask unit_get_members_mask(Unit *u);
+ CGroupMask unit_get_siblings_mask(Unit *u);
+diff --git systemd-clean/src/core/dbus-cgroup.c systemd-workdir/src/core/dbus-cgroup.c
+index fd48f3b..facd351 100644
+--- systemd-clean/src/core/dbus-cgroup.c
++++ systemd-workdir/src/core/dbus-cgroup.c
+@@ -1117,6 +1117,17 @@ int bus_cgroup_set_property(
+ 
+         flags |= UNIT_PRIVATE;
+ 
++#ifdef __roanix__
++        /* Recognize the existing property schema, including scaled limits,
++         * before any setter can save a policy the native kernel cannot apply. */
++        for (const sd_bus_vtable *v = bus_cgroup_vtable; v->type != _SD_BUS_VTABLE_END; v++)
++                if (v->type == _SD_BUS_VTABLE_PROPERTY &&
++                    (streq(name, v->x.property.member) ||
++                     streq(name, strjoina(v->x.property.member, "Scale"))))
++                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
++                                                 "%s is not supported by native Roanix resource controllers.", name);
++#endif
++
+         if (streq(name, "CPUAccounting"))
+                 return bus_cgroup_set_boolean(u, name, &c->cpu_accounting, get_cpu_accounting_mask(), message, flags, error);
+ 
+diff --git systemd-clean/src/core/dbus-execute.c systemd-workdir/src/core/dbus-execute.c
+index e297323..155cf7b 100644
+--- systemd-clean/src/core/dbus-execute.c
++++ systemd-workdir/src/core/dbus-execute.c
+@@ -2142,6 +2142,12 @@ int bus_exec_context_set_transient_property(
+                 if (r < 0)
+                         return r;
+ 
++#ifdef __roanix__
++                if (allow_list || !strv_isempty(l))
++                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
++                                                 "RestrictFileSystems= is not supported on Roanix.");
++#endif
++
+                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                         _cleanup_free_ char *joined = NULL;
+                         FilesystemParseFlags invert_flag = allow_list ? 0 : FILESYSTEM_PARSE_INVERT;
+diff --git systemd-clean/src/core/exec-invoke.c systemd-workdir/src/core/exec-invoke.c
+index 9d636f5..5e833a5 100644
+--- systemd-clean/src/core/exec-invoke.c
++++ systemd-workdir/src/core/exec-invoke.c
+@@ -550,6 +550,17 @@ static int setup_output(
+                 return open_terminal_as(exec_context_tty_path(context), O_WRONLY, fileno);
+ 
+         case EXEC_OUTPUT_KMSG:
++#ifdef __roanix__
++        {
++                _cleanup_close_ int fd = open("/dev/kmsg", O_WRONLY|O_NOCTTY|O_CLOEXEC);
++                if (fd < 0)
++                        return -errno;
++                r = move_fd(fd, fileno, false);
++                if (r >= 0)
++                        TAKE_FD(fd);
++                return r;
++        }
++#endif
+         case EXEC_OUTPUT_KMSG_AND_CONSOLE:
+         case EXEC_OUTPUT_JOURNAL:
+         case EXEC_OUTPUT_JOURNAL_AND_CONSOLE:
+@@ -1366,6 +1377,56 @@ static bool context_has_no_new_privileges(const ExecContext *c) {
+         return context_has_seccomp(c);
+ }
+ 
++#ifdef __roanix__
++static int check_native_sandbox(
++                const ExecContext *context,
++                const ExecParameters *params,
++                const ExecRuntime *runtime,
++                int *exit_status) {
++
++        /* Check the raw namespace modes before upstream capability probes
++         * can downgrade them to a less restrictive configuration. */
++        if (context->private_users != PRIVATE_USERS_NO ||
++            context->private_pids != PRIVATE_PIDS_NO ||
++            context->private_tmp != PRIVATE_TMP_NO ||
++            context->protect_control_groups != PROTECT_CONTROL_GROUPS_NO ||
++            context->protect_hostname ||
++            context->mount_apivfs > 0 ||
++            exec_needs_network_namespace(context) ||
++            exec_needs_mount_namespace(context, params, runtime)) {
++                *exit_status = EXIT_NAMESPACE;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Service namespace isolation is not supported on Roanix.");
++        }
++
++        if (context->no_new_privileges) {
++                *exit_status = EXIT_NO_NEW_PRIVILEGES;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "NoNewPrivileges= is not supported on Roanix.");
++        }
++
++        if (context_has_seccomp(context)) {
++                *exit_status = EXIT_SECCOMP;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Seccomp restrictions are not supported on Roanix.");
++        }
++
++        if (context->selinux_context || context->apparmor_profile || context->smack_process_label) {
++                *exit_status = EXIT_SELINUX_CONTEXT;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Linux security module settings are not supported on Roanix.");
++        }
++
++        if (context->pam_name) {
++                *exit_status = EXIT_PAM;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "PAMName= is not supported on Roanix.");
++        }
++
++        return 0;
++}
++#endif
++
+ #if HAVE_SECCOMP
+ 
+ static bool seccomp_allows_drop_privileges(const ExecContext *c) {
+@@ -3545,6 +3606,11 @@ static int setup_keyring(
+         if (context->keyring_mode == EXEC_KEYRING_INHERIT)
+                 return 0;
+ 
++#ifdef __roanix__
++        return log_exec_error_errno(context, p, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                    "Private and shared kernel keyrings are not supported on Roanix.");
++#endif
++
+         /* Acquiring a reference to the user keyring is nasty. We briefly change identity in order to get things set up
+          * properly by the kernel. If we don't do that then we can't create it atomically, and that sucks for parallel
+          * execution. This mimics what pam_keyinit does, too. Setting up session keyring, to be owned by the right user
+@@ -4275,7 +4341,9 @@ int exec_invoke(
+         gid_t gid = GID_INVALID;
+         size_t n_fds, /* fds to pass to the child */
+                n_keep_fds; /* total number of fds not to close */
++#ifndef __roanix__
+         int secure_bits;
++#endif
+         _cleanup_free_ gid_t *gids_after_pam = NULL;
+         int ngids_after_pam = 0;
+ 
+@@ -4306,6 +4374,64 @@ int exec_invoke(
+ 
+         LOG_CONTEXT_PUSH_EXEC(context, params);
+ 
++        /* Fully privileged command prefixes explicitly bypass sandboxing. */
++        needs_sandboxing = (params->flags & EXEC_APPLY_SANDBOXING) && !(command->flags & EXEC_COMMAND_FULLY_PRIVILEGED);
++
++#ifdef __roanix__
++        /* Native kmsg is a direct device, without the Linux journal daemon or
++         * its stream forwarding/namespace protocol. Reject those requests
++         * before the payload rather than falling back to /dev/null. */
++        if (context->log_namespace ||
++            IN_SET(context->std_output, EXEC_OUTPUT_JOURNAL, EXEC_OUTPUT_JOURNAL_AND_CONSOLE,
++                                       EXEC_OUTPUT_KMSG_AND_CONSOLE)) {
++                *exit_status = EXIT_STDOUT;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Journal, log namespaces, and combined console logging are not supported on Roanix.");
++        }
++        if (IN_SET(context->std_error, EXEC_OUTPUT_JOURNAL, EXEC_OUTPUT_JOURNAL_AND_CONSOLE,
++                                      EXEC_OUTPUT_KMSG_AND_CONSOLE)) {
++                *exit_status = EXIT_STDERR;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Journal and combined console logging are not supported on Roanix.");
++        }
++        if ((context->std_output == EXEC_OUTPUT_KMSG || context->std_error == EXEC_OUTPUT_KMSG) &&
++            (context->syslog_priority != (LOG_DAEMON|LOG_INFO) ||
++             context->syslog_identifier || !context->syslog_level_prefix ||
++             context->n_log_extra_fields > 0 || context->log_level_max >= 0 ||
++             !set_isempty(context->log_filter_allowed_patterns) ||
++             !set_isempty(context->log_filter_denied_patterns) ||
++             context->log_ratelimit.interval > 0 || context->log_ratelimit.burst > 0)) {
++                *exit_status = context->std_output == EXEC_OUTPUT_KMSG ? EXIT_STDOUT : EXIT_STDERR;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Journal metadata, filtering, and rate limits are not supported by native kmsg.");
++        }
++        /* Native processes have a fixed root identity and no Linux capability
++         * sets. Keep the default execution path, but reject requested changes
++         * instead of reporting restrictions that the kernel cannot enforce. */
++        if (context->dynamic_user ||
++            (context->user && !STR_IN_SET(context->user, "root", "0"))) {
++                *exit_status = EXIT_USER;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Only the fixed root service user is supported on Roanix.");
++        }
++        if (context->group && !STR_IN_SET(context->group, "root", "0")) {
++                *exit_status = EXIT_GROUP;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Only the fixed root service group is supported on Roanix.");
++        }
++        if (context->capability_bounding_set != CAP_MASK_UNSET ||
++            context->capability_ambient_set != 0 || context->secure_bits != 0) {
++                *exit_status = EXIT_CAPABILITIES;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Linux capability settings are not supported on Roanix.");
++        }
++        if (needs_sandboxing) {
++                r = check_native_sandbox(context, params, runtime, exit_status);
++                if (r < 0)
++                        return r;
++        }
++#endif
++
+         if (context->std_input == EXEC_INPUT_SOCKET ||
+             context->std_output == EXEC_OUTPUT_SOCKET ||
+             context->std_error == EXEC_OUTPUT_SOCKET) {
+@@ -4514,6 +4640,14 @@ int exec_invoke(
+                 }
+         }
+ 
++#ifdef __roanix__
++        if ((uid_is_valid(uid) && uid != 0) || (gid_is_valid(gid) && gid != 0)) {
++                *exit_status = uid_is_valid(uid) && uid != 0 ? EXIT_USER : EXIT_GROUP;
++                return log_exec_error_errno(context, params, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                            "Non-root service credentials are not supported on Roanix.");
++        }
++#endif
++
+         /* Initialize user supplementary groups and get SupplementaryGroups= ones */
+         r = get_supplementary_groups(context, username, groupname, gid,
+                                      &supplementary_gids, &ngids);
+@@ -4748,10 +4882,6 @@ int exec_invoke(
+                 }
+         }
+ 
+-        /* We need sandboxing if the caller asked us to apply it and the command isn't explicitly excepted
+-         * from it. */
+-        needs_sandboxing = (params->flags & EXEC_APPLY_SANDBOXING) && !(command->flags & EXEC_COMMAND_FULLY_PRIVILEGED);
+-
+         if (params->cgroup_path) {
+                 /* If delegation is enabled we'll pass ownership of the cgroup to the user of the new process. On cgroup v1
+                  * this is only about systemd's own hierarchy, i.e. not the controller hierarchies, simply because that's not
+@@ -5235,7 +5365,9 @@ int exec_invoke(
+          * and it has O_CLOEXEC set, after all we want it to be closed by the execve(), so that our parent knows we
+          * came this far. */
+ 
++#ifndef __roanix__
+         secure_bits = context->secure_bits;
++#endif
+ 
+         if (needs_sandboxing) {
+                 uint64_t bset;
+@@ -5419,6 +5551,7 @@ int exec_invoke(
+                 }
+ #endif
+ 
++#ifndef __roanix__
+                 /* PR_GET_SECUREBITS is not privileged, while PR_SET_SECUREBITS is. So to suppress potential
+                  * EPERMs we'll try not to call PR_SET_SECUREBITS unless necessary. Setting securebits
+                  * requires CAP_SETPCAP. */
+@@ -5445,6 +5578,8 @@ int exec_invoke(
+                         }
+                 }
+ 
++#endif
++
+                 if (context_has_no_new_privileges(context))
+                         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                                 *exit_status = EXIT_NO_NEW_PRIVILEGES;
+diff --git systemd-clean/src/core/load-dropin.c systemd-workdir/src/core/load-dropin.c
+index 5c1ccc9..439042b 100644
+--- systemd-clean/src/core/load-dropin.c
++++ systemd-workdir/src/core/load-dropin.c
+@@ -118,6 +118,10 @@ int unit_load_dropin(Unit *u) {
+                                  UNIT_VTABLE(u)->sections,
+                                  config_item_perf_lookup, load_fragment_gperf_lookup,
+                                  0, u, &st);
++#ifdef __roanix__
++                if (r == -ENOMEM)
++                        return r;
++#endif
+                 if (r > 0)
+                         u->dropin_mtime = MAX(u->dropin_mtime, timespec_load(&st.st_mtim));
+         }
+diff --git systemd-clean/src/core/load-fragment-gperf.gperf.in systemd-workdir/src/core/load-fragment-gperf.gperf.in
+index d7564b3..3460e9a 100644
+--- systemd-clean/src/core/load-fragment-gperf.gperf.in
++++ systemd-workdir/src/core/load-fragment-gperf.gperf.in
+@@ -79,16 +79,16 @@
+ {{type}}.RestrictAddressFamilies,             config_parse_address_families,                      0,                                  offsetof({{type}}, exec_context)
+ {{type}}.LockPersonality,                     config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.lock_personality)
+ {% else %}
+-{{type}}.SystemCallFilter,                    config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.SystemCallArchitectures,             config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.SystemCallErrorNumber,               config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.SystemCallLog,                       config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.MemoryDenyWriteExecute,              config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.RestrictNamespaces,                  config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.RestrictRealtime,                    config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.RestrictSUIDSGID,                    config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.RestrictAddressFamilies,             config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
+-{{type}}.LockPersonality,                     config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
++{{type}}.SystemCallFilter,                    config_parse_disabled_sandbox,                       0,                                  0
++{{type}}.SystemCallArchitectures,             config_parse_disabled_sandbox,                       0,                                  0
++{{type}}.SystemCallErrorNumber,               config_parse_disabled_sandbox,                       0,                                  0
++{{type}}.SystemCallLog,                       config_parse_disabled_sandbox,                       0,                                  0
++{{type}}.MemoryDenyWriteExecute,              config_parse_disabled_sandbox,                       1,                                  0
++{{type}}.RestrictNamespaces,                  config_parse_disabled_sandbox,                       1,                                  0
++{{type}}.RestrictRealtime,                    config_parse_disabled_sandbox,                       1,                                  0
++{{type}}.RestrictSUIDSGID,                    config_parse_disabled_sandbox,                       1,                                  0
++{{type}}.RestrictAddressFamilies,             config_parse_disabled_sandbox,                       0,                                  0
++{{type}}.LockPersonality,                     config_parse_disabled_sandbox,                       1,                                  0
+ {% endif %}
+ {{type}}.RestrictFileSystems,                 config_parse_restrict_filesystems,                  0,                                  offsetof({{type}}, exec_context)
+ {{type}}.LimitCPU,                            config_parse_rlimit,                                RLIMIT_CPU,                         offsetof({{type}}, exec_context.rlimit)
+@@ -160,7 +160,7 @@
+ {% if HAVE_PAM %}
+ {{type}}.PAMName,                             config_parse_unit_string_printf,                    0,                                  offsetof({{type}}, exec_context.pam_name)
+ {% else %}
+-{{type}}.PAMName,                             config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
++{{type}}.PAMName,                             config_parse_disabled_sandbox,                       0,                                  0
+ {% endif %}
+ {{type}}.IgnoreSIGPIPE,                       config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.ignore_sigpipe)
+ {{type}}.UtmpIdentifier,                      config_parse_unit_string_printf,                    0,                                  offsetof({{type}}, exec_context.utmp_id)
+@@ -168,17 +168,17 @@
+ {% if HAVE_SELINUX %}
+ {{type}}.SELinuxContext,                      config_parse_exec_selinux_context,                  0,                                  offsetof({{type}}, exec_context)
+ {% else %}
+-{{type}}.SELinuxContext,                      config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
++{{type}}.SELinuxContext,                      config_parse_disabled_sandbox,                       0,                                  0
+ {% endif %}
+ {% if HAVE_APPARMOR %}
+ {{type}}.AppArmorProfile,                     config_parse_exec_apparmor_profile,                 0,                                  offsetof({{type}}, exec_context)
+ {% else %}
+-{{type}}.AppArmorProfile,                     config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
++{{type}}.AppArmorProfile,                     config_parse_disabled_sandbox,                       0,                                  0
+ {% endif %}
+ {% if ENABLE_SMACK %}
+ {{type}}.SmackProcessLabel,                   config_parse_exec_smack_process_label,              0,                                  offsetof({{type}}, exec_context)
+ {% else %}
+-{{type}}.SmackProcessLabel,                   config_parse_warn_compat,                           DISABLED_CONFIGURATION,             0
++{{type}}.SmackProcessLabel,                   config_parse_disabled_sandbox,                       0,                                  0
+ {% endif %}
+ {{type}}.ProtectHostname,                     config_parse_bool,                                  0,                                  offsetof({{type}}, exec_context.protect_hostname)
+ {{type}}.MemoryKSM,                           config_parse_tristate,                              0,                                  offsetof({{type}}, exec_context.memory_ksm)
+diff --git systemd-clean/src/core/load-fragment.c systemd-workdir/src/core/load-fragment.c
+index f34c930..1d47a97 100644
+--- systemd-clean/src/core/load-fragment.c
++++ systemd-workdir/src/core/load-fragment.c
+@@ -3612,6 +3612,34 @@ int config_parse_restrict_namespaces(
+ }
+ #endif
+ 
++int config_parse_disabled_sandbox(
++                const char *unit,
++                const char *filename,
++                unsigned line,
++                const char *section,
++                unsigned section_line,
++                const char *lvalue,
++                int ltype,
++                const char *rvalue,
++                void *data,
++                void *userdata) {
++#ifdef __roanix__
++        Unit *u = ASSERT_PTR(userdata);
++
++        /* Check after the last drop-in, since an empty assignment or a
++         * disabled boolean can clear a request made by the base unit. */
++        if (isempty(rvalue) || (ltype != 0 && parse_boolean(rvalue) == 0)) {
++                free(set_remove(u->unsupported_sandbox, lvalue));
++                return 0;
++        }
++
++        return set_put_strdup(&u->unsupported_sandbox, lvalue);
++#else
++        return config_parse_warn_compat(unit, filename, line, section, section_line, lvalue,
++                                        DISABLED_CONFIGURATION, rvalue, data, userdata);
++#endif
++}
++
+ int config_parse_restrict_filesystems(
+                 const char *unit,
+                 const char *filename,
+@@ -3631,6 +3659,11 @@ int config_parse_restrict_filesystems(
+         assert(lvalue);
+         assert(rvalue);
+ 
++#ifdef __roanix__
++        return config_parse_disabled_sandbox(unit, filename, line, section, section_line, lvalue,
++                                             0, rvalue, data, userdata);
++#endif
++
+         if (isempty(rvalue)) {
+                 /* Empty assignment resets the list */
+                 c->restrict_filesystems = set_free_free(c->restrict_filesystems);
+@@ -6282,6 +6315,7 @@ void unit_dump_config_items(FILE *f) {
+                 const char *rvalue;
+         } table[] = {
+                 { config_parse_warn_compat,           "NOTSUPPORTED" },
++                { config_parse_disabled_sandbox,      "NOTSUPPORTED" },
+                 { config_parse_int,                   "INTEGER" },
+                 { config_parse_unsigned,              "UNSIGNED" },
+                 { config_parse_iec_size,              "SIZE" },
+@@ -6675,8 +6709,12 @@ int config_parse_log_filter_patterns(
+                                           "Regex pattern invalid, ignoring: %s=%s", lvalue, rvalue);
+         }
+ 
++#ifndef __roanix__
+         if (pattern_compile_and_log(pattern, 0, NULL) < 0)
+                 return 0;
++#endif
++        /* Roanix rejects journal filtering in the executor. Preserve the
++         * request even without PCRE2 instead of silently discarding it. */
+ 
+         r = set_put_strdup(is_allowlist ? &c->log_filter_allowed_patterns : &c->log_filter_denied_patterns,
+                            pattern);
+diff --git systemd-clean/src/core/load-fragment.h systemd-workdir/src/core/load-fragment.h
+index 8ac962a..e49b69a 100644
+--- systemd-clean/src/core/load-fragment.h
++++ systemd-workdir/src/core/load-fragment.h
+@@ -128,6 +128,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_user_group_compat);
+ CONFIG_PARSER_PROTOTYPE(config_parse_user_group_strv_compat);
+ CONFIG_PARSER_PROTOTYPE(config_parse_restrict_namespaces);
+ CONFIG_PARSER_PROTOTYPE(config_parse_restrict_filesystems);
++CONFIG_PARSER_PROTOTYPE(config_parse_disabled_sandbox);
+ CONFIG_PARSER_PROTOTYPE(config_parse_bind_paths);
+ CONFIG_PARSER_PROTOTYPE(config_parse_exec_keyring_mode);
+ CONFIG_PARSER_PROTOTYPE(config_parse_protect_proc);
+diff --git systemd-clean/src/core/main.c systemd-workdir/src/core/main.c
+index 172742c..65a3070 100644
+--- systemd-clean/src/core/main.c
++++ systemd-workdir/src/core/main.c
+@@ -1362,6 +1362,7 @@ static int bump_rlimit_nofile(const struct rlimit *saved_rlimit) {
+         return 0;
+ }
+ 
++#ifndef __roanix__
+ static int bump_rlimit_memlock(const struct rlimit *saved_rlimit) {
+         struct rlimit new_rlimit;
+         uint64_t mm;
+@@ -1396,6 +1397,7 @@ static int bump_rlimit_memlock(const struct rlimit *saved_rlimit) {
+ 
+         return 0;
+ }
++#endif
+ 
+ static int enforce_syscall_archs(Set *archs) {
+ #if HAVE_SECCOMP
+@@ -1791,10 +1793,12 @@ static void initialize_coredump(bool skip_setup) {
+         if (getpid_cached() != 1)
+                 return;
+ 
++#ifndef __roanix__
+         /* Don't limit the core dump size, so that coredump handlers such as systemd-coredump (which honour
+          * the limit) will process core dumps for system services by default. */
+         if (setrlimit(RLIMIT_CORE, &RLIMIT_MAKE_CONST(RLIM_INFINITY)) < 0)
+                 log_warning_errno(errno, "Failed to set RLIMIT_CORE: %m");
++#endif
+ 
+         /* But at the same time, turn off the core_pattern logic by default, so that no coredumps are stored
+          * until the systemd-coredump tool is enabled via sysctl. However it can be changed via the kernel
+@@ -2541,7 +2545,12 @@ static int initialize_runtime(
+ 
+         /* Bump up RLIMIT_NOFILE for systemd itself */
+         (void) bump_rlimit_nofile(saved_rlimit_nofile);
++#ifndef __roanix__
+         (void) bump_rlimit_memlock(saved_rlimit_memlock);
++#else
++        /* No implicit MEMLOCK policy without native locked-memory accounting. */
++        (void) saved_rlimit_memlock;
++#endif
+ 
+         return 0;
+ }
+@@ -2625,8 +2634,10 @@ static void save_rlimits(struct rlimit *saved_rlimit_nofile,
+         if (getrlimit(RLIMIT_NOFILE, saved_rlimit_nofile) < 0)
+                 log_warning_errno(errno, "Reading RLIMIT_NOFILE failed, ignoring: %m");
+ 
++#ifndef __roanix__
+         if (getrlimit(RLIMIT_MEMLOCK, saved_rlimit_memlock) < 0)
+                 log_warning_errno(errno, "Reading RLIMIT_MEMLOCK failed, ignoring: %m");
++#endif
+ }
+ 
+ static void fallback_rlimit_nofile(const struct rlimit *saved_rlimit_nofile) {
+@@ -2673,6 +2684,7 @@ static void fallback_rlimit_nofile(const struct rlimit *saved_rlimit_nofile) {
+         arg_defaults.rlimit[RLIMIT_NOFILE] = rl;
+ }
+ 
++#ifndef __roanix__
+ static void fallback_rlimit_memlock(const struct rlimit *saved_rlimit_memlock) {
+         struct rlimit *rl;
+ 
+@@ -2696,6 +2708,7 @@ static void fallback_rlimit_memlock(const struct rlimit *saved_rlimit_memlock) {
+ 
+         arg_defaults.rlimit[RLIMIT_MEMLOCK] = rl;
+ }
++#endif
+ 
+ static void setenv_manager_environment(void) {
+         int r;
+@@ -2813,7 +2826,9 @@ static int parse_configuration(const struct rlimit *saved_rlimit_nofile,
+ 
+         /* Initialize some default rlimits for services if they haven't been configured */
+         fallback_rlimit_nofile(saved_rlimit_nofile);
++#ifndef __roanix__
+         fallback_rlimit_memlock(saved_rlimit_memlock);
++#endif
+ 
+         /* Note that this also parses bits from the kernel command line, including "debug". */
+         log_parse_environment();
+diff --git systemd-clean/src/core/manager.c systemd-workdir/src/core/manager.c
+index f21a4f7..550bfee 100644
+--- systemd-clean/src/core/manager.c
++++ systemd-workdir/src/core/manager.c
+@@ -5320,14 +5320,27 @@ void unit_defaults_init(UnitDefaults *defaults, RuntimeScope scope) {
+ 
+                 /* On 4.15+ with unified hierarchy, CPU accounting is essentially free as it doesn't require the CPU
+                  * controller to be enabled, so the default is to enable it unless we got told otherwise. */
++#ifdef __roanix__
++                .cpu_accounting = false,
++                .memory_accounting = false,
++#else
+                 .cpu_accounting = cpu_accounting_is_cheap(),
+                 .memory_accounting = MEMORY_ACCOUNTING_DEFAULT,
++#endif
+                 .io_accounting = false,
+                 .blockio_accounting = false,
++#ifdef __roanix__
++                .tasks_accounting = false,
++#else
+                 .tasks_accounting = true,
++#endif
+                 .ip_accounting = false,
+ 
++#ifdef __roanix__
++                .tasks_max = CGROUP_TASKS_MAX_UNSET,
++#else
+                 .tasks_max = DEFAULT_TASKS_MAX,
++#endif
+                 .timer_accuracy_usec = 1 * USEC_PER_MINUTE,
+ 
+                 .memory_pressure_watch = CGROUP_PRESSURE_WATCH_AUTO,
+diff --git systemd-clean/src/core/service.c systemd-workdir/src/core/service.c
+index c436650..bb7df37 100644
+--- systemd-clean/src/core/service.c
++++ systemd-workdir/src/core/service.c
+@@ -164,8 +164,12 @@ static void service_init(Unit *u) {
+         s->control_pid = PIDREF_NULL;
+         s->control_command_id = _SERVICE_EXEC_COMMAND_INVALID;
+ 
++#ifdef __roanix__
++        s->exec_context.keyring_mode = EXEC_KEYRING_INHERIT;
++#else
+         s->exec_context.keyring_mode = MANAGER_IS_SYSTEM(u->manager) ?
+                 EXEC_KEYRING_PRIVATE : EXEC_KEYRING_INHERIT;
++#endif
+ 
+         s->notify_access_override = _NOTIFY_ACCESS_INVALID;
+ 
+diff --git systemd-clean/src/core/slice.c systemd-workdir/src/core/slice.c
+index d9ba4a8..ba25b2a 100644
+--- systemd-clean/src/core/slice.c
++++ systemd-workdir/src/core/slice.c
+@@ -324,15 +324,17 @@ static void slice_enumerate_perpetual(Manager *m) {
+ 
+         r = slice_make_perpetual(m, SPECIAL_ROOT_SLICE, &u);
+         if (r >= 0 && manager_owns_host_root_cgroup(m)) {
+-                Slice *s = SLICE(u);
+-
+                 /* If we are managing the root cgroup then this means our root slice covers the whole system, which
+                  * means the kernel will track CPU/tasks/memory for us anyway, and it is all available in /proc. Let's
+                  * hence turn accounting on here, so that our APIs to query this data are available. */
+ 
++#ifndef __roanix__
++                Slice *s = SLICE(u);
++
+                 s->cgroup_context.cpu_accounting = true;
+                 s->cgroup_context.tasks_accounting = true;
+                 s->cgroup_context.memory_accounting = true;
++#endif
+         }
+ 
+         if (MANAGER_IS_SYSTEM(m))
+diff --git systemd-clean/src/core/taint.c systemd-workdir/src/core/taint.c
+index b7a1c64..be5e917 100644
+--- systemd-clean/src/core/taint.c
++++ systemd-workdir/src/core/taint.c
+@@ -61,10 +61,13 @@ char** taint_strv(void) {
+         if (os_release_support_ended(NULL, /* quiet= */ true, NULL) > 0)
+                 stage[n++] = "support-ended";
+ 
++#if !defined(__roanix__)
++        /* Roanix releases do not describe Linux kernel API versions. */
+         struct utsname uts;
+         assert_se(uname(&uts) >= 0);
+         if (strverscmp_improved(uts.release, KERNEL_BASELINE_VERSION) < 0)
+                 stage[n++] = "old-kernel";
++#endif
+ 
+         _cleanup_free_ char *overflowuid = NULL, *overflowgid = NULL;
+         if (read_one_line_file("/proc/sys/kernel/overflowuid", &overflowuid) >= 0 &&
+diff --git systemd-clean/src/core/unit.c systemd-workdir/src/core/unit.c
+index 0d88f4f..964c8c0 100644
+--- systemd-clean/src/core/unit.c
++++ systemd-workdir/src/core/unit.c
+@@ -844,6 +844,9 @@ Unit* unit_free(Unit *u) {
+         free(u->description);
+         strv_free(u->documentation);
+         free(u->fragment_path);
++#ifdef __roanix__
++        set_free_free(u->unsupported_sandbox);
++#endif
+         free(u->source_path);
+         strv_free(u->dropin_paths);
+         free(u->instance);
+@@ -1285,6 +1288,12 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
+                         return r;
+         }
+ 
++#ifdef __roanix__
++        /* Native kmsg opens the kernel device directly. The executor rejects
++         * journal protocols, so do not pull in Linux journal socket units. */
++        return 0;
++#endif
++
+         if (!IN_SET(c->std_output,
+                     EXEC_OUTPUT_JOURNAL, EXEC_OUTPUT_JOURNAL_AND_CONSOLE,
+                     EXEC_OUTPUT_KMSG, EXEC_OUTPUT_KMSG_AND_CONSOLE) &&
+@@ -1654,6 +1663,15 @@ int unit_load(Unit *u) {
+ 
+         assert(u->load_state != UNIT_STUB);
+ 
++#ifdef __roanix__
++        const char *sandbox_option = set_first(u->unsupported_sandbox);
++        if (sandbox_option) {
++                r = log_unit_error_errno(u, SYNTHETIC_ERRNO(EOPNOTSUPP),
++                                         "%s= is not supported on Roanix.", sandbox_option);
++                goto fail;
++        }
++#endif
++
+         if (u->load_state == UNIT_LOADED) {
+                 unit_add_to_target_deps_queue(u);
+ 
+@@ -1911,6 +1929,10 @@ int unit_start(Unit *u, ActivationDetails *details) {
+         if (!unit_type_supported(u->type))
+                 return -EOPNOTSUPP;
+ 
++        r = unit_check_cgroup_support(u);
++        if (r < 0)
++                return r;
++
+         /* Let's make sure that the deps really are in order before we start this. Normally the job engine
+          * should have taken care of this already, but let's check this here again. After all, our
+          * dependencies might not be in effect anymore, due to a reload or due to an unmet condition. */
+diff --git systemd-clean/src/core/unit.h systemd-workdir/src/core/unit.h
+index 8a3b812..af70a11 100644
+--- systemd-clean/src/core/unit.h
++++ systemd-workdir/src/core/unit.h
+@@ -348,6 +348,9 @@ typedef struct Unit {
+ 
+         /* Error code when we didn't manage to load the unit (negative) */
+         int load_error;
++#ifdef __roanix__
++        Set *unsupported_sandbox;
++#endif
+ 
+         /* Put a ratelimit on unit starting */
+         RateLimit start_ratelimit;
+diff --git systemd-clean/src/libsystemd/sd-event/sd-event.c systemd-workdir/src/libsystemd/sd-event/sd-event.c
+index 7aea7d2..ae77eed 100644
+--- systemd-clean/src/libsystemd/sd-event/sd-event.c
++++ systemd-workdir/src/libsystemd/sd-event/sd-event.c
+@@ -1895,7 +1895,10 @@ _public_ int sd_event_trim_memory(void) {
+ 
+         usec_t before_timestamp = now(CLOCK_MONOTONIC);
+         hashmap_trim_pools();
++        r = 0;
++#if HAVE_MALLOC_TRIM
+         r = malloc_trim(0);
++#endif
+         usec_t after_timestamp = now(CLOCK_MONOTONIC);
+ 
+         if (r > 0)
+diff --git systemd-clean/src/shared/bpf-program.h systemd-workdir/src/shared/bpf-program.h
+index 904f2b9..fd7e938 100644
+--- systemd-clean/src/shared/bpf-program.h
++++ systemd-workdir/src/shared/bpf-program.h
+@@ -4,7 +4,9 @@
+ #include <linux/bpf.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#ifndef __roanix__
+ #include <sys/syscall.h>
++#endif
+ 
+ #include "fdset.h"
+ #include "list.h"
+diff --git systemd-clean/src/shared/bus-util.c systemd-workdir/src/shared/bus-util.c
+index ff80e58..a866304 100644
+--- systemd-clean/src/shared/bus-util.c
++++ systemd-workdir/src/shared/bus-util.c
+@@ -782,6 +782,7 @@ int bus_reply_pair_array(sd_bus_message *m, char **l) {
+ }
+ 
+ static int method_dump_memory_state_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
++#if HAVE_MALLOC_INFO
+         _cleanup_(memstream_done) MemStream m = {};
+         _cleanup_free_ char *dump = NULL;
+         _cleanup_close_ int fd = -EBADF;
+@@ -812,6 +813,9 @@ static int method_dump_memory_state_by_fd(sd_bus_message *message, void *userdat
+                 return r;
+ 
+         return 1; /* Stop further processing */
++#else
++        return -EOPNOTSUPP;
++#endif
+ }
+ 
+ /* The default install callback will fail and disconnect the bus if it cannot register the match, but this
+diff --git systemd-clean/src/shared/common-signal.c systemd-workdir/src/shared/common-signal.c
+index 8e70e36..2ed98ff 100644
+--- systemd-clean/src/shared/common-signal.c
++++ systemd-workdir/src/shared/common-signal.c
+@@ -57,6 +57,7 @@ int sigrtmin18_handler(sd_event_source *s, const struct signalfd_siginfo *si, vo
+                 break;
+ 
+         case COMMON_SIGNAL_COMMAND_MALLOC_INFO: {
++#if HAVE_MALLOC_INFO
+                 _cleanup_(memstream_done) MemStream m = {};
+                 FILE *f;
+ 
+@@ -72,6 +73,9 @@ int sigrtmin18_handler(sd_event_source *s, const struct signalfd_siginfo *si, vo
+                 }
+ 
+                 (void) memstream_dump(LOG_INFO, &m);
++#else
++                log_notice("The C library does not provide malloc allocation diagnostics.");
++#endif
+                 break;
+         }
+ 
+diff --git systemd-clean/src/shared/exec-util.c systemd-workdir/src/shared/exec-util.c
+index 8435c4f..fb5949f 100644
+--- systemd-clean/src/shared/exec-util.c
++++ systemd-workdir/src/shared/exec-util.c
+@@ -3,6 +3,7 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <sys/prctl.h>
++#include <sys/time.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ #include <stdio.h>
+@@ -123,8 +124,14 @@ static int do_execute(
+         /* Abort execution of this process after the timeout. We simply rely on SIGALRM as
+          * default action terminating the process, and turn on alarm(). */
+ 
+-        if (timeout != USEC_INFINITY)
+-                alarm(DIV_ROUND_UP(timeout, USEC_PER_SEC));
++        if (timeout != USEC_INFINITY) {
++                struct itimerval timer = {
++                        .it_value.tv_sec = DIV_ROUND_UP(timeout, USEC_PER_SEC),
++                };
++
++                if (setitimer(ITIMER_REAL, &timer, NULL) < 0)
++                        return log_error_errno(errno, "Failed to arm execution timeout: %m");
++        }
+ 
+         STRV_FOREACH(e, envp)
+                 if (putenv(*e) != 0)
+diff --git systemd-clean/src/shared/killall.c systemd-workdir/src/shared/killall.c
+index 184aec0..5ae765d 100644
+--- systemd-clean/src/shared/killall.c
++++ systemd-workdir/src/shared/killall.c
+@@ -23,6 +23,7 @@
+ #include "string-util.h"
+ #include "terminal-util.h"
+ 
++#ifndef __roanix__
+ static bool argv_has_at(pid_t pid) {
+         _cleanup_fclose_ FILE *f = NULL;
+         const char *p;
+@@ -73,8 +74,15 @@ static bool is_in_survivor_cgroup(const PidRef *pid) {
+ 
+         return r > 0;
+ }
++#endif
+ 
+ static bool ignore_proc(const PidRef *pid, bool warn_rootfs) {
++#ifdef __roanix__
++        /* Native procfs lists userspace processes. Native shutdown has no
++         * initrd storage daemons or cgroup exemptions. */
++        (void) warn_rootfs;
++        return pid->pid == 1;
++#else
+         uid_t uid;
+         int r;
+ 
+@@ -118,6 +126,7 @@ static bool ignore_proc(const PidRef *pid, bool warn_rootfs) {
+         }
+ 
+         return true;
++#endif
+ }
+ 
+ static void log_children_not_yet_killed(Set *pids) {
+diff --git systemd-clean/src/shared/mount-setup.c systemd-workdir/src/shared/mount-setup.c
+index d5009fb..a438d5d 100644
+--- systemd-clean/src/shared/mount-setup.c
++++ systemd-workdir/src/shared/mount-setup.c
+@@ -55,7 +55,10 @@ typedef struct MountPoint {
+  * fourth (securityfs) is needed by IMA to load a custom policy. The
+  * other ones we can delay until SELinux and IMA are loaded. When
+  * SMACK is enabled we need smackfs, too, so it's a fifth one. */
+-#if ENABLE_SMACK
++#if defined(__roanix__)
++/* Native devfs and PTYs are established by the kernel. */
++#define N_EARLY_MOUNT 1
++#elif ENABLE_SMACK
+ #define N_EARLY_MOUNT 5
+ #else
+ #define N_EARLY_MOUNT 4
+@@ -79,12 +82,14 @@ static bool check_recursiveprot_supported(void) {
+ static const MountPoint mount_table[] = {
+         { "proc",        "/proc",                     "proc",       NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+           NULL,          MNT_FATAL|MNT_IN_CONTAINER|MNT_FOLLOW_SYMLINK },
++#ifndef __roanix__
+         { "sysfs",       "/sys",                      "sysfs",      NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+           NULL,          MNT_FATAL|MNT_IN_CONTAINER },
+         { "devtmpfs",    "/dev",                      "devtmpfs",   "mode=0755" TMPFS_LIMITS_DEV,               MS_NOSUID|MS_STRICTATIME,
+           NULL,          MNT_FATAL|MNT_IN_CONTAINER },
+         { "securityfs",  "/sys/kernel/security",      "securityfs", NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+           NULL,          MNT_NONE                   },
++#endif
+ #if ENABLE_SMACK
+         { "smackfs",     "/sys/fs/smackfs",           "smackfs",    "smackfsdef=*",                             MS_NOSUID|MS_NOEXEC|MS_NODEV,
+           mac_smack_use, MNT_FATAL                  },
+@@ -93,8 +98,10 @@ static const MountPoint mount_table[] = {
+ #endif
+         { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777",                               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+           NULL,          MNT_FATAL|MNT_IN_CONTAINER },
++#ifndef __roanix__
+         { "devpts",      "/dev/pts",                  "devpts",     "mode=0620,gid=" STRINGIFY(TTY_GID),        MS_NOSUID|MS_NOEXEC,
+           NULL,          MNT_IN_CONTAINER           },
++#endif
+ #if ENABLE_SMACK
+         { "tmpfs",       "/run",                      "tmpfs",      "mode=0755,smackfsroot=*" TMPFS_LIMITS_RUN, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+           mac_smack_use, MNT_FATAL                  },
+diff --git systemd-clean/src/shared/socket-label.c systemd-workdir/src/shared/socket-label.c
+index b86a6ad..5cd54c5 100644
+--- systemd-clean/src/shared/socket-label.c
++++ systemd-workdir/src/shared/socket-label.c
+@@ -91,9 +91,15 @@ int socket_address_listen(
+                 }
+         }
+ 
+-        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, true);
+-        if (r < 0)
+-                return r;
++#if defined(__roanix__)
++        /* Native Unix sockets use pathname lifetime, with unlink-and-rebind below. */
++        if (socket_address_family(a) != AF_UNIX)
++#endif
++        {
++                r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, true);
++                if (r < 0)
++                        return r;
++        }
+ 
+         p = socket_address_get_path(a);
+         if (p) {
+diff --git systemd-clean/src/shutdown/shutdown.c systemd-workdir/src/shutdown/shutdown.c
+index e26a857..e37110e 100644
+--- systemd-clean/src/shutdown/shutdown.c
++++ systemd-workdir/src/shutdown/shutdown.c
+@@ -432,10 +432,12 @@ int main(int argc, char *argv[]) {
+         /* Lock us into memory */
+         (void) mlockall(MCL_CURRENT|MCL_FUTURE);
+ 
++#ifndef __roanix__
+         /* We need to make mounts private so that we can MS_MOVE in unmount_all(). Kernel does not allow
+          * MS_MOVE when parent mountpoints have shared propagation. */
+         if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
+                 log_warning_errno(errno, "Failed to make mounts private, ignoring: %m");
++#endif
+ 
+         /* Synchronize everything that is not written to disk yet at this point already. This is a good idea so that
+          * slow IO is processed here already and the final process killing spree is not impacted by processes
+@@ -667,6 +669,12 @@ int main(int argc, char *argv[]) {
+         }
+ 
+         (void) reboot(cmd);
++#ifdef __roanix__
++        if (cmd == RB_POWER_OFF && errno == EOPNOTSUPP) {
++                log_notice("Platform power-off is unavailable. Halting.");
++                (void) reboot(RB_HALT_SYSTEM);
++        }
++#endif
+         if (ERRNO_IS_PRIVILEGE(errno) && in_container) {
+                 /* If we are in a container, and we lacked CAP_SYS_BOOT just exit, this will kill our
+                  * container for good. */
+diff --git systemd-clean/src/shutdown/umount.c systemd-workdir/src/shutdown/umount.c
+index 4bc01c7..92dea5d 100644
+--- systemd-clean/src/shutdown/umount.c
++++ systemd-workdir/src/shutdown/umount.c
+@@ -321,6 +321,10 @@ static int umount_with_timeout(MountPoint *m, bool last_try) {
+ 
+                 log_info("Unmounting '%s'.", m->path);
+ 
++#ifdef __roanix__
++                /* Native mounts support a regular, non-symlink-following detach. */
++                r = RET_NERRNO(umount2(m->path, UMOUNT_NOFOLLOW));
++#else
+                 /* Start the mount operation here in the child Using MNT_FORCE causes some filesystems
+                  * (e.g. FUSE and NFS and other network filesystems) to abort any pending requests and return
+                  * -EIO rather than blocking indefinitely. If the filesysten is "busy", this may allow
+@@ -329,6 +333,7 @@ static int umount_with_timeout(MountPoint *m, bool last_try) {
+                 r = RET_NERRNO(umount2(m->path,
+                                        UMOUNT_NOFOLLOW | /* Don't follow symlinks: this should never happen unless our mount list was wrong */
+                                        (m->umount_lazily ? MNT_DETACH : MNT_FORCE)));
++#endif
+                 if (r < 0) {
+                         log_full_errno(last_try ? LOG_ERR : LOG_INFO, r, "Failed to unmount %s: %m", m->path);
+ 
+diff --git systemd-clean/src/udev/generate-keyboard-keys-list.sh systemd-workdir/src/udev/generate-keyboard-keys-list.sh
+index ead3113..f6a364d 100755
+--- systemd-clean/src/udev/generate-keyboard-keys-list.sh
++++ systemd-workdir/src/udev/generate-keyboard-keys-list.sh
+@@ -3,7 +3,7 @@
+ set -eu
+ set -o pipefail
+ 
+-${1:?} -dM -include linux/input.h - </dev/null | awk '
++${1:?} -I"${2:?}" -dM -include linux/input.h - </dev/null | awk '
+     /\<(KEY_(MAX|MIN_INTERESTING))|(BTN_(MISC|MOUSE|JOYSTICK|GAMEPAD|DIGI|WHEEL|TRIGGER_HAPPY))\>/  { next }
+     /^#define[ \t]+(KEY|BTN)_[^ ]+[ \t]+[0-9BK]/                                                    { print $2 }
+ '
+diff --git systemd-clean/src/udev/meson.build systemd-workdir/src/udev/meson.build
+index 3535551..b5ee332 100644
+--- systemd-clean/src/udev/meson.build
++++ systemd-workdir/src/udev/meson.build
+@@ -58,7 +58,8 @@ generate_keyboard_keys_list = find_program('generate-keyboard-keys-list.sh')
+ keyboard_keys_list_txt = custom_target(
+         'keyboard-keys-list.txt',
+         output : 'keyboard-keys-list.txt',
+-        command : [generate_keyboard_keys_list, cpp],
++        command : [generate_keyboard_keys_list, cpp, project_source_root / 'src/basic'],
++        depend_files : files('../basic/linux/input.h', '../basic/linux/input-event-codes.h'),
+         capture : true)
+ 
+ generate_keyboard_keys_gperf = find_program('generate-keyboard-keys-gperf.sh')

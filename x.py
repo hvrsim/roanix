@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -33,6 +34,7 @@ SYSTEM_PACKAGES = (
     "python",
     "stress-ng",
     "util-roanix",
+    "systemd",
 )
 BOOTSTRAP_PACKAGES = ("coreutils", "bash", "mlibc", "util-roanix")
 
@@ -257,6 +259,7 @@ class Build:
         self.out = self.base / "out" / self.profile
         self.sysroot = self.base / "sysroot"
         self.jinx_dir = self.base / "jinx"
+        self.machine_id = self.base / "machine-id"
 
         self.kernel = self.out / "roanix"
         self.initramfs = self.out / f"roanix-{self.arch}.initramfs.tar.gz"
@@ -359,6 +362,37 @@ class Build:
         for package, module in zip(DRIVERS[self.arch], self.modules):
             copy(target_dir / self.target / "release" / package, module)
 
+    def prepare_machine_id(self):
+        """Retain one identity for this architecture's read-only system images."""
+        self.base.mkdir(parents=True, exist_ok=True)
+        if not self.machine_id.exists():
+            # Publish a complete file without replacing an identity created by
+            # another image build. Neither packages nor source control own it.
+            with tempfile.TemporaryDirectory(prefix=".machine-id-", dir=self.base) as scratch:
+                candidate = Path(scratch) / "machine-id"
+                candidate.write_text(uuid.uuid4().hex + "\n")
+                candidate.chmod(0o444)
+                try:
+                    os.link(candidate, self.machine_id)
+                except FileExistsError:
+                    pass
+        if self.machine_id.is_symlink() or not self.machine_id.is_file():
+            raise RuntimeError(f"machine identity must be a regular file: {self.machine_id}")
+        identity = self.machine_id.read_bytes()
+        if not re.fullmatch(rb"[0-9a-f]{32}\n", identity) or identity == b"0" * 32 + b"\n":
+            raise RuntimeError(f"invalid cached machine identity: {self.machine_id}")
+
+    def install_machine_id(self, root):
+        """Install the retained identity without following guest file symlinks."""
+        self.prepare_machine_id()
+        destination = root / "etc/machine-id"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            destination.unlink()
+        if not destination.is_file() or destination.read_bytes() != self.machine_id.read_bytes():
+            destination.unlink(missing_ok=True)
+            shutil.copy2(self.machine_id, destination)
+
     def install(self, root, packages, *, bootstrap=False):
         """Install packages and modules into a fresh root or bootstrap tree."""
         self.jinx("install", root, *packages)
@@ -369,6 +403,7 @@ class Build:
             for name in ("dev/.roanix-keep", "tmp/.roanix-keep", "etc/roanix-root"):
                 remove(root / name)
         else:
+            self.install_machine_id(root)
             for header in (ROOT / "drivers/include/roanix").glob("*.h"):
                 copy(header, root / "usr/include/roanix" / header.name)
 
@@ -385,7 +420,8 @@ class Build:
 
         packages = sorted((self.jinx_dir / "pkgs").glob("*.xbps"))
         headers = sorted((ROOT / "drivers/include/roanix").glob("*.h"))
-        inputs = [*packages, *self.modules, *headers, USERLAND / "Jinxfile"]
+        self.prepare_machine_id()
+        inputs = [*packages, *self.modules, *headers, USERLAND / "Jinxfile", self.machine_id]
         assemble(
             self.sysroot,
             inputs=inputs,

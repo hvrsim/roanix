@@ -488,6 +488,9 @@ impl Ext4 {
 }
 
 impl FileSystem for Ext4 {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn id(&self) -> FilesystemId {
         self.id
     }
@@ -503,6 +506,8 @@ impl FileSystem for Ext4 {
     fn statfs(&self) -> StatFs {
         let block_size = u64::from(self.geometry.block_size);
         StatFs {
+            filesystem_type: 0xef53,
+            block_size,
             total_bytes: self.geometry.block_count.saturating_mul(block_size),
             used_bytes: self
                 .geometry

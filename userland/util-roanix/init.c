@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -37,7 +38,8 @@ static int create_tmp(void) {
 }
 
 static int open_console(void) {
-    int serial = open("/dev/ttyS0", O_RDWR);
+    /* Leave ownership to the console service once the real manager starts. */
+    int serial = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
     if (serial < 0)
         return -1;
 
@@ -214,6 +216,14 @@ int main(void) {
         fprintf(stderr, "init: continuing with the emergency initramfs\n");
     }
 
+    if (getenv(ROOT_READY) != NULL) {
+        execl("/usr/lib/systemd/systemd", "systemd", (char *)NULL);
+        fprintf(stderr, "init: cannot start systemd: %s\n", strerror(errno));
+        fprintf(stderr, "init: continuing with the emergency console\n");
+    }
+
+    /* Only the emergency supervisor owns the terminal directly. */
+    (void)ioctl(STDIN_FILENO, TIOCSCTTY, 0);
     detect_terminal_size();
     clear_terminal();
     printf("Welcome to roanix!\n");

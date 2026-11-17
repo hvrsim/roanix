@@ -430,6 +430,9 @@ impl Fat32 {
 }
 
 impl FileSystem for Fat32 {
+    fn read_only(&self) -> bool {
+        true
+    }
     fn id(&self) -> FilesystemId {
         self.id
     }
@@ -450,6 +453,8 @@ impl FileSystem for Fat32 {
                 * u64::from(self.volume.geometry.bytes_per_cluster)
         });
         StatFs {
+            filesystem_type: 0x4d44,
+            block_size: u64::from(self.volume.geometry.bytes_per_cluster),
             total_bytes,
             used_bytes,
             total_nodes: u64::from(self.volume.geometry.cluster_count),

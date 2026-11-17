@@ -1,0 +1,38 @@
+#! /bin/sh
+
+version=2.40.4
+revision=3
+tarball_url="https://www.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-${version}.tar.xz"
+tarball_blake2b="37c095d0ab97d54dd5a35160dd4d7d3ac683c19c799d57dac3a2e850a824160470e8654fbc77752cad9a9b1198cd1aa6594e8fa66f498c653c8a9f34ef0203e8"
+hostdeps="gcc-host pkg-config"
+builddeps="linux-headers"
+deps="sys-libs"
+
+prepare() {
+    autotools_recursive_regen
+}
+
+configure() {
+    # Build libmount's classic mount and epoll/inotify monitoring APIs. Its
+    # mount-FD and optional filesystem support remain disabled on Roanix.
+    autotools_configure \
+        --disable-all-programs \
+        --enable-libuuid \
+        --enable-libblkid \
+        --enable-libmount \
+        --disable-libmount-mountfd-support \
+        --disable-libmount-support-mtab \
+        --without-btrfs \
+        --without-python \
+        --without-systemd \
+        --without-udev
+}
+
+build() {
+    make -j"${parallelism}"
+}
+
+package() {
+    make DESTDIR="${dest_dir}" install
+    post_package_strip
+}

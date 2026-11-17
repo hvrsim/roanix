@@ -1,4 +1,4 @@
-//! Process ELF loading and initial userspace stack construction.
+//! Interpreter-script resolution, ELF loading, and initial userspace stacks.
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::{mem, str};
@@ -10,7 +10,7 @@ use xmas_elf::{
 };
 
 use crate::{
-    fs::{self, OpenFlags},
+    fs::{self, FileRef, OpenFlags},
     mem::{
         ObjectKind, PAGE_SIZE, USER_ADDRESS_MAX, VirtAddr, VmBacking, VmInheritance, VmMapping,
         VmObject, VmPlacement, VmProtection, VmSpace, align_down,
@@ -23,6 +23,8 @@ const INTERPRETER_BASE: u64 = 0x4000_0000;
 const PIE_BASE: u64 = 0x2000_0000;
 const STACK_SIZE: u64 = 1024 * 1024;
 const STACK_TOP: u64 = USER_ADDRESS_MAX - PAGE_SIZE;
+const SCRIPT_HEADER_SIZE: usize = 256;
+const MAX_SCRIPT_INTERPRETERS: usize = 4;
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -41,6 +43,7 @@ const AT_EXECFN: u64 = 31;
 
 pub(super) struct LoadedProgram {
     pub address_space: Arc<VmSpace>,
+    pub executable: FileRef,
     pub entry: u64,
     pub stack: u64,
 }
@@ -77,8 +80,61 @@ pub(super) fn load<A: AsRef<[u8]>, E: AsRef<[u8]>>(
     arguments: &[A],
     environment: &[E],
 ) -> Result<LoadedProgram> {
+    let mut executable_path = path.to_vec();
+    let mut argument_bytes: Vec<Vec<u8>> =
+        arguments.iter().map(|arg| arg.as_ref().to_vec()).collect();
+    let mut scripts = 0;
+    let executable = loop {
+        let file = fs::open(&executable_path, OpenFlags::READ, 0)?;
+        let mut header = [0; SCRIPT_HEADER_SIZE];
+        let mut length = 0;
+        while length < header.len() {
+            let count = file.read_at(
+                length as u64,
+                &mut crate::mem::IoSink::kernel(&mut header[length..]),
+            )?;
+            if count == 0 {
+                break;
+            }
+            length += count;
+        }
+        let header = &header[..length];
+        if !header.starts_with(b"#!") {
+            break file;
+        }
+        if scripts == MAX_SCRIPT_INTERPRETERS {
+            return Err(fs::Error::SymlinkLoop.into());
+        }
+        scripts += 1;
+        let end = header.iter().position(|byte| matches!(byte, b'\n' | 0));
+        if end.is_none() && file.getattr()?.size > length as u64 {
+            return Err(Error::InvalidElf("script interpreter line too long"));
+        }
+        let line = header[2..end.unwrap_or(length)].trim_ascii();
+        let separator = line
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(line.len());
+        let interpreter = &line[..separator];
+        if interpreter.is_empty() {
+            return Err(Error::InvalidElf("script interpreter missing"));
+        }
+        let optional_argument = line[separator..].trim_ascii();
+        let mut script_arguments = Vec::with_capacity(argument_bytes.len() + 3);
+        script_arguments.push(interpreter.to_vec());
+        if !optional_argument.is_empty() {
+            script_arguments.push(optional_argument.to_vec());
+        }
+        script_arguments.push(executable_path);
+        script_arguments.extend(argument_bytes.into_iter().skip(1));
+        argument_bytes = script_arguments;
+        executable_path = super::current().map_or_else(
+            || interpreter.to_vec(),
+            |process| process.resolve_path(interpreter),
+        );
+    };
     let address_space = VmSpace::new()?;
-    let main_bytes = read_file(path)?;
+    let main_bytes = read_file(&executable)?;
     let main_spec = parse_elf(&main_bytes)?;
     let main_base = if main_spec.image_type == ElfType::SharedObject {
         PIE_BASE
@@ -88,7 +144,8 @@ pub(super) fn load<A: AsRef<[u8]>, E: AsRef<[u8]>>(
     let main = map_elf(&address_space, &main_bytes, &main_spec, main_base)?;
 
     let (entry, interpreter_base) = if let Some(interpreter) = &main_spec.interpreter {
-        let interpreter_bytes = read_file(interpreter.as_bytes())?;
+        let interpreter_file = fs::open(interpreter.as_bytes(), OpenFlags::READ, 0)?;
+        let interpreter_bytes = read_file(&interpreter_file)?;
         let interpreter_spec = parse_elf(&interpreter_bytes)?;
         if interpreter_spec.image_type != ElfType::SharedObject {
             return Err(Error::UnsupportedElf);
@@ -104,7 +161,7 @@ pub(super) fn load<A: AsRef<[u8]>, E: AsRef<[u8]>>(
         (main.entry, 0)
     };
 
-    let argument_refs: Vec<_> = arguments.iter().map(|value| value.as_ref()).collect();
+    let argument_refs: Vec<_> = argument_bytes.iter().map(Vec::as_slice).collect();
     let environment_refs: Vec<_> = environment.iter().map(|value| value.as_ref()).collect();
     let stack = build_stack(
         &address_space,
@@ -116,13 +173,13 @@ pub(super) fn load<A: AsRef<[u8]>, E: AsRef<[u8]>>(
     )?;
     Ok(LoadedProgram {
         address_space,
+        executable,
         entry,
         stack,
     })
 }
 
-fn read_file(path: &[u8]) -> Result<Vec<u8>> {
-    let file = fs::open(path, OpenFlags::READ, 0)?;
+fn read_file(file: &FileRef) -> Result<Vec<u8>> {
     let size =
         usize::try_from(file.getattr()?.size).map_err(|_| Error::InvalidElf("file too large"))?;
     let mut bytes = vec![0u8; size];

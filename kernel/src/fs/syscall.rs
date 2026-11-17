@@ -8,7 +8,7 @@ use crate::{
         self, IoctlContext, OpenFlags, PathAnchor, PollEvents, SeekFrom, Vnode, VnodeAttr,
         VnodeKind,
     },
-    mem::{IoSink, IoSource, VirtAddr},
+    mem::{IoSink, IoSource, IoVector, VirtAddr},
     proc::{self, Descriptor, PipeEnd, PipeError, Process},
     sys::{
         clock,
@@ -21,6 +21,7 @@ use crate::{
 };
 
 const MAX_IO_SIZE: usize = 16 * 1024 * 1024;
+const MAX_IOV: usize = 1024;
 const MAX_IOCTL_SIZE: usize = 4096;
 
 const O_ACCMODE: u64 = 0o3;
@@ -36,6 +37,7 @@ const O_LARGEFILE: u64 = 0o100000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
+const O_PATH: u64 = 0o10000000;
 const FD_CLOEXEC: u64 = 1;
 
 const F_DUPFD: u64 = 0;
@@ -102,6 +104,7 @@ enum AtPath {
     Vfs { base: PathAnchor, path: Vec<u8> },
     Pipe,
     Anonymous,
+    Socket(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -143,12 +146,15 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_read(_frame, fd: i32 = 0, buffer: u64 = 1, size: u64 = 2) {
+        let process = current_process()?;
+        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+        if matches!(&descriptor, Descriptor::File(file) if file.is_path()) {
+            return Err(Errno::BadFileDescriptor);
+        }
         let size = clamped_io_size(size)?;
         if size == 0 {
             return Ok(0);
         }
-        let process = current_process()?;
-        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         check_terminal_job_control(&process, &descriptor, false)?;
         let address_space = process.address_space();
         let mut sink = IoSink::user(&address_space, VirtAddr::new(buffer), size)
@@ -160,18 +166,62 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_write(_frame, fd: i32 = 0, buffer: u64 = 1, size: u64 = 2) {
+        let process = current_process()?;
+        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+        if matches!(&descriptor, Descriptor::File(file) if file.is_path()) {
+            return Err(Errno::BadFileDescriptor);
+        }
         let size = clamped_io_size(size)?;
         if size == 0 {
             return Ok(0);
         }
-        let process = current_process()?;
-        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         check_terminal_job_control(&process, &descriptor, true)?;
         let address_space = process.address_space();
         let source = IoSource::user(&address_space, VirtAddr::new(buffer), size)
             .map_err(map_memory_error)?;
         let written = descriptor_write(&descriptor, &source)?;
         Ok(written as u64)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_writev(_frame, fd: i32 = 0, vectors: u64 = 1, count: i32 = 2) {
+        let count = usize::try_from(count).map_err(|_| Errno::Invalid)?;
+        if count > MAX_IOV {
+            return Err(Errno::Invalid);
+        }
+        let process = current_process()?;
+        let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
+        if matches!(&descriptor, Descriptor::File(file) if file.is_path()) {
+            return Err(Errno::BadFileDescriptor);
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        let space = process.address_space();
+        let metadata = IoSource::user(&space, VirtAddr::new(vectors), count * 16)
+            .map_err(map_memory_error)?;
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(count).map_err(|_| Errno::OutOfMemory)?;
+        let mut total = 0usize;
+        for index in 0..count {
+            let mut record = [0u8; 16];
+            metadata.load(index * 16, &mut record).map_err(map_memory_error)?;
+            let address = u64::from_ne_bytes(record[..8].try_into().unwrap());
+            let length = u64::from_ne_bytes(record[8..].try_into().unwrap()) as usize;
+            total = total.checked_add(length).filter(|total| *total <= isize::MAX as usize)
+                .ok_or(Errno::Invalid)?;
+            if length != 0 {
+                segments.push(IoVector { address: VirtAddr::new(address), end: total });
+            }
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+        check_terminal_job_control(&process, &descriptor, true)?;
+        let source = IoSource::vectored(&space, &segments).map_err(map_memory_error)?;
+        let bounded = source.slice(0, total.min(MAX_IO_SIZE)).map_err(map_memory_error)?;
+        Ok(descriptor_write(&descriptor, &bounded)? as u64)
     }
 }
 
@@ -200,6 +250,9 @@ crate::syscall_handler! {
         let Descriptor::File(file) = descriptor else {
             return Err(Errno::NotTty);
         };
+        if file.is_path() {
+            return Err(Errno::BadFileDescriptor);
+        }
         let spec = crate::dev::tty::ioctl_spec(request);
         if spec.size > MAX_IOCTL_SIZE {
             return Err(Errno::Invalid);
@@ -289,7 +342,57 @@ crate::syscall_handler! {
     syscall_file_umount(_frame, path: u64 = 0) {
         let process = current_process()?;
         let path = read_user_path(&process, path)?;
-        fs::unmount(&path).map_err(map_fs_error)?;
+        fs::unmount(&path, true).map_err(map_fs_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_umount_nofollow(_frame, path: u64 = 0) {
+        let process = current_process()?;
+        let path = read_user_path(&process, path)?;
+        fs::unmount(&path, false).map_err(map_fs_error)?;
+        Ok(0)
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_statfs(_frame, dirfd: i32 = 0, path: u64 = 1, output: u64 = 2) {
+        let process = current_process()?;
+        let anchor = if path == 0 {
+            match process.descriptor(dirfd).ok_or(Errno::BadFileDescriptor)? {
+                Descriptor::File(file) => file.path_anchor(),
+                _ => return Err(Errno::NotSupported),
+            }
+        } else {
+            let AtPath::Vfs { base, path } =
+                resolve_at_path(&process, dirfd, path, EmptyPath::Reject)?
+            else {
+                return Err(Errno::BadFileDescriptor);
+            };
+            fs::resolve_at(&base, &path, true).map_err(map_fs_error)?
+        };
+        let filesystem = anchor.filesystem();
+        let stats = filesystem.statfs();
+        if stats.block_size == 0 {
+            return Err(Errno::NotSupported);
+        }
+        let blocks = stats.total_bytes / stats.block_size;
+        let free = blocks.saturating_sub(stats.used_bytes.div_ceil(stats.block_size));
+        // Native, fixed-width ABI. No libc structure layout or padding crosses
+        // the kernel boundary. Unprivileged users have no separate block quota.
+        let record = [
+            stats.filesystem_type, stats.block_size, blocks, free, free,
+            stats.total_nodes, stats.total_nodes.saturating_sub(stats.used_nodes),
+            filesystem.id().get(), fs::path::MAX_NAME_LEN as u64,
+            u64::from(filesystem.read_only()),
+        ];
+        let mut bytes = [0u8; 80];
+        for (word, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(record) {
+            word.copy_from_slice(&value.to_ne_bytes());
+        }
+        process.address_space().write_user(VirtAddr::new(output), &bytes)
+            .map_err(map_memory_error)?;
         Ok(0)
     }
 }
@@ -302,11 +405,6 @@ crate::syscall_handler! {
         filesystem: u64 = 2,
         flags: u64 = 3,
     ) {
-        // Disk filesystems are currently mounted read-only. Accept Linux
-        // MS_RDONLY or no flags so libc can use its conventional interface.
-        if flags & !1 != 0 {
-            return Err(Errno::Invalid);
-        }
         let process = current_process()?;
         let source = read_user_path(&process, source)?;
         let target = read_user_path(&process, target)?;
@@ -316,7 +414,23 @@ crate::syscall_handler! {
         if target == b"/" && process.pid() != 1 {
             return Err(Errno::Permission);
         }
-        fs::mount_block(source, &target, filesystem).map_err(map_fs_error)?;
+        if filesystem == "proc" {
+            // This read-only view contains no device nodes, set-ID executables,
+            // or executable file data. These restrictions are intrinsic to it.
+            if flags & !0xf != 0 { return Err(Errno::Invalid); }
+            let filesystem: fs::FileSystemRef = fs::procfs::Procfs::new().map_err(map_fs_error)?;
+            fs::vfs::mount_with_source(&target, filesystem, source.as_bytes()).map_err(map_fs_error)?;
+        } else if filesystem == "cgroup2" {
+            // The hierarchy is writable; device nodes and executable data do
+            // not exist in it. Unsupported mount policies remain errors.
+            if flags & !0xe != 0 { return Err(Errno::Invalid); }
+            let filesystem: fs::FileSystemRef = fs::cgroupfs::Cgroupfs::global().map_err(map_fs_error)?;
+            fs::vfs::mount_with_source(&target, filesystem, source.as_bytes()).map_err(map_fs_error)?;
+        } else {
+            // Disk backends currently support read-only mounts only.
+            if flags & !1 != 0 { return Err(Errno::Invalid); }
+            fs::mount_block(source, &target, filesystem).map_err(map_fs_error)?;
+        }
         if target == b"/" {
             process.reset_cwd().map_err(map_process_error)?;
         }
@@ -400,6 +514,11 @@ crate::syscall_handler! {
             Descriptor::File(file) => {
                 write_user_stat(&process, output, file.getattr().map_err(map_fs_error)?)
             }
+            Descriptor::Unix(socket) => {
+                let mut stat = UserStat::anonymous(0o777, 7);
+                stat.inode = socket.id as u64;
+                write_user_stat_record(&process, output, stat)
+            }
             Descriptor::Pipe(_) => {
                 write_user_stat_record(&process, output, UserStat::anonymous(0o666, 6))
             }
@@ -416,6 +535,12 @@ crate::syscall_handler! {
 crate::syscall_handler! {
     syscall_file_fcntl(_frame, fd: i32 = 0, request: u64 = 1, argument: u64 = 2) {
         let process = current_process()?;
+        if !matches!(request, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL)
+            && let Some(Descriptor::File(file)) = process.descriptor(fd)
+            && file.is_path()
+        {
+            return Err(Errno::BadFileDescriptor);
+        }
         match request {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let minimum = usize::try_from(argument).map_err(|_| Errno::Invalid)?;
@@ -437,37 +562,9 @@ crate::syscall_handler! {
                     .then_some(0)
                     .ok_or(Errno::BadFileDescriptor)
             }
-            F_GETFL => match process.descriptor(fd).ok_or(Errno::BadFileDescriptor)? {
-                Descriptor::File(file) => Ok(open_flags_to_user(file.flags())),
-                Descriptor::Pipe(pipe) => {
-                    Ok(pipe.access_mode() | if pipe.is_nonblocking() { O_NONBLOCK } else { 0 })
-                }
-                Descriptor::SignalFd(signal_fd) => {
-                    Ok(if signal_fd.is_nonblocking() {
-                        O_NONBLOCK
-                    } else {
-                        0
-                    })
-                }
-                Descriptor::Epoll(_) => Ok(0),
-                Descriptor::Inotify(inotify) => {
-                    Ok(if inotify.is_nonblocking() {
-                        O_NONBLOCK
-                    } else {
-                        0
-                    })
-                }
-                Descriptor::TimerFd(timer) => {
-                    Ok(if timer.is_nonblocking() {
-                        O_NONBLOCK
-                    } else {
-                        0
-                    })
-                }
-                Descriptor::EventFd(counter) => {
-                    Ok(O_RDWR | if counter.is_nonblocking() { O_NONBLOCK } else { 0 })
-                }
-            },
+            F_GETFL => Ok(descriptor_open_flags(
+                &process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?, false,
+            )),
             F_SETFL => {
                 if argument & !(O_ACCMODE | O_APPEND | O_NONBLOCK) != 0 {
                     return Err(Errno::Invalid);
@@ -476,6 +573,7 @@ crate::syscall_handler! {
                     Descriptor::File(file) => {
                         file.set_status_flags(argument & O_APPEND != 0, argument & O_NONBLOCK != 0)
                     }
+                    Descriptor::Unix(socket) => socket.set_nonblocking(argument & O_NONBLOCK != 0),
                     Descriptor::Pipe(pipe) => pipe.set_nonblocking(argument & O_NONBLOCK != 0),
                     Descriptor::SignalFd(signal_fd) => {
                         signal_fd.set_nonblocking(argument & O_NONBLOCK != 0)
@@ -539,16 +637,19 @@ crate::syscall_handler! {
 
 crate::syscall_handler! {
     syscall_file_readdir(_frame, fd: i32 = 0, buffer: u64 = 1, size: u64 = 2) {
-        let size = checked_io_size(size)?;
-        let maximum = size / USER_DIRENT_SIZE;
-        if maximum == 0 {
-            return Err(Errno::Invalid);
-        }
         let process = current_process()?;
         let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         let Descriptor::File(file) = descriptor else {
             return Err(Errno::NotDirectory);
         };
+        if file.is_path() {
+            return Err(Errno::BadFileDescriptor);
+        }
+        let size = checked_io_size(size)?;
+        let maximum = size / USER_DIRENT_SIZE;
+        if maximum == 0 {
+            return Err(Errno::Invalid);
+        }
         let entries = file.readdir(maximum).map_err(map_fs_error)?;
         let output_size = entries
             .len()
@@ -871,6 +972,7 @@ fn file_access_at(process: &Process, dirfd: i32, path: u64, mode: u64, flags: u6
         }
         AtPath::Pipe => 0o666,
         AtPath::Anonymous => 0o600,
+        AtPath::Socket(_) => 0o777,
     };
     check_access(mode_bits, mode)?;
     Ok(0)
@@ -892,6 +994,11 @@ fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u6
         }
         AtPath::Pipe => write_user_stat_record(process, output, UserStat::anonymous(0o666, 6)),
         AtPath::Anonymous => write_user_stat_record(process, output, UserStat::anonymous(0o600, 1)),
+        AtPath::Socket(id) => {
+            let mut stat = UserStat::anonymous(0o777, 7);
+            stat.inode = id as u64;
+            write_user_stat_record(process, output, stat)
+        }
     }
 }
 
@@ -1074,7 +1181,7 @@ fn resolve_at_path(
             }
             Ok(AtPath::Vfs {
                 base: file.path_anchor(),
-                path: if path.is_empty() { b".".to_vec() } else { path },
+                path,
             })
         }
         Descriptor::Pipe(_) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
@@ -1087,7 +1194,11 @@ fn resolve_at_path(
         }
         Descriptor::SignalFd(_) if path.is_empty() => Err(Errno::BadFileDescriptor),
         Descriptor::SignalFd(_) => Err(Errno::NotDirectory),
+        Descriptor::Unix(socket) if path.is_empty() && matches!(empty, EmptyPath::AllowAny) => {
+            Ok(AtPath::Socket(socket.id))
+        }
         Descriptor::Epoll(_)
+        | Descriptor::Unix(_)
         | Descriptor::Inotify(_)
         | Descriptor::TimerFd(_)
         | Descriptor::EventFd(_)
@@ -1096,6 +1207,7 @@ fn resolve_at_path(
             Ok(AtPath::Anonymous)
         }
         Descriptor::Epoll(_)
+        | Descriptor::Unix(_)
         | Descriptor::Inotify(_)
         | Descriptor::TimerFd(_)
         | Descriptor::EventFd(_)
@@ -1104,6 +1216,7 @@ fn resolve_at_path(
             Err(Errno::BadFileDescriptor)
         }
         Descriptor::Epoll(_)
+        | Descriptor::Unix(_)
         | Descriptor::Inotify(_)
         | Descriptor::TimerFd(_)
         | Descriptor::EventFd(_) => Err(Errno::NotDirectory),
@@ -1111,12 +1224,23 @@ fn resolve_at_path(
 }
 
 fn lookup_at(base: &PathAnchor, path: &[u8], follow_final: bool) -> Result<Vnode> {
+    // An accepted AT_EMPTY_PATH names the description itself, including an
+    // O_PATH handle to a regular file or an unfollowed symbolic link.
+    if path.is_empty() {
+        return Ok(base.vnode().clone());
+    }
     fs::resolve_at(base, path, follow_final)
         .map(|anchor| anchor.vnode().clone())
         .map_err(map_fs_error)
 }
 
 fn parse_open_flags(flags: u64) -> Result<OpenFlags> {
+    if flags & O_PATH != 0 {
+        let mut result = OpenFlags::PATH;
+        result.set(OpenFlags::DIRECTORY, flags & O_DIRECTORY != 0);
+        result.set(OpenFlags::NOFOLLOW, flags & O_NOFOLLOW != 0);
+        return Ok(result);
+    }
     let allowed = O_ACCMODE
         | O_CREAT
         | O_EXCL
@@ -1233,7 +1357,37 @@ fn dirent_kind(kind: VnodeKind) -> u8 {
     }
 }
 
+/// Open-status flags shared by fcntl and procfs descriptor metadata.
+pub(super) fn descriptor_open_flags(descriptor: &Descriptor, close_on_exec: bool) -> u64 {
+    let (access, nonblocking) = match descriptor {
+        Descriptor::File(file) => {
+            return open_flags_to_user(file.flags()) | if close_on_exec { O_CLOEXEC } else { 0 };
+        }
+        Descriptor::Unix(socket) => (O_RDWR, socket.is_nonblocking()),
+        Descriptor::Pipe(pipe) => (pipe.access_mode(), pipe.is_nonblocking()),
+        Descriptor::SignalFd(fd) => (0, fd.is_nonblocking()),
+        Descriptor::Epoll(_) => (0, false),
+        Descriptor::Inotify(fd) => (0, fd.is_nonblocking()),
+        Descriptor::TimerFd(fd) => (0, fd.is_nonblocking()),
+        Descriptor::EventFd(fd) => (O_RDWR, fd.is_nonblocking()),
+    };
+    access | if nonblocking { O_NONBLOCK } else { 0 } | if close_on_exec { O_CLOEXEC } else { 0 }
+}
+
 fn open_flags_to_user(flags: OpenFlags) -> u64 {
+    if flags.contains(OpenFlags::PATH) {
+        return O_PATH
+            | if flags.contains(OpenFlags::DIRECTORY) {
+                O_DIRECTORY
+            } else {
+                0
+            }
+            | if flags.contains(OpenFlags::NOFOLLOW) {
+                O_NOFOLLOW
+            } else {
+                0
+            };
+    }
     let mut result = match (
         flags.contains(OpenFlags::READ),
         flags.contains(OpenFlags::WRITE),
@@ -1254,6 +1408,7 @@ fn open_flags_to_user(flags: OpenFlags) -> u64 {
 fn descriptor_read(descriptor: &Descriptor, sink: &mut IoSink<'_>) -> Result<usize> {
     match descriptor {
         Descriptor::File(file) => file.read(sink).map_err(map_fs_error),
+        Descriptor::Unix(socket) => socket.read(sink),
         Descriptor::Pipe(pipe) => pipe.read(sink).map_err(map_pipe_error),
         Descriptor::SignalFd(signal_fd) => signal_fd.read(sink),
         Descriptor::Epoll(_) => Err(Errno::BadFileDescriptor),
@@ -1266,6 +1421,7 @@ fn descriptor_read(descriptor: &Descriptor, sink: &mut IoSink<'_>) -> Result<usi
 fn descriptor_write(descriptor: &Descriptor, source: &IoSource<'_>) -> Result<usize> {
     match descriptor {
         Descriptor::File(file) => file.write(source).map_err(map_fs_error),
+        Descriptor::Unix(socket) => socket.write(source),
         Descriptor::Pipe(pipe) => pipe.write(source).map_err(map_pipe_error),
         Descriptor::EventFd(counter) => counter.write(source),
         Descriptor::SignalFd(_)
@@ -1337,6 +1493,7 @@ fn map_pipe_error(error: PipeError) -> Errno {
         PipeError::BadDescriptor => Errno::BadFileDescriptor,
         PipeError::TryAgain => Errno::TryAgain,
         PipeError::Fault => Errno::Fault,
+        PipeError::Interrupted => Errno::Interrupted,
         PipeError::BrokenPipe => {
             if let Some(process) = proc::current() {
                 proc::signal::send_kernel(&process, proc::signal::SIGPIPE);
