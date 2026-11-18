@@ -24,6 +24,7 @@ struct Partition {
     number: usize,
     first: u64,
     blocks: u64,
+    uuid: Option<[u8; 16]>,
 }
 
 /// Scans a newly registered whole disk. Corrupt or absent tables leave the
@@ -38,6 +39,7 @@ pub fn scan(device: &Arc<BlockDevice>) {
                     device.clone(),
                     partition.first,
                     partition.blocks,
+                    partition.uuid,
                 ) {
                     Ok(child) => {
                         log::info!(
@@ -153,6 +155,11 @@ fn discover_gpt(device: &BlockDevice, block_size: usize) -> Result<Vec<Partition
             number: index + 1,
             first,
             blocks: last - first + 1,
+            uuid: Some(
+                entry[16..32]
+                    .try_into()
+                    .map_err(|_| Error::InvalidArgument)?,
+            ),
         });
     }
     validate_ranges(output, device.block_count())
@@ -183,6 +190,7 @@ fn discover_mbr(device: &BlockDevice, block_size: usize, sector: &[u8]) -> Resul
                 number: index + 1,
                 first,
                 blocks,
+                uuid: None,
             });
         }
     }
@@ -236,6 +244,7 @@ fn discover_ebr(
                 number: *number,
                 first,
                 blocks,
+                uuid: None,
             });
             *number += 1;
         }

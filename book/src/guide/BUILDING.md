@@ -1,218 +1,90 @@
-# Building and running Roanix
+# Build and run Roanix
 
-`x.py` has three commands: `run`, `build`, and `rebuild`. Run it from the
-repository root. With no arguments, it builds a bootable HDD image and starts
-QEMU.
+Use a Linux host with Python 3.12 or newer and Rust installed through rustup.
+Run the commands in this guide from the repository root.
 
-## Requirements
+## Try Roanix in QEMU
 
-Use a Linux host with Python 3.12 or newer, rustup, a C compiler, GNU Make,
-Git, Bash, wget, awk, findutils, grep, gzip, sed, tar, zstd, coreutils, procps,
-and util-linux. [Jinx] uses unprivileged user namespaces to build packages in
-containers; run `x.py` as your normal user.
-
-Images also require `sgdisk` (gdisk/gptfdisk), `mtools`, and `e2fsprogs`.
-ISO creation requires `xorriso`. Install `qemu-system-x86_64` and/or
-`qemu-system-riscv64` for the architecture you want to run; distribution
-package names vary.
-
-Cargo installs the pinned nightly toolchains and targets from the kernel and
-driver `rust-toolchain.toml` files. The driver toolchain also requests
-`rust-src` for RISC-V's position-independent standard-library build. `x.py`
-downloads pinned Jinx, Limine, and UEFI firmware into `build/cache/`; bootloader
-and firmware archives are checked against their SHA256 hashes.
-
-[Jinx]: https://github.com/Mintsuki/Jinx
-
-## Build an image and boot it
-
-```bash
-./x.py                         # build changed parts, then boot the HDD image
-./x.py run iso                 # build and boot an ISO
-./x.py build                   # build an HDD image without starting QEMU
-./x.py build iso -a riscv64    # build a RISC-V ISO
-./x.py run -r                  # build and boot a release kernel
+```sh
+./x.py doctor run
+./x.py run
 ```
 
-Each image build:
+Install any tools that `doctor` reports as missing. The first run downloads
+build inputs and may compile packages that are unavailable as binaries. When
+QEMU starts, wait for the Roanix shell. After a code change, run `./x.py run`
+again. It reuses build outputs that are still current.
 
-1. Invokes Cargo for the kernel and the architecture's hardware drivers.
-   Cargo recompiles only what changed; drivers always use the release profile.
-2. Asks Jinx to download missing userland packages and dependencies from the
-   binary repository configured in `userland/Jinxfile`. Existing local XBPS
-   packages, including your rebuilt packages, are reused. If packages are
-   unavailable, it tries the host-tool repository and builds the missing
-   packages locally.
-3. Installs the packages and drivers into `build/<arch>/sysroot`, packs a
-   bootstrap initramfs, and creates the ext4 root disk and selected boot image.
-   Assembly steps are skipped when their inputs have not changed.
-4. For `run`, starts QEMU with the boot image and the root disk attached as an
-   NVMe device. The guest CPU count defaults to `nproc`, independently of the
-   number of build jobs.
+## Build a bootable image
 
-The HDD or ISO contains Limine, the kernel, and the bootstrap initramfs. The
-complete userland lives in the companion `roanix-<arch>.root.img`. **Keep both
-images together** when running outside `x.py`. After loading the storage drivers,
-the kernel mounts the read-only ext4 volume named by the Limine `root=`
-parameter and launches systemd as PID 1. The default is `/dev/nvme0n1p1`,
-which QEMU attaches as a disposable snapshot. If the root cannot be mounted,
-the kernel starts an initramfs rescue shell on `/dev/ttyS0`.
-
-`SYSTEM_PACKAGES` in `x.py` selects the top-level packages in the system.
-Jinx resolves their dependencies. `BOOTSTRAP_PACKAGES` selects the small early
-boot environment. Add a recipe under `userland/recipes/` and add its name to
-`SYSTEM_PACKAGES` when it should be included in the image.
-
-The systemd package supplies libudev, `udevadm`, and `systemd-udevd`. At boot,
-udev processes the devices exposed by native sysfs and receives subsequent
-device events through `NETLINK_KOBJECT_UEVENT`. Driver-owned device nodes stay
-in devfs; udev writes its database under `/run/udev` and manages aliases in
-writable trees under `/dev/char`, `/dev/block`, `/dev/disk`, `/dev/serial`,
-`/dev/input/by-id`, `/dev/input/by-path`, and `/dev/dri/by-path`.
-
-`systemd-logind.service` manages graphical seats and sessions through the
-system D-Bus broker. kmscon registers a logind session and uses libsystemd's
-D-Bus API to acquire input and DRM descriptors. Its service starts after udev
-coldplug and logind; the serial shell remains available independently.
-
-## Develop the kernel or drivers
-
-Edit the Rust sources and run `./x.py` again. Cargo checks changes on every
-invocation, including changes to dependencies, build scripts, and flags.
-To compile without assembling images:
-
-```bash
-./x.py build kernel
-./x.py build drivers -a riscv64
-./x.py build userland           # packages, drivers, and installed sysroot
+```sh
+./x.py doctor image
+./x.py image
 ```
 
-Kernel-only changes refresh the boot image while reusing the userland and
-root disk. Driver changes also refresh the installed modules and initramfs.
-See [the driver guide](../../../drivers/README.md) for module layout and APIs.
+The default build produces a standalone raw disk for x86_64 PCs in
+`build/dist/`. It includes a read-only system partition. On a physical PC, you
+need UEFI or legacy BIOS and a storage controller that Roanix supports.
+Use `./x.py image --format iso` to build a live ISO that loads the system into
+memory. For an ISO build, check the host with `./x.py doctor image --format iso`.
 
-## Develop a Jinx package
+Each image comes with a SHA-256 checksum and a JSON build manifest. Pass the
+image path to `x.py run` to boot it in QEMU.
 
-Image builds consider a package current when Jinx has an XBPS file matching
-its recipe version and revision. Source edits, patch edits, and recipe edits
-that keep that version and revision need an explicit package build. This
-also applies to the local C programs under `userland/util-roanix/`.
-
-To get working sources for a package that was downloaded as a binary:
-
-```bash
-./x.py build bash
+```sh
+./x.py run --image build/dist/roanix-pc-x86_64-standard-release.raw
 ```
 
-This runs a local Jinx build even if the binary package already exists.
-Edit `userland/sources/bash-workdir/`, then:
+Use `test boot --image` with the same path to run a headless boot test. The test
+runs a command in the guest shell and saves the serial log in
+`build/work/<arch>/logs/`.
 
-```bash
-./x.py rebuild bash
-./x.py                         # install the new package, refresh images, boot
+## Work on the kernel or drivers
+
+Run `./x.py check kernel` to check your kernel changes or
+`./x.py build kernel` to produce the kernel binary. Use `check driver nvme`
+or `build driver nvme` to work on a single driver. For a debugging session,
+`./x.py run --debug` pauses QEMU and prints the path to the kernel symbols
+and the GDB connection command.
+
+Both `run` and `image` accept `--machine qemu-riscv64-virt` to target the
+RISC-V QEMU machine and `--profile minimal` to use a smaller package set.
+`run` defaults to the development kernel, and `image` defaults to the release
+kernel. Select either with `--mode dev` or `--mode release`.
+
+## Edit a userland package
+
+1. Run `./x.py package edit bash` and make your changes in the worktree it
+   prints. The first call may build the package to prepare its sources.
+2. Run `./x.py run` to test the change in QEMU, or use
+   `./x.py build package bash` to build the XBPS archive on its own.
+3. Run `./x.py package export-patch bash` when you're ready to save the changes
+   as a patch in the recipe directory.
+
+For local packages such as `util-roanix`, edit the tracked source directly.
+Prefix host-tool recipes with `host:`, as in
+`./x.py build package host:binutils`. Package build logs are in
+`build/work/<arch>/logs/`. Add `--verbose` to see the build output as it runs.
+
+## Prepare for an offline build
+
+```sh
+./x.py fetch run
+./x.py run --offline
 ```
 
-`rebuild` asks Jinx to save the working source changes as
-`userland/recipes/bash/patches/jinx-working-patch.patch`, runs preparation,
-and rebuilds the package from a fresh build directory. It generates and
-indexes the new XBPS package in `build/<arch>/jinx/pkgs/`. It does not bump
-recipe revisions or rebuild reverse dependencies automatically.
+Use the same machine and profile options for both commands. Use `fetch image`
+when you plan to build portable media. During prefetch, `x.py` checks the
+version and hash of downloaded XBPS packages against the repository index.
+Jinx can build packages that are missing from the feed. To skip binary
+downloads and reuse any packages already staged locally, add
+`--packages source`.
 
-To verify that your patch works on freshly downloaded sources:
+## Reclaim disk space
 
-```bash
-./x.py rebuild bash -f
-```
+Run `./x.py disk-usage` to see where the build uses space. `./x.py clean`
+removes rebuildable work for the selected machine and keeps your downloads,
+staged packages, editable worktrees, and finished images. Preview cache
+cleanup with `./x.py cache prune --dry-run`.
 
-The patch is saved **before** the downloaded source, clean copy, working
-copy, and Jinx source markers are removed. Jinx then downloads the sources
-again and applies the saved patches. A failed patch-generation step stops
-before deletion. If no working copy exists yet, `rebuild` builds from the
-recipe and its already saved patches.
-
-Other package types use the same commands:
-
-```bash
-./x.py rebuild util-roanix      # rebuild local repository sources in place
-./x.py rebuild mlibc-headers    # regenerate mlibc's patch, rebuild its headers
-./x.py rebuild host:binutils    # host-sources/binutils-workdir; host-pkgs output
-```
-
-Shared-source recipes regenerate their source owner's patch. Local
-`source_dir` recipes such as `util-roanix` have no generated working patch;
-commit those source edits directly. `-f` never deletes local `source_dir`
-trees. Host packages are build tools and are not installed into the guest.
-
-After an ABI change, rebuild affected consumers explicitly or bump the
-appropriate recipe revisions using Jinx. Commit patches and recipe changes;
-downloaded working directories and package archives are ignored by Git.
-
-## Options and QEMU
-
-| Option | Meaning |
-| --- | --- |
-| `-a`, `--arch` | `x86_64` (default) or `riscv64` |
-| `-r`, `--release` | Use a release kernel instead of the default `dev` profile |
-| `-j`, `--jobs` | Cargo and Jinx build jobs; defaults to `nproc` |
-| `-v`, `--verbose` | Print subprocess commands |
-| `rebuild -f` | Save the patch and refetch downloaded sources |
-| `run --bios` | Use x86_64 BIOS instead of the default UEFI |
-| `run -- …` | Append raw QEMU arguments |
-
-Options can appear before or after the command. `ROANIX_ARCH` sets a default
-architecture; `-a` overrides it. Set `ROANIX_BINARY_PACKAGES=0` to skip cloud
-packages, or `ROANIX_PACKAGE_REPO` to use another repository. Disabling binary
-downloads still reuses existing local packages and allows source downloads.
-`ROANIX_RUSTFLAGS` appends kernel compiler flags.
-
-```bash
-./x.py run -- -display none                # serial console and QEMU monitor
-./x.py run -- -accel tcg -smp 4 -m 2G     # override emulator defaults
-./x.py run -- -s -S                       # GDB server, halted at reset
-```
-
-For GDB, connect from another terminal:
-
-```bash
-rust-gdb build/x86_64/out/dev/roanix -ex 'target remote :1234'
-```
-
-QEMU uses KVM for x86_64 when the host provides access to `/dev/kvm`;
-otherwise it uses software emulation. RISC-V uses the `virt` machine with
-UEFI, a framebuffer, USB input, and NVMe storage. On the serial terminal,
-Ctrl-A X exits QEMU; Ctrl-A C switches to its monitor.
-
-## Layout and direct tools
-
-```text
-build/
-├── cache/                   pinned Jinx, Limine, firmware, and downloads
-├── cargo/                   Cargo kernel outputs, namespaced by target/profile
-│   └── drivers/             driver workspace Cargo outputs
-└── <arch>/
-    ├── jinx/                package builds, pkgs/, host-pkgs/, and host tools
-    ├── drivers-rust/        finished .ko modules
-    ├── sysroot/             installed packages, modules, and public headers
-    └── out/<profile>/       kernel, initramfs, ext4 root disk, HDD/ISO
-```
-
-Small `.stamp` files beside assembled outputs track their inputs. Existing
-Jinx packages and downloaded sources from older builds are reused; the old
-`build/config.json` and `state/` files are no longer used. Architectures keep
-separate packages and images, but Jinx's source trees and container cache are
-shared. Run package builds/rebuilds one at a time across architectures.
-
-Use the underlying tools for less common work:
-
-```bash
-(cd build/x86_64/jinx && ../../cache/jinx/jinx dry-run '*')
-(cd build/x86_64/jinx && ../../cache/jinx/jinx run-in bash bash)
-(cd build/x86_64/jinx && ../../cache/jinx/jinx revbump mlibc)
-(cd kernel && cargo fmt --check)
-mdbook serve book
-```
-
-To discard generated images, remove `build/<arch>/out/`. Remove that
-architecture's `sysroot/` to reinstall its packages. Removing `build/<arch>/`
-also discards its package builds. Save patches with `rebuild` before removing
-anything under `userland/sources/` or `userland/host-sources/`.
+Run `./x.py --help` for the full command list.

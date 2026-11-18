@@ -1,0 +1,4 @@
+# Jinx and XBPS include the dependencies of these packages automatically.
+standard = ["libdrm", "kmscon", "dbus", "bash", "coreutils", "python", "stress-ng", "util-roanix", "systemd"]
+minimal = ["coreutils", "bash", "systemd", "util-roanix"]
+bootstrap = ["coreutils", "bash", "mlibc", "util-roanix"]

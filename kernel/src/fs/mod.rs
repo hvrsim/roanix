@@ -47,6 +47,16 @@ pub fn mount_block(source: &str, target: &[u8], filesystem: &str) -> Result<()> 
         return Err(Error::InvalidArgument);
     }
     let device = crate::dev::block::find(name).map_err(Error::from)?;
+    mount_block_device(device, source, target, filesystem)
+}
+
+/// Mounts a resolved block device and retains its original source in mount metadata.
+pub(crate) fn mount_block_device(
+    device: alloc::sync::Arc<crate::dev::block::BlockDevice>,
+    source: &str,
+    target: &[u8],
+    filesystem: &str,
+) -> Result<()> {
     let mounted: FileSystemRef = match filesystem {
         "ext4" => ext4::Ext4::new(device)?,
         "fat32" | "vfat" => fat32::Fat32::new(device)?,
@@ -61,14 +71,31 @@ pub fn mount_block(source: &str, target: &[u8], filesystem: &str) -> Result<()> 
         let shared = runtime_tmpfs(0o1777)?;
         replace_root(mounted, source.as_bytes())?;
         devfs::remount_global()?;
-        vfs::mount(b"/tmp", temporary)?;
-        vfs::mount(b"/run", runtime)?;
-        vfs::mount(b"/dev/shm", shared)?;
-        mount_device_links()?;
+        mount_runtime_filesystems(temporary, runtime, shared)?;
     } else {
         vfs::mount_with_source(target, mounted, source.as_bytes())?;
     }
     Ok(())
+}
+
+/// Sets up volatile mounts for a system running directly from the initramfs.
+pub fn prepare_runtime_root() -> Result<()> {
+    mount_runtime_filesystems(
+        runtime_tmpfs(0o1777)?,
+        runtime_tmpfs(0o755)?,
+        runtime_tmpfs(0o1777)?,
+    )
+}
+
+fn mount_runtime_filesystems(
+    temporary: FileSystemRef,
+    runtime: FileSystemRef,
+    shared: FileSystemRef,
+) -> Result<()> {
+    vfs::mount(b"/tmp", temporary)?;
+    vfs::mount(b"/run", runtime)?;
+    vfs::mount(b"/dev/shm", shared)?;
+    mount_device_links()
 }
 
 /// Device nodes remain driver-owned; udev owns links in these writable trees.

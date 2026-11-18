@@ -111,14 +111,48 @@ fn mount_boot_root() -> fs::Result<()> {
         .and_then(|value| core::str::from_utf8(value).ok())
         .filter(|value| !value.is_empty())
         .ok_or(fs::Error::InvalidArgument)?;
+    if source == "initramfs" {
+        return fs::prepare_runtime_root();
+    }
     info!(target: "boot", "mounting read-only ext4 root from {source}");
     let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let mut lookup = None;
+    if let Some(uuid) = source.strip_prefix("PARTUUID=") {
+        lookup = Some(parse_partition_uuid(uuid).ok_or(fs::Error::InvalidArgument)?);
+    }
+    let find_root = || match lookup {
+        Some(uuid) => dev::block::find_partition(uuid),
+        None => dev::block::find(name),
+    };
     for _ in 0..9 {
-        match dev::block::find(name) {
-            Ok(_) => break,
+        match find_root() {
+            Ok(device) => return fs::mount_block_device(device, source, b"/", "ext4"),
             Err(driver::Error::NotFound) => sys::clock::sleep(Duration::from_secs(1)),
             Err(error) => return Err(error.into()),
         }
     }
-    fs::mount_block(source, b"/", "ext4")
+    let device = find_root().map_err(fs::Error::from)?;
+    fs::mount_block_device(device, source, b"/", "ext4")
+}
+
+/// Decodes a canonical GPT GUID, reversing the fields stored little-endian.
+fn parse_partition_uuid(value: &str) -> Option<[u8; 16]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 || [8, 13, 18, 23].iter().any(|&i| bytes[i] != b'-') {
+        return None;
+    }
+    let mut digits = bytes.iter().copied();
+    let mut result = [0u8; 16];
+    for (index, byte) in result.iter_mut().enumerate() {
+        if [4, 6, 8, 10].contains(&index) {
+            digits.next();
+        }
+        let high = char::from(digits.next()?).to_digit(16)?;
+        let low = char::from(digits.next()?).to_digit(16)?;
+        *byte = (high * 16 + low) as u8;
+    }
+    result[..4].reverse();
+    result[4..6].reverse();
+    result[6..8].reverse();
+    Some(result)
 }

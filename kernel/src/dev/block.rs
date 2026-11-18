@@ -150,6 +150,7 @@ fn registry() -> Result<&'static Registry> {
 pub struct BlockDevice {
     header: ObjHeader,
     name: Box<str>,
+    partition_uuid: Option<[u8; 16]>,
     owner: Option<Arc<Module>>,
     parent: Option<Arc<BlockDevice>>,
     children: Mutex<Vec<Weak<BlockDevice>>>,
@@ -602,6 +603,7 @@ pub fn register_module(owner: Arc<Module>, name: &str, ops: BlockOps) -> Result<
         block_size,
         max_transfer,
         count,
+        None,
     )
 }
 
@@ -611,6 +613,7 @@ pub fn register_partition(
     parent: Arc<BlockDevice>,
     first: u64,
     block_count: u64,
+    partition_uuid: Option<[u8; 16]>,
 ) -> Result<Arc<BlockDevice>> {
     let _lifecycle = parent.lifecycle.lock();
     if parent.header.state() != ObjState::Live {
@@ -636,6 +639,7 @@ pub fn register_partition(
         parent.logical_block_size,
         parent.max_transfer_blocks,
         block_count,
+        partition_uuid,
     )
 }
 
@@ -649,6 +653,7 @@ fn register(
     logical_block_size: u32,
     max_transfer_blocks: u32,
     block_count: u64,
+    partition_uuid: Option<[u8; 16]>,
 ) -> Result<Arc<BlockDevice>> {
     if name.is_empty() || name.len() > 255 || name.bytes().any(|byte| byte == b'/') {
         return Err(Error::InvalidArgument);
@@ -665,6 +670,7 @@ fn register(
             parent.as_ref().map(|device| device.object_id()),
         ),
         name: name.to_string().into_boxed_str(),
+        partition_uuid,
         owner,
         parent: parent.clone(),
         children: Mutex::new(Vec::new()),
@@ -735,6 +741,20 @@ pub fn find(name: &str) -> Result<Arc<BlockDevice>> {
         .get(name)
         .cloned()
         .ok_or(Error::NotFound)
+}
+
+/// Finds a partition by its GPT unique identifier in on-disk byte order.
+pub fn find_partition(uuid: [u8; 16]) -> Result<Arc<BlockDevice>> {
+    let registry = registry()?;
+    let devices = registry.devices.lock();
+    let mut matching = devices
+        .values()
+        .filter(|device| device.partition_uuid == Some(uuid));
+    let device = matching.next().ok_or(Error::NotFound)?;
+    if matching.next().is_some() {
+        return Err(Error::AlreadyExists);
+    }
+    Ok(device.clone())
 }
 
 /// Removes a device and all unclaimed partition children.

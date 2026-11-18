@@ -1,0 +1,13 @@
+[binaries]
+c = '@ARCH@-roanix-gcc'
+cpp = '@ARCH@-roanix-g++'
+ar = '@ARCH@-roanix-ar'
+nm = '@ARCH@-roanix-nm'
+strip = '@ARCH@-roanix-strip'
+pkg-config = '@ARCH@-roanix-pkg-config'
+
+[host_machine]
+system = 'roanix'
+cpu_family = '@ARCH@'
+cpu = '@ARCH@'
+endian = 'little'

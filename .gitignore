@@ -9,7 +9,6 @@ kernel/target/
 userland/.jinx-cache/
 userland/host-sources/
 userland/sources/
-userland/util-roanix/roanix-root
 __pycache__/
 
 # editor artifacts
@@ -18,13 +17,6 @@ __pycache__/
 
 # mdbook
 book/book/
-
-# device tree artifacts
-*.dtb
-*.dts
-
-# custom scripts
-*.sh
 
 # agent skills
 .agents/

@@ -35,21 +35,22 @@ the hardware backend to the native terminal layer.
 
 ## Building
 
-```
-./x.py --arch x86_64        # build, install, and boot x86_64
-./x.py --arch riscv64       # build, install, and boot RISC-V
-./x.py build drivers       # build only the hardware modules
+```bash
+./x.py run
+./x.py run --machine qemu-riscv64-virt
+./x.py build drivers
+./x.py build driver nvme
 ```
 
 The workspace targets `x86_64-unknown-none` and `riscv64gc-unknown-none-elf`
-with the pinned nightly toolchain in `rust-toolchain.toml`. RISC-V builds
-rebuild `core` and `alloc` with `-Z build-std` so every image stays position
-independent. `x.py` lets Cargo detect changes and keeps intermediates under
-`build/cargo/drivers`. It copies finished modules to `build/<arch>/drivers-rust`
-and installs them directly into the staged sysroot alongside the public headers.
+with the pinned nightly toolchain in the [root toolchain file](../rust-toolchain.toml). RISC-V builds
+rebuild the Rust standard-library components needed by the modules for
+position-independent code. Cargo keeps intermediates in `build/cargo/drivers`;
+finished modules are staged under `build/work/<arch>/drivers-rust`.
 
-Drivers always use the release profile. Add new module packages to the
-architecture's `DRIVERS` tuple in `x.py`.
+Drivers use the release profile. Add modules to the appropriate machine in
+[`tools/machines.toml`](../tools/machines.toml). See the
+[build guide](../book/src/guide/BUILDING.md) for package and image workflows.
 
 ## Writing a driver
 
