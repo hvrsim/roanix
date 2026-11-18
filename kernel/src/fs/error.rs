@@ -53,6 +53,10 @@ pub enum Error {
     OutOfMemory,
     /// A low-level I/O operation failed.
     Io,
+    /// A FIFO writer has no corresponding reader.
+    NoDeviceAddress,
+    /// The last reader of a byte pipe has closed.
+    BrokenPipe,
 }
 
 impl fmt::Display for Error {
@@ -79,6 +83,8 @@ impl fmt::Display for Error {
             Self::ReadOnly => "read-only filesystem",
             Self::BadFileDescriptor => "bad file descriptor",
             Self::OutOfMemory => "out of memory",
+            Self::NoDeviceAddress => "no device address",
+            Self::BrokenPipe => "broken pipe",
             Self::Io => "I/O error",
         })
     }

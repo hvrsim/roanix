@@ -1,0 +1,11 @@
+--- a/dbus/dbus-pollable-set-epoll.c
++++ b/dbus/dbus-pollable-set-epoll.c
+@@ -30,7 +30,7 @@
+ #include <dbus/dbus-internals.h>
+ #include <dbus/dbus-sysdeps.h>
+ 
+-#ifndef __linux__
++#if !defined(__linux__) && !defined(__roanix__)
+ # error This file is for Linux epoll(4)
+ #endif
+ 

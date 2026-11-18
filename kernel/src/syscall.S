@@ -107,6 +107,7 @@ syscall_table:
     .quad syscall_process_parent_signal
     .quad syscall_process_getmain_tid
     .quad syscall_file_writev
+    .quad syscall_file_mknodat
 .size syscall_table, . - syscall_table
 
 .globl syscall_table_count

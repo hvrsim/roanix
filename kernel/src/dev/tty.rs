@@ -1657,6 +1657,12 @@ impl WinSize {
 /// Returns the userspace-copy requirements for a terminal ioctl.
 pub fn ioctl_spec(request: u64) -> IoctlSpec {
     match request {
+        // EVIOCREVOKE encodes a size but takes an immediate zero argument.
+        0x4004_4591 => IoctlSpec {
+            input: false,
+            output: false,
+            size: 0,
+        },
         TCGETS => IoctlSpec {
             input: false,
             output: true,

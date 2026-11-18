@@ -45,6 +45,9 @@ static NAMES: Once<Mutex<BTreeMap<Name, Weak<UnixSocket>>>> = Once::new();
 pub(crate) enum Kind {
     Stream = 1,
     Datagram = 2,
+    UeventRaw = 3,
+    UeventDatagram = 4,
+    SeqPacket = 5,
 }
 impl TryFrom<u64> for Kind {
     type Error = Errno;
@@ -52,6 +55,9 @@ impl TryFrom<u64> for Kind {
         match value {
             1 => Ok(Self::Stream),
             2 => Ok(Self::Datagram),
+            3 => Ok(Self::UeventRaw),
+            4 => Ok(Self::UeventDatagram),
+            5 => Ok(Self::SeqPacket),
             _ => Err(Errno::ProtocolNotSupported),
         }
     }
@@ -62,10 +68,12 @@ pub(crate) enum Address {
     Unnamed,
     Path(Vec<u8>),
     Abstract(Vec<u8>),
+    Netlink { port: u32, groups: u32 },
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Name {
+    Netlink(u32),
     Inode(VnodeKey),
     Abstract(Vec<u8>),
 }
@@ -99,6 +107,7 @@ struct State {
     receive_limit: usize,
     send_limit: usize,
     passcred: bool,
+    overflow: bool,
     read_shutdown: bool,
     write_shutdown: bool,
     closed: bool,
@@ -132,6 +141,7 @@ impl UnixSocket {
                 receive_limit: MAX_QUEUE,
                 send_limit: MAX_MESSAGE,
                 passcred: false,
+                overflow: false,
                 read_shutdown: false,
                 write_shutdown: false,
                 closed: false,
@@ -147,15 +157,19 @@ impl UnixSocket {
         let b = Self::new(kind, nonblocking);
         a.state.lock().peer = Some(Arc::downgrade(&b));
         b.state.lock().peer = Some(Arc::downgrade(&a));
-        if kind == Kind::Stream {
+        if matches!(kind, Kind::Stream | Kind::SeqPacket) {
             a.state.lock().stream = StreamState::Connected(Connection::unnamed(pid));
             b.state.lock().stream = StreamState::Connected(Connection::unnamed(pid));
         }
         (a, b)
     }
 
+    fn is_uevent(&self) -> bool {
+        matches!(self.kind, Kind::UeventRaw | Kind::UeventDatagram)
+    }
+
     pub(crate) fn is_stream(&self) -> bool {
-        self.kind == Kind::Stream
+        matches!(self.kind, Kind::Stream | Kind::SeqPacket)
     }
 
     pub(crate) fn bind(self: &Arc<Self>, address: Address) -> Result<()> {
@@ -171,13 +185,29 @@ impl UnixSocket {
                 return Err(Errno::Invalid);
             }
         }
-        let address = if address == Address::Unnamed {
+        if self.is_uevent() != matches!(address, Address::Netlink { .. }) {
+            return Err(Errno::ProtocolType);
+        }
+        let address = if let Address::Netlink { port, groups } = address {
+            if groups & !3 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Address::Netlink {
+                port: if port == 0 {
+                    u32::try_from(self.id).map_err(|_| Errno::NoSpace)?
+                } else {
+                    port
+                },
+                groups,
+            }
+        } else if address == Address::Unnamed {
             Address::Abstract(format!("roanix-{:x}", self.id).into_bytes())
         } else {
             address
         };
         let mut registry = names().lock();
         let (name, location) = match &address {
+            Address::Netlink { port, .. } => (Name::Netlink(*port), None),
             Address::Abstract(bytes) => (Name::Abstract(bytes.clone()), None),
             Address::Path(path) => {
                 let process = super::current().ok_or(Errno::Invalid)?;
@@ -211,6 +241,7 @@ impl UnixSocket {
 
     fn lookup(address: &Address) -> Result<Arc<Self>> {
         let name = match address {
+            Address::Netlink { port, .. } => Name::Netlink(*port),
             Address::Abstract(bytes) => Name::Abstract(bytes.clone()),
             Address::Path(path) => {
                 let process = super::current().ok_or(Errno::Invalid)?;
@@ -298,7 +329,14 @@ impl UnixSocket {
         rights: Vec<DescriptorEntry>,
     ) -> Result<usize> {
         let process = super::current().ok_or(Errno::Invalid)?;
-        let stream = self.is_stream();
+        if self.is_uevent() {
+            if !rights.is_empty() {
+                return Err(Errno::NotSupported);
+            }
+            return self.send_uevent(data, destination);
+        }
+        let connected = self.is_stream();
+        let stream = self.kind == Kind::Stream;
         let (peer, address, limit) = {
             let state = self.state.lock();
             if state.closed {
@@ -307,7 +345,7 @@ impl UnixSocket {
             if state.write_shutdown {
                 return Err(Errno::BrokenPipe);
             }
-            if stream && !matches!(state.stream, StreamState::Connected(_)) {
+            if connected && !matches!(state.stream, StreamState::Connected(_)) {
                 return Err(Errno::NotConnected);
             }
             (
@@ -331,7 +369,7 @@ impl UnixSocket {
         if !stream && data.len() > limit {
             return Err(Errno::MessageSize);
         }
-        if stream && destination.is_some() {
+        if connected && destination.is_some() {
             return Err(Errno::AlreadyConnected);
         }
         let target = if let Some(address) = destination {
@@ -339,7 +377,7 @@ impl UnixSocket {
         } else {
             peer.ok_or(Errno::DestinationRequired)?
                 .upgrade()
-                .ok_or(if stream {
+                .ok_or(if connected {
                     Errno::BrokenPipe
                 } else {
                     Errno::ConnectionRefused
@@ -366,7 +404,7 @@ impl UnixSocket {
             {
                 let mut state = target.state.lock();
                 if state.closed || state.read_shutdown {
-                    return Err(if stream {
+                    return Err(if connected {
                         Errno::BrokenPipe
                     } else {
                         Errno::ConnectionRefused
@@ -428,13 +466,58 @@ impl UnixSocket {
         }
     }
 
+    fn send_uevent(&self, data: Vec<u8>, destination: Option<&Address>) -> Result<usize> {
+        if data.len() > MAX_MESSAGE {
+            return Err(Errno::MessageSize);
+        }
+        let (source, peer) = {
+            let state = self.state.lock();
+            if state.closed {
+                return Err(Errno::BadFileDescriptor);
+            }
+            if state.write_shutdown {
+                return Err(Errno::BrokenPipe);
+            }
+            let source = state
+                .binding
+                .as_ref()
+                .map(|b| &b.address)
+                .ok_or(Errno::NotConnected)?;
+            (source.clone(), state.peer.clone())
+        };
+        let destination = destination
+            .cloned()
+            .or_else(|| {
+                peer.and_then(|peer| peer.upgrade()).and_then(|peer| {
+                    peer.state
+                        .lock()
+                        .binding
+                        .as_ref()
+                        .map(|b| b.address.clone())
+                })
+            })
+            .ok_or(Errno::DestinationRequired)?;
+        let Address::Netlink { port, groups } = destination else {
+            return Err(Errno::ProtocolType);
+        };
+        if groups & !2 != 0 {
+            return Err(Errno::Permission);
+        }
+        let Address::Netlink { port: sender, .. } = source else {
+            return Err(Errno::Invalid);
+        };
+        let pid = super::current().ok_or(Errno::Invalid)?.pid();
+        deliver_uevent(&data, port, groups, sender, pid)?;
+        Ok(data.len())
+    }
+
     fn receive(
         &self,
         flags: u64,
         capacity: usize,
         mut deliver: impl FnMut(&[u8], &Address, usize, bool, &[DescriptorEntry]) -> Result<usize>,
     ) -> Result<usize> {
-        if self.is_stream() {
+        if self.kind == Kind::Stream {
             return self.receive_stream(flags, capacity, deliver);
         }
         let process = super::current().ok_or(Errno::Invalid)?;
@@ -444,6 +527,9 @@ impl UnixSocket {
                 let mut state = self.state.lock();
                 if state.closed {
                     return Err(Errno::BadFileDescriptor);
+                }
+                if core::mem::take(&mut state.overflow) {
+                    return Err(Errno::NoBuffers);
                 }
                 if let Some(packet) = state.queue.front() {
                     let count = deliver(
@@ -463,7 +549,9 @@ impl UnixSocket {
                     }
                     return Ok(count);
                 }
-                if state.read_shutdown {
+                if state.read_shutdown
+                    || matches!(&state.stream, StreamState::Connected(connection) if connection.eof)
+                {
                     return Ok(0);
                 }
             }
@@ -488,7 +576,7 @@ impl UnixSocket {
         })
     }
     pub(crate) fn write(&self, source: &IoSource<'_>) -> Result<usize> {
-        if !self.is_stream() && source.len() > MAX_MESSAGE {
+        if self.kind != Kind::Stream && source.len() > MAX_MESSAGE {
             return Err(Errno::MessageSize);
         }
         let mut data = alloc::vec![0; source.len().min(MAX_MESSAGE)];
@@ -536,7 +624,27 @@ impl UnixSocket {
                 Ok(*limit as i32)
             }
             4 if value.is_none() => Ok(0), // SO_ERROR: no deferred connection errors.
-            5 if value.is_none() => Ok(self.kind as i32),
+            5 if value.is_none() => Ok(if self.kind == Kind::UeventDatagram {
+                2
+            } else {
+                self.kind as i32
+            }),
+            20 | 21 if self.is_uevent() => {
+                let group = value.ok_or(Errno::Invalid)?;
+                if !(1..=2).contains(&group) {
+                    return Err(Errno::Invalid);
+                }
+                let binding = state.binding.as_mut().ok_or(Errno::Invalid)?;
+                let Address::Netlink { groups, .. } = &mut binding.address else {
+                    return Err(Errno::Invalid);
+                };
+                if option == 20 {
+                    *groups |= 1 << (group - 1);
+                } else {
+                    *groups &= !(1 << (group - 1));
+                }
+                Ok(0)
+            }
             6 if value.is_none() => Ok(i32::from(matches!(
                 state.stream,
                 StreamState::Listening { .. }
@@ -618,7 +726,10 @@ impl UnixSocket {
                 return PollEvents::ERR | PollEvents::HUP;
             }
             let mut ready = PollEvents::empty();
-            if !state.queue.is_empty() || state.read_shutdown {
+            if state.overflow {
+                ready |= PollEvents::ERR;
+            }
+            if !state.queue.is_empty() || state.read_shutdown || state.overflow {
                 ready |= requested & (PollEvents::IN | PollEvents::RDNORM);
             }
             (ready, state.peer.clone(), !state.write_shutdown)
@@ -650,5 +761,62 @@ impl UnixSocket {
             output.push((&SPACE).into());
         }
         true
+    }
+}
+
+/// Broadcasts a kernel device event to NETLINK_KOBJECT_UEVENT subscribers.
+pub(crate) fn broadcast_uevent(data: &[u8]) {
+    let _ = deliver_uevent(data, 0, 1, 0, 0);
+}
+
+fn deliver_uevent(data: &[u8], port: u32, groups: u32, sender: u32, pid: usize) -> Result<()> {
+    let targets: Vec<_> = names()
+        .lock()
+        .iter()
+        .filter_map(|(name, endpoint)| {
+            if matches!(name, Name::Netlink(id) if groups != 0 || *id == port) {
+                endpoint.upgrade()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut delivered = false;
+    for endpoint in targets {
+        let mut state = endpoint.state.lock();
+        if state.closed || state.read_shutdown {
+            continue;
+        }
+        if groups != 0 && !state.binding.as_ref().is_some_and(|b| matches!(b.address, Address::Netlink { groups: subscribed, .. } if subscribed & groups != 0)) { continue; }
+        delivered = true;
+        let weight = data.len() + PACKET_OVERHEAD;
+        if state.bytes + weight > state.receive_limit
+            || QUEUED
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    n.checked_add(weight).filter(|n| *n <= GLOBAL_LIMIT)
+                })
+                .is_err()
+        {
+            state.overflow = true;
+        } else {
+            state.bytes += weight;
+            state.queue.push_back(Packet {
+                data: data.to_vec(),
+                offset: 0,
+                address: Address::Netlink {
+                    port: sender,
+                    groups,
+                },
+                pid,
+                rights: Vec::new(),
+            });
+        }
+        drop(state);
+        endpoint.changed.wake_all();
+    }
+    if groups == 0 && !delivered {
+        Err(Errno::ConnectionRefused)
+    } else {
+        Ok(())
     }
 }

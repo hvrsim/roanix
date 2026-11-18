@@ -183,7 +183,7 @@ struct SignalState {
 pub(crate) struct SignalManager {
     pending_work: AtomicBool,
     state: Mutex<SignalState>,
-    event: Event,
+    event: Arc<Event>,
 }
 
 /// A signalfd open-file description.
@@ -215,7 +215,7 @@ impl SignalManager {
                 suspend_restore_mask: None,
                 stopped: None,
             }),
-            event: Event::new(),
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -231,7 +231,7 @@ impl SignalManager {
                 suspend_restore_mask: None,
                 stopped: None,
             }),
-            event: Event::new(),
+            event: Arc::new(Event::new()),
         }
     }
 
@@ -568,9 +568,15 @@ impl SignalFd {
     pub(crate) fn poll_events<'a>(
         &'a self,
         _requested: PollEvents,
-        _output: &mut alloc::vec::Vec<EventSource<'a>>,
+        output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
-        false
+        let Some(process) = self.process.upgrade() else {
+            return false;
+        };
+        // Preserve readiness epochs across drain/refill races in edge-triggered
+        // consumers, including sd-event's child-process monitor.
+        output.push(process.signals.event.clone().into());
+        true
     }
 
     pub(crate) fn is_nonblocking(&self) -> bool {

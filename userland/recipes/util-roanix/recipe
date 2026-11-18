@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=0.1
-revision=29
+revision=32
 source_dir="util-roanix"
 hostdeps="gcc-host binutils"
 deps="sys-libs"
@@ -22,6 +22,8 @@ package() {
     install -Dm755 init "${dest_dir}/usr/bin/init"
     install -Dm755 dmesg "${dest_dir}/usr/bin/dmesg"
     install -Dm644 roanix-root "${dest_dir}/etc/roanix-root"
+    install -Dm644 "${recipe_dir}/passwd" "${dest_dir}/etc/passwd"
+    install -Dm644 "${recipe_dir}/group" "${dest_dir}/etc/group"
     install -Dm644 roanix-root "${dest_dir}/dev/.roanix-keep"
     install -Dm644 roanix-root "${dest_dir}/tmp/.roanix-keep"
     # API filesystems must have mount points before the read-only root is used.

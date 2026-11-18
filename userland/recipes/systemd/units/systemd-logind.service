@@ -1,0 +1,14 @@
+[Unit]
+Description=User Login and Seat Management
+Requires=dbus.service systemd-udev-trigger.service
+After=dbus.service systemd-udev-trigger.service
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/systemd/systemd-logind
+FileDescriptorStoreMax=768
+StandardOutput=kmsg
+StandardError=inherit
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s

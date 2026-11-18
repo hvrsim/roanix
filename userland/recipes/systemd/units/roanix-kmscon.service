@@ -1,5 +1,7 @@
 [Unit]
 Description=Roanix Graphical Console
+Requires=systemd-logind.service systemd-udev-trigger.service
+After=systemd-logind.service systemd-udev-trigger.service
 ConditionPathExists=/dev/dri/card0
 
 [Service]
@@ -9,6 +11,7 @@ StandardInput=null
 StandardOutput=kmsg
 StandardError=inherit
 SendSIGHUP=yes
+KillMode=process
 TimeoutStopSec=5s
 Restart=always
 RestartSec=1s

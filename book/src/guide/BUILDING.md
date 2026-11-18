@@ -62,6 +62,18 @@ Jinx resolves their dependencies. `BOOTSTRAP_PACKAGES` selects the small early
 boot environment. Add a recipe under `userland/recipes/` and add its name to
 `SYSTEM_PACKAGES` when it should be included in the image.
 
+The systemd package supplies libudev, `udevadm`, and `systemd-udevd`. At boot,
+udev processes the devices exposed by native sysfs and receives subsequent
+device events through `NETLINK_KOBJECT_UEVENT`. Driver-owned device nodes stay
+in devfs; udev writes its database under `/run/udev` and manages aliases in
+writable trees under `/dev/char`, `/dev/block`, `/dev/disk`, `/dev/serial`,
+`/dev/input/by-id`, `/dev/input/by-path`, and `/dev/dri/by-path`.
+
+`systemd-logind.service` manages graphical seats and sessions through the
+system D-Bus broker. kmscon registers a logind session and uses libsystemd's
+D-Bus API to acquire input and DRM descriptors. Its service starts after udev
+coldplug and logind; the serial shell remains available independently.
+
 ## Develop the kernel or drivers
 
 Edit the Rust sources and run `./x.py` again. Cargo checks changes on every

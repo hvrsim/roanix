@@ -1,5 +1,6 @@
 [Unit]
 Description=Roanix Serial Console
+DefaultDependencies=no
 
 [Service]
 ExecStart=/usr/bin/bash --login

@@ -1,0 +1,14 @@
+[Unit]
+Description=Device Manager
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/systemd/systemd-udevd --resolve-names=never --children-max=4
+StandardInput=null
+StandardOutput=kmsg
+StandardError=inherit
+Restart=on-failure
+RestartSec=1s
+

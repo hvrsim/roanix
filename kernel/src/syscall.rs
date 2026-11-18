@@ -20,6 +20,7 @@ pub(crate) enum Errno {
     NoProcess = 3,
     Interrupted = 4,
     Io = 5,
+    NoDeviceAddress = 6,
     ExecFormat = 8,
     BadFileDescriptor = 9,
     NoChild = 10,
@@ -53,6 +54,7 @@ pub(crate) enum Errno {
     ProtocolNotSupported = 93,
     NotSupported = 95,
     AddressInUse = 98,
+    NoBuffers = 105,
     AlreadyConnected = 106,
     AlreadyInProgress = 114,
     NotConnected = 107,
@@ -293,6 +295,13 @@ pub(crate) fn map_fs_error(error: fs::Error) -> Errno {
         fs::Error::ReadOnly => Errno::ReadOnly,
         fs::Error::BadFileDescriptor => Errno::BadFileDescriptor,
         fs::Error::OutOfMemory => Errno::OutOfMemory,
+        fs::Error::NoDeviceAddress => Errno::NoDeviceAddress,
+        fs::Error::BrokenPipe => {
+            if let Some(process) = proc::current() {
+                proc::signal::send_kernel(&process, proc::signal::SIGPIPE);
+            }
+            Errno::BrokenPipe
+        }
         fs::Error::Io => Errno::Io,
     }
 }

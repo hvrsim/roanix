@@ -100,7 +100,7 @@ impl UnixSocket {
                 StreamState::Listening { .. } => return Err(Errno::Invalid),
             }
             listener = Self::lookup(address)?;
-            if !listener.is_stream() {
+            if listener.kind != self.kind {
                 return Err(Errno::ProtocolType);
             }
             local = state
@@ -143,7 +143,7 @@ impl UnixSocket {
                     return Err(Errno::BadFileDescriptor);
                 }
                 if count < backlog {
-                    let accepted = Self::new(Kind::Stream, false);
+                    let accepted = Self::new(self.kind, false);
                     {
                         let mut child = accepted.state.lock();
                         child.receive_limit = server.receive_limit;

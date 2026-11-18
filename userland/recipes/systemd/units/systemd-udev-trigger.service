@@ -1,0 +1,14 @@
+[Unit]
+Description=Coldplug Native Devices
+DefaultDependencies=no
+Requires=systemd-udevd.service
+After=systemd-udevd.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/udevadm trigger --type=devices --action=add --settle
+RemainAfterExit=yes
+StandardOutput=kmsg
+StandardError=inherit
+

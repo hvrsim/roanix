@@ -8,6 +8,7 @@ pub mod devfs;
 pub mod error;
 pub mod ext4;
 pub mod fat32;
+mod fifo;
 pub mod file;
 mod io;
 mod location;
@@ -17,6 +18,7 @@ pub mod partition;
 pub mod path;
 pub mod procfs;
 mod syscall;
+pub mod sysfs;
 pub mod tmpfs;
 pub mod vfs;
 pub mod vnode;
@@ -62,8 +64,42 @@ pub fn mount_block(source: &str, target: &[u8], filesystem: &str) -> Result<()> 
         vfs::mount(b"/tmp", temporary)?;
         vfs::mount(b"/run", runtime)?;
         vfs::mount(b"/dev/shm", shared)?;
+        mount_device_links()?;
     } else {
         vfs::mount_with_source(target, mounted, source.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Device nodes remain driver-owned; udev owns links in these writable trees.
+fn mount_device_links() -> Result<()> {
+    let device_fs = devfs::global()?;
+    for path in [
+        "char",
+        "block",
+        "disk",
+        "serial",
+        "input/by-id",
+        "input/by-path",
+        "dri/by-path",
+    ] {
+        let mut parent = device_fs.root_id();
+        for component in path.split('/') {
+            parent = match device_fs.lookup_child(parent, component.as_bytes()) {
+                Ok(id) => id,
+                Err(Error::NotFound) => device_fs.create_dir(
+                    devfs::OwnerId::KERNEL,
+                    parent,
+                    component.as_bytes(),
+                    0o755,
+                )?,
+                Err(error) => return Err(error),
+            };
+        }
+        vfs::mount(
+            alloc::format!("/dev/{path}").as_bytes(),
+            runtime_tmpfs(0o755)?,
+        )?;
     }
     Ok(())
 }

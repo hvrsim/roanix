@@ -6,7 +6,7 @@ mod elf;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod inotify;
-mod pipe;
+pub(crate) mod pipe;
 pub(crate) mod signal;
 pub(crate) mod syscall;
 pub(crate) mod timerfd;

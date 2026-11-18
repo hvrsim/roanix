@@ -1,6 +1,6 @@
-//! Anonymous byte pipes used by process descriptors.
+//! Byte pipes for anonymous descriptors and named FIFOs.
 
-use crate::sys::event::EventSource;
+use crate::sys::event::{EventListener, EventSource};
 
 use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -27,31 +27,37 @@ pub(crate) enum PipeError {
     Fault,
     /// A pending signal interrupted the blocking operation.
     Interrupted,
+    /// A nonblocking FIFO writer has no reader.
+    NoReader,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Direction {
     Read,
     Write,
+    Both,
 }
 
 struct PipeState {
     buffer: VecDeque<u8>,
-    reader_open: bool,
-    writer_open: bool,
+    readers: usize,
+    writers: usize,
+    reader_generation: u64,
+    writer_generation: u64,
 }
 
 struct Pipe {
     state: Mutex<PipeState>,
-    readable: Event,
-    writable: Event,
+    readable: Arc<Event>,
+    writable: Arc<Event>,
 }
 
-/// One shared endpoint of an anonymous pipe.
+/// One shared open description for a pipe endpoint.
 pub(crate) struct PipeEnd {
     pipe: Arc<Pipe>,
     direction: Direction,
     nonblocking: AtomicBool,
+    initial_writer_generation: Option<u64>,
 }
 
 impl PipeEnd {
@@ -60,11 +66,13 @@ impl PipeEnd {
         let pipe = Arc::new(Pipe {
             state: Mutex::new(PipeState {
                 buffer: VecDeque::with_capacity(PIPE_CAPACITY),
-                reader_open: true,
-                writer_open: true,
+                readers: 1,
+                writers: 1,
+                reader_generation: 1,
+                writer_generation: 1,
             }),
-            readable: Event::new(),
-            writable: Event::new(),
+            readable: Arc::new(Event::new()),
+            writable: Arc::new(Event::new()),
         });
         pipe.writable.signal();
         (
@@ -72,18 +80,20 @@ impl PipeEnd {
                 pipe: pipe.clone(),
                 direction: Direction::Read,
                 nonblocking: AtomicBool::new(false),
+                initial_writer_generation: None,
             }),
             Arc::new(Self {
                 pipe,
                 direction: Direction::Write,
                 nonblocking: AtomicBool::new(false),
+                initial_writer_generation: None,
             }),
         )
     }
 
     /// Reads bytes, blocking until data or writer closure is observable.
     pub(crate) fn read(&self, sink: &mut IoSink<'_>) -> Result<usize, PipeError> {
-        if self.direction != Direction::Read {
+        if self.direction == Direction::Write {
             return Err(PipeError::BadDescriptor);
         }
         if sink.is_empty() {
@@ -111,21 +121,22 @@ impl PipeEnd {
                 self.pipe.writable.signal();
                 return Ok(copied);
             }
-            if !state.writer_open {
+            if state.writers == 0 {
                 return Ok(0);
             }
             if self.nonblocking.load(Ordering::Acquire) {
                 return Err(PipeError::TryAgain);
             }
             self.pipe.readable.reset();
+            let ready = self.pipe.readable.listen();
             drop(state);
-            wait_interruptibly(&self.pipe.readable)?;
+            wait_interruptibly(ready)?;
         }
     }
 
     /// Writes bytes, blocking only while the pipe buffer is full.
     pub(crate) fn write(&self, source: &IoSource<'_>) -> Result<usize, PipeError> {
-        if self.direction != Direction::Write {
+        if self.direction == Direction::Read {
             return Err(PipeError::BadDescriptor);
         }
         if source.is_empty() {
@@ -133,7 +144,7 @@ impl PipeEnd {
         }
         loop {
             let mut state = self.pipe.state.lock();
-            if !state.reader_open {
+            if state.readers == 0 {
                 return Err(PipeError::BrokenPipe);
             }
             let available = PIPE_CAPACITY - state.buffer.len();
@@ -166,8 +177,9 @@ impl PipeEnd {
                 return Err(PipeError::TryAgain);
             }
             self.pipe.writable.reset();
+            let ready = self.pipe.writable.listen();
             drop(state);
-            wait_interruptibly(&self.pipe.writable)?;
+            wait_interruptibly(ready)?;
         }
     }
 
@@ -176,6 +188,7 @@ impl PipeEnd {
         match self.direction {
             Direction::Read => 0,
             Direction::Write => 1,
+            Direction::Both => 2,
         }
     }
 
@@ -192,19 +205,32 @@ impl PipeEnd {
     /// Returns requested events that are immediately ready.
     pub(crate) fn poll(&self, events: PollEvents) -> PollEvents {
         let state = self.pipe.state.lock();
+        if self.direction == Direction::Both {
+            let mut ready = PollEvents::empty();
+            if !state.buffer.is_empty() {
+                ready |= events & (PollEvents::IN | PollEvents::RDNORM);
+            }
+            if state.buffer.len() < PIPE_CAPACITY {
+                ready |= events & (PollEvents::OUT | PollEvents::WRNORM);
+            }
+            return ready;
+        }
         match self.direction {
             Direction::Read => {
                 let mut ready = PollEvents::empty();
                 if !state.buffer.is_empty() {
                     ready |= events & (PollEvents::IN | PollEvents::RDNORM);
                 }
-                if !state.writer_open {
+                if state.writers == 0
+                    && self.initial_writer_generation != Some(state.writer_generation)
+                {
                     ready |= PollEvents::HUP;
                 }
                 ready
             }
+            Direction::Both => unreachable!(),
             Direction::Write => {
-                if !state.reader_open {
+                if state.readers == 0 {
                     PollEvents::ERR
                 } else if state.buffer.len() < PIPE_CAPACITY {
                     events & (PollEvents::OUT | PollEvents::WRNORM)
@@ -216,35 +242,31 @@ impl PipeEnd {
     }
 
     pub(crate) fn poll_events<'a>(
-        &'a self,
+        &self,
         events: PollEvents,
         output: &mut alloc::vec::Vec<EventSource<'a>>,
     ) -> bool {
-        match self.direction {
-            Direction::Read
-                if events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP) =>
-            {
-                output.push((&self.pipe.readable).into());
-            }
-            Direction::Write
-                if events.intersects(PollEvents::OUT | PollEvents::WRNORM | PollEvents::ERR) =>
-            {
-                output.push((&self.pipe.writable).into());
-            }
-            _ => {}
+        if self.direction != Direction::Write
+            && events.intersects(PollEvents::IN | PollEvents::RDNORM | PollEvents::HUP)
+        {
+            output.push(self.pipe.readable.clone().into());
+        }
+        if self.direction != Direction::Read
+            && events.intersects(PollEvents::OUT | PollEvents::WRNORM | PollEvents::ERR)
+        {
+            output.push(self.pipe.writable.clone().into());
         }
         true
     }
 }
 
-fn wait_interruptibly(event: &Event) -> Result<(), PipeError> {
-    let ready = event.listen();
+fn wait_interruptibly(ready: EventListener<'_>) -> Result<(), PipeError> {
     if let Some(process) = super::current() {
         let interrupt = process.interrupt_event().listen();
         if process.is_exited() || process.prepare_interrupt_wait() {
             return Err(PipeError::Interrupted);
         }
-        crate::sys::event::EventListener::wait_any(&[ready, interrupt]);
+        EventListener::wait_any(&[ready, interrupt]);
     } else {
         ready.wait();
     }
@@ -254,15 +276,105 @@ fn wait_interruptibly(event: &Event) -> Result<(), PipeError> {
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         let mut state = self.pipe.state.lock();
-        match self.direction {
-            Direction::Read => {
-                state.reader_open = false;
-                self.pipe.writable.signal();
+        if self.direction != Direction::Write {
+            state.readers -= 1;
+        }
+        if self.direction != Direction::Read {
+            state.writers -= 1;
+        }
+        if state.readers == 0 && state.writers == 0 {
+            state.buffer.clear();
+        }
+        self.pipe.readable.signal();
+        self.pipe.writable.signal();
+    }
+}
+
+/// Reopenable byte pipe backing a FIFO inode.
+pub(crate) struct NamedPipe {
+    pipe: Arc<Pipe>,
+}
+impl NamedPipe {
+    pub(crate) fn new() -> Self {
+        Self {
+            pipe: Arc::new(Pipe {
+                state: Mutex::new(PipeState {
+                    buffer: VecDeque::new(),
+                    readers: 0,
+                    writers: 0,
+                    reader_generation: 0,
+                    writer_generation: 0,
+                }),
+                readable: Arc::new(Event::new()),
+                writable: Arc::new(Event::new()),
+            }),
+        }
+    }
+    pub(crate) fn open(
+        &self,
+        read: bool,
+        write: bool,
+        nonblocking: bool,
+    ) -> Result<Arc<PipeEnd>, PipeError> {
+        if !read && !write {
+            return Err(PipeError::BadDescriptor);
+        }
+        let direction = if read && write {
+            Direction::Both
+        } else if read {
+            Direction::Read
+        } else {
+            Direction::Write
+        };
+        let (reader_generation, writer_generation, peer_present) = {
+            let mut state = self.pipe.state.lock();
+            if write && !read && nonblocking && state.readers == 0 {
+                return Err(PipeError::NoReader);
             }
-            Direction::Write => {
-                state.writer_open = false;
-                self.pipe.readable.signal();
+            if read {
+                state.readers += 1;
+                state.reader_generation = state.reader_generation.wrapping_add(1);
             }
+            if write {
+                state.writers += 1;
+                state.writer_generation = state.writer_generation.wrapping_add(1);
+            }
+            (
+                state.reader_generation,
+                state.writer_generation,
+                (read && state.writers != 0) || (write && state.readers != 0),
+            )
+        };
+        let end = Arc::new(PipeEnd {
+            pipe: self.pipe.clone(),
+            direction,
+            nonblocking: AtomicBool::new(nonblocking),
+            initial_writer_generation: (nonblocking && read && !peer_present)
+                .then_some(writer_generation),
+        });
+        self.pipe.readable.signal();
+        self.pipe.writable.signal();
+        if nonblocking || peer_present {
+            return Ok(end);
+        }
+        loop {
+            let event = if read {
+                &self.pipe.readable
+            } else {
+                &self.pipe.writable
+            };
+            let ready = {
+                let state = self.pipe.state.lock();
+                if (read && (state.writers != 0 || state.writer_generation != writer_generation))
+                    || (write
+                        && (state.readers != 0 || state.reader_generation != reader_generation))
+                {
+                    return Ok(end);
+                }
+                event.reset();
+                event.listen()
+            };
+            wait_interruptibly(ready)?;
         }
     }
 }

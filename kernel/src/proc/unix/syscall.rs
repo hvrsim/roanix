@@ -56,6 +56,10 @@ fn address(process: &Process, pointer: u64) -> Result<Option<Address>> {
         0 if length == 0 => Ok(Some(Address::Unnamed)),
         1 if length != 0 && !data.contains(&0) => Ok(Some(Address::Path(data.to_vec()))),
         2 => Ok(Some(Address::Abstract(data.to_vec()))),
+        4 if length == 8 => Ok(Some(Address::Netlink {
+            port: u32::from_ne_bytes(data[..4].try_into().unwrap()),
+            groups: u32::from_ne_bytes(data[4..].try_into().unwrap()),
+        })),
         3 if length == 0 => Ok(None), // Explicit disconnect.
         _ => Err(Errno::Invalid),
     }
@@ -65,7 +69,13 @@ fn write_address(process: &Process, pointer: u64, address: &Address) -> Result<(
         return Ok(());
     }
     let mut bytes = [0u8; 116];
+    let mut netlink = [0u8; 8];
     let (kind, name): (u32, &[u8]) = match address {
+        Address::Netlink { port, groups } => {
+            netlink[..4].copy_from_slice(&port.to_ne_bytes());
+            netlink[4..].copy_from_slice(&groups.to_ne_bytes());
+            (4, &netlink)
+        }
         Address::Unnamed => (0, &[]),
         Address::Path(name) => (1, name),
         Address::Abstract(name) => (2, name),
@@ -108,6 +118,7 @@ crate::syscall_handler! {
         let kind = Kind::try_from(kind)?;
         if flags & !3 != 0 { return Err(Errno::Invalid); }
         let process = current_process()?;
+        if matches!(kind, Kind::UeventRaw | Kind::UeventDatagram) { return Err(Errno::NotSupported); }
         let (a,b) = UnixSocket::pair(kind, flags & 1 != 0, process.pid());
         let first = process.install_descriptor_value(Descriptor::Unix(a), flags & 2 != 0).map_err(map_process_error)?;
         let second = match process.install_descriptor_value(Descriptor::Unix(b), flags & 2 != 0) {
@@ -222,7 +233,7 @@ crate::syscall_handler! {
                 let mut bytes = [0; 16]; bytes[..8].copy_from_slice(&(pid as u64).to_ne_bytes());
                 write(&process, word(&header, 24), &bytes)?;
             }
-            let status = u64::from(count < data.len()) | (u64::from(passcred) << 1);
+            let status = u64::from(count < data.len()) | (u64::from(passcred) << 1) | (u64::from(target.kind == Kind::SeqPacket) << 3);
             process.receive_rights(rights, rights_capacity, flags & RIGHTS_CLOEXEC != 0, |fds, truncated| {
                 if !fds.is_empty() {
                     let mut bytes = Vec::with_capacity(fds.len() * 4);

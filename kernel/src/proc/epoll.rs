@@ -452,7 +452,10 @@ crate::syscall_handler! {
 
         loop {
             let descriptors = epoll.wait_descriptors();
-            let mut wait_events = alloc::vec![crate::sys::event::EventSource::from(&epoll.changed)];
+            let mut wait_events = alloc::vec![
+                crate::sys::event::EventSource::from(&epoll.changed),
+                process.interrupt_event().into(),
+            ];
             let mut event_driven = true;
             for (descriptor, requested, life) in &descriptors {
                 wait_events.push((&life.closed).into());
@@ -472,7 +475,9 @@ crate::syscall_handler! {
                 return Ok(0);
             }
 
-
+            if process.prepare_interrupt_wait() {
+                return Err(Errno::Interrupted);
+            }
             if event_driven {
                 if let Some(deadline) = deadline {
                     let _ = clock::wait_listeners_timeout(

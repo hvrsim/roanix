@@ -199,7 +199,7 @@ impl ProcNode {
                 Ok(bytes)
             }
             Node::Filesystems => Ok(
-                b"nodev\ttmpfs\nnodev\tdevfs\nnodev\tproc\nnodev\tcgroup2\n\text4\n\tvfat\n"
+                b"nodev\ttmpfs\nnodev\tdevfs\nnodev\tproc\nnodev\tsysfs\nnodev\tcgroup2\n\text4\n\tvfat\n"
                     .to_vec(),
             ),
             // The native kernel currently has no cgroup controllers.

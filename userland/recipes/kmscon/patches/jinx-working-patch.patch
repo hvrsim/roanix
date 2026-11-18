@@ -1,20 +1,3 @@
-diff --git kmscon-clean/meson.build kmscon-workdir/meson.build
-index f34baa6..5ea7aa1 100644
---- kmscon-clean/meson.build
-+++ kmscon-workdir/meson.build
-@@ -52,7 +52,11 @@ systemdsystemunitdir = systemd_deps.get_variable(
- #
- xkbcommon_deps = dependency('xkbcommon', version: '>=0.5.0')
- libtsm_deps = dependency('libtsm', version: '>=4.8.0', allow_fallback: true)
--libudev_deps = dependency('libudev', version: '>=172')
-+if host_machine.system() == 'roanix'
-+    libudev_deps = declare_dependency()
-+else
-+    libudev_deps = dependency('libudev', version: '>=172')
-+endif
- dl_deps = dependency('dl')
- threads_deps = dependency('threads')
- zlib_deps = dependency('zlib')
 diff --git kmscon-clean/src/input/input.c kmscon-workdir/src/input/input.c
 index 328842c..76f8779 100644
 --- kmscon-clean/src/input/input.c
@@ -122,215 +105,34 @@ index dcfd8bc..9d13520 100644
  		hw_cursor_show(term, term->pointer.x, term->pointer.y);
  	redraw_all(term);
 diff --git kmscon-clean/src/uterm/meson.build kmscon-workdir/src/uterm/meson.build
-index 322038e..e02007d 100644
+index 322038e..3065ee5 100644
 --- kmscon-clean/src/uterm/meson.build
 +++ kmscon-workdir/src/uterm/meson.build
-@@ -2,12 +2,12 @@
- # libuterm
- # Provides API for VT switching, and monitoring devices (input and gpu)
- #
--uterm_srcs = [
--    'monitor.c',
--    'vt.c',
+@@ -5,8 +5,6 @@
+ uterm_srcs = [
+     'monitor.c',
+     'vt.c',
 -    'vt_fake.c',
 -    'vt_real.c',
--]
-+uterm_srcs = ['vt.c']
-+if host_machine.system() == 'roanix'
-+    uterm_srcs += ['monitor_roanix.c', 'vt_roanix.c']
-+else
-+    uterm_srcs += ['monitor.c', 'vt_fake.c', 'vt_real.c']
-+endif
+ ]
  
  uterm_dep = [
-     libudev_deps,
-diff --git kmscon-workdir/src/uterm/monitor_roanix.c kmscon-workdir/src/uterm/monitor_roanix.c
-new file mode 100644
-index 0000000..c75d4ff
---- /dev/null
-+++ kmscon-workdir/src/uterm/monitor_roanix.c
-@@ -0,0 +1,179 @@
-+/* SPDX-License-Identifier: MIT */
-+/* Discover native device nodes, including devices added after seat startup. */
-+#include <ctype.h>
-+#include <dirent.h>
-+#include <errno.h>
-+#include <stdio.h>
-+#include <stdlib.h>
-+#include <string.h>
-+#include <sys/stat.h>
-+#include "monitor.h"
-+#include "shl/dlist.h"
+@@ -18,6 +16,13 @@ uterm_dep = [
+     video_deps,
+ ]
+ 
++if host_machine.system() == 'roanix'
++    uterm_srcs += 'vt_logind.c'
++    uterm_dep += dependency('libsystemd', version: '>=257')
++else
++    uterm_srcs += ['vt_fake.c', 'vt_real.c']
++endif
 +
-+struct uterm_monitor_dev {
-+	struct dlist list;
-+	struct uterm_monitor *mon;
-+	enum uterm_monitor_dev_type type;
-+	char *node;
-+	dev_t filesystem;
-+	ino_t inode;
-+	bool seen;
-+	void *data;
-+};
-+
-+struct uterm_monitor {
-+	unsigned long ref;
-+	struct ev_eloop *eloop;
-+	struct ev_timer *timer;
-+	struct uterm_monitor_cb cb;
-+	struct dlist devices;
-+	void *data;
-+	bool scanning;
-+};
-+
-+static void remove_device(struct uterm_monitor_dev *dev)
-+{
-+	dlist_unlink(&dev->list);
-+	dev->mon->cb.free_dev(dev->mon->data, dev->type, dev->data);
-+	free(dev->node);
-+	free(dev);
-+}
-+
-+static bool device_name(const char *name, const char *prefix)
-+{
-+	size_t length = strlen(prefix);
-+	if (strncmp(name, prefix, length) || !name[length])
-+		return false;
-+	for (const char *p = name + length; *p; p++)
-+		if (!isdigit((unsigned char)*p))
-+			return false;
-+	return true;
-+}
-+
-+static void scan_directory(struct uterm_monitor *mon, const char *directory,
-+			   const char *prefix, enum uterm_monitor_dev_type type)
-+{
-+	DIR *dir = opendir(directory);
-+	struct dirent *entry;
-+	if (!dir)
-+		return;
-+	while ((entry = readdir(dir))) {
-+		struct uterm_monitor_dev *dev, *found = NULL;
-+		struct stat status;
-+		char *path;
-+		if (!device_name(entry->d_name, prefix))
-+			continue;
-+		if (asprintf(&path, "%s/%s", directory, entry->d_name) < 0)
-+			continue;
-+		if (stat(path, &status) || !S_ISCHR(status.st_mode)) {
-+			free(path);
-+			continue;
-+		}
-+		dlist_for_each_entry(dev, &mon->devices, list) {
-+			if (!strcmp(dev->node, path)) {
-+				found = dev;
-+				break;
-+			}
-+		}
-+		if (found && (found->filesystem != status.st_dev || found->inode != status.st_ino)) {
-+			remove_device(found);
-+			found = NULL;
-+		}
-+		if (found) {
-+			found->seen = true;
-+			free(path);
-+			continue;
-+		}
-+		dev = calloc(1, sizeof(*dev));
-+		if (!dev) {
-+			free(path);
-+			continue;
-+		}
-+		dev->mon = mon;
-+		dev->node = path;
-+		dev->filesystem = status.st_dev;
-+		dev->inode = status.st_ino;
-+		dev->type = type;
-+		dev->seen = true;
-+		dlist_link_tail(&mon->devices, &dev->list);
-+		mon->cb.new_dev(path, type, type == UTERM_MONITOR_DRM && !strcmp(entry->d_name, "card0")
-+				? UTERM_MONITOR_PRIMARY : 0,
-+				mon->data, dev);
-+	}
-+	closedir(dir);
-+}
-+
-+static void scan(struct uterm_monitor *mon)
-+{
-+	struct uterm_monitor_dev *dev;
-+	struct dlist *next;
-+	dlist_for_each_entry(dev, &mon->devices, list)
-+		dev->seen = false;
-+	scan_directory(mon, "/dev/dri", "card", UTERM_MONITOR_DRM);
-+	scan_directory(mon, "/dev/input", "event", UTERM_MONITOR_INPUT);
-+	dlist_for_each_entry_safe(dev, next, &mon->devices, list)
-+		if (!dev->seen)
-+			remove_device(dev);
-+}
-+
-+static void rescan(struct ev_timer *timer, uint64_t count, void *data)
-+{
-+	struct uterm_monitor *mon = data;
-+	if (mon->scanning)
-+		scan(mon);
-+}
-+
-+int uterm_monitor_new(struct uterm_monitor **out, struct ev_eloop *eloop,
-+		      struct uterm_monitor_cb *cb, void *data)
-+{
-+	struct uterm_monitor *mon = calloc(1, sizeof(*mon));
-+	struct itimerspec interval = {.it_value.tv_sec = 1, .it_interval.tv_sec = 1};
-+	int ret;
-+	if (!mon)
-+		return -ENOMEM;
-+	mon->ref = 1;
-+	mon->eloop = eloop;
-+	mon->cb = *cb;
-+	mon->data = data;
-+	dlist_init(&mon->devices);
-+	ret = ev_eloop_new_timer(eloop, &mon->timer, &interval, rescan, mon);
-+	if (ret) {
-+		free(mon);
-+		return ret;
-+	}
-+	ev_eloop_ref(eloop);
-+	*out = mon;
-+	return 0;
-+}
-+
-+void uterm_monitor_ref(struct uterm_monitor *mon)
-+{
-+	if (mon)
-+		++mon->ref;
-+}
-+
-+void uterm_monitor_unref(struct uterm_monitor *mon)
-+{
-+	struct uterm_monitor_dev *dev;
-+	struct dlist *next;
-+	if (!mon || --mon->ref)
-+		return;
-+	ev_eloop_rm_timer(mon->timer);
-+	dlist_for_each_entry_safe(dev, next, &mon->devices, list)
-+		remove_device(dev);
-+	ev_eloop_unref(mon->eloop);
-+	free(mon);
-+}
-+
-+void uterm_monitor_scan(struct uterm_monitor *mon, const char *seat_name)
-+{
-+	if (!mon || strcmp(seat_name, "seat0"))
-+		return;
-+	mon->scanning = true;
-+	scan(mon);
-+}
-+
-+void uterm_monitor_set_dev_data(struct uterm_monitor_dev *dev, void *data)
-+{
-+	dev->data = data;
-+}
+ if enable_libseat
+     uterm_srcs += 'vt_libseat.c'
+     uterm_dep += libseat_deps
 diff --git kmscon-clean/src/uterm/vt.c kmscon-workdir/src/uterm/vt.c
-index 67c4bcd..883cac8 100644
+index 67c4bcd..203e370 100644
 --- kmscon-clean/src/uterm/vt.c
 +++ kmscon-workdir/src/uterm/vt.c
 @@ -78,6 +78,9 @@ struct uterm_vt *uterm_vt_allocate(struct ev_eloop *eloop, bool libseat, struct
@@ -338,7 +140,7 @@ index 67c4bcd..883cac8 100644
  		return NULL;
  
 +#ifdef __roanix__
-+	vt = uterm_vt_roanix_new(eloop, input);
++	vt = uterm_vt_logind_new(eloop, input);
 +#else
  	if (libseat)
  		vt = uterm_vt_libseat_new(eloop, input, vt_name);
@@ -352,64 +154,337 @@ index 67c4bcd..883cac8 100644
  	if (!vt)
  		return NULL;
 diff --git kmscon-clean/src/uterm/vt_internal.h kmscon-workdir/src/uterm/vt_internal.h
-index 86932d3..4c1f2f6 100644
+index 86932d3..b40f145 100644
 --- kmscon-clean/src/uterm/vt_internal.h
 +++ kmscon-workdir/src/uterm/vt_internal.h
-@@ -37,6 +37,10 @@ void vt_cb_activate(struct uterm_vt *vt);
- int vt_cb_deactivate(struct uterm_vt *vt, bool force);
- void vt_cb_hup(struct uterm_vt *vt);
+@@ -33,6 +33,10 @@ struct uterm_vt {
+ 	const struct uterm_vt_ops *ops;
+ };
  
 +#ifdef __roanix__
-+struct uterm_vt *uterm_vt_roanix_new(struct ev_eloop *eloop, struct input *input);
++struct uterm_vt *uterm_vt_logind_new(struct ev_eloop *eloop, struct input *input);
 +#endif
 +
- struct uterm_vt *uterm_vt_real_new(struct ev_eloop *eloop, struct input *input,
- 				   const char *vt_name);
- struct uterm_vt *uterm_vt_fake_new(struct ev_eloop *eloop, struct input *input);
-diff --git kmscon-workdir/src/uterm/vt_roanix.c kmscon-workdir/src/uterm/vt_roanix.c
+ void vt_cb_activate(struct uterm_vt *vt);
+ int vt_cb_deactivate(struct uterm_vt *vt, bool force);
+ void vt_cb_hup(struct uterm_vt *vt);
+diff --git kmscon-workdir/src/uterm/vt_logind.c kmscon-workdir/src/uterm/vt_logind.c
 new file mode 100644
-index 0000000..255cf0c
+index 0000000..ad23452
 --- /dev/null
-+++ kmscon-workdir/src/uterm/vt_roanix.c
-@@ -0,0 +1,39 @@
++++ kmscon-workdir/src/uterm/vt_logind.c
+@@ -0,0 +1,312 @@
 +/* SPDX-License-Identifier: MIT */
-+/* Roanix has a userspace seat; terminal sessions are managed by kmscon. */
++/* Native logind session and device control, without a kernel VT requirement. */
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <poll.h>
 +#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <systemd/sd-bus.h>
++#include <time.h>
++#include <unistd.h>
 +#include "vt_internal.h"
++#include "shl/log.h"
++#include "shl/misc.h"
 +
-+static int activate(struct uterm_vt *vt)
-+{
-+	vt_cb_activate(vt);
-+	return 0;
-+}
++#define LOG_SUBSYSTEM "logind"
++#define LOGIN "org.freedesktop.login1"
++#define MANAGER_PATH "/org/freedesktop/login1"
++#define MANAGER LOGIN ".Manager"
++#define SESSION LOGIN ".Session"
 +
-+static int deactivate(struct uterm_vt *vt)
-+{
-+	return vt_cb_deactivate(vt, false);
-+}
-+
-+static void destroy(struct uterm_vt *vt)
-+{
-+	vt_cb_deactivate(vt, true);
-+	input_sleep(vt->input);
-+}
-+
-+static const struct uterm_vt_ops ops = {
-+	.activate = activate,
-+	.deactivate = deactivate,
-+	.destroy = destroy,
++struct device {
++    struct device *next;
++    int id;
++    unsigned int major, minor;
 +};
-+
-+struct uterm_vt *uterm_vt_roanix_new(struct ev_eloop *eloop, struct input *input)
++struct pause {
++    struct pause *next;
++    unsigned int major, minor;
++};
++struct logind_vt {
++    struct uterm_vt base;
++    sd_bus *bus;
++    sd_bus_slot *properties, *paused, *resumed, *removed;
++    struct ev_fd *watch;
++    struct ev_timer *timer;
++    struct device *devices;
++    struct pause *pauses;
++    char *session, *path, *seat;
++    int fifo, next_id;
++    bool refresh, enabled;
++};
++static struct logind_vt *native(struct uterm_vt *vt)
 +{
-+	struct uterm_vt *vt = calloc(1, sizeof(*vt));
-+	if (!vt)
-+		return NULL;
-+	vt->eloop = eloop;
-+	vt->input = input;
-+	vt->ops = &ops;
-+	input_wake_up(input);
-+	return vt;
++    return shl_offsetof(vt, struct logind_vt, base);
++}
++static int send_method(struct logind_vt *vt, const char *path, const char *interface,
++                       const char *method, const char *types, ...)
++{
++    sd_bus_message *message = NULL;
++    va_list args;
++    int r = sd_bus_message_new_method_call(vt->bus, &message, LOGIN, path, interface, method);
++    if (r >= 0) r = sd_bus_message_set_expect_reply(message, 0);
++    va_start(args, types);
++    if (r >= 0) r = sd_bus_message_appendv(message, types, args);
++    va_end(args);
++    if (r >= 0) r = sd_bus_send(vt->bus, message, NULL);
++    sd_bus_message_unref(message);
++    return r;
++}
++static void release_device(struct logind_vt *vt, unsigned int major, unsigned int minor)
++{
++    send_method(vt, vt->path, SESSION, "ReleaseDevice", "uu", major, minor);
++}
++static int open_device(struct uterm_vt *base, const char *node, int *id)
++{
++    struct logind_vt *vt = native(base);
++    sd_bus_error error = SD_BUS_ERROR_NULL;
++    sd_bus_message *reply = NULL;
++    struct stat st;
++    struct device *device;
++    int borrowed, paused, fd = -1, r;
++    if (stat(node, &st) < 0) return -errno;
++    if (!S_ISCHR(st.st_mode)) return -ENODEV;
++    device = calloc(1, sizeof(*device));
++    if (!device) return -ENOMEM;
++    if (vt->next_id == INT_MAX) { free(device); return -EOVERFLOW; }
++    device->major = major(st.st_rdev);
++    device->minor = minor(st.st_rdev);
++    r = sd_bus_call_method(vt->bus, LOGIN, vt->path, SESSION, "TakeDevice", &error, &reply,
++                           "uu", device->major, device->minor);
++    if (r >= 0) r = sd_bus_message_read(reply, "hb", &borrowed, &paused);
++    if (r >= 0) {
++        if (paused) r = -EACCES;
++        else if ((fd = fcntl(borrowed, F_DUPFD_CLOEXEC, 0)) < 0) r = -errno;
++        if (r < 0) release_device(vt, device->major, device->minor);
++    }
++    if (r < 0) {
++        log_warning("TakeDevice(%s): %s", node, error.message ? error.message : strerror(-r));
++        free(device);
++    } else {
++        *id = device->id = ++vt->next_id;
++        device->next = vt->devices;
++        vt->devices = device;
++    }
++    sd_bus_message_unref(reply);
++    sd_bus_error_free(&error);
++    return r < 0 ? r : fd;
++}
++static void close_device(struct uterm_vt *base, int fd, int id)
++{
++    struct logind_vt *vt = native(base);
++    struct device **link = &vt->devices, *device;
++
++    close(fd);
++    while ((device = *link)) {
++        if (device->id == id) {
++            struct pause **pending = &vt->pauses;
++            while (*pending) {
++                struct pause *pause = *pending;
++                if (pause->major == device->major && pause->minor == device->minor) {
++                    send_method(vt, vt->path, SESSION, "PauseDeviceComplete", "uu",
++                                pause->major, pause->minor);
++                    *pending = pause->next;
++                    free(pause);
++                    break;
++                }
++                pending = &pause->next;
++            }
++            *link = device->next;
++            release_device(vt, device->major, device->minor);
++            free(device);
++            break;
++        }
++        link = &device->next;
++    }
++}
++static int input_open(const char *node, int *id, void *data)
++{
++    return open_device(data, node, id);
++}
++static void input_close(int fd, int id, void *data)
++{
++    close_device(data, fd, id);
++}
++static int changed(sd_bus_message *message, void *data, sd_bus_error *error)
++{
++    struct logind_vt *vt = data;
++    vt->refresh = true;
++    return 0;
++}
++static int paused(sd_bus_message *message, void *data, sd_bus_error *error)
++{
++    struct logind_vt *vt = data;
++    unsigned int major, minor;
++    const char *type;
++    int r = sd_bus_message_read(message, "uus", &major, &minor, &type);
++    if (r < 0) return r;
++    /* udev removes a vanished device without deactivating the seat. */
++    if (!strcmp(type, "gone")) return 0;
++    vt->enabled = false;
++    if (!strcmp(type, "pause")) {
++        struct pause *pause = calloc(1, sizeof(*pause));
++        if (!pause) return -ENOMEM;
++        pause->major = major; pause->minor = minor;
++        pause->next = vt->pauses; vt->pauses = pause;
++    }
++    return 0;
++}
++static int removed(sd_bus_message *message, void *data, sd_bus_error *error)
++{
++    struct logind_vt *vt = data;
++    const char *id, *path;
++    int r = sd_bus_message_read(message, "so", &id, &path);
++    if (r < 0) return r;
++    if (!strcmp(id, vt->session)) {
++        vt->base.hup = true;
++        vt->enabled = false;
++    }
++    return 0;
++}
++static int apply_state(struct logind_vt *vt)
++{
++    int r;
++    if (vt->refresh && !vt->pauses) {
++        int active;
++        vt->refresh = false;
++        r = sd_bus_get_property_trivial(vt->bus, LOGIN, vt->path, SESSION, "Active", NULL, 'b', &active);
++        if (r < 0) return r;
++        vt->enabled = active;
++    }
++    if (vt->enabled) vt_cb_activate(&vt->base);
++    else vt_cb_deactivate(&vt->base, true);
++    while (vt->pauses) {
++        struct pause *pause = vt->pauses;
++        send_method(vt, vt->path, SESSION, "PauseDeviceComplete", "uu", pause->major, pause->minor);
++        vt->pauses = pause->next;
++        free(pause);
++    }
++    return 0;
++}
++static int arm(struct logind_vt *vt)
++{
++    struct itimerspec spec = {0};
++    struct timespec now;
++    uint64_t timeout, current, delay;
++    int events = sd_bus_get_events(vt->bus);
++    if (events < 0) return events;
++    int r = ev_fd_update(vt->watch, ((events & POLLIN) ? EV_READABLE : 0) |
++                                   ((events & POLLOUT) ? EV_WRITEABLE : 0));
++    if (r < 0) return r;
++    r = sd_bus_get_timeout(vt->bus, &timeout);
++    if (r < 0) return r;
++    if (timeout != UINT64_MAX) {
++        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return -errno;
++        current = (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
++        delay = timeout > current ? timeout - current : 1;
++        spec.it_value.tv_sec = delay / 1000000;
++        spec.it_value.tv_nsec = (delay % 1000000) * 1000;
++    }
++    return ev_timer_update(vt->timer, &spec);
++}
++static void dispatch(struct logind_vt *vt)
++{
++    int r;
++    while ((r = sd_bus_process(vt->bus, NULL)) > 0) {}
++    if (r >= 0) r = apply_state(vt);
++    if (r >= 0 && !vt->base.hup) r = arm(vt);
++    if (r < 0 || vt->base.hup) {
++        log_warning("logind connection lost: %s", r < 0 ? strerror(-r) : "session removed");
++        vt_cb_deactivate(&vt->base, true);
++        vt_cb_hup(&vt->base);
++    }
++}
++static void fd_event(struct ev_fd *fd, int mask, void *data) { dispatch(data); }
++static void timer_event(struct ev_timer *timer, uint64_t count, void *data) { dispatch(data); }
++static int activate(struct uterm_vt *base)
++{
++    struct logind_vt *vt = native(base);
++    int r = sd_bus_call_method(vt->bus, LOGIN, vt->path, SESSION, "Activate", NULL, NULL, "");
++    if (r < 0) return r;
++    vt->refresh = true;
++    r = apply_state(vt);
++    return r < 0 ? r : arm(vt);
++}
++static int deactivate(struct uterm_vt *base) { return vt_cb_deactivate(base, true); }
++static const char *seat_name(struct uterm_vt *base) { return native(base)->seat; }
++static void destroy(struct uterm_vt *base)
++{
++    struct logind_vt *vt = native(base);
++    vt_cb_deactivate(base, true);
++    input_sleep(base->input);
++    if (vt->watch) ev_eloop_rm_fd(vt->watch);
++    if (vt->timer) ev_eloop_rm_timer(vt->timer);
++    while (vt->devices) {
++        struct device *device = vt->devices;
++        release_device(vt, device->major, device->minor);
++        vt->devices = device->next;
++        free(device);
++    }
++    while (vt->pauses) { struct pause *pause = vt->pauses; vt->pauses = pause->next; free(pause); }
++    if (vt->path) send_method(vt, vt->path, SESSION, "ReleaseControl", "");
++    if (vt->session) send_method(vt, MANAGER_PATH, MANAGER, "ReleaseSession", "s", vt->session);
++    if (vt->fifo >= 0) close(vt->fifo);
++    sd_bus_slot_unref(vt->properties); sd_bus_slot_unref(vt->paused);
++    sd_bus_slot_unref(vt->resumed); sd_bus_slot_unref(vt->removed);
++    sd_bus_flush_close_unref(vt->bus);
++    free(vt->session); free(vt->path); free(vt->seat);
++}
++static const struct uterm_vt_ops ops = {
++    .activate = activate, .deactivate = deactivate, .destroy = destroy,
++    .get_name = seat_name, .open_device = open_device, .close_device = close_device,
++};
++struct uterm_vt *uterm_vt_logind_new(struct ev_eloop *eloop, struct input *input)
++{
++    struct logind_vt *vt = calloc(1, sizeof(*vt));
++    sd_bus_error error = SD_BUS_ERROR_NULL;
++    sd_bus_message *reply = NULL;
++    const char *session, *path, *runtime, *seat;
++    unsigned int uid, vtnr;
++    int fifo, existing, r;
++    if (!vt) return NULL;
++    vt->fifo = -1;
++    vt->base.eloop = eloop; vt->base.input = input; vt->base.ops = &ops;
++    r = sd_bus_open_system(&vt->bus);
++    if (r < 0) goto fail;
++    r = sd_bus_call_method(vt->bus, LOGIN, MANAGER_PATH, MANAGER, "CreateSession", &error, &reply,
++                          "uusssssussbssa(sv)", (unsigned int)getuid(), (unsigned int)getpid(),
++                          "kmscon", "tty", "user-light", "", "seat0", 0U, "", "", 0, "", "", 0);
++    if (r < 0) goto fail;
++    r = sd_bus_message_read(reply, "soshusub", &session, &path, &runtime, &fifo, &uid, &seat, &vtnr, &existing);
++    if (r < 0) goto fail;
++    vt->session = strdup(session); vt->path = strdup(path); vt->seat = strdup(seat);
++    if (!vt->session || !vt->path || !vt->seat) { r = -ENOMEM; goto fail; }
++    vt->fifo = fcntl(fifo, F_DUPFD_CLOEXEC, 0);
++    if (vt->fifo < 0) { r = -errno; goto fail; }
++    if (setenv("XDG_SESSION_ID", session, 1) || setenv("XDG_SEAT", seat, 1) ||
++        setenv("XDG_SESSION_TYPE", "tty", 1) || setenv("XDG_RUNTIME_DIR", runtime, 1)) { r = -errno; goto fail; }
++    sd_bus_message_unref(reply); reply = NULL;
++    r = sd_bus_call_method(vt->bus, LOGIN, vt->path, SESSION, "TakeControl", &error, NULL, "b", 0);
++    if (r < 0) goto fail;
++    r = sd_bus_match_signal(vt->bus, &vt->properties, LOGIN, vt->path,
++                           "org.freedesktop.DBus.Properties", "PropertiesChanged", changed, vt);
++    if (r >= 0) r = sd_bus_match_signal(vt->bus, &vt->paused, LOGIN, vt->path, SESSION, "PauseDevice", paused, vt);
++    if (r >= 0) r = sd_bus_match_signal(vt->bus, &vt->resumed, LOGIN, vt->path, SESSION, "ResumeDevice", changed, vt);
++    if (r >= 0) r = sd_bus_match_signal(vt->bus, &vt->removed, LOGIN, MANAGER_PATH, MANAGER, "SessionRemoved", removed, vt);
++    if (r < 0) goto fail;
++    r = ev_eloop_new_fd(eloop, &vt->watch, sd_bus_get_fd(vt->bus), EV_READABLE, fd_event, vt);
++    if (r >= 0) r = ev_eloop_new_timer(eloop, &vt->timer, NULL, timer_event, vt);
++    if (r >= 0) r = arm(vt);
++    if (r < 0) goto fail;
++    input_set_device_ops(input, input_open, input_close, &vt->base);
++    log_notice("logind session %s on %s", vt->session, vt->seat);
++    return &vt->base;
++fail:
++    log_error("cannot establish logind session: %s", error.message ? error.message : strerror(-r));
++    sd_bus_error_free(&error); sd_bus_message_unref(reply);
++    destroy(&vt->base); free(vt);
++    return NULL;
 +}
 diff --git kmscon-clean/src/video/drm2d_video.c kmscon-workdir/src/video/drm2d_video.c
 index 8e86feb..5e5041e 100644

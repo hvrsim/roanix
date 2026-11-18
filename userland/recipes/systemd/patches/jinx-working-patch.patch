@@ -500,7 +500,7 @@ index e2cd8b4..26c325c 100644
  #  else
          errno = ENOSYS;
 diff --git systemd-clean/src/basic/process-util.c systemd-workdir/src/basic/process-util.c
-index 3253a9c..33959aa 100644
+index 3253a9c..ff5f682 100644
 --- systemd-clean/src/basic/process-util.c
 +++ systemd-workdir/src/basic/process-util.c
 @@ -16,6 +16,9 @@
@@ -513,7 +513,42 @@ index 3253a9c..33959aa 100644
  #if HAVE_VALGRIND_VALGRIND_H
  #include <valgrind/valgrind.h>
  #endif
-@@ -711,13 +714,25 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
+@@ -423,18 +426,26 @@ int namespace_get_leader(pid_t pid, NamespaceType type, pid_t *ret) {
+ }
+ 
+ int pid_is_kernel_thread(pid_t pid) {
++#ifndef __roanix__
+         _cleanup_free_ char *line = NULL;
+         unsigned long long flags;
+         size_t l, i;
+         const char *p;
+         char *q;
+         int r;
++#endif
+ 
+         if (IN_SET(pid, 0, 1) || pid == getpid_cached()) /* pid 1, and we ourselves certainly aren't a kernel thread */
+                 return 0;
+         if (!pid_is_valid(pid))
+                 return -EINVAL;
+ 
++#ifdef __roanix__
++        /* Only userspace processes have entries in native procfs. */
++        if (access(procfs_file_alloca(pid, "status"), F_OK) < 0)
++                return errno == ENOENT ? -ESRCH : -errno;
++        return 0;
++#else
+         p = procfs_file_alloca(pid, "stat");
+         r = read_one_line_file(p, &line);
+         if (r == -ENOENT)
+@@ -478,6 +489,7 @@ int pid_is_kernel_thread(pid_t pid) {
+                 return r;
+ 
+         return !!(flags & PF_KTHREAD);
++#endif
+ }
+ 
+ int pidref_is_kernel_thread(const PidRef *pid) {
+@@ -711,13 +723,25 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
          if (pid == 1) /* PID 1 has no parent, shortcut this case */
                  return -EADDRNOTAVAIL;
  
@@ -539,7 +574,7 @@ index 3253a9c..33959aa 100644
          /* Let's skip the pid and comm fields. The latter is enclosed in () but does not escape any () in its
           * value, so let's skip over it manually */
  
-@@ -733,6 +748,8 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
+@@ -733,6 +757,8 @@ int get_process_ppid(pid_t pid, pid_t *ret) {
                     &ppid) != 1)
                  return -EIO;
  
@@ -548,7 +583,7 @@ index 3253a9c..33959aa 100644
          /* If ppid is zero the process has no parent. Which might be the case for PID 1 but also for
           * processes originating in other namespaces that are inserted into a pidns. Return a recognizable
           * error in this case. */
-@@ -1226,12 +1243,16 @@ int pid_from_same_root_fs(pid_t pid) {
+@@ -1226,12 +1252,16 @@ int pid_from_same_root_fs(pid_t pid) {
  }
  
  bool is_main_thread(void) {
@@ -1349,6 +1384,57 @@ index 8a3b812..af70a11 100644
  
          /* Put a ratelimit on unit starting */
          RateLimit start_ratelimit;
+diff --git systemd-clean/src/libsystemd/sd-device/device-monitor.c systemd-workdir/src/libsystemd/sd-device/device-monitor.c
+index d2892c4..34516f5 100644
+--- systemd-clean/src/libsystemd/sd-device/device-monitor.c
++++ systemd-workdir/src/libsystemd/sd-device/device-monitor.c
+@@ -814,7 +814,12 @@ _public_ int sd_device_monitor_filter_update(sd_device_monitor *m) {
+         if (m->filter_uptodate)
+                 return 0;
+ 
+-        if (m->snl.nl.nl_groups == MONITOR_GROUP_KERNEL ||
++        if (
++#ifdef __roanix__
++            /* Native sockets use the property filter in passes_filter(). */
++            true ||
++#endif
++            m->snl.nl.nl_groups == MONITOR_GROUP_KERNEL ||
+             (hashmap_isempty(m->subsystem_filter) &&
+              set_isempty(m->tag_filter))) {
+                 m->filter_uptodate = true;
+diff --git systemd-clean/src/libsystemd/sd-device/device-private.c systemd-workdir/src/libsystemd/sd-device/device-private.c
+index 1c148b8..06de44d 100644
+--- systemd-clean/src/libsystemd/sd-device/device-private.c
++++ systemd-workdir/src/libsystemd/sd-device/device-private.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: LGPL-2.1-or-later */
+ 
+ #include <ctype.h>
++#include <fcntl.h>
+ #include <net/if.h>
+ #include <sys/types.h>
+ 
+@@ -717,8 +718,20 @@ static int device_tag(sd_device *device, const char *tag, bool add) {
+ 
+         path = strjoina("/run/udev/tags/", tag, "/", id);
+ 
++#ifdef __roanix__
++        if (add) {
++                _cleanup_close_ int fd = -EBADF;
++
++                r = mkdir_parents(path, 0755);
++                if (r < 0)
++                        return r;
++                fd = open(path, O_WRONLY|O_CREAT|O_CLOEXEC|O_NOCTTY, 0444);
++                return fd < 0 ? -errno : 0;
++        }
++#else
+         if (add)
+                 return touch_file(path, true, USEC_INFINITY, UID_INVALID, GID_INVALID, 0444);
++#endif
+ 
+         if (unlink(path) < 0 && errno != ENOENT)
+                 return -errno;
 diff --git systemd-clean/src/libsystemd/sd-event/sd-event.c systemd-workdir/src/libsystemd/sd-event/sd-event.c
 index 7aea7d2..ae77eed 100644
 --- systemd-clean/src/libsystemd/sd-event/sd-event.c
@@ -1364,6 +1450,139 @@ index 7aea7d2..ae77eed 100644
          usec_t after_timestamp = now(CLOCK_MONOTONIC);
  
          if (r > 0)
+diff --git systemd-clean/src/login/logind-button.c systemd-workdir/src/login/logind-button.c
+index f980ea5..d5fd004 100644
+--- systemd-clean/src/login/logind-button.c
++++ systemd-workdir/src/login/logind-button.c
+@@ -254,6 +254,14 @@ static int button_dispatch(sd_event_source *s, int fd, uint32_t revents, void *u
+         assert(s);
+         assert(fd == b->fd);
+ 
++#ifdef __roanix__
++        /* Native evdev signals disconnect before it can unpublish an open node. */
++        if (revents & (EPOLLHUP|EPOLLERR)) {
++                button_free(b);
++                return 0;
++        }
++#endif
++
+         l = read(b->fd, &ev, sizeof(ev));
+         if (l < 0)
+                 return errno != EAGAIN ? -errno : 0;
+diff --git systemd-clean/src/login/logind-dbus.c systemd-workdir/src/login/logind-dbus.c
+index 80a2470..a765c76 100644
+--- systemd-clean/src/login/logind-dbus.c
++++ systemd-workdir/src/login/logind-dbus.c
+@@ -1746,7 +1746,7 @@ static int have_multiple_sessions(
+         /* Check for other users' sessions. Greeter sessions do not
+          * count, and non-login sessions do not count either. */
+         HASHMAP_FOREACH(session, m->sessions)
+-                if (IN_SET(session->class, SESSION_USER, SESSION_USER_EARLY) &&
++                if (IN_SET(session->class, SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT) &&
+                     session->user->user_record->uid != uid)
+                         return true;
+ 
+@@ -4476,10 +4476,12 @@ int manager_start_scope(
+         if (r < 0)
+                 return r;
+ 
++#ifndef __roanix__
+         /* disable TasksMax= for the session scope, rely on the slice setting for it */
+         r = sd_bus_message_append(m, "(sv)", "TasksMax", "t", UINT64_MAX);
+         if (r < 0)
+                 return bus_log_create_error(r);
++#endif
+ 
+         if (more_properties) {
+                 /* If TasksMax also appears here, it will overwrite the default value set above */
+diff --git systemd-clean/src/login/logind-session.c systemd-workdir/src/login/logind-session.c
+index 351b64b..b95d687 100644
+--- systemd-clean/src/login/logind-session.c
++++ systemd-workdir/src/login/logind-session.c
+@@ -1671,6 +1671,7 @@ DEFINE_STRING_TABLE_LOOKUP(session_type, SessionType);
+ static const char* const session_class_table[_SESSION_CLASS_MAX] = {
+         [SESSION_USER]              = "user",
+         [SESSION_USER_EARLY]        = "user-early",
++        [SESSION_USER_LIGHT]        = "user-light",
+         [SESSION_USER_INCOMPLETE]   = "user-incomplete",
+         [SESSION_GREETER]           = "greeter",
+         [SESSION_LOCK_SCREEN]       = "lock-screen",
+diff --git systemd-clean/src/login/logind-session.h systemd-workdir/src/login/logind-session.h
+index 2d2cb18..3ac6661 100644
+--- systemd-clean/src/login/logind-session.h
++++ systemd-workdir/src/login/logind-session.h
+@@ -22,6 +22,7 @@ typedef enum SessionState {
+ typedef enum SessionClass {
+         SESSION_USER,               /* A regular user session */
+         SESSION_USER_EARLY,         /* A user session, that is not ordered after systemd-user-sessions.service (i.e. for root) */
++        SESSION_USER_LIGHT,         /* An interactive session without a user service manager */
+         SESSION_USER_INCOMPLETE,    /* A user session that is only half-way set up and doesn't pull in the service manager, and can be upgraded to a full user session later */
+         SESSION_GREETER,            /* A login greeter pseudo-session */
+         SESSION_LOCK_SCREEN,        /* A lock screen */
+@@ -38,7 +39,7 @@ typedef enum SessionClass {
+ #define SESSION_CLASS_IS_EARLY(class) IN_SET((class), SESSION_USER_EARLY, SESSION_MANAGER_EARLY)
+ 
+ /* Which session classes want their own scope units? (all of them, except the manager, which comes in its own service unit already */
+-#define SESSION_CLASS_WANTS_SCOPE(class) IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_INCOMPLETE, SESSION_GREETER, SESSION_LOCK_SCREEN, SESSION_BACKGROUND, SESSION_BACKGROUND_LIGHT)
++#define SESSION_CLASS_WANTS_SCOPE(class) IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT, SESSION_USER_INCOMPLETE, SESSION_GREETER, SESSION_LOCK_SCREEN, SESSION_BACKGROUND, SESSION_BACKGROUND_LIGHT)
+ 
+ /* Which session classes want their own per-user service manager? */
+ #define SESSION_CLASS_WANTS_SERVICE_MANAGER(class) IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER, SESSION_LOCK_SCREEN, SESSION_BACKGROUND)
+@@ -47,22 +48,22 @@ typedef enum SessionClass {
+ #define SESSION_CLASS_PIN_USER(class) (!IN_SET((class), SESSION_MANAGER, SESSION_MANAGER_EARLY))
+ 
+ /* Which session classes decide whether system is idle? (should only cover sessions that have input, and are not idle screens themselves)*/
+-#define SESSION_CLASS_CAN_IDLE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER))
++#define SESSION_CLASS_CAN_IDLE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT, SESSION_GREETER))
+ 
+ /* Which session classes have a lock screen concept? */
+-#define SESSION_CLASS_CAN_LOCK(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY))
++#define SESSION_CLASS_CAN_LOCK(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT))
+ 
+ /* Which sessions are candidates to become "display" sessions */
+-#define SESSION_CLASS_CAN_DISPLAY(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER))
++#define SESSION_CLASS_CAN_DISPLAY(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT, SESSION_GREETER))
+ 
+ /* Which sessions classes should be subject to stop-in-idle */
+-#define SESSION_CLASS_CAN_STOP_ON_IDLE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY))
++#define SESSION_CLASS_CAN_STOP_ON_IDLE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT))
+ 
+ /* Which session classes can take control of devices */
+-#define SESSION_CLASS_CAN_TAKE_DEVICE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER, SESSION_LOCK_SCREEN))
++#define SESSION_CLASS_CAN_TAKE_DEVICE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT, SESSION_GREETER, SESSION_LOCK_SCREEN))
+ 
+ /* Which session classes allow changing session types */
+-#define SESSION_CLASS_CAN_CHANGE_TYPE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER, SESSION_LOCK_SCREEN))
++#define SESSION_CLASS_CAN_CHANGE_TYPE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_USER_LIGHT, SESSION_GREETER, SESSION_LOCK_SCREEN))
+ 
+ typedef enum SessionType {
+         SESSION_UNSPECIFIED,
+diff --git systemd-clean/src/login/user-runtime-dir.c systemd-workdir/src/login/user-runtime-dir.c
+index b242f83..df00e9d 100644
+--- systemd-clean/src/login/user-runtime-dir.c
++++ systemd-workdir/src/login/user-runtime-dir.c
+@@ -96,6 +96,13 @@ static int user_mkdir_runtime_path(
+                 if (r < 0 && r != -EEXIST)
+                         return log_error_errno(r, "Failed to create %s: %m", runtime_path);
+ 
++#ifdef __roanix__
++                /* /run is already a kernel-mounted tmpfs. Keep this user's
++                 * private directory on that filesystem. */
++                r = chmod_and_chown(runtime_path, 0700, uid, gid);
++                if (r < 0)
++                        goto fail;
++#else
+                 r = mount_nofollow_verbose(LOG_DEBUG, "tmpfs", runtime_path, "tmpfs", MS_NODEV|MS_NOSUID, options);
+                 if (r < 0) {
+                         if (!ERRNO_IS_PRIVILEGE(r)) {
+@@ -114,6 +121,7 @@ static int user_mkdir_runtime_path(
+                         }
+                 }
+ 
++#endif
+                 r = label_fix(runtime_path, 0);
+                 if (r < 0)
+                         log_warning_errno(r, "Failed to fix label of \"%s\", ignoring: %m", runtime_path);
 diff --git systemd-clean/src/shared/bpf-program.h systemd-workdir/src/shared/bpf-program.h
 index 904f2b9..fd7e938 100644
 --- systemd-clean/src/shared/bpf-program.h
@@ -1488,7 +1707,7 @@ index 184aec0..5ae765d 100644
  
  static void log_children_not_yet_killed(Set *pids) {
 diff --git systemd-clean/src/shared/mount-setup.c systemd-workdir/src/shared/mount-setup.c
-index d5009fb..a438d5d 100644
+index d5009fb..51b9bae 100644
 --- systemd-clean/src/shared/mount-setup.c
 +++ systemd-workdir/src/shared/mount-setup.c
 @@ -55,7 +55,10 @@ typedef struct MountPoint {
@@ -1498,18 +1717,16 @@ index d5009fb..a438d5d 100644
 -#if ENABLE_SMACK
 +#if defined(__roanix__)
 +/* Native devfs and PTYs are established by the kernel. */
-+#define N_EARLY_MOUNT 1
++#define N_EARLY_MOUNT 2
 +#elif ENABLE_SMACK
  #define N_EARLY_MOUNT 5
  #else
  #define N_EARLY_MOUNT 4
-@@ -79,12 +82,14 @@ static bool check_recursiveprot_supported(void) {
- static const MountPoint mount_table[] = {
-         { "proc",        "/proc",                     "proc",       NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+@@ -81,10 +84,12 @@ static const MountPoint mount_table[] = {
            NULL,          MNT_FATAL|MNT_IN_CONTAINER|MNT_FOLLOW_SYMLINK },
-+#ifndef __roanix__
          { "sysfs",       "/sys",                      "sysfs",      NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
            NULL,          MNT_FATAL|MNT_IN_CONTAINER },
++#ifndef __roanix__
          { "devtmpfs",    "/dev",                      "devtmpfs",   "mode=0755" TMPFS_LIMITS_DEV,               MS_NOSUID|MS_STRICTATIME,
            NULL,          MNT_FATAL|MNT_IN_CONTAINER },
          { "securityfs",  "/sys/kernel/security",      "securityfs", NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
@@ -1632,3 +1849,22 @@ index 3535551..b5ee332 100644
          capture : true)
  
  generate_keyboard_keys_gperf = find_program('generate-keyboard-keys-gperf.sh')
+diff --git systemd-clean/src/udev/udev-manager.c systemd-workdir/src/udev/udev-manager.c
+index 32bc0db..2b8a8c8 100644
+--- systemd-clean/src/udev/udev-manager.c
++++ systemd-workdir/src/udev/udev-manager.c
+@@ -749,7 +749,14 @@ static int event_queue_insert(Manager *manager, sd_device *dev) {
+         };
+ 
+         if (!manager->events) {
++#ifdef __roanix__
++                /* Only existence matters for this queue marker. */
++                int marker = open("/run/udev/queue", O_WRONLY|O_CREAT|O_CLOEXEC, 0644);
++                r = marker < 0 ? -errno : 0;
++                safe_close(marker);
++#else
+                 r = touch("/run/udev/queue");
++#endif
+                 if (r < 0)
+                         log_warning_errno(r, "Failed to touch /run/udev/queue, ignoring: %m");
+         }

@@ -1,18 +1,19 @@
 #! /bin/sh
 
 version=10.0.4
-revision=3
+revision=6
 tarball_url="https://github.com/kmscon/kmscon/archive/refs/tags/v${version}.tar.gz"
 tarball_blake2b="6531d9d12895588f2f6f8ead8bf915cf262d7fedd8eeca9b90e6d66b92828ca5c57e6bc2f0dfaf8418a23a2925c9418cdbaf3564f23623ceb27bc112ba45d0d9"
 imagedeps="build-essential zlib1g-dev ncurses-bin"
 hostdeps="gcc-host pkg-config"
 builddeps="linux-headers"
-deps="sys-libs libdrm libtsm libxkbcommon zlib"
+deps="sys-libs systemd libdrm libtsm libxkbcommon zlib"
 
 configure() {
     meson_configure \
         -Dauto_features=disabled \
         -Dtests=false \
+        -Dlibseat=disabled \
         -Dvideo_drm2d=enabled \
         -Dfont_unifont=enabled
 }

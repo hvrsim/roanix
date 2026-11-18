@@ -74,6 +74,7 @@ struct UserStat {
     accessed_ns: u64,
     modified_ns: u64,
     changed_ns: u64,
+    rdev: u64,
 }
 
 impl UserStat {
@@ -89,6 +90,7 @@ impl UserStat {
             accessed_ns: 0,
             modified_ns: 0,
             changed_ns: 0,
+            rdev: 0,
         }
     }
 }
@@ -420,6 +422,10 @@ crate::syscall_handler! {
             if flags & !0xf != 0 { return Err(Errno::Invalid); }
             let filesystem: fs::FileSystemRef = fs::procfs::Procfs::new().map_err(map_fs_error)?;
             fs::vfs::mount_with_source(&target, filesystem, source.as_bytes()).map_err(map_fs_error)?;
+        } else if filesystem == "sysfs" {
+            if flags & !0xe != 0 { return Err(Errno::Invalid); }
+            let filesystem: fs::FileSystemRef = fs::sysfs::Sysfs::new().map_err(map_fs_error)?;
+            fs::vfs::mount_with_source(&target, filesystem, source.as_bytes()).map_err(map_fs_error)?;
         } else if filesystem == "cgroup2" {
             // The hierarchy is writable; device nodes and executable data do
             // not exist in it. Unsupported mount policies remain errors.
@@ -512,21 +518,21 @@ crate::syscall_handler! {
         let descriptor = process.descriptor(fd).ok_or(Errno::BadFileDescriptor)?;
         match descriptor {
             Descriptor::File(file) => {
-                write_user_stat(&process, output, file.getattr().map_err(map_fs_error)?)
+                write_user_stat(&process, output, file.getattr().map_err(map_fs_error)?, false)
             }
             Descriptor::Unix(socket) => {
                 let mut stat = UserStat::anonymous(0o777, 7);
                 stat.inode = socket.id as u64;
-                write_user_stat_record(&process, output, stat)
+                write_user_stat_record(&process, output, stat, false)
             }
             Descriptor::Pipe(_) => {
-                write_user_stat_record(&process, output, UserStat::anonymous(0o666, 6))
+                write_user_stat_record(&process, output, UserStat::anonymous(0o666, 6), false)
             }
             Descriptor::SignalFd(_) => {
-                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
+                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1), false)
             }
             Descriptor::Epoll(_) | Descriptor::Inotify(_) | Descriptor::TimerFd(_) | Descriptor::EventFd(_) => {
-                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1))
+                write_user_stat_record(&process, output, UserStat::anonymous(0o600, 1), false)
             }
         }
     }
@@ -979,7 +985,9 @@ fn file_access_at(process: &Process, dirfd: i32, path: u64, mode: u64, flags: u6
 }
 
 fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u64) -> Result<u64> {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH) != 0 {
+    const EXTENDED: u64 = 1 << 31;
+    let extended = flags & EXTENDED != 0;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | EXTENDED) != 0 {
         return Err(Errno::Invalid);
     }
     let empty = if flags & AT_EMPTY_PATH != 0 {
@@ -990,14 +998,23 @@ fn file_stat_at(process: &Process, dirfd: i32, path: u64, flags: u64, output: u6
     match resolve_at_path(process, dirfd, path, empty)? {
         AtPath::Vfs { base, path } => {
             let vnode = lookup_at(&base, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-            write_user_stat(process, output, vnode.getattr().map_err(map_fs_error)?)
+            write_user_stat(
+                process,
+                output,
+                vnode.getattr().map_err(map_fs_error)?,
+                extended,
+            )
         }
-        AtPath::Pipe => write_user_stat_record(process, output, UserStat::anonymous(0o666, 6)),
-        AtPath::Anonymous => write_user_stat_record(process, output, UserStat::anonymous(0o600, 1)),
+        AtPath::Pipe => {
+            write_user_stat_record(process, output, UserStat::anonymous(0o666, 6), extended)
+        }
+        AtPath::Anonymous => {
+            write_user_stat_record(process, output, UserStat::anonymous(0o600, 1), extended)
+        }
         AtPath::Socket(id) => {
             let mut stat = UserStat::anonymous(0o777, 7);
             stat.inode = id as u64;
-            write_user_stat_record(process, output, stat)
+            write_user_stat_record(process, output, stat, extended)
         }
     }
 }
@@ -1295,7 +1312,12 @@ fn ioctl_context(process: &Process) -> Result<IoctlContext> {
     })
 }
 
-fn write_user_stat(process: &Process, output: u64, attributes: VnodeAttr) -> Result<u64> {
+fn write_user_stat(
+    process: &Process,
+    output: u64,
+    attributes: VnodeAttr,
+    extended: bool,
+) -> Result<u64> {
     write_user_stat_record(
         process,
         output,
@@ -1309,14 +1331,22 @@ fn write_user_stat(process: &Process, output: u64, attributes: VnodeAttr) -> Res
             accessed_ns: attributes.accessed_ns,
             modified_ns: attributes.modified_ns,
             changed_ns: attributes.changed_ns,
+            rdev: fs::devfs::device_number(attributes.key).unwrap_or(0),
         },
+        extended,
     )
 }
 
 /// The complete record is assembled once and copied to user memory in a single
 /// transfer, so a partially written structure can never be observed.
-fn write_user_stat_record(process: &Process, output: u64, stat: UserStat) -> Result<u64> {
-    let mut bytes = [0u8; 64];
+fn write_user_stat_record(
+    process: &Process,
+    output: u64,
+    stat: UserStat,
+    extended: bool,
+) -> Result<u64> {
+    let mut bytes = [0u8; 72];
+    bytes[64..72].copy_from_slice(&stat.rdev.to_ne_bytes());
     bytes[0..8].copy_from_slice(&stat.device.to_ne_bytes());
     bytes[8..16].copy_from_slice(&stat.inode.to_ne_bytes());
     bytes[16..20].copy_from_slice(&stat.mode.to_ne_bytes());
@@ -1328,7 +1358,10 @@ fn write_user_stat_record(process: &Process, output: u64, stat: UserStat) -> Res
     bytes[56..64].copy_from_slice(&stat.changed_ns.to_ne_bytes());
     process
         .address_space()
-        .write_user(VirtAddr::new(output), &bytes)
+        .write_user(
+            VirtAddr::new(output),
+            &bytes[..if extended { 72 } else { 64 }],
+        )
         .map_err(map_memory_error)?;
     Ok(0)
 }
@@ -1490,6 +1523,7 @@ fn zeroed_bytes(length: usize) -> Result<Vec<u8>> {
 
 fn map_pipe_error(error: PipeError) -> Errno {
     match error {
+        PipeError::NoReader => Errno::NoDeviceAddress,
         PipeError::BadDescriptor => Errno::BadFileDescriptor,
         PipeError::TryAgain => Errno::TryAgain,
         PipeError::Fault => Errno::Fault,
@@ -1500,5 +1534,15 @@ fn map_pipe_error(error: PipeError) -> Errno {
             }
             Errno::BrokenPipe
         }
+    }
+}
+
+crate::syscall_handler! {
+    syscall_file_mknodat(_frame, dirfd: i32 = 0, path: u64 = 1, mode: u64 = 2, device: u64 = 3) {
+        if mode & !0o177777 != 0 || mode & 0o170000 != 0o010000 || device != 0 { return Err(Errno::NotSupported); }
+        let process = current_process()?;
+        let AtPath::Vfs { base, path } = resolve_at_path(&process, dirfd, path, EmptyPath::Reject)? else { return Err(Errno::NotDirectory); };
+        fs::vfs::create_fifo_at(&base, &path, mode as u16 & 0o7777 & !process.umask()).map_err(map_fs_error)?;
+        Ok(0)
     }
 }

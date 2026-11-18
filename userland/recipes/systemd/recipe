@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=257
-revision=22
+revision=29
 tarball_url="https://github.com/systemd/systemd/archive/refs/tags/v${version}.tar.gz"
 tarball_blake2b="ada784bbad28f5bdcfb77d232f44d116b77f32df295aeb1b96416ebb37f7a702362fed5a4279d63602ca340687df2e257a917936a9bce12afe811e9f5181e328"
 imagedeps="build-essential python3-jinja2 gperf"
@@ -35,7 +35,7 @@ configure() {
         -Dcoredump=false \
         -Dpstore=false \
         -Doomd=false \
-        -Dlogind=false \
+        -Dlogind=true \
         -Dhostnamed=false \
         -Dlocaled=false \
         -Dmachined=false \
@@ -72,11 +72,13 @@ package() {
     # execing the manager. Do not replace it with systemd's compatibility link.
     rm "${dest_dir}/usr/bin/init"
     # Native APIs and devices exist before PID 1 starts. Upstream boot hooks
-    # depend on Linux sysfs, udev, writable /etc, or unsupported namespaces.
+    # require writable /etc or unsupported administration and namespace APIs.
     rm -r "${dest_dir}/usr/lib/systemd/system-generators"
     for directory in "${dest_dir}"/usr/lib/systemd/system/*.wants; do
         rm -r "$directory"
     done
+    # Preserve the user slice lifecycle without setting a pids controller limit.
+    sed -i '/^TasksMax=/d' "${dest_dir}/usr/lib/systemd/system/user-.slice.d/10-defaults.conf"
     for unit in "${recipe_dir}"/units/*; do
         install -Dm644 "$unit" "${dest_dir}/usr/lib/systemd/system/${unit##*/}"
     done

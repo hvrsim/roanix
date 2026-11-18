@@ -29,6 +29,7 @@ SYSTEM_PACKAGES = (
     "linux-headers",
     "libdrm",
     "kmscon",
+    "dbus",
     "bash",
     "coreutils",
     "python",

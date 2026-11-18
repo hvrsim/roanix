@@ -1,0 +1,11 @@
+[Unit]
+Description=User Runtime Directory /run/user/%i
+After=systemd-logind.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/systemd/systemd-user-runtime-dir start %i
+ExecStop=/usr/lib/systemd/systemd-user-runtime-dir stop %i
+StandardOutput=kmsg
+StandardError=inherit

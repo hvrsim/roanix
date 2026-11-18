@@ -1,0 +1,39 @@
+#! /bin/sh
+
+version=1.16.2
+revision=4
+tarball_url="https://dbus.freedesktop.org/releases/dbus/dbus-${version}.tar.xz"
+tarball_blake2b="ddca8abdd5df70b24d51293a262cda3f9e69681b31ae8bb560a6286ca6f2dc0c420dc5322a61bb142a77b2b5f86bdafcc6bf84b0d78af9610af7a78763b8b8fb"
+imagedeps="build-essential"
+hostdeps="gcc-host pkg-config"
+builddeps="linux-headers"
+deps="sys-libs libexpat systemd"
+
+configure() {
+    meson_configure \
+        -Dauto_features=disabled \
+        -Dmessage_bus=true \
+        -Dsystemd=enabled \
+        -Depoll=enabled \
+        -Dinotify=enabled \
+        -Ddbus_user=root \
+        -Druntime_dir=/run \
+        -Dsystem_socket=/run/dbus/system_bus_socket \
+        -Dsystemd_system_unitdir=/usr/lib/systemd/system \
+        -Dsystemd_user_unitdir=/usr/lib/systemd/user
+}
+
+build() {
+    ninja -j"${parallelism}"
+}
+
+package() {
+    DESTDIR="${dest_dir}" ninja install
+    for unit in "${recipe_dir}"/units/*; do
+        install -Dm644 "$unit" "${dest_dir}/usr/lib/systemd/system/${unit##*/}"
+    done
+    # Native credentials are root-only; retain the service identity.
+    sed -i '/<user>root<\/user>/d' "${dest_dir}/usr/share/dbus-1/system.conf"
+    chmod 755 "${dest_dir}/usr/libexec/dbus-daemon-launch-helper"
+    post_package_strip
+}

@@ -24,8 +24,7 @@ index 4abb00d..2bffe59 100644
  #include <printf.h>
 +#include <stdint.h>
 +#include <stddef.h>
--
-+
+ 
 -size_t parse_printf_format(const char * __restrict, size_t, int * __restrict) {
 -	__ensure(!"Not implemented");
 -	__builtin_unreachable();
@@ -130,42 +129,30 @@ index bf8126b..b8ce2d4 100644
 --- mlibc-clean/options/internal/generic/getopt.cpp
 +++ mlibc-workdir/options/internal/generic/getopt.cpp
 @@ -126,6 +126,11 @@ int getopt_common_internal(int argc, char * const argv[], const char *optstring,
--		return frg::null_opt;
-+		return frg::null_opt;
--	};
-+	};
--
-+
+ 		return frg::null_opt;
+ 	};
+ 
 +	// GNU return-in-order mode treats positional arguments as option 1.
 +	// The leading '-' selects the mode and is not a short option.
 +	bool return_in_order = optstring[0] == '-';
 +	if(return_in_order)
 +		++optstring;
--	bool colon = optstring[0] == ':';
-+	bool colon = optstring[0] == ':';
--	bool stop_at_first_nonarg = (optstring[0] == '+' || getenv("POSIXLY_CORRECT"));
-+	bool stop_at_first_nonarg = (optstring[0] == '+' || getenv("POSIXLY_CORRECT"));
--
-+
+ 	bool colon = optstring[0] == ':';
+ 	bool stop_at_first_nonarg = (optstring[0] == '+' || getenv("POSIXLY_CORRECT"));
+ 
 @@ -154,6 +159,12 @@ int getopt_common_internal(int argc, char * const argv[], const char *optstring,
--				return -1;
-+				return -1;
--			}
-+			}
--
-+
+ 				return -1;
+ 			}
+ 
 +			if(return_in_order) {
 +				optarg = arg;
 +				optind++;
 +				return 1;
 +			}
 +
--			if(stop_at_first_nonarg) {
-+			if(stop_at_first_nonarg) {
--				optarg = nullptr;
-+				optarg = nullptr;
--				return -1;
-+				return -1;
+ 			if(stop_at_first_nonarg) {
+ 				optarg = nullptr;
+ 				return -1;
 diff --git mlibc-clean/options/internal/include/mlibc/sysdep-signatures.hpp mlibc-workdir/options/internal/include/mlibc/sysdep-signatures.hpp
 index 35f023f..90ca671 100644
 --- mlibc-clean/options/internal/include/mlibc/sysdep-signatures.hpp
@@ -196,11 +183,9 @@ index c7db3e0..c6c7402 100644
 --- mlibc-clean/options/linux/generic/sched.cpp
 +++ mlibc-workdir/options/linux/generic/sched.cpp
 @@ -37,12 +37,22 @@ int unshare(int flags) {
--	return 0;
-+	return 0;
+ 	return 0;
  }
--
-+
+ 
 -int sched_setaffinity(pid_t, size_t, const cpu_set_t *) {
 -	__ensure(!"Not implemented");
 -	__builtin_unreachable();
@@ -211,8 +196,7 @@ index c7db3e0..c6c7402 100644
 +    }
 +    return 0;
  }
--
-+
+ 
  int clone(int (*)(void *), void *, int, void *, ...) {
 -	__ensure(!"Not implemented");
 -	__builtin_unreachable();
@@ -261,8 +245,7 @@ index 4ec13b1..bacd6c8 100644
 @@ -55,7 +56,10 @@ int setrlimit(int resource, const struct rlimit *limit) {
  [[gnu::alias("setrlimit")]] int setrlimit64(int resource, const struct rlimit *limit);
  #endif /* !__MLIBC_LINUX_OPTION */
--
-+
+ 
 -int prlimit(pid_t, int, const struct rlimit *, struct rlimit *) {
 -	__ensure(!"Not implemented");
 -	__builtin_unreachable();
@@ -279,17 +262,13 @@ index 6d11040..c09363e 100644
 +++ mlibc-workdir/options/posix/generic/sys-uio.cpp
 @@ -23,8 +23,6 @@ ssize_t readv(int fd, const struct iovec *iovs, int iovc) {
  }
--
-+
+ 
  ssize_t writev(int fd, const struct iovec *iovs, int iovc) {
 -	__ensure(iovc);
 -
--	ssize_t written = 0;
-+	ssize_t written = 0;
--
-+
--	if constexpr (mlibc::IsImplemented<Writev>) {
-+	if constexpr (mlibc::IsImplemented<Writev>) {
+ 	ssize_t written = 0;
+ 
+ 	if constexpr (mlibc::IsImplemented<Writev>) {
 diff --git mlibc-workdir/sysdeps/roanix/generic/entry.cpp mlibc-workdir/sysdeps/roanix/generic/entry.cpp
 new file mode 100644
 index 0000000..9e8955e
@@ -317,10 +296,10 @@ index 0000000..9e8955e
 +}
 diff --git mlibc-workdir/sysdeps/roanix/generic/sockets.cpp mlibc-workdir/sysdeps/roanix/generic/sockets.cpp
 new file mode 100644
-index 0000000..0cc493b
+index 0000000..29dd4ad
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/generic/sockets.cpp
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,326 @@
 +#include <errno.h>
 +#include <stddef.h>
 +#include <stdint.h>
@@ -328,6 +307,7 @@ index 0000000..0cc493b
 +#include <sys/socket.h>
 +#include <sys/un.h>
 +#include <sys/uio.h>
++#include <linux/netlink.h>
 +#include <mlibc/all-sysdeps.hpp>
 +#include <roanix/syscall.h>
 +
@@ -336,6 +316,14 @@ index 0000000..0cc493b
 +int error(long result) { return result < 0 && result >= -4095 ? static_cast<int>(-result) : 0; }
 +
 +int socket_type(int domain, int type, int protocol, unsigned *kind, unsigned *flags) {
++    if (domain == AF_NETLINK) {
++        if (protocol != NETLINK_KOBJECT_UEVENT) return EPROTONOSUPPORT;
++        int base = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
++        if (base != SOCK_RAW && base != SOCK_DGRAM) return ESOCKTNOSUPPORT;
++        *kind = base == SOCK_RAW ? 3 : 4;
++        *flags = (type & SOCK_NONBLOCK ? 1 : 0) | (type & SOCK_CLOEXEC ? 2 : 0);
++        return 0;
++    }
 +    if (domain != AF_UNIX) return EAFNOSUPPORT;
 +    if (protocol != 0) return EPROTONOSUPPORT;
 +    *kind = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -349,6 +337,16 @@ index 0000000..0cc493b
 +    memcpy(&family, address, sizeof(family));
 +    *out = {};
 +    if (family == AF_UNSPEC) { out->kind = 3; return 0; }
++    if (family == AF_NETLINK) {
++        if (size != sizeof(sockaddr_nl)) return EINVAL;
++        sockaddr_nl native;
++        memcpy(&native, address, sizeof(native));
++        if (native.nl_pad) return EINVAL;
++        out->kind = 4; out->length = 8;
++        memcpy(out->name, &native.nl_pid, 4);
++        memcpy(out->name + 4, &native.nl_groups, 4);
++        return 0;
++    }
 +    if (family != AF_UNIX) return EAFNOSUPPORT;
 +    constexpr size_t prefix = offsetof(sockaddr_un, sun_path);
 +    if (size < prefix || size > sizeof(sockaddr_un)) return EINVAL;
@@ -369,6 +367,17 @@ index 0000000..0cc493b
 +}
 +int copy_address(const roanix_socket_address &address, sockaddr *out, socklen_t capacity,
 +                 socklen_t *actual) {
++    if (address.kind == 4) {
++        sockaddr_nl native = {};
++        native.nl_family = AF_NETLINK;
++        memcpy(&native.nl_pid, address.name, 4);
++        memcpy(&native.nl_groups, address.name + 4, 4);
++        size_t count = capacity < sizeof(native) ? capacity : sizeof(native);
++        if (count && !out) return EFAULT;
++        if (count) memcpy(out, &native, count);
++        *actual = sizeof(native);
++        return 0;
++    }
 +    sockaddr_un native = {};
 +    native.sun_family = AF_UNIX;
 +    size_t length = offsetof(sockaddr_un, sun_path);
@@ -391,10 +400,15 @@ index 0000000..0cc493b
 +    return e ? e : copy_address(address, out, capacity, actual);
 +}
 +int option_number(int layer, int number) {
++    if (layer == SOL_NETLINK) {
++        if (number == NETLINK_ADD_MEMBERSHIP) return 20;
++        if (number == NETLINK_DROP_MEMBERSHIP) return 21;
++        return 0;
++    }
 +    if (layer != SOL_SOCKET) return 0;
 +    switch (number) {
 +        case SO_PASSCRED: return 1;
-+        case SO_RCVBUF: return 2;
++        case SO_RCVBUF: case SO_RCVBUFFORCE: return 2;
 +        case SO_SNDBUF: return 3;
 +        case SO_ERROR: return 4;
 +        case SO_TYPE: return 5;
@@ -430,6 +444,7 @@ index 0000000..0cc493b
 +    return e;
 +}
 +int Sysdeps<Socketpair>::operator()(int domain, int type, int protocol, int *fds) {
++    if (domain != AF_UNIX) return EAFNOSUPPORT;
 +    unsigned kind, flags;
 +    if (int e = socket_type(domain, type, protocol, &kind, &flags)) return e;
 +    return error(roanix_syscall3(ROANIX_SYS_SOCKET_PAIR, kind, flags, pointer(fds)));
@@ -578,7 +593,7 @@ index 0000000..0cc493b
 +    if (header->msg_name) {
 +        if (int e = copy_address(address, static_cast<sockaddr *>(header->msg_name), header->msg_namelen, &header->msg_namelen)) return e;
 +    } else header->msg_namelen = 0;
-+    header->msg_flags = (message.flags & 1 ? MSG_TRUNC : 0) | (message.flags & 4 ? MSG_CTRUNC : 0);
++    header->msg_flags = (message.flags & 1 ? MSG_TRUNC : 0) | (message.flags & 4 ? MSG_CTRUNC : 0) | (message.flags & 8 ? MSG_EOR : 0);
 +    header->msg_controllen = 0;
 +    if (message.rights_count && !append_control(header, capacity, SCM_RIGHTS, rights, message.rights_count * sizeof(int))) {
 +        for (size_t i = 0; i < message.rights_count; i++) roanix_syscall1(ROANIX_SYS_FILE_CLOSE, rights[i]);
@@ -613,10 +628,10 @@ index 0000000..0cc493b
 +} // namespace mlibc
 diff --git mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
 new file mode 100644
-index 0000000..807d0b0
+index 0000000..e564133
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/generic/sysdeps.cpp
-@@ -0,0 +1,1682 @@
+@@ -0,0 +1,1691 @@
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -737,6 +752,7 @@ index 0000000..807d0b0
 +void fill_stat(const struct roanix_stat &source, struct stat *target) {
 +    memset(target, 0, sizeof(*target));
 +    target->st_dev = source.device;
++    target->st_rdev = source.rdev;
 +    target->st_ino = source.inode;
 +    target->st_mode = source.mode | file_type(source.kind);
 +    target->st_nlink = source.links;
@@ -1168,11 +1184,19 @@ index 0000000..807d0b0
 +int Sysdeps<SignalfdCreate>::operator()(
 +        const sigset_t *mask, int flags, int *fd) {
 +    long result = roanix_syscall3(
-+        ROANIX_SYS_SIGNAL_FD, -1, as_word(mask), flags);
++        ROANIX_SYS_SIGNAL_FD, *fd, as_word(mask), flags);
 +    int error = syscall_error(result);
 +    if (!error)
 +        *fd = static_cast<int>(result);
 +    return error;
++}
++
++int Sysdeps<Mknodat>::operator()(int dirfd, const char *path, int mode, int device) {
++    return syscall_error(roanix_syscall4(ROANIX_SYS_FILE_MKNODAT, dirfd, as_word(path), mode, device));
++}
++
++int Sysdeps<Mkfifoat>::operator()(int dirfd, const char *path, mode_t mode) {
++    return mlibc::sysdep<Mknodat>(dirfd, path, (mode & ~S_IFMT) | S_IFIFO, 0);
 +}
 +
 +int Sysdeps<Chdir>::operator()(const char *path) {
@@ -1272,14 +1296,14 @@ index 0000000..807d0b0
 +    struct roanix_stat source;
 +    long result;
 +    if (target == mlibc::fsfd_target::fd) {
-+        result = roanix_syscall2(
-+            ROANIX_SYS_FILE_FSTAT, fd, as_word(&source));
++        result = roanix_syscall4(
++            ROANIX_SYS_FILE_STATAT, fd, as_word(""), AT_EMPTY_PATH | (1U << 31), as_word(&source));
 +    } else if (target == mlibc::fsfd_target::path) {
 +        result = roanix_syscall4(
 +            ROANIX_SYS_FILE_STATAT,
 +            AT_FDCWD,
 +            as_word(path),
-+            flags,
++            static_cast<unsigned>(flags) | (1U << 31),
 +            as_word(&source)
 +        );
 +    } else if (target == mlibc::fsfd_target::fd_path) {
@@ -1287,7 +1311,7 @@ index 0000000..807d0b0
 +            ROANIX_SYS_FILE_STATAT,
 +            fd,
 +            as_word(path),
-+            flags,
++            static_cast<unsigned>(flags) | (1U << 31),
 +            as_word(&source)
 +        );
 +    } else {
@@ -2385,10 +2409,10 @@ index 0000000..375b4f1
 \ No newline at end of file
 diff --git mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
 new file mode 100644
-index 0000000..02d4459
+index 0000000..6224310
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/mlibc/sysdeps.hpp
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,176 @@
 +#pragma once
 +
 +#include <mlibc/sysdep-signatures.hpp>
@@ -2464,6 +2488,8 @@ index 0000000..02d4459
 +    GetCwd,
 +    Access,
 +    Faccessat,
++    Mknodat,
++    Mkfifoat,
 +    Stat,
 +    Statx,
 +    NameToHandleAt,
@@ -2565,10 +2591,10 @@ index 0000000..02d4459
 +} // namespace mlibc
 diff --git mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
 new file mode 100644
-index 0000000..7d4e901
+index 0000000..13f98b8
 --- /dev/null
 +++ mlibc-workdir/sysdeps/roanix/include/roanix/syscall.h
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,313 @@
 +#ifndef ROANIX_SYSCALL_H
 +#define ROANIX_SYSCALL_H
 +
@@ -2678,7 +2704,8 @@ index 0000000..7d4e901
 +    ROANIX_SYS_PROCESS_NOFILE,
 +    ROANIX_SYS_PROCESS_PARENT_SIGNAL,
 +    ROANIX_SYS_PROCESS_GETMAIN_TID,
-+    ROANIX_SYS_FILE_WRITEV
++    ROANIX_SYS_FILE_WRITEV,
++    ROANIX_SYS_FILE_MKNODAT
 +};
 +
 +enum {
@@ -2715,6 +2742,7 @@ index 0000000..7d4e901
 +    uint64_t accessed_ns;
 +    uint64_t modified_ns;
 +    uint64_t changed_ns;
++    uint64_t rdev; /* Requested with statat bit 31. */
 +};
 +
 +/* Filesystem accounting uses the supplied block size, not host page units. */

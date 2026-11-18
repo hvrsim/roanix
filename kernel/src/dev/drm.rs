@@ -191,7 +191,7 @@ impl Card {
                     (48, &b"Roanix boot display KMS"[..]),
                 ] {
                     let count = (get64(bytes, offset) as usize).min(text.len());
-                    if count != 0 {
+                    if count != 0 && get64(bytes, offset + 8) != 0 {
                         copy_to_user(context, get64(bytes, offset + 8), &text[..count])?;
                     }
                     put64(bytes, offset, text.len() as u64);
@@ -229,10 +229,9 @@ impl Card {
             }
             0x1f => {
                 // DROP_MASTER
-                if state.master != Some(file) {
-                    return Err(Error::PermissionDenied);
+                if state.master == Some(file) {
+                    state.master = None;
                 }
-                state.master = None;
             }
             0xa0 => {
                 // GETRESOURCES

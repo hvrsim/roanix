@@ -178,6 +178,8 @@ pub enum CreateKind {
     Symlink(Vec<u8>),
     /// Create a local socket rendezvous inode, without file data.
     Socket,
+    /// Create a named byte pipe.
+    Fifo,
 }
 
 /// One directory entry returned by `readdir`.

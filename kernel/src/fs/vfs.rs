@@ -366,6 +366,20 @@ pub(crate) fn create_socket_at(
     Ok((node, directory))
 }
 
+/// Creates a FIFO under a retained directory anchor.
+pub(crate) fn create_fifo_at(base: &PathAnchor, path: &[u8], mode: u16) -> Result<Vnode> {
+    let _mutation = super::namespace::mutation();
+    let (directory, parent) = resolve_parent(Some(base), path)?;
+    if parent.trailing_slash {
+        return Err(Error::NotDirectory);
+    }
+    let attrs = directory.vnode.getattr()?;
+    if attrs.mode & 0o222 == 0 || attrs.mode & 0o111 == 0 {
+        return Err(Error::PermissionDenied);
+    }
+    directory.vnode.create(parent.name, CreateKind::Fifo, mode)
+}
+
 /// Creates an empty directory directly below a stable directory anchor.
 pub(crate) fn create_dir_at(base: &PathAnchor, path: &[u8], mode: u16) -> Result<Vnode> {
     let _mutation = super::namespace::mutation();

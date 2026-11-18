@@ -15,6 +15,7 @@ pub const KEY_BYTES: usize = 96;
 
 struct Reader {
     event: Option<OwnedEvent>,
+    revoked: bool,
     head: usize,
     length: usize,
     records: [[u8; RECORD]; QUEUE],
@@ -23,12 +24,16 @@ impl Reader {
     const fn new() -> Self {
         Self {
             event: None,
+            revoked: false,
             head: 0,
             length: 0,
             records: [[0; RECORD]; QUEUE],
         }
     }
     fn push(&mut self, record: [u8; RECORD]) {
+        if self.revoked {
+            return;
+        }
         if self.length == QUEUE {
             self.head = 0;
             self.length = 1;
@@ -214,6 +219,7 @@ unsafe extern "C" fn open(context: *mut c_void, _: u32, out: *mut usize) -> i32 
             .position(|reader| reader.event.is_none())
         {
             let reader = &mut state.readers[index];
+            reader.revoked = false;
             reader.head = 0;
             reader.length = 0;
             reader.event = event.take();
@@ -265,6 +271,9 @@ unsafe extern "C" fn read(
                 return i64::from(ddk::ENODEV);
             }
             let reader = &mut state.readers[index];
+            if reader.revoked {
+                return i64::from(ddk::ENODEV);
+            }
             let Some(event) = reader.event.as_ref().map(OwnedEvent::event) else {
                 return i64::from(ddk::EINVAL);
             };
@@ -305,7 +314,7 @@ unsafe extern "C" fn poll(
     _: u32,
 ) -> i64 {
     let state = keyboard(context).state.lock_irqsave();
-    if !state.online {
+    if !state.online || state.readers.get(index).is_some_and(|r| r.revoked) {
         return i64::from(ddk::POLL_HUP);
     }
     if state.readers.get(index).is_some_and(|r| r.length != 0) {
@@ -325,10 +334,10 @@ unsafe extern "C" fn readable(context: *mut c_void, index: usize) -> usize {
 }
 unsafe extern "C" fn ioctl(
     context: *mut c_void,
-    _: usize,
+    index: usize,
     _: *const raw::IoctlIdentity,
     request: u64,
-    _: u64,
+    value: u64,
     buffer: *mut u8,
     length: usize,
 ) -> i64 {
@@ -336,9 +345,27 @@ unsafe extern "C" fn ioctl(
         return i64::from(ddk::ENOTTY);
     }
     let keyboard = keyboard(context);
-    let state = keyboard.state.lock_irqsave();
+    let mut state = keyboard.state.lock_irqsave();
     if !state.online {
         return i64::from(ddk::ENODEV);
+    }
+    let Some(reader) = state.readers.get_mut(index) else {
+        return i64::from(ddk::EINVAL);
+    };
+    if reader.revoked {
+        return i64::from(ddk::ENODEV);
+    }
+    if request == 0x4004_4591 {
+        // EVIOCREVOKE takes an immediate argument.
+        if value != 0 {
+            return i64::from(ddk::EINVAL);
+        }
+        reader.revoked = true;
+        reader.length = 0;
+        if let Some(event) = &reader.event {
+            let _ = event.signal();
+        }
+        return 0;
     }
     // SAFETY: the node ABI provides length bytes of initialized kernel storage.
     let output = unsafe { slice::from_raw_parts_mut(buffer, length) };

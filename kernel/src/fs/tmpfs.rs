@@ -79,6 +79,7 @@ struct TmpfsNode {
 
 enum TmpfsData {
     Socket,
+    Fifo(super::fifo::Fifo),
     // Shared reads may fault and copy concurrently. Length-changing writes,
     // append and truncate remain exclusive to preserve their ordering.
     File(RwLock<TmpfsFile>),
@@ -186,6 +187,12 @@ impl Tmpfs {
         let id = NodeId::new(self.next_node.fetch_add(1, Ordering::Relaxed));
         let now_ns = clock::monotonic_ns();
         let (vnode_kind, size, links, data) = match kind {
+            CreateKind::Fifo => (
+                VnodeKind::Fifo,
+                0,
+                1,
+                TmpfsData::Fifo(super::fifo::Fifo::new()),
+            ),
             CreateKind::Socket => (VnodeKind::Socket, 0, 1, TmpfsData::Socket),
             CreateKind::Regular => (
                 VnodeKind::Regular,
@@ -297,7 +304,9 @@ impl TmpfsNode {
         match &self.data {
             TmpfsData::File(file) => Ok(file),
             TmpfsData::Directory(_) => Err(Error::IsDirectory),
-            TmpfsData::Symlink(_) | TmpfsData::Socket => Err(Error::InvalidArgument),
+            TmpfsData::Symlink(_) | TmpfsData::Socket | TmpfsData::Fifo(_) => {
+                Err(Error::InvalidArgument)
+            }
         }
     }
 
@@ -425,12 +434,80 @@ impl TmpfsNode {
 }
 
 impl VnodeOps for TmpfsNode {
-    fn open(&self, _vnode: &Vnode, _flags: u32) -> Result<usize> {
+    fn open(&self, _vnode: &Vnode, flags: u32) -> Result<usize> {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            return fifo.open(flags);
+        }
         if self.kind == VnodeKind::Socket {
             Err(Error::Unsupported)
         } else {
             Ok(0)
         }
+    }
+
+    fn close(&self, _vnode: &Vnode, id: usize, _flags: u32) {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            fifo.close(id);
+        }
+    }
+    fn read_at_with_flags(
+        &self,
+        vnode: &Vnode,
+        id: usize,
+        offset: u64,
+        sink: &mut IoSink<'_>,
+        flags: u32,
+    ) -> Result<usize> {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            return fifo.read(id, sink, flags);
+        }
+        self.read_at(vnode, offset, sink)
+    }
+    fn write_at_with_flags(
+        &self,
+        vnode: &Vnode,
+        id: usize,
+        offset: u64,
+        source: &IoSource<'_>,
+        flags: u32,
+    ) -> Result<usize> {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            return fifo.write(id, source, flags);
+        }
+        self.write_at(vnode, offset, source)
+    }
+    fn poll(
+        &self,
+        _vnode: &Vnode,
+        id: usize,
+        _offset: u64,
+        events: super::PollEvents,
+        flags: u32,
+    ) -> Result<super::PollEvents> {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            return fifo.poll(id, events);
+        }
+        let mut ready = super::PollEvents::empty();
+        let flags = super::OpenFlags::from_bits_retain(flags);
+        if flags.contains(super::OpenFlags::READ) {
+            ready |= events & (super::PollEvents::IN | super::PollEvents::RDNORM);
+        }
+        if flags.contains(super::OpenFlags::WRITE) {
+            ready |= events & (super::PollEvents::OUT | super::PollEvents::WRNORM);
+        }
+        Ok(ready)
+    }
+    fn poll_events<'a>(
+        &'a self,
+        _vnode: &Vnode,
+        id: usize,
+        events: super::PollEvents,
+        output: &mut Vec<crate::sys::event::EventSource<'a>>,
+    ) -> bool {
+        if let TmpfsData::Fifo(fifo) = &self.data {
+            return fifo.events(id, events, output);
+        }
+        false
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -5,6 +5,7 @@ use crate::sys::event::EventSource;
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -310,11 +311,142 @@ pub trait DeviceNodeOps: Send + Sync {
     }
 }
 
+/// A coherent snapshot of a published device node.
+#[derive(Clone)]
+pub(crate) struct DeviceInfo {
+    pub id: u64,
+    pub path: String,
+    pub block: bool,
+}
+
+impl DeviceInfo {
+    pub fn subsystem(&self) -> &'static str {
+        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        if self.path.starts_with("input/") {
+            "input"
+        } else if self.path.starts_with("dri/") {
+            "drm"
+        } else if self.block {
+            "block"
+        } else if name.starts_with("tty") || name == "console" || name == "ptmx" {
+            "tty"
+        } else {
+            "misc"
+        }
+    }
+
+    pub fn syspath(&self) -> String {
+        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        if self.subsystem() == "input" {
+            let index = name.strip_prefix("event").unwrap_or(name);
+            alloc::format!("devices/virtual/input/input{index}/{name}")
+        } else {
+            alloc::format!("devices/virtual/{}/{name}", self.subsystem())
+        }
+    }
+
+    /// Reads input metadata through the same driver ABI as evdev clients.
+    pub fn input_attribute(&self, attribute: &str) -> Result<Vec<u8>> {
+        let (number, length) = match attribute {
+            "name" => (6, 256),
+            "properties" => (9, 8),
+            "capabilities/ev" => (0x20, 8),
+            "capabilities/key" => (0x21, 96),
+            "capabilities/rel" => (0x22, 8),
+            "capabilities/abs" => (0x23, 8),
+            "capabilities/msc" => (0x24, 8),
+            "capabilities/led" => (0x31, 8),
+            "id/bustype" | "id/vendor" | "id/product" | "id/version" => (2, 8),
+            _ => return Err(Error::NotFound),
+        };
+        let vnode = global()?
+            .state
+            .lock()
+            .records
+            .get(&DevNodeId::new(self.id))
+            .ok_or(Error::NotFound)?
+            .vnode
+            .clone();
+        let flags = (super::OpenFlags::READ | super::OpenFlags::NONBLOCK).bits();
+        let file = vnode.open(flags)?;
+        let mut bytes = alloc::vec![0u8; length];
+        let request = (2u64 << 30) | ((length as u64) << 16) | (u64::from(b'E') << 8) | number;
+        let result = vnode.ioctl(
+            file,
+            IoctlContext {
+                process_id: 0,
+                process_group: 0,
+                session_id: 0,
+                is_session_leader: false,
+            },
+            request,
+            0,
+            &mut bytes,
+        );
+        vnode.close(file, flags);
+        result?;
+        if attribute == "name" {
+            bytes.truncate(bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len()));
+            bytes.push(b'\n');
+            return Ok(bytes);
+        }
+        if let Some(field) = attribute.strip_prefix("id/") {
+            let offset = match field {
+                "bustype" => 0,
+                "vendor" => 2,
+                "product" => 4,
+                _ => 6,
+            };
+            return Ok(alloc::format!(
+                "{:04x}\n",
+                u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap())
+            )
+            .into_bytes());
+        }
+        let mut words: Vec<_> = bytes
+            .chunks_exact(8)
+            .map(|word| u64::from_ne_bytes(word.try_into().unwrap()))
+            .collect();
+        while words.len() > 1 && words.last() == Some(&0) {
+            words.pop();
+        }
+        let mut text = String::new();
+        for word in words.iter().rev() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&alloc::format!("{word:x}"));
+        }
+        text.push('\n');
+        Ok(text.into_bytes())
+    }
+
+    /// Linux-compatible device numbers for the native device namespace.
+    pub fn numbers(&self) -> (u32, u32) {
+        if let Some(index) = self
+            .path
+            .strip_prefix("input/event")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            (13, 64 + index)
+        } else if let Some(index) = self
+            .path
+            .strip_prefix("dri/card")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            (226, index)
+        } else {
+            (if self.block { 259 } else { 240 }, self.id as u32)
+        }
+    }
+}
+
 /// Mounted driver-managed filesystem.
 pub struct Devfs {
     id: FilesystemId,
     next_node: AtomicU64,
     used_nodes: AtomicU64,
+    generation: AtomicU64,
     state: Mutex<DevfsState>,
     root: Once<Vnode>,
 }
@@ -376,6 +508,7 @@ impl Devfs {
             id: FilesystemId::allocate(),
             next_node: AtomicU64::new(ROOT_NODE_ID + 1),
             used_nodes: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             state: Mutex::new(DevfsState {
                 records: BTreeMap::new(),
             }),
@@ -396,6 +529,48 @@ impl Devfs {
         filesystem.used_nodes.store(1, Ordering::Release);
         filesystem.root.call_once(|| root);
         Ok(filesystem)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Snapshots names and identities under the registry lock. No driver calls
+    /// are made while holding it.
+    pub(crate) fn devices(&self) -> Vec<DeviceInfo> {
+        let state = self.state.lock();
+        state
+            .records
+            .iter()
+            .filter_map(|(id, record)| {
+                if !matches!(
+                    record.vnode.kind(),
+                    VnodeKind::CharacterDevice | VnodeKind::BlockDevice
+                ) {
+                    return None;
+                }
+                let mut components = Vec::new();
+                let mut current = *id;
+                while current != self.root_id() {
+                    let entry = state.records.get(&current)?;
+                    let parent = state.records.get(&entry.parent)?;
+                    components.push(parent.ordered.get(&current)?.as_ref());
+                    current = entry.parent;
+                }
+                let mut path = String::new();
+                for component in components.iter().rev() {
+                    if !path.is_empty() {
+                        path.push('/');
+                    }
+                    path.push_str(core::str::from_utf8(component).ok()?);
+                }
+                Some(DeviceInfo {
+                    id: id.get(),
+                    path,
+                    block: record.vnode.kind() == VnodeKind::BlockDevice,
+                })
+            })
+            .collect()
     }
 
     /// Returns the root directory identifier.
@@ -447,6 +622,10 @@ impl Devfs {
         if node == self.root_id() {
             return Err(Error::PermissionDenied);
         }
+        let info = self
+            .devices()
+            .into_iter()
+            .find(|device| device.id == node.get());
         let mut state = self.state.lock();
         let record = state.records.get(&node).ok_or(Error::NotFound)?;
         if record.owner != owner {
@@ -462,6 +641,11 @@ impl Devfs {
         operations.try_revoke()?;
         remove_record(&mut state, node)?;
         self.used_nodes.fetch_sub(1, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        if let Some(info) = info {
+            super::sysfs::emit("remove", &info);
+        }
         Ok(())
     }
 
@@ -499,6 +683,7 @@ impl Devfs {
 
     pub(crate) fn force_remove_owner(&self, owner: OwnerId) -> Result<()> {
         let _namespace_mutation = super::namespace::mutation();
+        let devices = self.devices();
         let mut state = self.state.lock();
         validate_no_foreign_children(&state, owner)?;
         // Check every node before revoking any: partial revocation must not
@@ -517,7 +702,22 @@ impl Devfs {
         {
             node_operations(&record.vnode)?.force_revoke();
         }
-        remove_owned_records(self, &mut state, owner)
+        let removed: Vec<_> = devices
+            .into_iter()
+            .filter(|device| {
+                state
+                    .records
+                    .get(&DevNodeId::new(device.id))
+                    .is_some_and(|record| record.owner == owner)
+            })
+            .collect();
+        remove_owned_records(self, &mut state, owner)?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        for info in removed {
+            super::sysfs::emit("remove", &info);
+        }
+        Ok(())
     }
 
     fn create_node(
@@ -573,6 +773,16 @@ impl Devfs {
             },
         );
         self.used_nodes.fetch_add(1, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        if kind != VnodeKind::Directory
+            && let Some(info) = self
+                .devices()
+                .into_iter()
+                .find(|device| device.id == id.get())
+        {
+            super::sysfs::emit("add", &info);
+        }
         Ok(id)
     }
 
@@ -1185,4 +1395,23 @@ fn validate_no_foreign_children(state: &DevfsState, owner: OwnerId) -> Result<()
             }
             Ok(())
         })
+}
+
+/// Returns the device number advertised by sysfs for this devfs vnode.
+pub(crate) fn device_number(key: VnodeKey) -> Option<u64> {
+    let filesystem = global().ok()?;
+    if key.filesystem != filesystem.id {
+        return None;
+    }
+    let device = filesystem
+        .devices()
+        .into_iter()
+        .find(|device| device.id == key.node.get())?;
+    let (major, minor) = device.numbers();
+    Some(
+        (u64::from(major & 0xfff) << 8)
+            | u64::from(minor & 0xff)
+            | (u64::from(minor & !0xff) << 12)
+            | (u64::from(major & !0xfff) << 32),
+    )
 }
