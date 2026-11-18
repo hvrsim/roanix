@@ -68,8 +68,7 @@ build() {
 
 package() {
     DESTDIR="${dest_dir}" ninja install
-    # Roanix's initramfs bootstrap owns init and mounts the real root before
-    # execing the manager. Do not replace it with systemd's compatibility link.
+    # util-roanix provides /sbin/init as a direct link to the manager.
     rm "${dest_dir}/usr/bin/init"
     # Native APIs and devices exist before PID 1 starts. Upstream boot hooks
     # require writable /etc or unsupported administration and namespace APIs.

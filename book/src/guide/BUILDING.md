@@ -52,10 +52,11 @@ Each image build:
 
 The HDD or ISO contains Limine, the kernel, and the bootstrap initramfs. The
 complete userland lives in the companion `roanix-<arch>.root.img`. **Keep both
-images together** when running outside `x.py`. Init mounts the ext4 root from
-`/dev/nvme0n1p1`; QEMU uses a disposable snapshot of that disk. The filesystem
-is formatted with the feature subset supported by Roanix's read-only ext4
-driver.
+images together** when running outside `x.py`. After loading the storage drivers,
+the kernel mounts the read-only ext4 volume named by the Limine `root=`
+parameter and launches systemd as PID 1. The default is `/dev/nvme0n1p1`,
+which QEMU attaches as a disposable snapshot. If the root cannot be mounted,
+the kernel starts an initramfs rescue shell on `/dev/ttyS0`.
 
 `SYSTEM_PACKAGES` in `x.py` selects the top-level packages in the system.
 Jinx resolves their dependencies. `BOOTSTRAP_PACKAGES` selects the small early

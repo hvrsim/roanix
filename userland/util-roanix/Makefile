@@ -1,7 +1,7 @@
 CFLAGS ?= -O2 -pipe
 LDFLAGS ?=
 
-PROGRAMS = init dmesg
+PROGRAMS = dmesg
 
 all: $(PROGRAMS)
 

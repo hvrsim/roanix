@@ -5,11 +5,12 @@
 
 extern crate alloc;
 
+use core::time::Duration;
 use limine::{
     BaseRevision,
     request::{RequestsEndMarker, RequestsStartMarker},
 };
-use log::info;
+use log::{error, info};
 
 pub mod arch;
 pub mod dev;
@@ -82,10 +83,42 @@ fn init_thread() {
         sys::clock::monotonic_ns() / 1_000_000
     );
 
-    proc::spawn_init().expect("boot: failed to start /sbin/init");
+    match mount_boot_root() {
+        Ok(()) => {
+            if let Err(error) = proc::spawn_init(false) {
+                error!(target: "boot", "cannot start /sbin/init: {error}");
+                proc::spawn_init(true).expect("boot: failed to start the serial rescue shell");
+            }
+        }
+        Err(error) => {
+            error!(target: "boot", "cannot mount the system root: {error}");
+            proc::spawn_init(true).expect("boot: failed to start the serial rescue shell");
+        }
+    }
 
     // The console is the user's terminal from here on. Routine kernel chatter
     // would fight with the shell for it, so only failures stay on screen while
     // the full log remains available through /dev/klog and dmesg.
     sys::klog::set_console_level(sys::klog::Level::Error);
+}
+
+/// Waits for the configured block device before replacing the bootstrap root.
+fn mount_boot_root() -> fs::Result<()> {
+    let source = sys::cmdline::get()
+        .split(u8::is_ascii_whitespace)
+        .rev()
+        .find_map(|arg| arg.strip_prefix(b"root="))
+        .and_then(|value| core::str::from_utf8(value).ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(fs::Error::InvalidArgument)?;
+    info!(target: "boot", "mounting read-only ext4 root from {source}");
+    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    for _ in 0..9 {
+        match dev::block::find(name) {
+            Ok(_) => break,
+            Err(driver::Error::NotFound) => sys::clock::sleep(Duration::from_secs(1)),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::mount_block(source, b"/", "ext4")
 }

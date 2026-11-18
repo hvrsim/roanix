@@ -1,7 +1,7 @@
 #! /bin/sh
 
 version=0.1
-revision=32
+revision=33
 source_dir="util-roanix"
 hostdeps="gcc-host binutils"
 deps="sys-libs"
@@ -19,7 +19,6 @@ build() {
 }
 
 package() {
-    install -Dm755 init "${dest_dir}/usr/bin/init"
     install -Dm755 dmesg "${dest_dir}/usr/bin/dmesg"
     install -Dm644 roanix-root "${dest_dir}/etc/roanix-root"
     install -Dm644 "${recipe_dir}/passwd" "${dest_dir}/etc/passwd"
@@ -32,7 +31,7 @@ package() {
     done
 
     install -d -m755 "${dest_dir}/sbin"
-    ln -s ../usr/bin/init "${dest_dir}/sbin/init"
+    ln -s ../usr/lib/systemd/systemd "${dest_dir}/sbin/init"
 
     # Canonical executable and runtime paths for the native image.
     install -d -m755 "${dest_dir}/var"

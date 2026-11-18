@@ -918,17 +918,56 @@ pub(crate) fn process_ids() -> Vec<usize> {
         .collect()
 }
 
-/// Loads and schedules `/sbin/init`.
-pub fn spawn_init() -> Result<usize> {
+/// Loads the system manager or the serial rescue shell as PID 1.
+pub fn spawn_init(rescue: bool) -> Result<usize> {
+    use crate::fs::{self, IoctlContext, OpenFlags};
+
+    let path: &[u8] = if rescue {
+        b"/usr/bin/bash"
+    } else {
+        b"/sbin/init"
+    };
+    let rescue_args = [path, b"--noprofile", b"--norc", b"-i"];
+    let init_args = [path];
+    let args = if rescue {
+        rescue_args.as_slice()
+    } else {
+        init_args.as_slice()
+    };
     let image = elf::load(
-        b"/sbin/init",
-        &[b"/sbin/init".as_slice()],
-        &[b"PATH=/usr/bin:/bin".as_slice(), b"HOME=/".as_slice()],
+        path,
+        args,
+        &[b"PATH=/usr/bin:/bin".as_slice(), b"HOME=/", b"TERM=vt220"],
     )?;
+
+    let flags = OpenFlags::READ | OpenFlags::WRITE;
+    let serial = fs::open(b"/dev/ttyS0", flags, 0);
+    let console = if rescue {
+        serial?
+    } else {
+        serial.or_else(|_| fs::open(b"/dev/null", flags, 0))?
+    };
     let process = Process::new_root(image.address_space, image.executable);
+    for _ in 0..3 {
+        process.install_file(console.clone(), false)?;
+    }
     let pid = process.pid();
+    if rescue {
+        let context = IoctlContext {
+            process_id: pid,
+            process_group: pid as i32,
+            session_id: pid as i32,
+            is_session_leader: true,
+        };
+        console.ioctl(context, crate::dev::tty::TIOCSCTTY, 0, &mut [])?;
+        process.set_controlling_tty(console);
+        log::error!(target: "boot", "starting the serial rescue shell on /dev/ttyS0");
+    }
     let tid = sched::run_user(process, image.entry, image.stack);
-    info!("started /sbin/init as pid {pid}, tid {tid}");
+    info!(
+        "started {} as pid {pid}, tid {tid}",
+        core::str::from_utf8(path).unwrap()
+    );
     Ok(pid)
 }
 

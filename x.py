@@ -401,8 +401,9 @@ class Build:
             copy(module, root / "usr/lib/roanix/drivers" / module.name)
 
         if bootstrap:
-            for name in ("dev/.roanix-keep", "tmp/.roanix-keep", "etc/roanix-root"):
+            for name in ("dev/.roanix-keep", "tmp/.roanix-keep", "etc/roanix-root", "sbin/init"):
                 remove(root / name)
+            (root / "tmp").chmod(0o1777)
         else:
             self.install_machine_id(root)
             for header in (ROOT / "drivers/include/roanix").glob("*.h"):
