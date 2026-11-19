@@ -5,27 +5,9 @@
  * static inline wrapper over a versioned kernel import or a compile-time
  * constant, so a module needs no support library.
  *
- * A module looks like this:
- *
- *     #include <roanix/driver.h>
- *
- *     static int32_t probe(void *ctx, const struct rdf_device *dev, uintptr_t data)
- *     {
- *         ...
- *         return RDF_OK;
- *     }
- *
- *     static const struct rdf_match matches[] = {
- *         RDF_MATCH_COMPATIBLE("vendor,widget"),
- *     };
- *
- *     static int32_t init(const struct rdf_module *self)
- *     {
- *         static struct rdf_driver_def def = { ... };
- *         return rdf_driver_register(&def, NULL);
- *     }
- *
- *     RDF_MODULE("widget", "Widget controller", init, NULL);
+ * Declare a module with RDF_MODULE. Its init callback registers the driver
+ * definition and match table with rdf_driver_register. Keep callback code and
+ * context valid until the corresponding registrations have been removed.
  */
 #ifndef ROANIX_DRIVER_H
 #define ROANIX_DRIVER_H
@@ -396,7 +378,7 @@ static inline void rdf_device_set_data(const struct rdf_device *device, void *va
     rdf_api_v2_device_set_data(device, value);
 }
 
-/* Stores data only if the device identity is still live; preserves caller
+/* Stores data only if the device identity is still live and preserves caller
  * ownership on failure. Use this when transferring an allocated context. */
 static inline int32_t rdf_device_set_data_checked(const struct rdf_device *device, void *value)
 {
@@ -597,7 +579,7 @@ static inline int32_t rdf_irq_domain_register(const char *name, uint32_t flags,
     return rdf_api_v2_irq_domain_register(rdf_self, name, flags, hwirq_count, definition, out);
 }
 
-/* Publishes a fully initialized firmware controller; may retry consumers. */
+/* Publishes a fully initialized firmware controller and may retry consumers. */
 static inline int32_t rdf_irq_domain_set_device(const struct rdf_irq_domain *domain,
     const struct rdf_device *device)
 {
@@ -723,67 +705,66 @@ static inline int32_t rdf_mmio_direct(uint64_t physical, void **out)
     return rdf_api_v2_mmio_direct(physical, out);
 }
 
-/* Port I/O is an inline hardware primitive, not a kernel ABI call. */
+/* Reads an x86 I/O port byte. Returns all ones on other architectures. */
 static inline uint8_t rdf_port_read8(uint16_t port)
 {
-#if defined(__x86_64__)
-    uint8_t value;
-    __asm__ volatile("inb %w1, %0" : "=a"(value) : "Nd"(port));
-    return value;
+#if RDF_HAVE_PORT_IO
+    return rdf_in8(port);
 #else
     (void)port;
     return UINT8_MAX;
 #endif
 }
 
+/* Reads an x86 I/O port word. Returns all ones on other architectures. */
 static inline uint16_t rdf_port_read16(uint16_t port)
 {
-#if defined(__x86_64__)
-    uint16_t value;
-    __asm__ volatile("inw %w1, %0" : "=a"(value) : "Nd"(port));
-    return value;
+#if RDF_HAVE_PORT_IO
+    return rdf_in16(port);
 #else
     (void)port;
     return UINT16_MAX;
 #endif
 }
 
+/* Reads an x86 I/O port doubleword. Returns all ones on other architectures. */
 static inline uint32_t rdf_port_read32(uint16_t port)
 {
-#if defined(__x86_64__)
-    uint32_t value;
-    __asm__ volatile("inl %w1, %0" : "=a"(value) : "Nd"(port));
-    return value;
+#if RDF_HAVE_PORT_IO
+    return rdf_in32(port);
 #else
     (void)port;
     return UINT32_MAX;
 #endif
 }
 
+/* Writes an x86 I/O port byte. Other architectures ignore the write. */
 static inline void rdf_port_write8(uint16_t port, uint8_t value)
 {
-#if defined(__x86_64__)
-    __asm__ volatile("outb %0, %w1" : : "a"(value), "Nd"(port));
+#if RDF_HAVE_PORT_IO
+    rdf_out8(port, value);
 #else
     (void)port;
     (void)value;
 #endif
 }
 
+/* Writes an x86 I/O port word. Other architectures ignore the write. */
 static inline void rdf_port_write16(uint16_t port, uint16_t value)
 {
-#if defined(__x86_64__)
-    __asm__ volatile("outw %0, %w1" : : "a"(value), "Nd"(port));
+#if RDF_HAVE_PORT_IO
+    rdf_out16(port, value);
 #else
     (void)port;
     (void)value;
 #endif
 }
 
+/* Writes an x86 I/O port doubleword. Other architectures ignore the write. */
 static inline void rdf_port_write32(uint16_t port, uint32_t value)
 {
-#if defined(__x86_64__)
-    __asm__ volatile("outl %0, %w1" : : "a"(value), "Nd"(port));
+#if RDF_HAVE_PORT_IO
+    rdf_out32(port, value);
 #else
     (void)port;
     (void)value;
@@ -799,11 +780,11 @@ static inline void rdf_port_write32(uint16_t port, uint32_t value)
 static inline int32_t rdf_mmio_wait32(const struct rdf_mmio *window, size_t offset,
                                       uint32_t mask, uint32_t want, uint64_t timeout_ns)
 {
-    uint64_t deadline = rdf_api_v2_time_monotonic() + timeout_ns;
+    uint64_t start = rdf_api_v2_time_monotonic();
     for (;;) {
         if ((rdf_read32(window, offset) & mask) == want)
             return RDF_OK;
-        if (rdf_api_v2_time_monotonic() >= deadline)
+        if (rdf_api_v2_time_monotonic() - start >= timeout_ns)
             return RDF_ETIMEDOUT;
         rdf_cpu_relax();
     }

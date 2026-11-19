@@ -3,7 +3,7 @@
  *
  * A freestanding compiler may still emit calls to memcpy, memset, memmove, and
  * memcmp for ordinary structure assignments, so every module needs its own
- * copies. Defining them here keeps modules self-contained; unused copies are
+ * copies. Defining them here keeps modules self-contained. Unused copies are
  * removed by section garbage collection at link time.
  */
 #ifndef ROANIX_STRING_H
@@ -32,13 +32,14 @@ RDF_USED static void *memmove(void *destination, const void *source, size_t leng
     const uint8_t *in = (const uint8_t *)source;
     if (out == in || length == 0)
         return destination;
-    if (out < in) {
+    if ((uintptr_t)out < (uintptr_t)in) {
         for (size_t index = 0; index < length; ++index)
             out[index] = in[index];
     } else {
         for (size_t index = length; index > 0; --index)
             out[index - 1] = in[index - 1];
     }
+
     return destination;
 }
 
@@ -60,6 +61,7 @@ RDF_USED static int memcmp(const void *left, const void *right, size_t length)
         if (a[index] != b[index])
             return a[index] < b[index] ? -1 : 1;
     }
+
     return 0;
 }
 
@@ -79,6 +81,7 @@ RDF_UNUSED static int strcmp(const char *left, const char *right)
         ++left;
         ++right;
     }
+
     return (int)(unsigned char)*left - (int)(unsigned char)*right;
 }
 
@@ -93,6 +96,7 @@ RDF_UNUSED static int strncmp(const char *left, const char *right, size_t length
         if (a == '\0')
             break;
     }
+
     return 0;
 }
 
@@ -119,6 +123,7 @@ RDF_UNUSED static int rdf_strlist_contains(const uint8_t *bytes, size_t length, 
             return 1;
         offset = end + 1;
     }
+
     return 0;
 }
 
@@ -131,6 +136,7 @@ RDF_UNUSED static size_t rdf_strlcpy(char *destination, const char *source, size
         memcpy(destination, source, copied);
         destination[copied] = '\0';
     }
+
     return length;
 }
 

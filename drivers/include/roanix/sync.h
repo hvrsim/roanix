@@ -28,7 +28,13 @@ static inline uintptr_t rdf_irq_save(void)
 {
 #if defined(__x86_64__)
     uintptr_t flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    __asm__ volatile(
+        "pushfq\n\t"
+        "popq %0\n\t"
+        "cli"
+        : "=r"(flags)
+        :
+        : "memory");
     return flags;
 #elif defined(__riscv)
     uintptr_t previous;
@@ -99,6 +105,7 @@ static inline uintptr_t rdf_spin_lock_irqsave(struct rdf_spinlock *lock)
 {
     uintptr_t state = rdf_irq_save();
     rdf_spin_lock(lock);
+
     return state;
 }
 

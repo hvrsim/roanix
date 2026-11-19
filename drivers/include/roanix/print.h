@@ -19,12 +19,14 @@ extern "C" {
 /* Largest formatted log line. Longer messages are truncated. */
 #define RDF_LOG_LINE 512
 
+/* Tracks the destination and would-be length of one formatted message. */
 struct rdf_sink {
     char *buffer;
     size_t capacity;
     size_t length;
 };
 
+/* Counts a character and stores it only if there is room for the trailing NUL. */
 RDF_UNUSED static void rdf_sink_char(struct rdf_sink *sink, char value)
 {
     if (sink->length + 1 < sink->capacity)
@@ -38,6 +40,7 @@ RDF_UNUSED static void rdf_sink_text(struct rdf_sink *sink, const char *text, si
         rdf_sink_char(sink, text[index]);
 }
 
+/* Emits unsigned digits with the selected base, case, and minimum width. */
 RDF_UNUSED static void rdf_sink_unsigned(struct rdf_sink *sink, uint64_t value, unsigned base,
                               int uppercase, unsigned width, int zero_pad)
 {
@@ -56,6 +59,7 @@ RDF_UNUSED static void rdf_sink_unsigned(struct rdf_sink *sink, uint64_t value, 
         rdf_sink_char(sink, scratch[--length]);
 }
 
+/* Emits signed decimal without overflowing when taking the magnitude of INT64_MIN. */
 RDF_UNUSED static void rdf_sink_signed(struct rdf_sink *sink, int64_t value, unsigned width, int zero_pad)
 {
     if (value < 0) {
@@ -78,6 +82,7 @@ RDF_UNUSED static size_t rdf_vsnprintf(char *buffer, size_t capacity, const char
             rdf_sink_char(&sink, *cursor);
             continue;
         }
+
         ++cursor;
         if (*cursor == '\0')
             break;
@@ -87,11 +92,13 @@ RDF_UNUSED static size_t rdf_vsnprintf(char *buffer, size_t capacity, const char
             zero_pad = 1;
             ++cursor;
         }
+
         unsigned width = 0;
         while (*cursor >= '0' && *cursor <= '9') {
             width = width * 10u + (unsigned)(*cursor - '0');
             ++cursor;
         }
+
         int wide = 0;
         while (*cursor == 'l' || *cursor == 'z') {
             wide = 1;
@@ -144,6 +151,7 @@ RDF_UNUSED static size_t rdf_vsnprintf(char *buffer, size_t capacity, const char
         size_t terminator = sink.length < sink.capacity ? sink.length : sink.capacity - 1;
         sink.buffer[terminator] = '\0';
     }
+
     return sink.length;
 }
 
@@ -154,6 +162,7 @@ RDF_UNUSED static size_t rdf_snprintf(char *buffer, size_t capacity, const char 
     va_start(args, format);
     size_t length = rdf_vsnprintf(buffer, capacity, format, args);
     va_end(args);
+
     return length;
 }
 

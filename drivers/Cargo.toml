@@ -1,20 +1,84 @@
 [workspace]
 members = [
     "ddk",
-    "bus/pci",
-    "platform/acpi",
-    "platform/fdt",
-    "irqchip/ioapic",
-    "irqchip/plic",
-    "tty/uart8250",
-    "input/i8042",
     "input/evdev",
     "usb/usb",
-    "usb/xhci",
-    "usb/keyboard",
-    "storage/nvme",
 ]
 resolver = "3"
+
+[package]
+name = "roanix-drivers"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.87"
+
+[lib]
+name = "firmware_tree"
+path = "platform/fdt/firmware.rs"
+
+[[bin]]
+name = "pci"
+path = "bus/pci/pci.rs"
+
+[[bin]]
+name = "i8042"
+path = "input/i8042.rs"
+
+[[bin]]
+name = "ioapic"
+path = "irqchip/ioapic.rs"
+
+[[bin]]
+name = "plic"
+path = "irqchip/plic.rs"
+
+[[bin]]
+name = "acpi"
+path = "platform/acpi.rs"
+
+[[bin]]
+name = "fdt"
+path = "platform/fdt/fdt.rs"
+
+[[bin]]
+name = "nvme"
+path = "storage/nvme.rs"
+
+[[bin]]
+name = "uart8250"
+path = "tty/uart8250.rs"
+
+[[bin]]
+name = "usb-keyboard"
+path = "usb/keyboard.rs"
+
+[[bin]]
+name = "usb-mouse"
+path = "usb/mouse.rs"
+
+[[bin]]
+name = "usb-xhci"
+path = "usb/xhci/xhci.rs"
+
+[[bin]]
+name = "usb-storage"
+path = "usb/storage.rs"
+
+[dependencies]
+ddk = { path = "ddk" }
+evdev = { path = "input/evdev" }
+usb = { path = "usb/usb" }
+
+[build-dependencies]
+ddk = { path = "ddk", features = ["module-build"] }
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
 
 [profile.dev]
 opt-level = 2

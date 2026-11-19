@@ -75,8 +75,8 @@ class Build:
         self.initramfs = self.out / f"roanix-{self.arch}.initramfs.tar.gz"
         self.root_disk = self.sysroot.parent / "root.img"
         self.modules = []
-        for package in self.drivers:
-            filename = "storage-nvme.ko" if package == "nvme" else f"{package}.ko"
+        for name in self.drivers:
+            filename = "storage-nvme.ko" if name == "nvme" else f"{name}.ko"
             self.modules.append(self.base / "drivers-rust" / filename)
 
     def cargo(self, action, *, drivers=False, driver=None):
@@ -90,9 +90,9 @@ class Build:
         if drivers:
             target_dir /= "drivers"
             options.append("--release")
-            packages = (driver,) if driver else self.drivers
-            for package in packages:
-                options.extend(("--package", package))
+            names = (driver,) if driver else self.drivers
+            for name in names:
+                options.extend(("--bin", name))
             if self.arch == "riscv64":
                 options.extend((
                     "-Zbuild-std=core,alloc,compiler_builtins",
@@ -129,11 +129,11 @@ class Build:
     def build_drivers(self, driver=None):
         msg(f"Building {driver or 'drivers'} ({self.arch})")
         target_dir = self.cargo("build", drivers=True, driver=driver) / "release"
-        packages = (driver,) if driver else self.drivers
-        for package in packages:
-            filename = "storage-nvme.ko" if package == "nvme" else f"{package}.ko"
+        names = (driver,) if driver else self.drivers
+        for name in names:
+            filename = "storage-nvme.ko" if name == "nvme" else f"{name}.ko"
             output = self.base / "drivers-rust" / filename
-            copy(target_dir / package, output)
+            copy(target_dir / name, output)
         return output if driver else self.modules
 
     def prepare_machine_id(self):

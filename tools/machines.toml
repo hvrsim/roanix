@@ -1,9 +1,9 @@
 [pc-x86_64]
 arch = "x86_64"
 rust-target = "x86_64-unknown-none"
-drivers = ["acpi", "ioapic", "pci", "nvme", "uart8250", "i8042", "usb-xhci", "usb-keyboard"]
+drivers = ["acpi", "ioapic", "pci", "nvme", "uart8250", "i8042", "usb-xhci", "usb-keyboard", "usb-mouse", "usb-storage"]
 
 [qemu-riscv64-virt]
 arch = "riscv64"
 rust-target = "riscv64gc-unknown-none-elf"
-drivers = ["fdt", "plic", "pci", "nvme", "uart8250", "usb-xhci", "usb-keyboard"]
+drivers = ["fdt", "plic", "pci", "nvme", "uart8250", "usb-xhci", "usb-keyboard", "usb-mouse", "usb-storage"]

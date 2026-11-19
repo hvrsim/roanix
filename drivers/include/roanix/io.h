@@ -39,7 +39,7 @@ static inline void rdf_wmb(void)
 
 /* Orders coherent DMA memory and device register accesses together. Use before
  * publishing a descriptor through a doorbell and after observing completion
- * before reading its DMA payload. Register accessors below are volatile only;
+ * before reading its DMA payload. Register accessors below are volatile only.
  * they do not insert this ordering or flush posted writes. */
 static inline void rdf_device_barrier(void)
 {
@@ -105,14 +105,6 @@ static inline void rdf_write64(const struct rdf_mmio *window, size_t offset, uin
 {
     *(volatile uint64_t *)rdf_mmio_at(window, offset) = value;
 }
-
-/*
- * Spins until a masked register field reaches `want`, or the timeout expires.
- *
- * Returns RDF_OK on success and RDF_ETIMEDOUT otherwise. This is the shape
- * every controller reset and doorbell handshake needs. It lives in
- * <roanix/driver.h> because it needs the kernel's clock.
- */
 
 /* --- Port access -------------------------------------------------------- */
 
